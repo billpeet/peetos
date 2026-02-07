@@ -19,7 +19,7 @@ Key references in the C project:
 
 - `boot/` Reused stage1 and stage2 bootloader assembly.
 - `kernel/` Rust kernel binary crate.
-- `crates/` Placeholder subsystem crates for drivers, filesystems, networking, syscalls, and user ABI.
+- `crates/` Subsystem crates (currently `arch_x86_64` provides port I/O and interrupt wrappers; others are placeholders).
 - `linker/` Linker script for the kernel.
 - `docs/PORTING_PLAN.md` High-level implementation roadmap.
 
@@ -27,7 +27,9 @@ Key references in the C project:
 
 - Boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a `hlt` loop.
 - Panic handler prints over serial, then halts with `cli; hlt`.
-- Subsystem crates are placeholders; interrupts, memory management, drivers, and user space are not yet implemented.
+- `arch_x86_64` now provides basic port I/O helpers and interrupt enable/disable wrappers.
+- GDT/IDT setup is wired in with basic interrupt stubs and a default exception handler; PIC/PIT and hardware IRQ handling are still pending.
+- Subsystem crates are placeholders beyond `arch_x86_64`; interrupts, memory management, drivers, and user space are not yet implemented.
 
 ## Build Prerequisites
 

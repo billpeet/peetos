@@ -3,6 +3,8 @@
 use core::fmt;
 use core::fmt::Write;
 
+use arch_x86_64::port::{inb, outb};
+
 const COM1_BASE: u16 = 0x3F8;
 
 fn write_str_with_crlf<F: FnMut(u8)>(s: &str, mut write: F) {
@@ -98,16 +100,6 @@ macro_rules! serial_println {
     ($fmt:expr, $($arg:tt)*) => ($crate::serial_print!(
         concat!($fmt, "\n"), $($arg)*
     ));
-}
-
-unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-}
-
-unsafe fn inb(port: u16) -> u8 {
-    let mut val: u8;
-    core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
-    val
 }
 
 #[cfg(test)]

@@ -17,6 +17,9 @@ version = "0.1.0"
 [[package]]
 name = "kernel"
 version = "0.1.0"
+dependencies = [
+ "arch_x86_64",
+]
 
 [[package]]
 name = "net"
