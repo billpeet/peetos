@@ -1,0 +1,234 @@
+; ===========================================================================
+; PeetOS Kernel Entry Point - entry.asm
+; ===========================================================================
+;
+; Tell the linker we don't need an executable stack
+; This suppresses the linker warning about missing .note.GNU-stack
+section .note.GNU-stack noalloc noexec nowrite progbits
+
+; ===========================================================================
+;
+; WHAT IS THIS FILE?
+; ==================
+; This is the entry point for the kernel. When the bootloader finishes
+; transitioning to 64-bit Long Mode, it jumps here.
+;
+; This file is written in assembly because we need precise control over
+; the early kernel environment before we can call C code.
+;
+; WHAT DOES IT DO?
+; ================
+; 1. Sets up a proper stack for 64-bit operation
+; 2. Clears the BSS section (uninitialized data)
+; 3. Calls the C kernel main function (kmain)
+; 4. If kmain returns (it shouldn't), halts the CPU
+;
+; THE BSS SECTION:
+; ================
+; In C, global and static variables that are not explicitly initialized
+; are placed in the BSS section. The C standard requires these to be
+; zero-initialized, but the linker/loader doesn't actually store zeros
+; in the binary - that would waste space. Instead, the BSS section is
+; simply a reserved area that must be zeroed at runtime.
+;
+; It's our responsibility to zero it before running C code!
+;
+; ===========================================================================
+
+[BITS 64]                       ; We're in 64-bit Long Mode
+
+; ---------------------------------------------------------------------------
+; EXTERNAL SYMBOLS
+; ---------------------------------------------------------------------------
+; These symbols are defined in the linker script or C code.
+
+extern kmain                    ; The C kernel main function
+
+; These are defined in the linker script (kernel.ld)
+extern __bss_start              ; Start address of BSS section
+extern __bss_end                ; End address of BSS section
+
+; ---------------------------------------------------------------------------
+; EXPORTED SYMBOLS
+; ---------------------------------------------------------------------------
+
+global _start                   ; Export our entry point
+
+; ===========================================================================
+; CODE SECTION
+; ===========================================================================
+
+section .text
+
+; ===========================================================================
+; _start - Kernel Entry Point
+; ===========================================================================
+; This is the first kernel code executed.
+; The bootloader has set up:
+;   - 64-bit Long Mode
+;   - Identity mapping of first 2 MB
+;   - Basic stack (but we'll set up our own)
+; ===========================================================================
+
+_start:
+    ; -----------------------------------------------------------------------
+    ; STEP 1: Clear direction flag
+    ; -----------------------------------------------------------------------
+    ; The direction flag (DF) controls the direction of string operations.
+    ; DF=0: String operations increment (forward)
+    ; DF=1: String operations decrement (backward)
+    ;
+    ; The C calling convention expects DF=0, so we ensure that.
+
+    cld                         ; Clear Direction Flag (forward string ops)
+
+    ; -----------------------------------------------------------------------
+    ; STEP 1.5: Jump to higher-half and ensure cache coherency
+    ; -----------------------------------------------------------------------
+    ; CRITICAL FIX: The bootloader jumped to us at the identity-mapped
+    ; address (0x100000). We need to immediately jump to our higher-half
+    ; virtual address to fix cache aliasing.
+    ;
+    ; Note: We keep the identity mapping because the framebuffer uses it,
+    ; but jumping to higher-half ensures all kernel code/data access uses
+    ; the higher-half mapping consistently.
+
+    mov rax, .higher_half       ; Load absolute address (sign-extended imm64)
+    jmp rax                     ; Jump to higher-half
+
+.higher_half:
+    ; Now executing at higher-half virtual address!
+
+    ; -----------------------------------------------------------------------
+    ; STEP 2: Clear the BSS section
+    ; -----------------------------------------------------------------------
+    ; The BSS section contains uninitialized global/static variables that
+    ; must be zeroed by the C standard. The linker provides __bss_start and
+    ; __bss_end symbols marking the range to clear.
+    ;
+    ; IMPORTANT: We do NOT clear the .data section! Variables initialized
+    ; to non-zero values (like pml4_addr = 0xDEADBEEFDEADBEEF in vmm.c)
+    ; are in .data and are loaded from disk with their initialized values.
+    ;
+    ; Using linker symbols instead of hardcoded addresses ensures this code
+    ; remains correct even when the kernel size changes.
+
+    ; Calculate BSS size and clear it using rep stosq
+    mov rdi, __bss_start        ; Start address (from linker script)
+    mov rsi, __bss_end          ; End address (from linker script)
+    sub rsi, rdi                ; Size in bytes
+    shr rsi, 3                  ; Convert to qwords (divide by 8)
+    xor rax, rax                ; Value to write (0)
+    mov rcx, rsi                ; Count for rep
+    rep stosq                   ; Store RAX to [RDI], repeat RCX times
+
+    ; Memory barrier to ensure all writes complete before proceeding
+    mfence
+
+    ; -----------------------------------------------------------------------
+    ; STEP 3: Unmap identity mapping
+    ; -----------------------------------------------------------------------
+    ; Unmap the identity mapping (PML4[0]) now that we're running from higher-half.
+    ; This prevents accidental use of low addresses and frees up the lower half
+    ; of the address space for future user processes.
+
+    mov rax, 0xFFFFFFFF80010000  ; PML4 in higher-half (physical 0x10000)
+    mov qword [rax], 0           ; Clear PML4[0] (unmap identity mapping)
+
+    ; Flush TLB to remove stale entries
+    mov rax, cr3
+    mov cr3, rax
+
+    ; -----------------------------------------------------------------------
+    ; STEP 4: Set up the kernel stack
+    ; -----------------------------------------------------------------------
+    ; We need a proper stack for C function calls.
+    ; The stack grows downward, so RSP points to the top (highest address).
+    ; We reserve 16 KB for the stack, which should be plenty for now.
+    ;
+    ; Note: The x86_64 ABI requires the stack to be 16-byte aligned
+    ; before a CALL instruction. Our stack_top is aligned in the BSS.
+
+    mov rsp, stack_top          ; Set stack pointer
+
+    ; -----------------------------------------------------------------------
+    ; STEP 4: Enable SSE/SSE2 for user-space programs
+    ; -----------------------------------------------------------------------
+    ; musl libc and many user programs use SSE instructions by default.
+    ; We need to enable SSE support in the CPU:
+    ;   - CR0.EM (bit 2) = 0: Disable x87 emulation mode
+    ;   - CR0.MP (bit 1) = 1: Monitor coprocessor (enables WAIT/FWAIT)
+    ;   - CR4.OSFXSR (bit 9) = 1: Enable FXSAVE/FXRSTOR for SSE state
+    ;   - CR4.OSXMMEXCPT (bit 10) = 1: Enable unmasked SSE exceptions
+
+    ; Modify CR0: clear EM (bit 2), set MP (bit 1)
+    mov rax, cr0
+    and ax, 0xFFFB              ; Clear bit 2 (EM)
+    or ax, 0x0002               ; Set bit 1 (MP)
+    mov cr0, rax
+
+    ; Modify CR4: set OSFXSR (bit 9) and OSXMMEXCPT (bit 10)
+    mov rax, cr4
+    or ax, (1 << 9) | (1 << 10) ; Set OSFXSR and OSXMMEXCPT
+    mov cr4, rax
+
+    ; -----------------------------------------------------------------------
+    ; STEP 5: Call the C kernel main function
+    ; -----------------------------------------------------------------------
+    ; Now that we have a stack and BSS is cleared, we can call C code!
+    ;
+    ; Note: We don't pass any arguments to kmain(). If we wanted to pass
+    ; boot information, we'd put it in RDI, RSI, etc. (System V AMD64 ABI).
+
+    call kmain                  ; Call the C kernel
+
+    ; -----------------------------------------------------------------------
+    ; STEP 6: Halt if kmain returns
+    ; -----------------------------------------------------------------------
+    ; kmain() should never return - it should run an infinite loop.
+    ; But if it does, we halt the CPU.
+
+.hang:
+    cli                         ; Disable interrupts
+    hlt                         ; Halt CPU
+    jmp .hang                   ; Loop forever (in case of NMI)
+
+; ===========================================================================
+; DATA SECTION - Read-Only Data
+; ===========================================================================
+
+section .rodata
+
+; No read-only data for now
+
+; ===========================================================================
+; BSS SECTION - Uninitialized Data
+; ===========================================================================
+; This section is for uninitialized global variables.
+; It's zeroed by our code above before kmain() is called.
+; ===========================================================================
+
+section .bss
+
+; Align the stack to 16 bytes (required by x86_64 ABI)
+align 16
+
+; Reserve space for the stack
+; We allocate 16 KB which should be plenty for our simple kernel.
+; Remember: stack grows DOWN, so stack_top is at the HIGH address.
+
+stack_bottom:                   ; Lowest address of stack (never used directly)
+    resb 16384                  ; Reserve 16 KB (16384 bytes)
+stack_top:                      ; Highest address of stack (initial RSP value)
+
+; ===========================================================================
+; END OF ENTRY.ASM
+; ===========================================================================
+; At this point, we've:
+;   1. Set up a 16 KB stack
+;   2. Cleared the BSS section
+;   3. Called kmain()
+;
+; The kernel is now running in C!
+; See kernel/src/kernel.c for what happens next.
+; ===========================================================================

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+  "kernel",
+  "crates/arch_x86_64",
+  "crates/drivers",
+  "crates/fs",
+  "crates/net",
+  "crates/syscall",
+  "crates/userabi",
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
