@@ -9,3 +9,4 @@ arch_x86_64 = { path = "../crates/arch_x86_64" }
 [features]
 default = []
 test-exit = []
+vga = []

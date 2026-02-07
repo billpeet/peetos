@@ -6,4 +6,6 @@ extern crate std;
 pub mod interrupts;
 pub mod gdt;
 pub mod idt;
+pub mod pic;
+pub mod pit;
 pub mod port;

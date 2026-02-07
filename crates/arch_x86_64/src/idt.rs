@@ -6,6 +6,8 @@ use core::ptr;
 
 #[cfg(target_os = "none")]
 use crate::interrupts;
+#[cfg(target_os = "none")]
+use crate::pic;
 
 pub const IDT_ENTRIES: usize = 256;
 
@@ -14,6 +16,7 @@ pub const IDT_GATE_TRAP: u8 = 0x8F;
 pub const IDT_GATE_USER: u8 = 0xEE;
 
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
+pub const EXCEPTION_PAGE_FAULT: u8 = 14;
 
 pub type InterruptHandler = extern "C" fn(frame: &mut InterruptFrame);
 
@@ -82,6 +85,49 @@ static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
 #[cfg(target_os = "none")]
 static mut IDTR: Idtr = Idtr { limit: 0, base: 0 };
 static mut HANDLERS: [Option<InterruptHandler>; IDT_ENTRIES] = [None; IDT_ENTRIES];
+
+static EXCEPTION_NAMES: [&str; 32] = [
+    "Divide Error (#DE)",
+    "Debug (#DB)",
+    "Non-Maskable Interrupt",
+    "Breakpoint (#BP)",
+    "Overflow (#OF)",
+    "Bound Range Exceeded (#BR)",
+    "Invalid Opcode (#UD)",
+    "Device Not Available (#NM)",
+    "Double Fault (#DF)",
+    "Coprocessor Segment Overrun",
+    "Invalid TSS (#TS)",
+    "Segment Not Present (#NP)",
+    "Stack-Segment Fault (#SS)",
+    "General Protection Fault (#GP)",
+    "Page Fault (#PF)",
+    "Reserved",
+    "x87 FPU Error (#MF)",
+    "Alignment Check (#AC)",
+    "Machine Check (#MC)",
+    "SIMD Floating-Point (#XM)",
+    "Virtualization Exception (#VE)",
+    "Control Protection (#CP)",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Reserved",
+    "Hypervisor Injection (#HV)",
+    "VMM Communication (#VC)",
+    "Security Exception (#SX)",
+    "Reserved",
+];
+
+pub fn exception_name(vector: u8) -> &'static str {
+    if (vector as usize) < EXCEPTION_NAMES.len() {
+        EXCEPTION_NAMES[vector as usize]
+    } else {
+        "Unknown Interrupt"
+    }
+}
 
 fn fill_entry(entry: &mut IdtEntry, handler: u64, selector: u16, type_attr: u8) {
     entry.offset_low = (handler & 0xFFFF) as u16;
@@ -162,7 +208,8 @@ pub fn init() {
 pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
     interrupts::disable();
 
-    let vector = frame.int_no as usize;
+    let int_no = unsafe { ptr::read_unaligned(ptr::addr_of!(frame.int_no)) };
+    let vector = int_no as usize;
     let handler = unsafe { HANDLERS[vector] };
 
     if let Some(handler) = handler {
@@ -170,7 +217,15 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
         return;
     }
 
-    if frame.int_no < 32 {
+    if (32..48).contains(&int_no) {
+        let irq = (int_no - 32) as u8;
+        if !pic::is_spurious(irq) {
+            pic::send_eoi(irq);
+        }
+        return;
+    }
+
+    if int_no < 32 {
         default_exception_handler(frame);
     }
 }
