@@ -35,7 +35,14 @@ ENTRY_SRC := kernel/arch/x86_64/entry.asm
 KERNEL_TARGET_DIR := target/x86_64-unknown-none/$(PROFILE)
 KERNEL_TARGET := $(KERNEL_TARGET_DIR)/kernel
 
-.PHONY: all image bootloader kernel clean run
+KERNEL_FEATURES ?=
+ifneq ($(strip $(KERNEL_FEATURES)),)
+CARGO_FEATURES := --features $(KERNEL_FEATURES)
+else
+CARGO_FEATURES :=
+endif
+
+.PHONY: all image bootloader kernel clean run test
 
 all: image
 
@@ -62,7 +69,7 @@ $(ENTRY_OBJ): $(ENTRY_SRC) | $(BUILD_DIR)
 	$(ASM) -f elf64 -g -o $@ $<
 
 kernel: $(ENTRY_OBJ)
-	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS)
+	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@cp $(KERNEL_TARGET) $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
 
@@ -79,6 +86,9 @@ image: bootloader kernel
 
 run: image
 	$(QEMU) -drive format=raw,file=$(IMAGE) -serial stdio
+
+test:
+	@tests/run.sh
 
 clean:
 	@rm -rf $(BUILD_DIR)

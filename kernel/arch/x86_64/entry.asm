@@ -14,13 +14,13 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 ; transitioning to 64-bit Long Mode, it jumps here.
 ;
 ; This file is written in assembly because we need precise control over
-; the early kernel environment before we can call C code.
+; the early kernel environment before we can call Rust code.
 ;
 ; WHAT DOES IT DO?
 ; ================
 ; 1. Sets up a proper stack for 64-bit operation
 ; 2. Clears the BSS section (uninitialized data)
-; 3. Calls the C kernel main function (kmain)
+; 3. Calls the Rust kernel main function (kmain)
 ; 4. If kmain returns (it shouldn't), halts the CPU
 ;
 ; THE BSS SECTION:
@@ -31,7 +31,7 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 ; in the binary - that would waste space. Instead, the BSS section is
 ; simply a reserved area that must be zeroed at runtime.
 ;
-; It's our responsibility to zero it before running C code!
+; It's our responsibility to zero it before running Rust code!
 ;
 ; ===========================================================================
 
@@ -78,7 +78,7 @@ _start:
     ; DF=0: String operations increment (forward)
     ; DF=1: String operations decrement (backward)
     ;
-    ; The C calling convention expects DF=0, so we ensure that.
+    ; The System V AMD64 ABI expects DF=0, so we ensure that.
 
     cld                         ; Clear Direction Flag (forward string ops)
 
@@ -173,14 +173,14 @@ _start:
     mov cr4, rax
 
     ; -----------------------------------------------------------------------
-    ; STEP 5: Call the C kernel main function
+    ; STEP 5: Call the Rust kernel main function
     ; -----------------------------------------------------------------------
-    ; Now that we have a stack and BSS is cleared, we can call C code!
+    ; Now that we have a stack and BSS is cleared, we can call Rust code!
     ;
     ; Note: We don't pass any arguments to kmain(). If we wanted to pass
     ; boot information, we'd put it in RDI, RSI, etc. (System V AMD64 ABI).
 
-    call kmain                  ; Call the C kernel
+    call kmain                  ; Call the Rust kernel
 
     ; -----------------------------------------------------------------------
     ; STEP 6: Halt if kmain returns
@@ -229,6 +229,6 @@ stack_top:                      ; Highest address of stack (initial RSP value)
 ;   2. Cleared the BSS section
 ;   3. Called kmain()
 ;
-; The kernel is now running in C!
-; See kernel/src/kernel.c for what happens next.
+; The kernel is now running in Rust!
+; See kernel/src/main.rs for what happens next.
 ; ===========================================================================

@@ -6,6 +6,12 @@ This document captures a high-level roadmap to reimplement the existing PeetOS C
 
 The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the kernel sources in `../peetos/kernel/src`. The Rust port should aim for parity with Stages 1–9 before attempting Stage 10 optimizations.
 
+## Current Status (Last reviewed: 2026-02-07)
+
+- Phase 0: Complete. Workspace, subsystem crates, bootloader/linker reuse, Makefile, `.cargo/config.toml`, and kernel entry assembly are present.
+- Phase 1: Complete. The kernel boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a loop. The panic handler reports over serial before halting.
+- Phases 2–10: Not started.
+
 ## Phase 0: Project Scaffolding
 
 - Establish a Rust workspace with `kernel` plus subsystem crates (`arch_x86_64`, `drivers`, `fs`, `net`, `syscall`, `userabi`).
@@ -76,3 +82,4 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 
 - Re-run the shell test scripts from the C project (`../peetos/tests/*.sh`).
 - Validate the “What Works” list in `../peetos/docs/ROADMAP.md`.
+ - Use `make test` for Rust-port checks (host unit tests plus QEMU serial banner check; QEMU exits via `isa-debug-exit`).

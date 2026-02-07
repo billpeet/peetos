@@ -23,6 +23,12 @@ Key references in the C project:
 - `linker/` Linker script for the kernel.
 - `docs/PORTING_PLAN.md` High-level implementation roadmap.
 
+## Current Status (Last reviewed: 2026-02-07)
+
+- Boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a `hlt` loop.
+- Panic handler prints over serial, then halts with `cli; hlt`.
+- Subsystem crates are placeholders; interrupts, memory management, drivers, and user space are not yet implemented.
+
 ## Build Prerequisites
 
 - `nasm`
@@ -56,7 +62,15 @@ make run
 
 ## Testing
 
-Initial smoke test is a QEMU boot to the kernel `kmain()` loop. As features land, re-run the C project shell tests for parity:
+Initial smoke test is a QEMU boot to the kernel `kmain()` loop. Use the repo test runner:
+
+```bash
+make test
+```
+
+`make test` runs host unit tests (currently serial formatting) and then boots QEMU with the `isa-debug-exit` device so the VM exits automatically after the kernel prints the serial banner.
+
+As features land, re-run the C project shell tests for parity:
 
 ```bash
 ../peetos/tests/run_tests.sh
