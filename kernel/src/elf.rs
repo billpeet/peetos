@@ -2,9 +2,10 @@ use core::cmp;
 use core::mem::size_of;
 use core::ptr;
 
-use arch_x86_64::addr::{PhysAddr, VirtAddr, PAGE_SIZE};
+use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
 
 use crate::memory::{pmm, vmm};
+
 #[cfg(not(test))]
 macro_rules! elf_log {
     ($($arg:tt)*) => {
@@ -32,12 +33,17 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
 
 const PT_LOAD: u32 = 1;
+const PT_PHDR: u32 = 6;
+const PT_INTERP: u32 = 3;
 
 const PF_X: u32 = 0x1;
 const PF_W: u32 = 0x2;
+
+const ELF_INTERP_MAX: usize = 256;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -75,6 +81,14 @@ pub struct ElfLoadResult {
     pub entry_point: u64,
     pub program_break: u64,
     pub success: bool,
+
+    pub phdr_addr: u64,
+    pub phdr_count: u16,
+    pub phdr_size: u16,
+    pub base_addr: u64,
+    pub interp_base: u64,
+    pub interp_path: [u8; ELF_INTERP_MAX],
+    pub is_dynamic: bool,
 }
 
 fn align_down(value: u64, align: u64) -> u64 {
@@ -92,15 +106,26 @@ fn phdr_bounds_ok(data_len: usize, offset: u64, size: u64) -> bool {
     }
 }
 
-pub fn validate(data: &[u8]) -> bool {
+fn read_ehdr(data: &[u8]) -> Option<Elf64Ehdr> {
     if data.len() < size_of::<Elf64Ehdr>() {
-        elf_log!("[ELF] Invalid: too small");
-        return false;
+        return None;
     }
 
-    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
-    let ident = ehdr.e_ident;
+    let ptr = data.as_ptr() as *const Elf64Ehdr;
+    Some(unsafe { ptr::read_unaligned(ptr) })
+}
 
+fn read_phdr(data: &[u8], offset: usize) -> Option<Elf64Phdr> {
+    if offset.checked_add(size_of::<Elf64Phdr>())? > data.len() {
+        return None;
+    }
+
+    let ptr = unsafe { data.as_ptr().add(offset) as *const Elf64Phdr };
+    Some(unsafe { ptr::read_unaligned(ptr) })
+}
+
+fn check_ident(ehdr: &Elf64Ehdr) -> bool {
+    let ident = ehdr.e_ident;
     let magic = u32::from_le_bytes([ident[EI_MAG0], ident[EI_MAG1], ident[EI_MAG2], ident[EI_MAG3]]);
     if magic != ELF_MAGIC {
         elf_log!("[ELF] Invalid: bad magic");
@@ -117,83 +142,229 @@ pub fn validate(data: &[u8]) -> bool {
         return false;
     }
 
-    if ehdr.e_type != ET_EXEC {
+    true
+}
+
+fn phdr_table_bytes(ehdr: &Elf64Ehdr) -> Option<usize> {
+    (ehdr.e_phnum as usize).checked_mul(ehdr.e_phentsize as usize)
+}
+
+fn validate_common(data: &[u8], allow_dyn: bool) -> Option<Elf64Ehdr> {
+    let ehdr = match read_ehdr(data) {
+        Some(header) => header,
+        None => {
+            elf_log!("[ELF] Invalid: too small");
+            return None;
+        }
+    };
+
+    if !check_ident(&ehdr) {
+        return None;
+    }
+
+    if !allow_dyn && ehdr.e_type != ET_EXEC {
         elf_log!("[ELF] Invalid: not ET_EXEC");
-        return false;
+        return None;
+    }
+
+    if allow_dyn && ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN {
+        elf_log!("[ELF] Invalid: not ET_EXEC or ET_DYN");
+        return None;
     }
 
     if ehdr.e_machine != EM_X86_64 {
         elf_log!("[ELF] Invalid: not x86_64");
-        return false;
+        return None;
     }
 
     if ehdr.e_phentsize as usize != size_of::<Elf64Phdr>() {
         elf_log!("[ELF] Invalid: phdr size mismatch");
-        return false;
+        return None;
     }
 
-    let phdr_bytes = (ehdr.e_phnum as usize)
-        .checked_mul(ehdr.e_phentsize as usize)
-        .unwrap_or(usize::MAX);
-    if phdr_bytes == usize::MAX {
-        elf_log!("[ELF] Invalid: phdr size overflow");
-        return false;
-    }
+    let phdr_bytes = match phdr_table_bytes(&ehdr) {
+        Some(bytes) => bytes,
+        None => {
+            elf_log!("[ELF] Invalid: phdr size overflow");
+            return None;
+        }
+    };
 
     if !phdr_bounds_ok(data.len(), ehdr.e_phoff, phdr_bytes as u64) {
         elf_log!("[ELF] Invalid: phdr out of bounds");
-        return false;
+        return None;
     }
 
-    true
+    Some(ehdr)
 }
 
-pub fn load(data: &[u8], pml4: PhysAddr) -> ElfLoadResult {
-    let mut result = ElfLoadResult {
+fn init_result() -> ElfLoadResult {
+    ElfLoadResult {
         entry_point: 0,
         program_break: 0,
         success: false,
+        phdr_addr: 0,
+        phdr_count: 0,
+        phdr_size: 0,
+        base_addr: 0,
+        interp_base: 0,
+        interp_path: [0u8; ELF_INTERP_MAX],
+        is_dynamic: false,
+    }
+}
+
+fn is_user_range(start: u64, end: u64) -> bool {
+    start < end && end <= KERNEL_VIRT_BASE
+}
+
+pub fn validate(data: &[u8]) -> bool {
+    validate_common(data, false).is_some()
+}
+
+pub fn validate_dynamic(data: &[u8]) -> bool {
+    validate_common(data, true).is_some()
+}
+
+pub fn is_dynamic(data: &[u8]) -> bool {
+    let ehdr = match validate_common(data, true) {
+        Some(header) => header,
+        None => return false,
     };
 
-    if !validate(data) {
-        return result;
+    let phdr_bytes = match phdr_table_bytes(&ehdr) {
+        Some(bytes) => bytes,
+        None => return false,
+    };
+    if !phdr_bounds_ok(data.len(), ehdr.e_phoff, phdr_bytes as u64) {
+        return false;
     }
 
-    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
-    let phdrs = unsafe {
-        core::slice::from_raw_parts(
-            data.as_ptr().add(ehdr.e_phoff as usize) as *const Elf64Phdr,
-            ehdr.e_phnum as usize,
-        )
+    for i in 0..ehdr.e_phnum {
+        let offset = ehdr.e_phoff as usize + (i as usize * ehdr.e_phentsize as usize);
+        let phdr = match read_phdr(data, offset) {
+            Some(phdr) => phdr,
+            None => return false,
+        };
+        if phdr.p_type == PT_INTERP {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn get_interp(data: &[u8], path_out: &mut [u8; ELF_INTERP_MAX]) -> bool {
+    let ehdr = match validate_common(data, true) {
+        Some(header) => header,
+        None => return false,
     };
 
-    let mut highest_addr = 0u64;
+    let phdr_bytes = match phdr_table_bytes(&ehdr) {
+        Some(bytes) => bytes,
+        None => return false,
+    };
+    if !phdr_bounds_ok(data.len(), ehdr.e_phoff, phdr_bytes as u64) {
+        return false;
+    }
 
-    for phdr in phdrs.iter() {
+    for byte in path_out.iter_mut() {
+        *byte = 0;
+    }
+
+    for i in 0..ehdr.e_phnum {
+        let offset = ehdr.e_phoff as usize + (i as usize * ehdr.e_phentsize as usize);
+        let phdr = match read_phdr(data, offset) {
+            Some(phdr) => phdr,
+            None => return false,
+        };
+
+        if phdr.p_type != PT_INTERP {
+            continue;
+        }
+
+        if !phdr_bounds_ok(data.len(), phdr.p_offset, phdr.p_filesz) {
+            return false;
+        }
+
+        let len = cmp::min(phdr.p_filesz as usize, ELF_INTERP_MAX.saturating_sub(1));
+        if len == 0 {
+            return true;
+        }
+
+        let src = &data[phdr.p_offset as usize..phdr.p_offset as usize + len];
+        path_out[..len].copy_from_slice(src);
+        path_out[len] = 0;
+        return true;
+    }
+
+    false
+}
+
+fn load_segments(data: &[u8], ehdr: &Elf64Ehdr, pml4: PhysAddr, load_bias: u64) -> Option<(u64, u64, u64, bool)> {
+    let mut highest_addr = 0u64;
+    let mut phdr_addr = 0u64;
+    let mut found_pt_phdr = false;
+
+    for i in 0..ehdr.e_phnum {
+        let offset = ehdr.e_phoff as usize + (i as usize * ehdr.e_phentsize as usize);
+        let phdr = read_phdr(data, offset)?;
+
+        if phdr.p_type == PT_PHDR {
+            phdr_addr = match phdr.p_vaddr.checked_add(load_bias) {
+                Some(addr) => addr,
+                None => {
+                    elf_log!("[ELF] ERROR: PT_PHDR address overflow");
+                    return None;
+                }
+            };
+            found_pt_phdr = true;
+            continue;
+        }
+
         if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
             continue;
         }
 
         if phdr.p_filesz > phdr.p_memsz {
             elf_log!("[ELF] ERROR: segment filesz > memsz");
-            return result;
+            return None;
         }
 
         if !phdr_bounds_ok(data.len(), phdr.p_offset, phdr.p_filesz) {
             elf_log!("[ELF] ERROR: segment out of bounds");
-            return result;
+            return None;
         }
 
         let segment_end = match phdr.p_vaddr.checked_add(phdr.p_memsz) {
             Some(end) => end,
             None => {
                 elf_log!("[ELF] ERROR: segment address overflow");
-                return result;
+                return None;
             }
         };
 
-        let vaddr_start = align_down(phdr.p_vaddr, PAGE_SIZE);
-        let vaddr_end = align_up(segment_end, PAGE_SIZE);
+        let seg_vaddr = match phdr.p_vaddr.checked_add(load_bias) {
+            Some(addr) => addr,
+            None => {
+                elf_log!("[ELF] ERROR: segment vaddr overflow");
+                return None;
+            }
+        };
+        let seg_end = match segment_end.checked_add(load_bias) {
+            Some(addr) => addr,
+            None => {
+                elf_log!("[ELF] ERROR: segment end overflow");
+                return None;
+            }
+        };
+
+        let vaddr_start = align_down(seg_vaddr, PAGE_SIZE);
+        let vaddr_end = align_up(seg_end, PAGE_SIZE);
+        if !is_user_range(vaddr_start, vaddr_end) {
+            elf_log!("[ELF] ERROR: segment outside user range");
+            return None;
+        }
+
         let num_pages = (vaddr_end - vaddr_start) / PAGE_SIZE;
 
         let mut page_flags = vmm::PTE_PRESENT | vmm::PTE_USER;
@@ -201,7 +372,7 @@ pub fn load(data: &[u8], pml4: PhysAddr) -> ElfLoadResult {
             page_flags |= vmm::PTE_WRITE;
         }
         if (phdr.p_flags & PF_X) == 0 {
-            // NX is not enabled yet; keep pages executable for now.
+            page_flags |= vmm::PTE_NO_EXECUTE;
         }
 
         for page in 0..num_pages {
@@ -214,7 +385,7 @@ pub fn load(data: &[u8], pml4: PhysAddr) -> ElfLoadResult {
             let phys = pmm::alloc_page();
             if phys.as_u64() == 0 {
                 elf_log!("[ELF] ERROR: failed to allocate page");
-                return result;
+                return None;
             }
 
             unsafe {
@@ -224,13 +395,13 @@ pub fn load(data: &[u8], pml4: PhysAddr) -> ElfLoadResult {
             if vmm::map_page_in(pml4, virt, phys, page_flags) != 0 {
                 elf_log!("[ELF] ERROR: failed to map page");
                 pmm::free_page(phys);
-                return result;
+                return None;
             }
         }
 
         let mut bytes_remaining = phdr.p_filesz;
         let mut src_offset = phdr.p_offset as usize;
-        let mut dest_vaddr = phdr.p_vaddr;
+        let mut dest_vaddr = seg_vaddr;
 
         while bytes_remaining > 0 {
             let page_vaddr = dest_vaddr & !0xFFF;
@@ -241,7 +412,7 @@ pub fn load(data: &[u8], pml4: PhysAddr) -> ElfLoadResult {
                 Some(phys) => phys,
                 None => {
                     elf_log!("[ELF] ERROR: page not mapped during copy");
-                    return result;
+                    return None;
                 }
             };
 
@@ -263,8 +434,120 @@ pub fn load(data: &[u8], pml4: PhysAddr) -> ElfLoadResult {
         }
     }
 
-    result.entry_point = ehdr.e_entry;
-    result.program_break = align_up(highest_addr, PAGE_SIZE);
+    if !found_pt_phdr {
+        for i in 0..ehdr.e_phnum {
+            let offset = ehdr.e_phoff as usize + (i as usize * ehdr.e_phentsize as usize);
+            let phdr = read_phdr(data, offset)?;
+            if phdr.p_type != PT_LOAD || phdr.p_filesz == 0 {
+                continue;
+            }
+
+            let phdr_off = ehdr.e_phoff;
+            if phdr_off >= phdr.p_offset && phdr_off < phdr.p_offset + phdr.p_filesz {
+                let base = match phdr.p_vaddr.checked_add(load_bias) {
+                    Some(addr) => addr,
+                    None => {
+                        elf_log!("[ELF] ERROR: phdr address overflow");
+                        return None;
+                    }
+                };
+                phdr_addr = base + (phdr_off - phdr.p_offset);
+                break;
+            }
+        }
+    }
+
+    Some((highest_addr, phdr_addr, load_bias, found_pt_phdr))
+}
+
+pub fn load(data: &[u8], pml4: PhysAddr) -> ElfLoadResult {
+    let mut result = init_result();
+
+    let ehdr = match validate_common(data, false) {
+        Some(header) => header,
+        None => return result,
+    };
+
+    result.phdr_count = ehdr.e_phnum;
+    result.phdr_size = ehdr.e_phentsize;
+    result.base_addr = 0;
+    result.interp_base = 0;
+    result.is_dynamic = is_dynamic(data);
+    let _ = get_interp(data, &mut result.interp_path);
+
+    let (highest_addr, phdr_addr, load_bias, _) = match load_segments(data, &ehdr, pml4, 0) {
+        Some(values) => values,
+        None => return result,
+    };
+
+    result.phdr_addr = phdr_addr;
+    result.entry_point = ehdr.e_entry + load_bias;
+    result.program_break = align_up(highest_addr + load_bias, PAGE_SIZE);
+    result.success = true;
+
+    result
+}
+
+pub fn load_at(data: &[u8], pml4: PhysAddr, base_addr: u64) -> ElfLoadResult {
+    let mut result = init_result();
+
+    let ehdr = match validate_common(data, true) {
+        Some(header) => header,
+        None => return result,
+    };
+
+    let mut lowest_addr = u64::MAX;
+    let mut highest_addr = 0u64;
+
+    for i in 0..ehdr.e_phnum {
+        let offset = ehdr.e_phoff as usize + (i as usize * ehdr.e_phentsize as usize);
+        let phdr = match read_phdr(data, offset) {
+            Some(phdr) => phdr,
+            None => return result,
+        };
+        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+            continue;
+        }
+
+        if phdr.p_vaddr < lowest_addr {
+            lowest_addr = phdr.p_vaddr;
+        }
+        let segment_end = match phdr.p_vaddr.checked_add(phdr.p_memsz) {
+            Some(end) => end,
+            None => return result,
+        };
+        if segment_end > highest_addr {
+            highest_addr = segment_end;
+        }
+    }
+
+    if lowest_addr == u64::MAX {
+        elf_log!("[ELF] ERROR: no loadable segments");
+        return result;
+    }
+
+    let aligned_lowest = align_down(lowest_addr, PAGE_SIZE);
+    if base_addr < aligned_lowest {
+        elf_log!("[ELF] ERROR: base address below lowest segment");
+        return result;
+    }
+    let load_bias = base_addr - aligned_lowest;
+
+    result.phdr_count = ehdr.e_phnum;
+    result.phdr_size = ehdr.e_phentsize;
+    result.base_addr = base_addr;
+    result.interp_base = 0;
+    result.is_dynamic = is_dynamic(data);
+    let _ = get_interp(data, &mut result.interp_path);
+
+    let (seg_highest, phdr_addr, _, _) = match load_segments(data, &ehdr, pml4, load_bias) {
+        Some(values) => values,
+        None => return result,
+    };
+
+    result.phdr_addr = phdr_addr;
+    result.entry_point = ehdr.e_entry + load_bias;
+    result.program_break = align_up(seg_highest + load_bias, PAGE_SIZE);
     result.success = true;
 
     result
@@ -273,17 +556,6 @@ pub fn load(data: &[u8], pml4: PhysAddr) -> ElfLoadResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn elf_header_size_matches() {
-        assert_eq!(size_of::<Elf64Ehdr>(), 64);
-        assert_eq!(size_of::<Elf64Phdr>(), 56);
-    }
-
-    #[test]
-    fn validate_rejects_short_buffer() {
-        assert!(!validate(&[0u8; 8]));
-    }
 
     fn minimal_header() -> Elf64Ehdr {
         let mut ident = [0u8; 16];
@@ -312,17 +584,29 @@ mod tests {
         }
     }
 
+    fn write_struct<T: Copy>(out: &mut [u8], value: &T) {
+        let size = size_of::<T>();
+        unsafe {
+            ptr::copy_nonoverlapping(value as *const T as *const u8, out.as_mut_ptr(), size);
+        }
+    }
+
+    #[test]
+    fn elf_header_size_matches() {
+        assert_eq!(size_of::<Elf64Ehdr>(), 64);
+        assert_eq!(size_of::<Elf64Phdr>(), 56);
+    }
+
+    #[test]
+    fn validate_rejects_short_buffer() {
+        assert!(!validate(&[0u8; 8]));
+    }
+
     #[test]
     fn validate_accepts_minimal_header() {
         let header = minimal_header();
         let mut bytes = vec![0u8; size_of::<Elf64Ehdr>()];
-        unsafe {
-            ptr::copy_nonoverlapping(
-                &header as *const Elf64Ehdr as *const u8,
-                bytes.as_mut_ptr(),
-                bytes.len(),
-            );
-        }
+        write_struct(&mut bytes, &header);
         assert!(validate(&bytes));
     }
 
@@ -331,13 +615,50 @@ mod tests {
         let mut header = minimal_header();
         header.e_ident[EI_CLASS] = 1;
         let mut bytes = vec![0u8; size_of::<Elf64Ehdr>()];
-        unsafe {
-            ptr::copy_nonoverlapping(
-                &header as *const Elf64Ehdr as *const u8,
-                bytes.as_mut_ptr(),
-                bytes.len(),
-            );
-        }
+        write_struct(&mut bytes, &header);
         assert!(!validate(&bytes));
+    }
+
+    #[test]
+    fn validate_dynamic_accepts_et_dyn() {
+        let mut header = minimal_header();
+        header.e_type = ET_DYN;
+        let mut bytes = vec![0u8; size_of::<Elf64Ehdr>()];
+        write_struct(&mut bytes, &header);
+        assert!(validate_dynamic(&bytes));
+    }
+
+    #[test]
+    fn interp_detection_and_copy() {
+        let mut header = minimal_header();
+        header.e_phnum = 1;
+        header.e_phoff = size_of::<Elf64Ehdr>() as u64;
+
+        let interp_len = b"/lib/ld.so\0".len() as u64;
+        let phdr = Elf64Phdr {
+            p_type: PT_INTERP,
+            p_flags: 0,
+            p_offset: (size_of::<Elf64Ehdr>() + size_of::<Elf64Phdr>()) as u64,
+            p_vaddr: 0,
+            p_paddr: 0,
+            p_filesz: interp_len,
+            p_memsz: interp_len,
+            p_align: 1,
+        };
+
+        let mut bytes = vec![0u8; size_of::<Elf64Ehdr>() + size_of::<Elf64Phdr>() + interp_len as usize];
+        write_struct(&mut bytes[..size_of::<Elf64Ehdr>()], &header);
+        write_struct(
+            &mut bytes[size_of::<Elf64Ehdr>()..size_of::<Elf64Ehdr>() + size_of::<Elf64Phdr>()],
+            &phdr,
+        );
+        bytes[size_of::<Elf64Ehdr>() + size_of::<Elf64Phdr>()..].copy_from_slice(b"/lib/ld.so\0");
+
+        assert!(is_dynamic(&bytes));
+        let mut path = [0u8; ELF_INTERP_MAX];
+        assert!(get_interp(&bytes, &mut path));
+        let nul_pos = path.iter().position(|b| *b == 0).unwrap_or(path.len());
+        let path_str = core::str::from_utf8(&path[..nul_pos]).unwrap();
+        assert_eq!(path_str, "/lib/ld.so");
     }
 }

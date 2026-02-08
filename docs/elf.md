@@ -1,6 +1,6 @@
 # ELF Loading
 
-This document describes the minimal ELF loader used for the Phase 4 user-mode bring-up. The loader accepts an embedded ELF64 image and maps its loadable segments into a fresh user address space.
+This document describes the ELF loader used for the Phase 4 user-mode bring-up. The loader accepts an embedded ELF64 image and maps its loadable segments into a fresh user address space.
 
 **Where It Lives**
 - `kernel/src/elf.rs`
@@ -10,7 +10,7 @@ This document describes the minimal ELF loader used for the Phase 4 user-mode br
 - `scripts/build_user.sh`
 
 **Supported Format**
-The loader only supports static ELF64 executables built as `ET_EXEC` for `x86_64` little-endian. It validates the ELF header and program header table before loading.
+The loader supports ELF64 for `x86_64` little-endian. `elf::load()` accepts `ET_EXEC` binaries, while `elf::load_at()` accepts both `ET_EXEC` and `ET_DYN` (PIE/shared objects) and applies a load bias.
 
 **Load Flow**
 1. `user::spawn_init()` creates a new address space (`vmm::create_address_space()`).
@@ -19,15 +19,15 @@ The loader only supports static ELF64 executables built as `ET_EXEC` for `x86_64
    - The virtual address range is aligned to 4KB pages.
    - Physical pages are allocated via `pmm::alloc_page()` and mapped with `vmm::map_page_in()`.
    - Pages are zeroed, then segment bytes are copied from the ELF image into the mapped pages.
-4. The loader returns the entry point (`e_entry`) and the top of the loaded image (`program_break`) for future heap work.
+4. The loader records program header metadata (PHDR address/count/size), detects `PT_INTERP` for dynamic binaries, and returns the entry point (`e_entry`) plus the top of the loaded image (`program_break`) for future heap work.
 5. `user::spawn_init()` sets up a 32KB user stack and builds an `InterruptFrame` to enter ring 3 at the ELF entry point.
 
 Limitations / Simplifications
-- Only `ET_EXEC` ELF64 images are accepted (no PIE/`ET_DYN`).
-- Only `PT_LOAD` segments are handled; `PT_INTERP`, `PT_DYNAMIC`, `PT_TLS`, and relocations are ignored.
+- `elf::load_at()` accepts PIE/`ET_DYN`, but relocations and `PT_DYNAMIC` parsing are not implemented.
+- `PT_INTERP` is detected and stored, but the interpreter is not loaded yet.
 - No dynamic linking or symbol resolution.
-- Segment permissions are minimal; `PF_X` does not affect page attributes (NX is not enabled).
+- Segment permissions set `PTE_NO_EXECUTE` for non-executable segments, but NX is not enabled in EFER yet.
 - No W^X enforcement or SMEP/SMAP integration.
-- No validation that segment virtual addresses stay within a safe user range.
+- User address range checks are minimal; there is no ASLR.
 - `program_break` is reported but not wired into a `brk`/heap syscall yet.
-- The embedded ELF is rebuilt manually via `scripts/build_user.sh`; no build integration in the Makefile yet.
+- The embedded ELF is rebuilt automatically via the Makefile, but `scripts/build_user.sh` is still manual.

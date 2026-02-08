@@ -13,9 +13,12 @@ IMAGE     := $(BUILD_DIR)/peetos.img
 BOOT_BIN   := $(BUILD_DIR)/boot.bin
 STAGE2_BIN := $(BUILD_DIR)/stage2.bin
 ENTRY_OBJ  := $(BUILD_DIR)/entry.o
+USER_OBJ   := $(BUILD_DIR)/user_hello.o
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 KERNEL_BIN := $(BUILD_DIR)/kernel.bin
+USER_ELF   := user/hello.elf
+USER_ASM   := user/hello.asm
 
 PROFILE ?= release
 ifeq ($(PROFILE),release)
@@ -42,7 +45,7 @@ else
 CARGO_FEATURES :=
 endif
 
-.PHONY: all image bootloader kernel clean run test
+.PHONY: all image bootloader kernel user clean run test
 
 all: image
 
@@ -68,7 +71,14 @@ bootloader: $(BOOT_BIN) $(STAGE2_BIN)
 $(ENTRY_OBJ): $(ENTRY_SRC) | $(BUILD_DIR)
 	$(ASM) -f elf64 -g -o $@ $<
 
-kernel: $(ENTRY_OBJ)
+$(USER_ELF): $(USER_ASM) | $(BUILD_DIR)
+	$(ASM) -f elf64 -g -o $(USER_OBJ) $<
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -Ttext 0x400000 \
+		-o $@ $(USER_OBJ)
+
+user: $(USER_ELF)
+
+kernel: $(ENTRY_OBJ) $(USER_ELF)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@cp $(KERNEL_TARGET) $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)

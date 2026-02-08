@@ -5,7 +5,8 @@
 Regenerate the binary if needed:
 
 ```bash
-scripts/build_user.sh
+make user
 ```
 
-This binary is embedded in the kernel via `include_bytes!`.
+This binary is embedded in the kernel via `include_bytes!`, and `make image`
+rebuilds it automatically.
