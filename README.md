@@ -35,7 +35,7 @@ Key references in the C project:
 - Dynamic user bootstrap now works for a minimal `PT_INTERP` flow: a PIE main image is loaded, its interpreter (`/lib/ld-peetos.so`) is mapped, and first user RIP starts in the interpreter with `AT_ENTRY`/`AT_BASE` set.
 - Syscall dispatch now uses a table-driven Linux-numbered stage-4/5 baseline (`open`, `openat`, `close`, `read`, `write`, `lseek`, `exit`, `exit_group`, `yield`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `brk`) with shared SYSCALL/int80 argument handling and per-task user metadata (`brk`, stack bounds, argv/envp/auxv pointers, ELF PHDR info, FD table state).
 - Initial user bootstrap now builds a conventional process stack (`argc`, `argv`, `envp`, `auxv`) so libc-facing usermode setup has a stable base for future `execve` work.
-- A phase-5 baseline VFS is now active with tmpfs root support and basic file-descriptor file operations.
+- A phase-5 baseline VFS is now active with concrete tmpfs behavior plus virtual `devfs`/`procfs` nodes and basic file-descriptor operations.
 - Subsystem crates (`drivers`, `net`, `syscall`, `userabi`) remain placeholders; device drivers and full user space are not yet implemented.
 
 ## Documentation
@@ -46,7 +46,7 @@ Key references in the C project:
 - `docs/elf.md` Minimal ELF loader and embedded user image bring-up.
 - `docs/syscall.md` SYSCALL/MSR setup and the current syscall stub.
 - `docs/tasking.md` Task structures, kernel threads, and scheduler behavior.
-- `docs/vfs.md` Baseline VFS/tmpfs design and syscall integration.
+- `docs/vfs.md` Baseline VFS/tmpfs/devfs/procfs design and syscall integration.
 - `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.
 - `docs/subsystems.md` Placeholder subsystem crates and intended usage.
 

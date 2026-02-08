@@ -1,6 +1,6 @@
-# VFS and tmpfs Baseline
+# VFS and Filesystems
 
-This document describes the phase-5 baseline VFS/filesystem implementation now wired into the Rust kernel.
+This document describes the phase-5 VFS/filesystem implementation currently wired into the Rust kernel.
 
 **Where It Lives**
 - `crates/fs/src/lib.rs`
@@ -10,10 +10,11 @@ This document describes the phase-5 baseline VFS/filesystem implementation now w
 - `kernel/src/user.rs`
 
 **Scope Implemented**
-- In-kernel VFS state with inode-like records and directory children.
-- tmpfs-backed root filesystem with static capacity limits.
-- Path resolution for absolute paths with `.` and `..` handling.
-- Basic directory creation (`mkdir`) in the VFS layer.
+- In-kernel VFS state with inode-like records and path traversal.
+- Concrete tmpfs-backed regular files and directories.
+- Virtual filesystems backed by dedicated node behavior:
+  - `devfs`: `/dev/null`, `/dev/zero`, `/dev/console`
+  - `procfs`: `/proc/uptime`, `/proc/meminfo`, `/proc/mounts`, `/proc/version`
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
   - `close`
@@ -22,29 +23,36 @@ This document describes the phase-5 baseline VFS/filesystem implementation now w
   - `lseek`
 
 **Default Filesystem Layout**
-On initialization, the kernel creates a tmpfs root and baseline directories/files:
-- `/tmp`
-- `/dev`
-- `/etc`
-- `/dev/console`
+On initialization, the kernel creates:
+- tmpfs: `/`, `/tmp`, `/etc`
+- devfs nodes under `/dev`
+- procfs nodes under `/proc`
+
+**Behavior Highlights**
+- tmpfs files are mutable and support offset-based reads/writes with sparse-zero fill on gaps.
+- `devfs` behavior:
+  - `/dev/null`: reads EOF, writes are discarded
+  - `/dev/zero`: reads return zero bytes, writes are discarded
+  - `/dev/console`: opened as a console descriptor; kernel routes writes to serial
+- `procfs` behavior:
+  - `/proc/uptime` and `/proc/meminfo` are generated from runtime kernel stats
+  - proc files are read-only (`-EROFS` on write)
 
 **Syscall Integration**
-- The syscall dispatcher now routes Linux-numbered file syscalls to the VFS baseline:
+- Linux-numbered file syscalls are dispatched through the VFS layer:
   - `open` (`2`)
   - `close` (`3`)
   - `lseek` (`8`)
   - `openat` (`257`)
   - `read` (`0`)
   - `write` (`1`)
-- Per-task FD tables are tracked in `Task` metadata (`kind`, `inode`, `offset`, `flags`).
-- User tasks initialize stdio (`fd 0/1/2`) as console descriptors at spawn.
-- Console writes still go to serial so existing user bring-up remains visible in QEMU logs.
+- Per-task FD tables track kind/inode/offset/flags.
+- User stdio (`fd 0/1/2`) is pre-seeded as console descriptors.
 
 Limitations / Simplifications
-- tmpfs is fixed-size/static-structure (no dynamic allocation growth).
-- Only absolute path handling is supported for `openat` (`AT_FDCWD` only).
-- No mount table, superblock abstraction, or multi-filesystem dispatch yet.
-- No permissions/UID/GID enforcement, timestamps, links, or unlink/rmdir.
-- Directory enumeration (`readdir`) is not exported through syscalls yet.
-- Console I/O is simplified; reads from console currently return EOF.
-- No locking/concurrency protections for VFS state yet (single-core assumption).
+- VFS storage model remains static-capacity and single-address-space; no dynamic mount table abstraction yet.
+- No permissions/UID/GID enforcement, timestamps, links, unlink/rmdir, or rename yet.
+- `openat` currently supports only `AT_FDCWD` with absolute paths.
+- `readdir`, `stat`, and broader metadata syscalls are not implemented yet.
+- Console input is not implemented yet; console reads currently return EOF.
+- No explicit synchronization/locking in fs state (single-core assumption).

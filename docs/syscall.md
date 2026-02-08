@@ -53,7 +53,7 @@ Limitations / Simplifications
 `kernel/src/syscall.rs` now implements a table-driven dispatcher shared by both the SYSCALL and int 0x80 paths. Arguments are normalized into a small `SyscallArgs` struct, syscall entries carry mode metadata (any task vs user task), unknown syscall logs are rate-limited, and return values use Linux-style negative errno.
 
 Current implemented handlers:
-- `open/openat/close/read/write/lseek` via baseline tmpfs-backed VFS descriptors
+- `open/openat/close/read/write/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
 - `exit(status)` and `exit_group(status)`
 - `sched_yield()`
 - `getpid()`, `getppid()`, `gettid()`
@@ -63,6 +63,7 @@ Current implemented handlers:
 Limitations / Simplifications
 - Most Linux syscall numbers are still unimplemented and return `-ENOSYS`.
 - VFS integration is baseline-only: `openat` currently supports `AT_FDCWD` with absolute paths; no full mount namespace/path-root semantics.
+- `devfs`/`procfs` are minimal virtual backends (`/dev/null`, `/dev/zero`, `/dev/console`, `/proc/{uptime,meminfo,mounts,version}`) and are not yet full Linux-compatible implementations.
 - Console I/O is simplified: stdio descriptors are pre-seeded for user tasks, console writes go to serial, and console reads currently return EOF.
 - `brk` only manages simple per-task heap growth/shrink and does not yet integrate with full userspace allocator semantics (no `mmap` fallback, no overcommit policy, no guard pages).
 - `set_tid_address` does not yet perform futex wakeups for robust thread teardown semantics.

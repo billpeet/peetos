@@ -2,9 +2,9 @@
 
 pub const VFS_MAX_PATH: usize = 256;
 pub const VFS_MAX_NAME: usize = 64;
-pub const TMPFS_MAX_INODES: usize = 128;
-pub const TMPFS_MAX_CHILDREN: usize = 32;
-pub const TMPFS_MAX_FILE_SIZE: usize = 16 * 1024;
+pub const VFS_MAX_INODES: usize = 192;
+pub const VFS_MAX_CHILDREN: usize = 48;
+pub const TMPFS_MAX_FILE_SIZE: usize = 32 * 1024;
 
 pub const O_RDONLY: u32 = 0x0000;
 pub const O_WRONLY: u32 = 0x0001;
@@ -22,6 +22,7 @@ pub const SEEK_END: u32 = 2;
 
 pub const AT_FDCWD: i32 = -100;
 
+pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
 pub const EEXIST: i64 = 17;
@@ -29,9 +30,12 @@ pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
+pub const EROFS: i64 = 30;
 pub const ENAMETOOLONG: i64 = 36;
 
 const ROOT_INODE: u16 = 0;
+const PROCFS_BUFFER_MAX: usize = 512;
+const PROC_TICK_HZ: u64 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -42,9 +46,23 @@ pub enum FileType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum NodeBackend {
+    Tmpfs = 0,
+    DevNull = 1,
+    DevZero = 2,
+    DevConsole = 3,
+    ProcUptime = 4,
+    ProcMeminfo = 5,
+    ProcMounts = 6,
+    ProcVersion = 7,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenResult {
     pub inode: u16,
     pub file_type: FileType,
+    pub is_console: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,12 +75,13 @@ pub struct WriteResult {
 struct Inode {
     used: bool,
     file_type: FileType,
+    backend: NodeBackend,
     parent: u16,
     name: [u8; VFS_MAX_NAME],
     name_len: u8,
     size: u32,
     child_count: u8,
-    children: [u16; TMPFS_MAX_CHILDREN],
+    children: [u16; VFS_MAX_CHILDREN],
     data: [u8; TMPFS_MAX_FILE_SIZE],
 }
 
@@ -71,12 +90,13 @@ impl Inode {
         Self {
             used: false,
             file_type: FileType::None,
+            backend: NodeBackend::Tmpfs,
             parent: ROOT_INODE,
             name: [0; VFS_MAX_NAME],
             name_len: 0,
             size: 0,
             child_count: 0,
-            children: [0; TMPFS_MAX_CHILDREN],
+            children: [0; VFS_MAX_CHILDREN],
             data: [0; TMPFS_MAX_FILE_SIZE],
         }
     }
@@ -84,14 +104,22 @@ impl Inode {
 
 struct VfsState {
     initialized: bool,
-    inodes: [Inode; TMPFS_MAX_INODES],
+    inodes: [Inode; VFS_MAX_INODES],
+    proc_uptime_ticks: u64,
+    proc_total_bytes: u64,
+    proc_free_bytes: u64,
+    proc_used_bytes: u64,
 }
 
 impl VfsState {
     const fn new() -> Self {
         Self {
             initialized: false,
-            inodes: [Inode::empty(); TMPFS_MAX_INODES],
+            inodes: [Inode::empty(); VFS_MAX_INODES],
+            proc_uptime_ticks: 0,
+            proc_total_bytes: 0,
+            proc_free_bytes: 0,
+            proc_used_bytes: 0,
         }
     }
 }
@@ -106,6 +134,10 @@ fn reset(state: &mut VfsState) {
     for slot in state.inodes.iter_mut() {
         *slot = Inode::empty();
     }
+    state.proc_uptime_ticks = 0;
+    state.proc_total_bytes = 0;
+    state.proc_free_bytes = 0;
+    state.proc_used_bytes = 0;
     state.initialized = false;
 }
 
@@ -114,6 +146,7 @@ fn setup_root(state: &mut VfsState) {
     *root = Inode::empty();
     root.used = true;
     root.file_type = FileType::Directory;
+    root.backend = NodeBackend::Tmpfs;
     root.parent = ROOT_INODE;
     root.name_len = 0;
 }
@@ -128,9 +161,18 @@ fn ensure_init(state: &mut VfsState) {
     state.initialized = true;
 
     let _ = mkdir_inner(state, "/tmp");
-    let _ = mkdir_inner(state, "/dev");
     let _ = mkdir_inner(state, "/etc");
-    let _ = create_regular_inner(state, "/dev/console");
+
+    let _ = mkdir_virtual_inner(state, "/dev");
+    let _ = create_virtual_file_inner(state, "/dev/null", NodeBackend::DevNull);
+    let _ = create_virtual_file_inner(state, "/dev/zero", NodeBackend::DevZero);
+    let _ = create_virtual_file_inner(state, "/dev/console", NodeBackend::DevConsole);
+
+    let _ = mkdir_virtual_inner(state, "/proc");
+    let _ = create_virtual_file_inner(state, "/proc/uptime", NodeBackend::ProcUptime);
+    let _ = create_virtual_file_inner(state, "/proc/meminfo", NodeBackend::ProcMeminfo);
+    let _ = create_virtual_file_inner(state, "/proc/mounts", NodeBackend::ProcMounts);
+    let _ = create_virtual_file_inner(state, "/proc/version", NodeBackend::ProcVersion);
 }
 
 fn name_eq(inode: &Inode, name: &[u8]) -> bool {
@@ -159,7 +201,7 @@ fn add_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
     if parent.file_type != FileType::Directory {
         return Err(ENOTDIR);
     }
-    if parent.child_count as usize >= TMPFS_MAX_CHILDREN {
+    if parent.child_count as usize >= VFS_MAX_CHILDREN {
         return Err(ENOSPC);
     }
 
@@ -172,6 +214,7 @@ fn add_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
 fn alloc_inode(
     state: &mut VfsState,
     file_type: FileType,
+    backend: NodeBackend,
     parent: u16,
     name: &[u8],
 ) -> Result<u16, i64> {
@@ -180,12 +223,13 @@ fn alloc_inode(
     }
 
     let mut slot = 1usize;
-    while slot < TMPFS_MAX_INODES {
+    while slot < VFS_MAX_INODES {
         if !state.inodes[slot].used {
             let inode = &mut state.inodes[slot];
             *inode = Inode::empty();
             inode.used = true;
             inode.file_type = file_type;
+            inode.backend = backend;
             inode.parent = parent;
             inode.name_len = name.len() as u8;
             inode.name[..name.len()].copy_from_slice(name);
@@ -342,11 +386,21 @@ fn create_regular_inner(state: &mut VfsState, path: &str) -> Result<u16, i64> {
     let mut name = [0u8; VFS_MAX_NAME];
     let (parent, name_len) = resolve_parent_inner(state, path, &mut name)?;
 
+    if state.inodes[parent as usize].backend != NodeBackend::Tmpfs {
+        return Err(EROFS);
+    }
+
     if find_child(state, parent, &name[..name_len]).is_some() {
         return Err(EEXIST);
     }
 
-    let inode = alloc_inode(state, FileType::Regular, parent, &name[..name_len])?;
+    let inode = alloc_inode(
+        state,
+        FileType::Regular,
+        NodeBackend::Tmpfs,
+        parent,
+        &name[..name_len],
+    )?;
     add_child(state, parent, inode)?;
     Ok(inode)
 }
@@ -355,19 +409,183 @@ fn mkdir_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
     let mut name = [0u8; VFS_MAX_NAME];
     let (parent, name_len) = resolve_parent_inner(state, path, &mut name)?;
 
+    if state.inodes[parent as usize].backend != NodeBackend::Tmpfs {
+        return Err(EROFS);
+    }
+
     if find_child(state, parent, &name[..name_len]).is_some() {
         return Err(EEXIST);
     }
 
-    let inode = alloc_inode(state, FileType::Directory, parent, &name[..name_len])?;
+    let inode = alloc_inode(
+        state,
+        FileType::Directory,
+        NodeBackend::Tmpfs,
+        parent,
+        &name[..name_len],
+    )?;
     add_child(state, parent, inode)?;
     Ok(())
+}
+
+fn mkdir_virtual_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
+    let mut name = [0u8; VFS_MAX_NAME];
+    let (parent, name_len) = resolve_parent_inner(state, path, &mut name)?;
+
+    if find_child(state, parent, &name[..name_len]).is_some() {
+        return Err(EEXIST);
+    }
+
+    let inode = alloc_inode(
+        state,
+        FileType::Directory,
+        NodeBackend::Tmpfs,
+        parent,
+        &name[..name_len],
+    )?;
+    add_child(state, parent, inode)?;
+    Ok(())
+}
+
+fn create_virtual_file_inner(
+    state: &mut VfsState,
+    path: &str,
+    backend: NodeBackend,
+) -> Result<u16, i64> {
+    let mut name = [0u8; VFS_MAX_NAME];
+    let (parent, name_len) = resolve_parent_inner(state, path, &mut name)?;
+
+    if find_child(state, parent, &name[..name_len]).is_some() {
+        return Err(EEXIST);
+    }
+
+    let inode = alloc_inode(state, FileType::Regular, backend, parent, &name[..name_len])?;
+    add_child(state, parent, inode)?;
+    Ok(inode)
+}
+
+fn append_bytes(out: &mut [u8], cursor: &mut usize, src: &[u8]) {
+    let remaining = out.len().saturating_sub(*cursor);
+    if remaining == 0 {
+        return;
+    }
+    let take = core::cmp::min(remaining, src.len());
+    out[*cursor..*cursor + take].copy_from_slice(&src[..take]);
+    *cursor += take;
+}
+
+fn append_str(out: &mut [u8], cursor: &mut usize, s: &str) {
+    append_bytes(out, cursor, s.as_bytes());
+}
+
+fn append_u64(out: &mut [u8], cursor: &mut usize, value: u64) {
+    let mut tmp = [0u8; 20];
+    let mut len = 0usize;
+    let mut n = value;
+
+    if n == 0 {
+        tmp[0] = b'0';
+        len = 1;
+    } else {
+        while n > 0 && len < tmp.len() {
+            tmp[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+    }
+
+    let mut idx = len;
+    while idx > 0 {
+        idx -= 1;
+        append_bytes(out, cursor, &tmp[idx..idx + 1]);
+    }
+}
+
+fn append_u64_fixed_2(out: &mut [u8], cursor: &mut usize, value: u64) {
+    let tens = ((value / 10) % 10) as u8;
+    let ones = (value % 10) as u8;
+    append_bytes(out, cursor, &[b'0' + tens, b'0' + ones]);
+}
+
+fn format_proc_payload(state: &VfsState, backend: NodeBackend, out: &mut [u8]) -> usize {
+    let mut cursor = 0usize;
+    match backend {
+        NodeBackend::ProcVersion => {
+            append_str(out, &mut cursor, "PeetOS-Rust 0.1\n");
+        }
+        NodeBackend::ProcMounts => {
+            append_str(out, &mut cursor, "tmpfs / tmpfs rw 0 0\n");
+            append_str(out, &mut cursor, "devfs /dev devfs rw 0 0\n");
+            append_str(out, &mut cursor, "proc /proc procfs ro 0 0\n");
+        }
+        NodeBackend::ProcUptime => {
+            let secs = state.proc_uptime_ticks / PROC_TICK_HZ;
+            let frac = state.proc_uptime_ticks % PROC_TICK_HZ;
+            append_u64(out, &mut cursor, secs);
+            append_str(out, &mut cursor, ".");
+            append_u64_fixed_2(out, &mut cursor, frac);
+            append_str(out, &mut cursor, " ");
+            append_u64(out, &mut cursor, secs);
+            append_str(out, &mut cursor, ".");
+            append_u64_fixed_2(out, &mut cursor, frac);
+            append_str(out, &mut cursor, "\n");
+        }
+        NodeBackend::ProcMeminfo => {
+            let total = state.proc_total_bytes / 1024;
+            let free = state.proc_free_bytes / 1024;
+            let used = if state.proc_used_bytes == 0 {
+                total.saturating_sub(free)
+            } else {
+                state.proc_used_bytes / 1024
+            };
+            append_str(out, &mut cursor, "MemTotal: ");
+            append_u64(out, &mut cursor, total);
+            append_str(out, &mut cursor, " kB\n");
+            append_str(out, &mut cursor, "MemFree: ");
+            append_u64(out, &mut cursor, free);
+            append_str(out, &mut cursor, " kB\n");
+            append_str(out, &mut cursor, "MemUsed: ");
+            append_u64(out, &mut cursor, used);
+            append_str(out, &mut cursor, " kB\n");
+        }
+        _ => {}
+    }
+    cursor
+}
+
+fn read_proc(node: &Inode, state: &VfsState, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
+    let mut buf = [0u8; PROCFS_BUFFER_MAX];
+    let len = format_proc_payload(state, node.backend, &mut buf);
+
+    if offset as usize >= len || dst.is_empty() {
+        return Ok(0);
+    }
+
+    let start = offset as usize;
+    let available = len - start;
+    let count = core::cmp::min(dst.len(), available);
+    dst[..count].copy_from_slice(&buf[start..start + count]);
+    Ok(count)
 }
 
 pub fn init() {
     let state = state();
     reset(state);
     ensure_init(state);
+}
+
+pub fn set_proc_uptime_ticks(ticks: u64) {
+    let state = state();
+    ensure_init(state);
+    state.proc_uptime_ticks = ticks;
+}
+
+pub fn set_proc_meminfo(total_bytes: u64, free_bytes: u64, used_bytes: u64) {
+    let state = state();
+    ensure_init(state);
+    state.proc_total_bytes = total_bytes;
+    state.proc_free_bytes = free_bytes;
+    state.proc_used_bytes = used_bytes;
 }
 
 pub fn mkdir(path: &str) -> Result<(), i64> {
@@ -406,12 +624,16 @@ pub fn open(path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
     }
 
     if (flags & O_TRUNC) != 0 && inode.file_type == FileType::Regular && access != O_RDONLY {
+        if inode.backend != NodeBackend::Tmpfs {
+            return Err(EROFS);
+        }
         inode.size = 0;
     }
 
     Ok(OpenResult {
         inode: inode_idx,
         file_type: inode.file_type,
+        is_console: inode.backend == NodeBackend::DevConsole,
     })
 }
 
@@ -419,7 +641,7 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
     let state = state();
     ensure_init(state);
 
-    if inode as usize >= TMPFS_MAX_INODES {
+    if inode as usize >= VFS_MAX_INODES {
         return Err(ENOENT);
     }
 
@@ -431,27 +653,41 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
         return Err(EISDIR);
     }
 
-    if dst.is_empty() {
-        return Ok(0);
-    }
+    match node.backend {
+        NodeBackend::Tmpfs => {
+            if dst.is_empty() {
+                return Ok(0);
+            }
 
-    let file_size = node.size as usize;
-    if offset as usize >= file_size {
-        return Ok(0);
-    }
+            let file_size = node.size as usize;
+            if offset as usize >= file_size {
+                return Ok(0);
+            }
 
-    let start = offset as usize;
-    let available = file_size - start;
-    let count = core::cmp::min(dst.len(), available);
-    dst[..count].copy_from_slice(&node.data[start..start + count]);
-    Ok(count)
+            let start = offset as usize;
+            let available = file_size - start;
+            let count = core::cmp::min(dst.len(), available);
+            dst[..count].copy_from_slice(&node.data[start..start + count]);
+            Ok(count)
+        }
+        NodeBackend::DevNull => Ok(0),
+        NodeBackend::DevZero => {
+            dst.fill(0);
+            Ok(dst.len())
+        }
+        NodeBackend::DevConsole => Ok(0),
+        NodeBackend::ProcUptime
+        | NodeBackend::ProcMeminfo
+        | NodeBackend::ProcMounts
+        | NodeBackend::ProcVersion => read_proc(node, state, offset, dst),
+    }
 }
 
 pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteResult, i64> {
     let state = state();
     ensure_init(state);
 
-    if inode as usize >= TMPFS_MAX_INODES {
+    if inode as usize >= VFS_MAX_INODES {
         return Err(ENOENT);
     }
 
@@ -463,55 +699,70 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
         return Err(EISDIR);
     }
 
-    let mut start = if append {
-        node.size as usize
-    } else {
-        match usize::try_from(offset) {
-            Ok(v) => v,
-            Err(_) => return Err(EINVAL),
+    match node.backend {
+        NodeBackend::Tmpfs => {
+            let mut start = if append {
+                node.size as usize
+            } else {
+                match usize::try_from(offset) {
+                    Ok(v) => v,
+                    Err(_) => return Err(EINVAL),
+                }
+            };
+
+            if start > TMPFS_MAX_FILE_SIZE {
+                return Err(ENOSPC);
+            }
+
+            if src.is_empty() {
+                return Ok(WriteResult {
+                    written: 0,
+                    new_offset: start as u64,
+                });
+            }
+
+            let current_size = node.size as usize;
+            if start > current_size {
+                node.data[current_size..start].fill(0);
+            }
+
+            let remaining = TMPFS_MAX_FILE_SIZE - start;
+            if remaining == 0 {
+                return Err(ENOSPC);
+            }
+
+            let count = core::cmp::min(src.len(), remaining);
+            node.data[start..start + count].copy_from_slice(&src[..count]);
+
+            start += count;
+            if start > node.size as usize {
+                node.size = start as u32;
+            }
+
+            Ok(WriteResult {
+                written: count,
+                new_offset: start as u64,
+            })
         }
-    };
-
-    if start > TMPFS_MAX_FILE_SIZE {
-        return Err(ENOSPC);
+        NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
+            let next = offset.saturating_add(src.len() as u64);
+            Ok(WriteResult {
+                written: src.len(),
+                new_offset: next,
+            })
+        }
+        NodeBackend::ProcUptime
+        | NodeBackend::ProcMeminfo
+        | NodeBackend::ProcMounts
+        | NodeBackend::ProcVersion => Err(EROFS),
     }
-
-    if src.is_empty() {
-        return Ok(WriteResult {
-            written: 0,
-            new_offset: start as u64,
-        });
-    }
-
-    let current_size = node.size as usize;
-    if start > current_size {
-        node.data[current_size..start].fill(0);
-    }
-
-    let remaining = TMPFS_MAX_FILE_SIZE - start;
-    if remaining == 0 {
-        return Err(ENOSPC);
-    }
-
-    let count = core::cmp::min(src.len(), remaining);
-    node.data[start..start + count].copy_from_slice(&src[..count]);
-
-    start += count;
-    if start > node.size as usize {
-        node.size = start as u32;
-    }
-
-    Ok(WriteResult {
-        written: count,
-        new_offset: start as u64,
-    })
 }
 
 pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i64> {
     let state = state();
     ensure_init(state);
 
-    if inode as usize >= TMPFS_MAX_INODES {
+    if inode as usize >= VFS_MAX_INODES {
         return Err(ENOENT);
     }
 
@@ -523,16 +774,49 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
         return Err(EISDIR);
     }
 
+    let end = match node.backend {
+        NodeBackend::Tmpfs => node.size as u64,
+        NodeBackend::ProcUptime
+        | NodeBackend::ProcMeminfo
+        | NodeBackend::ProcMounts
+        | NodeBackend::ProcVersion => {
+            let mut buf = [0u8; PROCFS_BUFFER_MAX];
+            format_proc_payload(state, node.backend, &mut buf) as u64
+        }
+        NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => current,
+    };
+
     let base = match whence {
         SEEK_SET => 0i128,
         SEEK_CUR => current as i128,
-        SEEK_END => node.size as i128,
+        SEEK_END => end as i128,
         _ => return Err(EINVAL),
     };
 
     let target = base + offset as i128;
-    if target < 0 || target > TMPFS_MAX_FILE_SIZE as i128 {
+    if target < 0 {
         return Err(EINVAL);
+    }
+
+    match node.backend {
+        NodeBackend::Tmpfs => {
+            if target > TMPFS_MAX_FILE_SIZE as i128 {
+                return Err(EINVAL);
+            }
+        }
+        NodeBackend::ProcUptime
+        | NodeBackend::ProcMeminfo
+        | NodeBackend::ProcMounts
+        | NodeBackend::ProcVersion => {
+            if target > end as i128 {
+                return Err(EINVAL);
+            }
+        }
+        NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
+            if target > u64::MAX as i128 {
+                return Err(EINVAL);
+            }
+        }
     }
 
     Ok(target as u64)
@@ -542,7 +826,7 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
     let state = state();
     ensure_init(state);
 
-    if inode as usize >= TMPFS_MAX_INODES {
+    if inode as usize >= VFS_MAX_INODES {
         return Err(ENOENT);
     }
 
@@ -551,7 +835,19 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
         return Err(ENOENT);
     }
 
-    Ok(node.size as u64)
+    let size = match node.backend {
+        NodeBackend::Tmpfs => node.size as u64,
+        NodeBackend::ProcUptime
+        | NodeBackend::ProcMeminfo
+        | NodeBackend::ProcMounts
+        | NodeBackend::ProcVersion => {
+            let mut buf = [0u8; PROCFS_BUFFER_MAX];
+            format_proc_payload(state, node.backend, &mut buf) as u64
+        }
+        NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => 0,
+    };
+
+    Ok(size)
 }
 
 #[cfg(test)]
@@ -642,5 +938,54 @@ mod tests {
         let dir = open("/tmp", O_RDONLY | O_DIRECTORY, 0).expect("directory open should work");
         let err = write(dir.inode, 0, b"bad", false).unwrap_err();
         assert_eq!(err, EISDIR);
+    }
+
+    #[test]
+    fn devfs_null_and_zero_behave() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let null_fd = open("/dev/null", O_RDWR, 0).expect("open /dev/null");
+        let mut null_read = [1u8; 4];
+        assert_eq!(read(null_fd.inode, 0, &mut null_read).unwrap(), 0);
+        assert_eq!(write(null_fd.inode, 0, b"drop", false).unwrap().written, 4);
+
+        let zero_fd = open("/dev/zero", O_RDONLY, 0).expect("open /dev/zero");
+        let mut zero_read = [1u8; 4];
+        assert_eq!(read(zero_fd.inode, 0, &mut zero_read).unwrap(), 4);
+        assert_eq!(zero_read, [0u8; 4]);
+    }
+
+    #[test]
+    fn procfs_files_are_dynamic_and_read_only() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        set_proc_uptime_ticks(1234);
+        set_proc_meminfo(128 * 1024 * 1024, 96 * 1024 * 1024, 32 * 1024 * 1024);
+
+        let uptime = open("/proc/uptime", O_RDONLY, 0).expect("open /proc/uptime");
+        let mut uptime_buf = [0u8; 64];
+        let uptime_n = read(uptime.inode, 0, &mut uptime_buf).expect("read uptime");
+        let uptime_text = core::str::from_utf8(&uptime_buf[..uptime_n]).expect("utf8");
+        assert!(uptime_text.contains("12.34"));
+
+        let meminfo = open("/proc/meminfo", O_RDONLY, 0).expect("open /proc/meminfo");
+        let mut mem_buf = [0u8; 160];
+        let mem_n = read(meminfo.inode, 0, &mut mem_buf).expect("read meminfo");
+        let mem_text = core::str::from_utf8(&mem_buf[..mem_n]).expect("utf8");
+        assert!(mem_text.contains("MemTotal:"));
+        assert!(mem_text.contains("MemFree:"));
+
+        assert_eq!(write(meminfo.inode, 0, b"bad", false).unwrap_err(), EROFS);
+    }
+
+    #[test]
+    fn dev_console_reports_console_open() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let console = open("/dev/console", O_RDWR, 0).expect("open /dev/console");
+        assert!(console.is_console);
     }
 }

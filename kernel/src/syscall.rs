@@ -3,6 +3,7 @@ use core::ptr;
 
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
 use arch_x86_64::idt::InterruptFrame;
+use arch_x86_64::pit;
 use arch_x86_64::syscall::SyscallFrame;
 
 use crate::memory::{pmm, vmm};
@@ -33,6 +34,7 @@ const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ESPIPE: i64 = 29;
+const EROFS: i64 = 30;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const ENOSYS: i64 = 38;
@@ -202,6 +204,7 @@ fn lookup_syscall(num: u64) -> Option<&'static SyscallDef> {
 
 fn fs_to_errno(err: i64) -> i64 {
     match err {
+        fs::EPERM => EPERM,
         fs::ENOENT => ENOENT,
         fs::EIO => EIO,
         fs::EEXIST => EEXIST,
@@ -209,6 +212,7 @@ fn fs_to_errno(err: i64) -> i64 {
         fs::EISDIR => EISDIR,
         fs::EINVAL => EINVAL,
         fs::ENOSPC => ENOSPC,
+        fs::EROFS => EROFS,
         fs::ENAMETOOLONG => EINVAL,
         _ => EIO,
     }
@@ -226,7 +230,7 @@ fn fd_slot_is_open(task_ptr: *mut task::Task, idx: usize) -> bool {
     unsafe { (*task_ptr).user_fd_kind[idx] != task::USER_FD_KIND_EMPTY }
 }
 
-fn fd_alloc(task_ptr: *mut task::Task, inode: u16, flags: u32) -> Result<i64, i64> {
+fn fd_alloc(task_ptr: *mut task::Task, kind: u8, inode: u16, flags: u32) -> Result<i64, i64> {
     if task_ptr.is_null() {
         return Err(-ESRCH);
     }
@@ -234,8 +238,12 @@ fn fd_alloc(task_ptr: *mut task::Task, inode: u16, flags: u32) -> Result<i64, i6
     for idx in 3..task::MAX_TASK_FDS {
         if unsafe { (*task_ptr).user_fd_kind[idx] == task::USER_FD_KIND_EMPTY } {
             unsafe {
-                (*task_ptr).user_fd_kind[idx] = task::USER_FD_KIND_VFS;
-                (*task_ptr).user_fd_inode[idx] = inode;
+                (*task_ptr).user_fd_kind[idx] = kind;
+                (*task_ptr).user_fd_inode[idx] = if kind == task::USER_FD_KIND_VFS {
+                    inode
+                } else {
+                    task::USER_FD_NONE
+                };
                 (*task_ptr).user_fd_offset[idx] = 0;
                 (*task_ptr).user_fd_flags[idx] = flags;
             }
@@ -287,6 +295,16 @@ fn read_user_path(path_ptr: u64, out: &mut [u8; fs::VFS_MAX_PATH]) -> Result<&st
         Ok(path) => Ok(path),
         Err(_) => Err(-EINVAL),
     }
+}
+
+fn refresh_procfs_runtime() {
+    let pmm_stats = pmm::get_stats();
+    fs::set_proc_uptime_ticks(pit::ticks());
+    fs::set_proc_meminfo(
+        pmm_stats.total_bytes,
+        pmm_stats.free_bytes,
+        pmm_stats.used_bytes,
+    );
 }
 
 fn user_range_ok(start: u64, len: usize) -> bool {
@@ -544,12 +562,20 @@ fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EINVAL;
     }
 
+    refresh_procfs_runtime();
+
     let opened = match fs::open(path, flags, mode) {
         Ok(opened) => opened,
         Err(err) => return -fs_to_errno(err),
     };
 
-    match fd_alloc(ctx.current, opened.inode, flags) {
+    let fd_kind = if opened.is_console {
+        task::USER_FD_KIND_CONSOLE
+    } else {
+        task::USER_FD_KIND_VFS
+    };
+
+    match fd_alloc(ctx.current, fd_kind, opened.inode, flags) {
         Ok(fd) => fd,
         Err(err) => err,
     }
@@ -606,6 +632,7 @@ fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         let read_n = if kind == task::USER_FD_KIND_CONSOLE {
             0usize
         } else if kind == task::USER_FD_KIND_VFS {
+            refresh_procfs_runtime();
             match fs::read(inode, offset, &mut chunk[..take]) {
                 Ok(n) => n,
                 Err(err) => {
