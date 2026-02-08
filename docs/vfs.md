@@ -17,6 +17,7 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
   - `procfs`: `/proc/uptime`, `/proc/meminfo`, `/proc/mounts`, `/proc/version`
 - ext2 baseline importer:
   - `mount_ext2_image(path, image)` parses a raw ext2 image and imports files/dirs as ext2-backed VFS nodes.
+  - The mounted ext2 image is kept as mutable fs state, and `export_ext2_image(out)` can snapshot the current mutated image bytes.
   - Kernel init mounts `user/sample_ext2.img` at `/mnt/ext2`.
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
@@ -44,6 +45,8 @@ On initialization, the kernel creates:
   - proc files are read-only (`-EROFS` on write)
 - ext2 behavior:
   - Imported files/directories support baseline mutable regular-file and directory operations (`read`, `write`, `truncate`, `create`, `mkdir`) through the existing VFS file APIs.
+  - Ext2 reads/writes operate on ext2 inode/data structures in the mounted image (not copied tmpfs file blobs), and size/offset tracking follows ext2 inode state.
+  - `create`/`mkdir` allocate ext2 inodes/blocks, update inode/block bitmaps and free counters, and insert directory entries in parent directories.
   - `/proc/mounts` reports ext2 as `rw` when mounted.
   - Mount import is rollback-safe: on parse/import failure, partially imported nodes are removed.
 
@@ -66,4 +69,4 @@ Limitations / Simplifications
 - Console input is not implemented yet; console reads currently return EOF.
 - No explicit synchronization/locking in fs state (single-core assumption).
 - ext2 importer is intentionally minimal: regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, no ownership/permission metadata mapping, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
-- ext2 writes are currently in-memory only after import; they do not write back to the source ext2 image and do not update on-disk ext2 metadata structures.
+- ext2 mutation durability is currently scoped to the mounted image buffer in RAM; there is no block-device flush path yet, so persistence across boots requires explicitly exporting the mutated image and reusing it.

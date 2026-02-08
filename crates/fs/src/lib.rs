@@ -43,10 +43,16 @@ const EXT2_ROOT_INODE: u32 = 2;
 const EXT2_GROUP_DESC_SIZE: usize = 32;
 const EXT2_INODE_DIRECT_COUNT: usize = 12;
 const EXT2_MAX_RECURSION: u8 = 16;
+const EXT2_MAX_IMAGE_SIZE: usize = 512 * 1024;
+
+const EXT2_FT_REG_FILE: u8 = 1;
+const EXT2_FT_DIR: u8 = 2;
 
 const EXT2_S_IFMT: u16 = 0xF000;
 const EXT2_S_IFDIR: u16 = 0x4000;
 const EXT2_S_IFREG: u16 = 0x8000;
+const EXT2_DEF_FILE_MODE: u16 = EXT2_S_IFREG | 0o644;
+const EXT2_DEF_DIR_MODE: u16 = EXT2_S_IFDIR | 0o755;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -95,6 +101,7 @@ struct Inode {
     child_count: u8,
     children: [u16; VFS_MAX_CHILDREN],
     data: [u8; TMPFS_MAX_FILE_SIZE],
+    ext2_ino: u32,
 }
 
 impl Inode {
@@ -110,6 +117,7 @@ impl Inode {
             child_count: 0,
             children: [0; VFS_MAX_CHILDREN],
             data: [0; TMPFS_MAX_FILE_SIZE],
+            ext2_ino: 0,
         }
     }
 }
@@ -121,6 +129,11 @@ struct VfsState {
     proc_total_bytes: u64,
     proc_free_bytes: u64,
     proc_used_bytes: u64,
+    ext2_mounted: bool,
+    ext2_mount_inode: u16,
+    ext2_meta: Ext2Meta,
+    ext2_image_len: usize,
+    ext2_image: [u8; EXT2_MAX_IMAGE_SIZE],
 }
 
 impl VfsState {
@@ -132,6 +145,11 @@ impl VfsState {
             proc_total_bytes: 0,
             proc_free_bytes: 0,
             proc_used_bytes: 0,
+            ext2_mounted: false,
+            ext2_mount_inode: ROOT_INODE,
+            ext2_meta: Ext2Meta::empty(),
+            ext2_image_len: 0,
+            ext2_image: [0; EXT2_MAX_IMAGE_SIZE],
         }
     }
 }
@@ -144,15 +162,35 @@ struct Ext2Meta {
     inode_size: usize,
     inodes_per_group: u32,
     blocks_per_group: u32,
+    total_blocks: u32,
+    first_data_block: u32,
     total_inodes: u32,
     group_count: u32,
     gdt_offset: usize,
+}
+
+impl Ext2Meta {
+    const fn empty() -> Self {
+        Self {
+            block_size: 0,
+            inode_size: 0,
+            inodes_per_group: 0,
+            blocks_per_group: 0,
+            total_blocks: 0,
+            first_data_block: 0,
+            total_inodes: 0,
+            group_count: 0,
+            gdt_offset: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Ext2Inode {
     mode: u16,
     size: u32,
+    links_count: u16,
+    block_count_512: u32,
     blocks: [u32; 15],
 }
 
@@ -171,6 +209,7 @@ fn clear_inode(inode: &mut Inode) {
     inode.child_count = 0;
     inode.children.fill(0);
     inode.data.fill(0);
+    inode.ext2_ino = 0;
 }
 
 fn reset(state: &mut VfsState) {
@@ -181,6 +220,11 @@ fn reset(state: &mut VfsState) {
     state.proc_total_bytes = 0;
     state.proc_free_bytes = 0;
     state.proc_used_bytes = 0;
+    state.ext2_mounted = false;
+    state.ext2_mount_inode = ROOT_INODE;
+    state.ext2_meta = Ext2Meta::empty();
+    state.ext2_image_len = 0;
+    state.ext2_image.fill(0);
     state.initialized = false;
 }
 
@@ -282,6 +326,17 @@ fn alloc_inode(
     }
 
     Err(ENOSPC)
+}
+
+fn has_free_vfs_inode(state: &VfsState) -> bool {
+    let mut slot = 1usize;
+    while slot < VFS_MAX_INODES {
+        if !state.inodes[slot].used {
+            return true;
+        }
+        slot += 1;
+    }
+    false
 }
 
 fn next_component(
@@ -438,13 +493,39 @@ fn create_regular_inner(state: &mut VfsState, path: &str) -> Result<u16, i64> {
         return Err(EEXIST);
     }
 
-    let inode = alloc_inode(
-        state,
-        FileType::Regular,
-        parent_backend,
-        parent,
-        &name[..name_len],
-    )?;
+    if parent_backend == NodeBackend::Ext2 {
+        if state.inodes[parent as usize].ext2_ino == 0 {
+            return Err(EIO);
+        }
+        if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
+            return Err(ENOSPC);
+        }
+        if !has_free_vfs_inode(state) {
+            return Err(ENOSPC);
+        }
+
+        let (ext2_ino, ext2_size) = ext2_create_child_on_disk(
+            state,
+            state.inodes[parent as usize].ext2_ino,
+            &name[..name_len],
+            FileType::Regular,
+        )?;
+
+        let inode = alloc_inode(
+            state,
+            FileType::Regular,
+            NodeBackend::Ext2,
+            parent,
+            &name[..name_len],
+        )?;
+        let node = &mut state.inodes[inode as usize];
+        node.ext2_ino = ext2_ino;
+        node.size = ext2_size;
+        add_child(state, parent, inode)?;
+        return Ok(inode);
+    }
+
+    let inode = alloc_inode(state, FileType::Regular, NodeBackend::Tmpfs, parent, &name[..name_len])?;
     add_child(state, parent, inode)?;
     Ok(inode)
 }
@@ -462,13 +543,39 @@ fn mkdir_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
         return Err(EEXIST);
     }
 
-    let inode = alloc_inode(
-        state,
-        FileType::Directory,
-        parent_backend,
-        parent,
-        &name[..name_len],
-    )?;
+    if parent_backend == NodeBackend::Ext2 {
+        if state.inodes[parent as usize].ext2_ino == 0 {
+            return Err(EIO);
+        }
+        if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
+            return Err(ENOSPC);
+        }
+        if !has_free_vfs_inode(state) {
+            return Err(ENOSPC);
+        }
+
+        let (ext2_ino, ext2_size) = ext2_create_child_on_disk(
+            state,
+            state.inodes[parent as usize].ext2_ino,
+            &name[..name_len],
+            FileType::Directory,
+        )?;
+
+        let inode = alloc_inode(
+            state,
+            FileType::Directory,
+            NodeBackend::Ext2,
+            parent,
+            &name[..name_len],
+        )?;
+        let node = &mut state.inodes[inode as usize];
+        node.ext2_ino = ext2_ino;
+        node.size = ext2_size;
+        add_child(state, parent, inode)?;
+        return Ok(());
+    }
+
+    let inode = alloc_inode(state, FileType::Directory, NodeBackend::Tmpfs, parent, &name[..name_len])?;
     add_child(state, parent, inode)?;
     Ok(())
 }
@@ -553,12 +660,10 @@ fn append_u64_fixed_2(out: &mut [u8], cursor: &mut usize, value: u64) {
 }
 
 fn has_ext2_mount(state: &VfsState) -> bool {
-    let mount_inode = match lookup_path_inner(state, "/mnt/ext2") {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    let mount = &state.inodes[mount_inode as usize];
+    if !state.ext2_mounted || (state.ext2_mount_inode as usize) >= VFS_MAX_INODES {
+        return false;
+    }
+    let mount = &state.inodes[state.ext2_mount_inode as usize];
     mount.used && mount.file_type == FileType::Directory && mount.backend == NodeBackend::Ext2
 }
 
@@ -645,6 +750,28 @@ fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32, i64> {
     ]))
 }
 
+fn write_u16_le(buf: &mut [u8], offset: usize, value: u16) -> Result<(), i64> {
+    if offset + 2 > buf.len() {
+        return Err(EIO);
+    }
+    let bytes = value.to_le_bytes();
+    buf[offset] = bytes[0];
+    buf[offset + 1] = bytes[1];
+    Ok(())
+}
+
+fn write_u32_le(buf: &mut [u8], offset: usize, value: u32) -> Result<(), i64> {
+    if offset + 4 > buf.len() {
+        return Err(EIO);
+    }
+    let bytes = value.to_le_bytes();
+    buf[offset] = bytes[0];
+    buf[offset + 1] = bytes[1];
+    buf[offset + 2] = bytes[2];
+    buf[offset + 3] = bytes[3];
+    Ok(())
+}
+
 fn ext2_parse_meta(image: &[u8]) -> Result<Ext2Meta, i64> {
     if image.len() < EXT2_SUPERBLOCK_OFFSET + 1024 {
         return Err(EIO);
@@ -658,6 +785,7 @@ fn ext2_parse_meta(image: &[u8]) -> Result<Ext2Meta, i64> {
 
     let total_inodes = read_u32_le(image, sb + 0)?;
     let total_blocks = read_u32_le(image, sb + 4)?;
+    let first_data_block = read_u32_le(image, sb + 20)?;
     let log_block_size = read_u32_le(image, sb + 24)?;
     let blocks_per_group = read_u32_le(image, sb + 32)?;
     let inodes_per_group = read_u32_le(image, sb + 40)?;
@@ -711,6 +839,8 @@ fn ext2_parse_meta(image: &[u8]) -> Result<Ext2Meta, i64> {
         inode_size,
         inodes_per_group,
         blocks_per_group,
+        total_blocks,
+        first_data_block,
         total_inodes,
         group_count,
         gdt_offset,
@@ -756,6 +886,8 @@ fn ext2_read_inode(image: &[u8], meta: &Ext2Meta, ino: u32) -> Result<Ext2Inode,
 
     let mode = read_u16_le(image, inode_offset)?;
     let size = read_u32_le(image, inode_offset + 4)?;
+    let links_count = read_u16_le(image, inode_offset + 26)?;
+    let block_count_512 = read_u32_le(image, inode_offset + 28)?;
 
     let mut blocks = [0u32; 15];
     let mut i = 0usize;
@@ -764,7 +896,13 @@ fn ext2_read_inode(image: &[u8], meta: &Ext2Meta, ino: u32) -> Result<Ext2Inode,
         i += 1;
     }
 
-    Ok(Ext2Inode { mode, size, blocks })
+    Ok(Ext2Inode {
+        mode,
+        size,
+        links_count,
+        block_count_512,
+        blocks,
+    })
 }
 
 fn ext2_block_slice<'a>(image: &'a [u8], meta: &Ext2Meta, block: u32) -> Result<&'a [u8], i64> {
@@ -779,40 +917,613 @@ fn ext2_block_slice<'a>(image: &'a [u8], meta: &Ext2Meta, block: u32) -> Result<
     Ok(&image[start..end])
 }
 
-fn ext2_copy_file_data(
+fn ext2_block_slice_mut<'a>(
+    image: &'a mut [u8],
+    meta: &Ext2Meta,
+    block: u32,
+) -> Result<&'a mut [u8], i64> {
+    if block == 0 {
+        return Err(EIO);
+    }
+    let start = (block as usize).checked_mul(meta.block_size).ok_or(EIO)?;
+    let end = start.checked_add(meta.block_size).ok_or(EIO)?;
+    if end > image.len() {
+        return Err(EIO);
+    }
+    Ok(&mut image[start..end])
+}
+
+fn ext2_group_desc_offset(meta: &Ext2Meta, group: u32) -> Result<usize, i64> {
+    if group >= meta.group_count {
+        return Err(EIO);
+    }
+    meta.gdt_offset
+        .checked_add((group as usize) * EXT2_GROUP_DESC_SIZE)
+        .ok_or(EIO)
+}
+
+fn ext2_group_bitmap_block(
     image: &[u8],
     meta: &Ext2Meta,
+    group: u32,
+    field_offset: usize,
+) -> Result<u32, i64> {
+    let desc_offset = ext2_group_desc_offset(meta, group)?;
+    read_u32_le(image, desc_offset + field_offset)
+}
+
+fn ext2_group_block_bitmap_block(image: &[u8], meta: &Ext2Meta, group: u32) -> Result<u32, i64> {
+    ext2_group_bitmap_block(image, meta, group, 0)
+}
+
+fn ext2_group_inode_bitmap_block(image: &[u8], meta: &Ext2Meta, group: u32) -> Result<u32, i64> {
+    ext2_group_bitmap_block(image, meta, group, 4)
+}
+
+fn ext2_inode_offset_in_image(image: &[u8], meta: &Ext2Meta, ino: u32) -> Result<usize, i64> {
+    if ino == 0 || ino > meta.total_inodes {
+        return Err(ENOENT);
+    }
+
+    let idx = ino - 1;
+    let group = idx / meta.inodes_per_group;
+    let local = idx % meta.inodes_per_group;
+    let inode_table_block = ext2_group_inode_table_block(image, meta, group)?;
+
+    let inode_table_offset = (inode_table_block as usize)
+        .checked_mul(meta.block_size)
+        .ok_or(EIO)?;
+    inode_table_offset
+        .checked_add((local as usize) * meta.inode_size)
+        .ok_or(EIO)
+}
+
+fn ext2_write_inode(
+    image: &mut [u8],
+    meta: &Ext2Meta,
+    ino: u32,
     inode: &Ext2Inode,
-    out: &mut [u8],
-) -> Result<usize, i64> {
-    let size = inode.size as usize;
-    if size > out.len() {
+) -> Result<(), i64> {
+    let inode_offset = ext2_inode_offset_in_image(image, meta, ino)?;
+    if inode_offset
+        .checked_add(meta.inode_size)
+        .filter(|end| *end <= image.len())
+        .is_none()
+    {
+        return Err(EIO);
+    }
+
+    write_u16_le(image, inode_offset, inode.mode)?;
+    write_u32_le(image, inode_offset + 4, inode.size)?;
+    write_u16_le(image, inode_offset + 26, inode.links_count)?;
+    write_u32_le(image, inode_offset + 28, inode.block_count_512)?;
+
+    let mut i = 0usize;
+    while i < 15 {
+        write_u32_le(image, inode_offset + 40 + i * 4, inode.blocks[i])?;
+        i += 1;
+    }
+
+    Ok(())
+}
+
+fn ext2_bitmap_get(bitmap: &[u8], bit_idx: u32) -> Result<bool, i64> {
+    let byte_idx = (bit_idx / 8) as usize;
+    if byte_idx >= bitmap.len() {
+        return Err(EIO);
+    }
+    let bit = (bit_idx % 8) as u8;
+    Ok((bitmap[byte_idx] & (1u8 << bit)) != 0)
+}
+
+fn ext2_bitmap_set(bitmap: &mut [u8], bit_idx: u32, value: bool) -> Result<(), i64> {
+    let byte_idx = (bit_idx / 8) as usize;
+    if byte_idx >= bitmap.len() {
+        return Err(EIO);
+    }
+    let bit = (bit_idx % 8) as u8;
+    let mask = 1u8 << bit;
+    if value {
+        bitmap[byte_idx] |= mask;
+    } else {
+        bitmap[byte_idx] &= !mask;
+    }
+    Ok(())
+}
+
+fn ext2_adjust_counter_u32(image: &mut [u8], offset: usize, delta: i32) -> Result<(), i64> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let current = read_u32_le(image, offset)? as i64;
+    let next = current + delta as i64;
+    if next < 0 || next > u32::MAX as i64 {
+        return Err(EIO);
+    }
+    write_u32_le(image, offset, next as u32)
+}
+
+fn ext2_adjust_counter_u16(image: &mut [u8], offset: usize, delta: i32) -> Result<(), i64> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let current = read_u16_le(image, offset)? as i64;
+    let next = current + delta as i64;
+    if next < 0 || next > u16::MAX as i64 {
+        return Err(EIO);
+    }
+    write_u16_le(image, offset, next as u16)
+}
+
+fn ext2_adjust_group_counters(
+    image: &mut [u8],
+    meta: &Ext2Meta,
+    group: u32,
+    block_delta: i32,
+    inode_delta: i32,
+    used_dir_delta: i32,
+) -> Result<(), i64> {
+    let desc_offset = ext2_group_desc_offset(meta, group)?;
+    ext2_adjust_counter_u16(image, desc_offset + 12, block_delta)?;
+    ext2_adjust_counter_u16(image, desc_offset + 14, inode_delta)?;
+    ext2_adjust_counter_u16(image, desc_offset + 16, used_dir_delta)?;
+    Ok(())
+}
+
+fn ext2_adjust_super_counters(
+    image: &mut [u8],
+    block_delta: i32,
+    inode_delta: i32,
+) -> Result<(), i64> {
+    let sb = EXT2_SUPERBLOCK_OFFSET;
+    ext2_adjust_counter_u32(image, sb + 12, block_delta)?;
+    ext2_adjust_counter_u32(image, sb + 16, inode_delta)?;
+    Ok(())
+}
+
+fn ext2_block_group_and_bit(meta: &Ext2Meta, block_num: u32) -> Result<(u32, u32), i64> {
+    if block_num < meta.first_data_block || block_num >= meta.total_blocks {
+        return Err(EIO);
+    }
+    let rel = block_num - meta.first_data_block;
+    let group = rel / meta.blocks_per_group;
+    if group >= meta.group_count {
+        return Err(EIO);
+    }
+    let bit = rel % meta.blocks_per_group;
+    Ok((group, bit))
+}
+
+fn ext2_inode_group_and_bit(meta: &Ext2Meta, ino: u32) -> Result<(u32, u32), i64> {
+    if ino == 0 || ino > meta.total_inodes {
+        return Err(ENOENT);
+    }
+    let idx = ino - 1;
+    Ok((idx / meta.inodes_per_group, idx % meta.inodes_per_group))
+}
+
+fn ext2_recalc_inode_block_count_512(meta: &Ext2Meta, inode: &Ext2Inode) -> u32 {
+    let sectors_per_block = (meta.block_size / 512) as u32;
+    let mut used = 0u32;
+    let mut i = 0usize;
+    while i < inode.blocks.len() {
+        if inode.blocks[i] != 0 {
+            used = used.saturating_add(sectors_per_block);
+        }
+        i += 1;
+    }
+    used
+}
+
+fn ext2_alloc_block(state: &mut VfsState) -> Result<u32, i64> {
+    if !state.ext2_mounted {
+        return Err(EINVAL);
+    }
+
+    let meta = state.ext2_meta;
+    let image = &mut state.ext2_image[..state.ext2_image_len];
+
+    let mut group = 0u32;
+    while group < meta.group_count {
+        let bitmap_block = ext2_group_block_bitmap_block(image, &meta, group)?;
+        let mut found = None;
+
+        {
+            let bitmap = ext2_block_slice_mut(image, &meta, bitmap_block)?;
+            let mut bit = 0u32;
+            while bit < meta.blocks_per_group {
+                let block_num = meta
+                    .first_data_block
+                    .saturating_add(group.saturating_mul(meta.blocks_per_group))
+                    .saturating_add(bit);
+                if block_num >= meta.total_blocks {
+                    break;
+                }
+
+                if !ext2_bitmap_get(bitmap, bit)? {
+                    ext2_bitmap_set(bitmap, bit, true)?;
+                    found = Some(block_num);
+                    break;
+                }
+                bit += 1;
+            }
+        }
+
+        if let Some(block_num) = found {
+            ext2_adjust_super_counters(image, -1, 0)?;
+            ext2_adjust_group_counters(image, &meta, group, -1, 0, 0)?;
+            let blk = ext2_block_slice_mut(image, &meta, block_num)?;
+            blk.fill(0);
+            return Ok(block_num);
+        }
+
+        group += 1;
+    }
+
+    Err(ENOSPC)
+}
+
+fn ext2_free_block(state: &mut VfsState, block_num: u32) -> Result<(), i64> {
+    if !state.ext2_mounted {
+        return Err(EINVAL);
+    }
+
+    let meta = state.ext2_meta;
+    let (group, bit) = ext2_block_group_and_bit(&meta, block_num)?;
+    let image = &mut state.ext2_image[..state.ext2_image_len];
+    let bitmap_block = ext2_group_block_bitmap_block(image, &meta, group)?;
+    let mut was_set = false;
+
+    {
+        let bitmap = ext2_block_slice_mut(image, &meta, bitmap_block)?;
+        if ext2_bitmap_get(bitmap, bit)? {
+            ext2_bitmap_set(bitmap, bit, false)?;
+            was_set = true;
+        }
+    }
+
+    if was_set {
+        ext2_adjust_super_counters(image, 1, 0)?;
+        ext2_adjust_group_counters(image, &meta, group, 1, 0, 0)?;
+    }
+
+    Ok(())
+}
+
+fn ext2_alloc_inode(state: &mut VfsState, is_dir: bool) -> Result<u32, i64> {
+    if !state.ext2_mounted {
+        return Err(EINVAL);
+    }
+
+    let meta = state.ext2_meta;
+    let image = &mut state.ext2_image[..state.ext2_image_len];
+    let mut group = 0u32;
+
+    while group < meta.group_count {
+        let bitmap_block = ext2_group_inode_bitmap_block(image, &meta, group)?;
+        let mut found = None;
+
+        {
+            let bitmap = ext2_block_slice_mut(image, &meta, bitmap_block)?;
+            let mut bit = 0u32;
+            while bit < meta.inodes_per_group {
+                let ino = group
+                    .saturating_mul(meta.inodes_per_group)
+                    .saturating_add(bit)
+                    .saturating_add(1);
+                if ino > meta.total_inodes {
+                    break;
+                }
+
+                if !ext2_bitmap_get(bitmap, bit)? {
+                    ext2_bitmap_set(bitmap, bit, true)?;
+                    found = Some(ino);
+                    break;
+                }
+                bit += 1;
+            }
+        }
+
+        if let Some(ino) = found {
+            ext2_adjust_super_counters(image, 0, -1)?;
+            ext2_adjust_group_counters(image, &meta, group, 0, -1, if is_dir { 1 } else { 0 })?;
+
+            let inode_offset = ext2_inode_offset_in_image(image, &meta, ino)?;
+            if inode_offset
+                .checked_add(meta.inode_size)
+                .filter(|end| *end <= image.len())
+                .is_none()
+            {
+                return Err(EIO);
+            }
+            image[inode_offset..inode_offset + meta.inode_size].fill(0);
+
+            return Ok(ino);
+        }
+
+        group += 1;
+    }
+
+    Err(ENOSPC)
+}
+
+fn ext2_dirent_file_type(file_type: FileType) -> u8 {
+    match file_type {
+        FileType::Directory => EXT2_FT_DIR,
+        FileType::Regular => EXT2_FT_REG_FILE,
+        _ => 0,
+    }
+}
+
+fn ext2_dirent_len(name_len: usize) -> usize {
+    (8 + name_len + 3) & !3
+}
+
+fn ext2_write_dirent(
+    block: &mut [u8],
+    pos: usize,
+    inode_no: u32,
+    rec_len: usize,
+    file_type: FileType,
+    name: &[u8],
+) -> Result<(), i64> {
+    if rec_len < 8 || rec_len > u16::MAX as usize {
+        return Err(EIO);
+    }
+    if name.len() > 255 || rec_len < ext2_dirent_len(name.len()) {
+        return Err(EIO);
+    }
+    if pos
+        .checked_add(rec_len)
+        .filter(|end| *end <= block.len())
+        .is_none()
+    {
+        return Err(EIO);
+    }
+
+    write_u32_le(block, pos, inode_no)?;
+    write_u16_le(block, pos + 4, rec_len as u16)?;
+    block[pos + 6] = name.len() as u8;
+    block[pos + 7] = ext2_dirent_file_type(file_type);
+    block[pos + 8..pos + 8 + name.len()].copy_from_slice(name);
+    if rec_len > 8 + name.len() {
+        block[pos + 8 + name.len()..pos + rec_len].fill(0);
+    }
+    Ok(())
+}
+
+fn ext2_free_inode(state: &mut VfsState, ino: u32, is_dir: bool) -> Result<(), i64> {
+    if !state.ext2_mounted {
+        return Err(EINVAL);
+    }
+    let meta = state.ext2_meta;
+    let (group, bit) = ext2_inode_group_and_bit(&meta, ino)?;
+    let image = &mut state.ext2_image[..state.ext2_image_len];
+    let bitmap_block = ext2_group_inode_bitmap_block(image, &meta, group)?;
+    let mut was_set = false;
+
+    {
+        let bitmap = ext2_block_slice_mut(image, &meta, bitmap_block)?;
+        if ext2_bitmap_get(bitmap, bit)? {
+            ext2_bitmap_set(bitmap, bit, false)?;
+            was_set = true;
+        }
+    }
+
+    if was_set {
+        ext2_adjust_super_counters(image, 0, 1)?;
+        ext2_adjust_group_counters(image, &meta, group, 0, 1, if is_dir { -1 } else { 0 })?;
+    }
+
+    let inode_offset = ext2_inode_offset_in_image(image, &meta, ino)?;
+    if inode_offset
+        .checked_add(meta.inode_size)
+        .filter(|end| *end <= image.len())
+        .is_none()
+    {
+        return Err(EIO);
+    }
+    image[inode_offset..inode_offset + meta.inode_size].fill(0);
+    Ok(())
+}
+
+fn ext2_read_inode_from_state(state: &VfsState, ino: u32) -> Result<Ext2Inode, i64> {
+    if !state.ext2_mounted {
+        return Err(EINVAL);
+    }
+    let image = &state.ext2_image[..state.ext2_image_len];
+    ext2_read_inode(image, &state.ext2_meta, ino)
+}
+
+fn ext2_write_inode_to_state(state: &mut VfsState, ino: u32, inode: &Ext2Inode) -> Result<(), i64> {
+    if !state.ext2_mounted {
+        return Err(EINVAL);
+    }
+    let meta = state.ext2_meta;
+    let image = &mut state.ext2_image[..state.ext2_image_len];
+    ext2_write_inode(image, &meta, ino, inode)
+}
+
+fn ext2_ensure_data_block(
+    state: &mut VfsState,
+    inode: &mut Ext2Inode,
+    block_idx: usize,
+) -> Result<u32, i64> {
+    if block_idx >= EXT2_INODE_DIRECT_COUNT {
         return Err(ENOSPC);
     }
 
-    let mut copied = 0usize;
-    let mut direct_idx = 0usize;
-    while copied < size {
-        let chunk = core::cmp::min(meta.block_size, size - copied);
+    if inode.blocks[block_idx] != 0 {
+        return Ok(inode.blocks[block_idx]);
+    }
 
-        if direct_idx >= EXT2_INODE_DIRECT_COUNT {
-            // Keep ext2 support intentionally minimal for this stage.
+    let block = ext2_alloc_block(state)?;
+    inode.blocks[block_idx] = block;
+    Ok(block)
+}
+
+fn ext2_write_zero_range(
+    state: &mut VfsState,
+    inode: &mut Ext2Inode,
+    mut start: usize,
+    end: usize,
+) -> Result<(), i64> {
+    if start >= end {
+        return Ok(());
+    }
+
+    let meta = state.ext2_meta;
+    while start < end {
+        let block_idx = start / meta.block_size;
+        if block_idx >= EXT2_INODE_DIRECT_COUNT {
+            return Err(ENOSPC);
+        }
+
+        let block_no = ext2_ensure_data_block(state, inode, block_idx)?;
+        let block_off = start % meta.block_size;
+        let chunk = core::cmp::min(end - start, meta.block_size - block_off);
+
+        let image = &mut state.ext2_image[..state.ext2_image_len];
+        let blk = ext2_block_slice_mut(image, &meta, block_no)?;
+        blk[block_off..block_off + chunk].fill(0);
+        start += chunk;
+    }
+
+    Ok(())
+}
+
+fn ext2_read_file(
+    state: &VfsState,
+    ino: u32,
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<usize, i64> {
+    if dst.is_empty() {
+        return Ok(0);
+    }
+
+    let meta = state.ext2_meta;
+    let image = &state.ext2_image[..state.ext2_image_len];
+    let inode = ext2_read_inode(image, &meta, ino)?;
+    let size = inode.size as usize;
+    if offset as usize >= size {
+        return Ok(0);
+    }
+
+    let mut copied = 0usize;
+    let mut pos = offset as usize;
+    while copied < dst.len() && pos < size {
+        let block_idx = pos / meta.block_size;
+        if block_idx >= EXT2_INODE_DIRECT_COUNT {
             return Err(EIO);
         }
 
-        let block_num = inode.blocks[direct_idx];
-        if block_num == 0 {
-            out[copied..copied + chunk].fill(0);
+        let block_off = pos % meta.block_size;
+        let remain_file = size - pos;
+        let chunk = core::cmp::min(meta.block_size - block_off, core::cmp::min(remain_file, dst.len() - copied));
+        let block_no = inode.blocks[block_idx];
+
+        if block_no == 0 {
+            dst[copied..copied + chunk].fill(0);
         } else {
-            let blk = ext2_block_slice(image, meta, block_num)?;
-            out[copied..copied + chunk].copy_from_slice(&blk[..chunk]);
+            let blk = ext2_block_slice(image, &meta, block_no)?;
+            dst[copied..copied + chunk].copy_from_slice(&blk[block_off..block_off + chunk]);
         }
 
         copied += chunk;
-        direct_idx += 1;
+        pos += chunk;
     }
 
-    Ok(size)
+    Ok(copied)
+}
+
+fn ext2_write_file(
+    state: &mut VfsState,
+    ino: u32,
+    offset: u64,
+    src: &[u8],
+    append: bool,
+) -> Result<WriteResult, i64> {
+    let meta = state.ext2_meta;
+    let max_size = core::cmp::min(TMPFS_MAX_FILE_SIZE, EXT2_INODE_DIRECT_COUNT * meta.block_size);
+
+    let mut inode = ext2_read_inode_from_state(state, ino)?;
+    let start = if append {
+        inode.size as usize
+    } else {
+        usize::try_from(offset).map_err(|_| EINVAL)?
+    };
+
+    if start > max_size {
+        return Err(ENOSPC);
+    }
+
+    if src.is_empty() {
+        return Ok(WriteResult {
+            written: 0,
+            new_offset: start as u64,
+        });
+    }
+
+    let old_size = inode.size as usize;
+    if start > old_size {
+        ext2_write_zero_range(state, &mut inode, old_size, start)?;
+    }
+
+    let room = max_size - start;
+    if room == 0 {
+        return Err(ENOSPC);
+    }
+
+    let count = core::cmp::min(src.len(), room);
+    let mut copied = 0usize;
+    let mut pos = start;
+    while copied < count {
+        let block_idx = pos / meta.block_size;
+        let block_off = pos % meta.block_size;
+        let chunk = core::cmp::min(count - copied, meta.block_size - block_off);
+        let block_no = ext2_ensure_data_block(state, &mut inode, block_idx)?;
+
+        let image = &mut state.ext2_image[..state.ext2_image_len];
+        let blk = ext2_block_slice_mut(image, &meta, block_no)?;
+        blk[block_off..block_off + chunk].copy_from_slice(&src[copied..copied + chunk]);
+
+        copied += chunk;
+        pos += chunk;
+    }
+
+    let end = start + count;
+    if end > inode.size as usize {
+        inode.size = end as u32;
+    }
+    inode.block_count_512 = ext2_recalc_inode_block_count_512(&meta, &inode);
+    ext2_write_inode_to_state(state, ino, &inode)?;
+
+    Ok(WriteResult {
+        written: count,
+        new_offset: end as u64,
+    })
+}
+
+fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
+    let meta = state.ext2_meta;
+    let mut inode = ext2_read_inode_from_state(state, ino)?;
+
+    let mut i = 0usize;
+    while i < EXT2_INODE_DIRECT_COUNT {
+        let block = inode.blocks[i];
+        if block != 0 {
+            ext2_free_block(state, block)?;
+            inode.blocks[i] = 0;
+        }
+        i += 1;
+    }
+
+    inode.size = 0;
+    inode.block_count_512 = 0;
+    let _ = meta; // keep read/write behavior explicit for future extensions
+    ext2_write_inode_to_state(state, ino, &inode)?;
+    Ok(())
 }
 
 fn ext2_for_each_dir_entry<F>(
@@ -859,6 +1570,165 @@ where
     }
 
     Ok(())
+}
+
+fn ext2_add_dir_entry(
+    state: &mut VfsState,
+    parent_ino: u32,
+    child_ino: u32,
+    name: &[u8],
+    child_type: FileType,
+) -> Result<(), i64> {
+    if name.is_empty() || name.len() >= 255 {
+        return Err(ENAMETOOLONG);
+    }
+
+    let meta = state.ext2_meta;
+    let mut parent = ext2_read_inode_from_state(state, parent_ino)?;
+    if ext2_mode_to_filetype(parent.mode) != Some(FileType::Directory) {
+        return Err(ENOTDIR);
+    }
+
+    let needed = ext2_dirent_len(name.len());
+    let mut idx = 0usize;
+    while idx < EXT2_INODE_DIRECT_COUNT {
+        let block_no = parent.blocks[idx];
+        if block_no == 0 {
+            let new_block = ext2_alloc_block(state)?;
+            parent.blocks[idx] = new_block;
+
+            let image = &mut state.ext2_image[..state.ext2_image_len];
+            let blk = ext2_block_slice_mut(image, &meta, new_block)?;
+            blk.fill(0);
+            ext2_write_dirent(blk, 0, child_ino, meta.block_size, child_type, name)?;
+
+            let min_size = ((idx + 1) * meta.block_size) as u32;
+            if parent.size < min_size {
+                parent.size = min_size;
+            }
+            parent.block_count_512 = ext2_recalc_inode_block_count_512(&meta, &parent);
+            ext2_write_inode_to_state(state, parent_ino, &parent)?;
+            return Ok(());
+        }
+
+        let mut inserted = false;
+        {
+            let image = &mut state.ext2_image[..state.ext2_image_len];
+            let blk = ext2_block_slice_mut(image, &meta, block_no)?;
+            let mut pos = 0usize;
+            while pos + 8 <= blk.len() {
+                let entry_ino = read_u32_le(blk, pos)?;
+                let rec_len = read_u16_le(blk, pos + 4)? as usize;
+                if rec_len < 8 || (rec_len & 0x3) != 0 || pos + rec_len > blk.len() {
+                    return Err(EIO);
+                }
+
+                if entry_ino == 0 {
+                    if rec_len >= needed {
+                        ext2_write_dirent(blk, pos, child_ino, rec_len, child_type, name)?;
+                        inserted = true;
+                        break;
+                    }
+                } else {
+                    let entry_name_len = blk[pos + 6] as usize;
+                    let used = ext2_dirent_len(entry_name_len);
+                    if rec_len >= used + needed {
+                        write_u16_le(blk, pos + 4, used as u16)?;
+                        let new_pos = pos + used;
+                        let new_len = rec_len - used;
+                        ext2_write_dirent(blk, new_pos, child_ino, new_len, child_type, name)?;
+                        inserted = true;
+                        break;
+                    }
+                }
+
+                pos += rec_len;
+            }
+        }
+
+        if inserted {
+            return Ok(());
+        }
+
+        idx += 1;
+    }
+
+    Err(ENOSPC)
+}
+
+fn ext2_create_child_on_disk(
+    state: &mut VfsState,
+    parent_ino: u32,
+    name: &[u8],
+    file_type: FileType,
+) -> Result<(u32, u32), i64> {
+    let is_dir = file_type == FileType::Directory;
+    let ino = ext2_alloc_inode(state, is_dir)?;
+    let meta = state.ext2_meta;
+
+    let mut inode = Ext2Inode {
+        mode: match file_type {
+            FileType::Regular => EXT2_DEF_FILE_MODE,
+            FileType::Directory => EXT2_DEF_DIR_MODE,
+            FileType::None => return Err(EINVAL),
+        },
+        size: 0,
+        links_count: if is_dir { 2 } else { 1 },
+        block_count_512: 0,
+        blocks: [0; 15],
+    };
+
+    if is_dir {
+        let block = match ext2_alloc_block(state) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = ext2_free_inode(state, ino, true);
+                return Err(err);
+            }
+        };
+        inode.blocks[0] = block;
+        inode.size = meta.block_size as u32;
+        inode.block_count_512 = ext2_recalc_inode_block_count_512(&meta, &inode);
+
+        {
+            let image = &mut state.ext2_image[..state.ext2_image_len];
+            let blk = ext2_block_slice_mut(image, &meta, block)?;
+            blk.fill(0);
+            ext2_write_dirent(blk, 0, ino, 12, FileType::Directory, b".")?;
+            ext2_write_dirent(
+                blk,
+                12,
+                parent_ino,
+                meta.block_size - 12,
+                FileType::Directory,
+                b"..",
+            )?;
+        }
+    }
+
+    if let Err(err) = ext2_write_inode_to_state(state, ino, &inode) {
+        if inode.blocks[0] != 0 {
+            let _ = ext2_free_block(state, inode.blocks[0]);
+        }
+        let _ = ext2_free_inode(state, ino, is_dir);
+        return Err(err);
+    }
+
+    if let Err(err) = ext2_add_dir_entry(state, parent_ino, ino, name, file_type) {
+        if inode.blocks[0] != 0 {
+            let _ = ext2_free_block(state, inode.blocks[0]);
+        }
+        let _ = ext2_free_inode(state, ino, is_dir);
+        return Err(err);
+    }
+
+    if is_dir {
+        let mut parent = ext2_read_inode_from_state(state, parent_ino)?;
+        parent.links_count = parent.links_count.saturating_add(1);
+        ext2_write_inode_to_state(state, parent_ino, &parent)?;
+    }
+
+    Ok((ino, inode.size))
 }
 
 fn ext2_mode_to_filetype(mode: u16) -> Option<FileType> {
@@ -947,16 +1817,14 @@ fn ext2_import_node(
 
     let node = alloc_inode(state, file_type, NodeBackend::Ext2, parent, name)?;
     add_child(state, parent, node)?;
+    {
+        let node_ref = &mut state.inodes[node as usize];
+        node_ref.ext2_ino = inode_num;
+        node_ref.size = ext2_inode.size;
+    }
 
     match file_type {
-        FileType::Regular => {
-            if (ext2_inode.size as usize) > TMPFS_MAX_FILE_SIZE {
-                return Err(ENOSPC);
-            }
-            let node_ref = &mut state.inodes[node as usize];
-            let copied = ext2_copy_file_data(image, meta, &ext2_inode, &mut node_ref.data)?;
-            node_ref.size = copied as u32;
-        }
+        FileType::Regular => {}
         FileType::Directory => {
             ext2_for_each_dir_entry(image, meta, &ext2_inode, |child_ino, _ft, child_name| {
                 ext2_import_node(
@@ -1019,8 +1887,15 @@ fn rollback_ext2_mount_import(state: &mut VfsState, mount_inode: u16) {
 
     let mount = &mut state.inodes[mount_inode as usize];
     mount.backend = NodeBackend::Tmpfs;
+    mount.ext2_ino = 0;
     mount.child_count = 0;
     mount.children = [0; VFS_MAX_CHILDREN];
+
+    state.ext2_mounted = false;
+    state.ext2_mount_inode = ROOT_INODE;
+    state.ext2_meta = Ext2Meta::empty();
+    state.ext2_image_len = 0;
+    state.ext2_image.fill(0);
 }
 
 pub fn init() {
@@ -1056,21 +1931,37 @@ pub fn mount_ext2_image(mount_path: &str, image: &[u8]) -> Result<(), i64> {
         return Err(EEXIST);
     }
 
-    let meta = ext2_parse_meta(image)?;
+    if image.is_empty() || image.len() > EXT2_MAX_IMAGE_SIZE {
+        return Err(ENOSPC);
+    }
+
+    state.ext2_image[..image.len()].copy_from_slice(image);
+    state.ext2_image_len = image.len();
+
+    let meta = ext2_parse_meta(&state.ext2_image[..state.ext2_image_len])?;
     if meta.blocks_per_group == 0 {
+        state.ext2_image_len = 0;
         return Err(EINVAL);
     }
 
-    let root = ext2_read_inode(image, &meta, EXT2_ROOT_INODE)?;
+    let root = ext2_read_inode(&state.ext2_image[..state.ext2_image_len], &meta, EXT2_ROOT_INODE)?;
     if ext2_mode_to_filetype(root.mode) != Some(FileType::Directory) {
+        state.ext2_image_len = 0;
         return Err(EIO);
     }
+
+    state.ext2_meta = meta;
+    state.ext2_mounted = true;
+    state.ext2_mount_inode = mount_inode;
 
     match ext2_for_each_dir_entry(image, &meta, &root, |child_ino, _file_type, name| {
         ext2_import_node(state, mount_inode, name, image, &meta, child_ino, 0)
     }) {
         Ok(()) => {
-            state.inodes[mount_inode as usize].backend = NodeBackend::Ext2;
+            let mount = &mut state.inodes[mount_inode as usize];
+            mount.backend = NodeBackend::Ext2;
+            mount.ext2_ino = EXT2_ROOT_INODE;
+            mount.size = root.size;
             Ok(())
         }
         Err(err) => {
@@ -1078,6 +1969,19 @@ pub fn mount_ext2_image(mount_path: &str, image: &[u8]) -> Result<(), i64> {
             Err(err)
         }
     }
+}
+
+pub fn export_ext2_image(out: &mut [u8]) -> Result<usize, i64> {
+    let state = state();
+    ensure_init(state);
+    if !state.ext2_mounted {
+        return Err(ENOENT);
+    }
+    if out.len() < state.ext2_image_len {
+        return Err(ENOSPC);
+    }
+    out[..state.ext2_image_len].copy_from_slice(&state.ext2_image[..state.ext2_image_len]);
+    Ok(state.ext2_image_len)
 }
 
 pub fn mkdir(path: &str) -> Result<(), i64> {
@@ -1106,8 +2010,8 @@ pub fn open(path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
         Err(err) => return Err(err),
     };
 
-    let inode = &mut state.inodes[inode_idx as usize];
-    if inode.file_type == FileType::Directory {
+    let inode_info = state.inodes[inode_idx as usize];
+    if inode_info.file_type == FileType::Directory {
         if access != O_RDONLY {
             return Err(EISDIR);
         }
@@ -1115,17 +2019,32 @@ pub fn open(path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
         return Err(ENOTDIR);
     }
 
-    if (flags & O_TRUNC) != 0 && inode.file_type == FileType::Regular && access != O_RDONLY {
-        if !matches!(inode.backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
+    if (flags & O_TRUNC) != 0 && inode_info.file_type == FileType::Regular && access != O_RDONLY {
+        if !matches!(inode_info.backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
             return Err(EROFS);
         }
-        inode.size = 0;
+
+        match inode_info.backend {
+            NodeBackend::Tmpfs => {
+                state.inodes[inode_idx as usize].size = 0;
+            }
+            NodeBackend::Ext2 => {
+                if inode_info.ext2_ino == 0 {
+                    return Err(EIO);
+                }
+                ext2_truncate_to_zero(state, inode_info.ext2_ino)?;
+                state.inodes[inode_idx as usize].size = 0;
+            }
+            _ => {}
+        }
     }
+
+    let opened = state.inodes[inode_idx as usize];
 
     Ok(OpenResult {
         inode: inode_idx,
-        file_type: inode.file_type,
-        is_console: inode.backend == NodeBackend::DevConsole,
+        file_type: opened.file_type,
+        is_console: opened.backend == NodeBackend::DevConsole,
     })
 }
 
@@ -1146,7 +2065,7 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
     }
 
     match node.backend {
-        NodeBackend::Tmpfs | NodeBackend::Ext2 => {
+        NodeBackend::Tmpfs => {
             if dst.is_empty() {
                 return Ok(0);
             }
@@ -1161,6 +2080,12 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
             let count = core::cmp::min(dst.len(), available);
             dst[..count].copy_from_slice(&node.data[start..start + count]);
             Ok(count)
+        }
+        NodeBackend::Ext2 => {
+            if node.ext2_ino == 0 {
+                return Err(EIO);
+            }
+            ext2_read_file(state, node.ext2_ino, offset, dst)
         }
         NodeBackend::DevNull => Ok(0),
         NodeBackend::DevZero => {
@@ -1183,7 +2108,7 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
         return Err(ENOENT);
     }
 
-    let node = &mut state.inodes[inode as usize];
+    let node = &state.inodes[inode as usize];
     if !node.used {
         return Err(ENOENT);
     }
@@ -1192,7 +2117,8 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
     }
 
     match node.backend {
-        NodeBackend::Tmpfs | NodeBackend::Ext2 => {
+        NodeBackend::Tmpfs => {
+            let node = &mut state.inodes[inode as usize];
             let mut start = if append {
                 node.size as usize
             } else {
@@ -1236,6 +2162,17 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
                 new_offset: start as u64,
             })
         }
+        NodeBackend::Ext2 => {
+            if node.ext2_ino == 0 {
+                return Err(EIO);
+            }
+            let result = ext2_write_file(state, node.ext2_ino, offset, src, append)?;
+            state.inodes[inode as usize].size = core::cmp::max(
+                state.inodes[inode as usize].size,
+                result.new_offset as u32,
+            );
+            Ok(result)
+        }
         NodeBackend::ProcUptime
         | NodeBackend::ProcMeminfo
         | NodeBackend::ProcMounts
@@ -1267,7 +2204,13 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
     }
 
     let end = match node.backend {
-        NodeBackend::Tmpfs | NodeBackend::Ext2 => node.size as u64,
+        NodeBackend::Tmpfs => node.size as u64,
+        NodeBackend::Ext2 => {
+            if node.ext2_ino == 0 {
+                return Err(EIO);
+            }
+            ext2_read_inode_from_state(state, node.ext2_ino)?.size as u64
+        }
         NodeBackend::ProcUptime
         | NodeBackend::ProcMeminfo
         | NodeBackend::ProcMounts
@@ -1291,8 +2234,15 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
     }
 
     match node.backend {
-        NodeBackend::Tmpfs | NodeBackend::Ext2 => {
+        NodeBackend::Tmpfs => {
             if target > TMPFS_MAX_FILE_SIZE as i128 {
+                return Err(EINVAL);
+            }
+        }
+        NodeBackend::Ext2 => {
+            let max_size =
+                core::cmp::min(TMPFS_MAX_FILE_SIZE, EXT2_INODE_DIRECT_COUNT * state.ext2_meta.block_size);
+            if target > max_size as i128 {
                 return Err(EINVAL);
             }
         }
@@ -1328,7 +2278,13 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
     }
 
     let size = match node.backend {
-        NodeBackend::Tmpfs | NodeBackend::Ext2 => node.size as u64,
+        NodeBackend::Tmpfs => node.size as u64,
+        NodeBackend::Ext2 => {
+            if node.ext2_ino == 0 {
+                return Err(EIO);
+            }
+            ext2_read_inode_from_state(state, node.ext2_ino)?.size as u64
+        }
         NodeBackend::ProcUptime
         | NodeBackend::ProcMeminfo
         | NodeBackend::ProcMounts
@@ -1549,5 +2505,40 @@ mod tests {
         let created =
             open("/mnt/ext2/fallback.txt", O_CREAT | O_RDWR, 0).expect("tmpfs path still writable");
         let _ = write(created.inode, 0, b"ok", false).expect("write fallback");
+    }
+
+    #[test]
+    fn ext2_mutations_persist_in_exported_image() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        mount_ext2_image("/mnt/ext2", SAMPLE_EXT2).expect("mount sample ext2");
+
+        let created = open("/mnt/ext2/persist.txt", O_CREAT | O_RDWR, 0).expect("create persist");
+        let _ = write(created.inode, 0, b"persist", false).expect("write persist");
+        mkdir("/mnt/ext2/persist_dir").expect("mkdir persist dir");
+        let hello = open("/mnt/ext2/hello.txt", O_WRONLY | O_TRUNC, 0).expect("truncate hello");
+        let _ = write(hello.inode, 0, b"rewritten", false).expect("rewrite hello");
+
+        let mut exported = [0u8; EXT2_MAX_IMAGE_SIZE];
+        let image_len = export_ext2_image(&mut exported).expect("export image");
+
+        let remount_image = std::vec::Vec::from(&exported[..image_len]);
+        init();
+        mount_ext2_image("/mnt/ext2", &remount_image).expect("remount exported image");
+
+        let persist = open("/mnt/ext2/persist.txt", O_RDONLY, 0).expect("open persisted file");
+        let mut persist_buf = [0u8; 16];
+        let persist_n = read(persist.inode, 0, &mut persist_buf).expect("read persisted file");
+        assert_eq!(&persist_buf[..persist_n], b"persist");
+
+        let persisted_hello = open("/mnt/ext2/hello.txt", O_RDONLY, 0).expect("open rewritten hello");
+        let mut hello_buf = [0u8; 16];
+        let hello_n = read(persisted_hello.inode, 0, &mut hello_buf).expect("read rewritten hello");
+        assert_eq!(&hello_buf[..hello_n], b"rewritten");
+
+        let nested = open("/mnt/ext2/persist_dir/new.txt", O_CREAT | O_RDWR, 0)
+            .expect("create in persisted dir");
+        let _ = write(nested.inode, 0, b"x", false).expect("write nested");
     }
 }

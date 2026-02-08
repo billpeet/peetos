@@ -13,7 +13,7 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 - Phase 2: Complete (baseline). Added `arch_x86_64` port I/O helpers, interrupt enable/disable wrappers (plus RAII guard), GDT/IDT setup with interrupt stubs and handler registration, PIC remap, PIT timer init, syscall entry/MSR setup, and a serial exception report.
 - Phase 3: Complete (baseline). Added typed address helpers, bitmap-based PMM, VMM mapping/address-space support, and a kernel heap allocator.
 - Phase 4: In progress. Baseline tasking + scheduler (kernel threads, run queue, PIT-driven preemption, yield/block/sleep paths) are in place. A minimal user-mode task now boots via `int 0x80` with a Linux-numbered syscall subset (`open`/`openat`, `close`, `read`, `write`, `lseek`, `exit`/`exit_group`, `yield`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `brk`) backed by a table-driven shared SYSCALL/int80 dispatcher and per-task user metadata (`brk`, stack bounds, initial stack pointers, ELF PHDR/base/dynamic flags, per-task FD table). Initial user bootstrap now builds `argc`/`argv`/`envp`/`auxv` for ring-3 entry, and a minimal dynamic-linking bootstrap is wired (`PT_INTERP` mapping + interpreter-first entry with `AT_ENTRY`/`AT_BASE`). The ELF loader includes stricter header/segment validation (alignment checks, malformed `PT_INTERP` rejection, RWX-segment rejection, entrypoint-in-exec-range checks), plus `ET_EXEC` loading and `ET_DYN` metadata support (`PT_INTERP`, `PT_DYNAMIC`, `load_at`). NXE is enabled in `IA32_EFER` so non-executable mappings are enforced. Full musl/toybox syscall coverage and full reloc/symbol dynamic linker semantics remain outstanding.
-- Phase 5: In progress (expanded baseline). Added a minimal VFS with concrete tmpfs regular-file behavior, virtual fs backends for `devfs` (`/dev/null`, `/dev/zero`, `/dev/console`) and `procfs` (`/proc/uptime`, `/proc/meminfo`, `/proc/mounts`, `/proc/version`), plus a baseline ext2 importer (`mount_ext2_image`) used to mount an embedded sample image at `/mnt/ext2` with in-memory read/write operations. Syscall wiring for baseline file-descriptor operations is in place over these backends.
+- Phase 5: In progress (expanded baseline). Added a minimal VFS with concrete tmpfs regular-file behavior, virtual fs backends for `devfs` (`/dev/null`, `/dev/zero`, `/dev/console`) and `procfs` (`/proc/uptime`, `/proc/meminfo`, `/proc/mounts`, `/proc/version`), plus a baseline ext2 importer (`mount_ext2_image`) used to mount an embedded sample image at `/mnt/ext2` with direct-block ext2 read/write/create/mkdir/truncate support that updates inode/block bitmaps and ext2 metadata in the mounted image. Syscall wiring for baseline file-descriptor operations is in place over these backends.
 - Phases 6–10: Not started.
 
 ## Phase 0: Project Scaffolding
@@ -56,7 +56,7 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 
 - VFS core (inode/dentry model).
 - tmpfs, devfs, procfs.
-- ext2 baseline support (image import + mount + in-memory read/write operations) done; on-disk ext2 metadata/data writeback pending.
+- ext2 baseline support (image import + mount + direct-block read/write/create/mkdir/truncate with inode/block bitmap updates) done; block-device-backed persistence, indirect blocks, and journal semantics pending.
 - FAT32 support pending.
 - Block device layer and partitioning.
 
