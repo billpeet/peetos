@@ -30,13 +30,16 @@ const EIO: i64 = 5;
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
+const EBUSY: i64 = 16;
 const EEXIST: i64 = 17;
+const EXDEV: i64 = 18;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ESPIPE: i64 = 29;
 const EROFS: i64 = 30;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
+const ENOTEMPTY: i64 = 39;
 const ENOSYS: i64 = 38;
 const ENOSPC: i64 = 28;
 
@@ -44,6 +47,7 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_FSTAT: u64 = 5;
 const SYS_LSEEK: u64 = 8;
 const SYS_BRK: u64 = 12;
 const SYS_YIELD: u64 = 24;
@@ -52,8 +56,16 @@ const SYS_EXIT: u64 = 60;
 const SYS_GETPPID: u64 = 110;
 const SYS_GETTID: u64 = 186;
 const SYS_SET_TID_ADDRESS: u64 = 218;
+const SYS_GETDENTS64: u64 = 217;
 const SYS_EXIT_GROUP: u64 = 231;
 const SYS_OPENAT: u64 = 257;
+const SYS_MKDIRAT: u64 = 258;
+const SYS_NEWFSTATAT: u64 = 262;
+const SYS_UNLINKAT: u64 = 263;
+const SYS_RENAMEAT: u64 = 264;
+
+const AT_REMOVEDIR: u32 = 0x200;
+const AT_EMPTY_PATH: u32 = 0x1000;
 
 const WRITE_CHUNK_SIZE: usize = 128;
 const READ_CHUNK_SIZE: usize = 128;
@@ -159,6 +171,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_WRITE, "write", SyscallMode::UserTask, sys_write),
     syscall_def(SYS_OPEN, "open", SyscallMode::UserTask, sys_open),
     syscall_def(SYS_CLOSE, "close", SyscallMode::UserTask, sys_close),
+    syscall_def(SYS_FSTAT, "fstat", SyscallMode::UserTask, sys_fstat),
     syscall_def(SYS_LSEEK, "lseek", SyscallMode::UserTask, sys_lseek),
     syscall_def(SYS_BRK, "brk", SyscallMode::UserTask, sys_brk),
     syscall_def(SYS_YIELD, "sched_yield", SyscallMode::AnyTask, sys_yield),
@@ -178,7 +191,12 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_exit_group,
     ),
+    syscall_def(SYS_GETDENTS64, "getdents64", SyscallMode::UserTask, sys_getdents64),
     syscall_def(SYS_OPENAT, "openat", SyscallMode::UserTask, sys_openat),
+    syscall_def(SYS_MKDIRAT, "mkdirat", SyscallMode::UserTask, sys_mkdirat),
+    syscall_def(SYS_NEWFSTATAT, "newfstatat", SyscallMode::UserTask, sys_newfstatat),
+    syscall_def(SYS_UNLINKAT, "unlinkat", SyscallMode::UserTask, sys_unlinkat),
+    syscall_def(SYS_RENAMEAT, "renameat", SyscallMode::UserTask, sys_renameat),
 ];
 
 #[inline]
@@ -208,11 +226,13 @@ fn fs_to_errno(err: i64) -> i64 {
         fs::ENOENT => ENOENT,
         fs::EIO => EIO,
         fs::EEXIST => EEXIST,
+        fs::EBUSY => EBUSY,
         fs::ENOTDIR => ENOTDIR,
         fs::EISDIR => EISDIR,
         fs::EINVAL => EINVAL,
         fs::ENOSPC => ENOSPC,
         fs::EROFS => EROFS,
+        fs::ENOTEMPTY => ENOTEMPTY,
         fs::ENAMETOOLONG => EINVAL,
         _ => EIO,
     }
@@ -294,6 +314,86 @@ fn read_user_path(path_ptr: u64, out: &mut [u8; fs::VFS_MAX_PATH]) -> Result<&st
     match core::str::from_utf8(&out[..len]) {
         Ok(path) => Ok(path),
         Err(_) => Err(-EINVAL),
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxStat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    __pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime: i64,
+    st_atime_nsec: i64,
+    st_mtime: i64,
+    st_mtime_nsec: i64,
+    st_ctime: i64,
+    st_ctime_nsec: i64,
+    __unused: [i64; 3],
+}
+
+impl LinuxStat {
+    fn from_fs(stat: fs::FileStat) -> Self {
+        Self {
+            st_dev: 0,
+            st_ino: stat.ino,
+            st_nlink: stat.nlink as u64,
+            st_mode: stat.mode,
+            st_uid: stat.uid,
+            st_gid: stat.gid,
+            __pad0: 0,
+            st_rdev: 0,
+            st_size: stat.size as i64,
+            st_blksize: stat.blksize as i64,
+            st_blocks: stat.blocks as i64,
+            st_atime: stat.atime as i64,
+            st_atime_nsec: 0,
+            st_mtime: stat.mtime as i64,
+            st_mtime_nsec: 0,
+            st_ctime: stat.ctime as i64,
+            st_ctime_nsec: 0,
+            __unused: [0; 3],
+        }
+    }
+}
+
+fn resolve_dir_inode(ctx: &SyscallContext, dirfd: i32) -> Result<u16, i64> {
+    if dirfd == fs::AT_FDCWD {
+        if ctx.current.is_null() {
+            return Err(-ESRCH);
+        }
+        return Ok(unsafe { (*ctx.current).user_cwd_inode });
+    }
+
+    let idx = fd_index(dirfd)?;
+    if !fd_slot_is_open(ctx.current, idx) {
+        return Err(-EBADF);
+    }
+
+    let (kind, inode) = unsafe { ((*ctx.current).user_fd_kind[idx], (*ctx.current).user_fd_inode[idx]) };
+    if kind != task::USER_FD_KIND_VFS {
+        return Err(-ENOTDIR);
+    }
+    match fs::inode_is_dir(inode) {
+        Ok(true) => Ok(inode),
+        Ok(false) => Err(-ENOTDIR),
+        Err(err) => Err(-fs_to_errno(err)),
+    }
+}
+
+fn resolve_dir_for_path(ctx: &SyscallContext, dirfd: i32, path: &str) -> Result<u16, i64> {
+    if path.starts_with('/') {
+        Ok(fs::root_inode())
+    } else {
+        resolve_dir_inode(ctx, dirfd)
     }
 }
 
@@ -546,10 +646,6 @@ fn sys_open(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 }
 
 fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
-    if call.arg(0) as i32 != fs::AT_FDCWD {
-        return -EINVAL;
-    }
-
     let flags = call.arg(2) as u32;
     let mode = call.arg(3) as u32;
     let mut path_buf = [0u8; fs::VFS_MAX_PATH];
@@ -557,14 +653,14 @@ fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(path) => path,
         Err(err) => return err,
     };
-
-    if !path.starts_with('/') {
-        return -EINVAL;
-    }
+    let dir_inode = match resolve_dir_for_path(ctx, call.arg(0) as i32, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
 
     refresh_procfs_runtime();
 
-    let opened = match fs::open(path, flags, mode) {
+    let opened = match fs::openat(dir_inode, path, flags, mode) {
         Ok(opened) => opened,
         Err(err) => return -fs_to_errno(err),
     };
@@ -578,6 +674,246 @@ fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     match fd_alloc(ctx.current, fd_kind, opened.inode, flags) {
         Ok(fd) => fd,
         Err(err) => err,
+    }
+}
+
+fn sys_mkdirat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(call.arg(1), &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let dir_inode = match resolve_dir_for_path(ctx, call.arg(0) as i32, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+    let _mode = call.arg(2) as u32;
+
+    match fs::mkdirat(dir_inode, path) {
+        Ok(()) => 0,
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+fn write_stat_to_user(task_ptr: *mut task::Task, dst: u64, stat: fs::FileStat) -> i64 {
+    let raw = LinuxStat::from_fs(stat);
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&raw as *const LinuxStat) as *const u8,
+            core::mem::size_of::<LinuxStat>(),
+        )
+    };
+    match copy_to_user_task(task_ptr, dst, bytes) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
+}
+
+fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let idx = match fd_index(call.arg(0) as i32) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let inode = unsafe {
+        if (*ctx.current).user_fd_kind[idx] != task::USER_FD_KIND_VFS {
+            return -EBADF;
+        }
+        (*ctx.current).user_fd_inode[idx]
+    };
+    let stat = match fs::stat(inode) {
+        Ok(stat) => stat,
+        Err(err) => return -fs_to_errno(err),
+    };
+    write_stat_to_user(ctx.current, call.arg(1), stat)
+}
+
+fn sys_newfstatat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let flags = call.arg(3) as u32;
+    if flags & !AT_EMPTY_PATH != 0 {
+        return -EINVAL;
+    }
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(call.arg(1), &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let dir_inode = match resolve_dir_for_path(ctx, call.arg(0) as i32, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    let inode = if path.is_empty() {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return -ENOENT;
+        }
+        dir_inode
+    } else {
+        match fs::lookupat(dir_inode, path) {
+            Ok(inode) => inode,
+            Err(err) => return -fs_to_errno(err),
+        }
+    };
+    let stat = match fs::stat(inode) {
+        Ok(stat) => stat,
+        Err(err) => return -fs_to_errno(err),
+    };
+    write_stat_to_user(ctx.current, call.arg(2), stat)
+}
+
+fn dirent_record_len(name_len: usize) -> usize {
+    (19 + name_len + 1 + 7) & !7
+}
+
+fn write_u16_ne(dst: &mut [u8], offset: usize, value: u16) {
+    let b = value.to_ne_bytes();
+    dst[offset] = b[0];
+    dst[offset + 1] = b[1];
+}
+
+fn write_u64_ne(dst: &mut [u8], offset: usize, value: u64) {
+    let b = value.to_ne_bytes();
+    dst[offset..offset + 8].copy_from_slice(&b);
+}
+
+fn write_i64_ne(dst: &mut [u8], offset: usize, value: i64) {
+    let b = value.to_ne_bytes();
+    dst[offset..offset + 8].copy_from_slice(&b);
+}
+
+fn sys_getdents64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let idx = match fd_index(call.arg(0) as i32) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let (kind, inode, mut offset) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+            (*ctx.current).user_fd_offset[idx],
+        )
+    };
+    if kind != task::USER_FD_KIND_VFS {
+        return -EBADF;
+    }
+    match fs::inode_is_dir(inode) {
+        Ok(true) => {}
+        Ok(false) => return -ENOTDIR,
+        Err(err) => return -fs_to_errno(err),
+    }
+
+    let max_len = call.arg(2) as usize;
+    if max_len == 0 {
+        return 0;
+    }
+
+    let mut total = 0usize;
+    let mut record = [0u8; 128];
+    loop {
+        let entry = match fs::readdir(inode, offset) {
+            Ok(Some(v)) => v,
+            Ok(None) => break,
+            Err(err) => {
+                if total > 0 {
+                    break;
+                }
+                return -fs_to_errno(err);
+            }
+        };
+        let reclen = dirent_record_len(entry.name_len);
+        if reclen > record.len() {
+            return -EIO;
+        }
+        if total + reclen > max_len {
+            break;
+        }
+
+        record[..reclen].fill(0);
+        write_u64_ne(&mut record, 0, entry.ino);
+        write_i64_ne(&mut record, 8, entry.next_offset as i64);
+        write_u16_ne(&mut record, 16, reclen as u16);
+        record[18] = entry.d_type;
+        record[19..19 + entry.name_len].copy_from_slice(&entry.name[..entry.name_len]);
+        record[19 + entry.name_len] = 0;
+
+        if let Err(err) = copy_to_user_task(ctx.current, call.arg(1) + total as u64, &record[..reclen]) {
+            if total > 0 {
+                break;
+            }
+            return -err;
+        }
+
+        total += reclen;
+        offset = entry.next_offset;
+    }
+
+    unsafe {
+        (*ctx.current).user_fd_offset[idx] = offset;
+    }
+    total as i64
+}
+
+fn sys_unlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let flags = call.arg(2) as u32;
+    if flags & !AT_REMOVEDIR != 0 {
+        return -EINVAL;
+    }
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(call.arg(1), &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let dir_inode = match resolve_dir_for_path(ctx, call.arg(0) as i32, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+    let res = if (flags & AT_REMOVEDIR) != 0 {
+        fs::rmdirat(dir_inode, path)
+    } else {
+        fs::unlinkat(dir_inode, path)
+    };
+    match res {
+        Ok(()) => 0,
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+fn sys_renameat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let mut old_buf = [0u8; fs::VFS_MAX_PATH];
+    let mut new_buf = [0u8; fs::VFS_MAX_PATH];
+    let old_path = match read_user_path(call.arg(1), &mut old_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_path = match read_user_path(call.arg(3), &mut new_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let old_dir = match resolve_dir_for_path(ctx, call.arg(0) as i32, old_path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+    let new_dir = match resolve_dir_for_path(ctx, call.arg(2) as i32, new_path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    match fs::renameat(old_dir, old_path, new_dir, new_path) {
+        Ok(()) => 0,
+        Err(err) => {
+            if err == fs::EINVAL && old_dir != new_dir {
+                -EXDEV
+            } else {
+                -fs_to_errno(err)
+            }
+        }
     }
 }
 
@@ -961,6 +1297,15 @@ mod tests {
     fn syscall_lookup_finds_known_entry() {
         let def = lookup_syscall(SYS_GETPID).expect("syscall should exist");
         assert_eq!(def.name, "getpid");
+    }
+
+    #[test]
+    fn syscall_lookup_includes_vfs_extensions() {
+        assert_eq!(lookup_syscall(SYS_MKDIRAT).map(|d| d.name), Some("mkdirat"));
+        assert_eq!(lookup_syscall(SYS_NEWFSTATAT).map(|d| d.name), Some("newfstatat"));
+        assert_eq!(lookup_syscall(SYS_GETDENTS64).map(|d| d.name), Some("getdents64"));
+        assert_eq!(lookup_syscall(SYS_UNLINKAT).map(|d| d.name), Some("unlinkat"));
+        assert_eq!(lookup_syscall(SYS_RENAMEAT).map(|d| d.name), Some("renameat"));
     }
 
     #[test]

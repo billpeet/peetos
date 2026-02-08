@@ -71,6 +71,9 @@ pub struct Task {
     pub(crate) user_base_addr: u64,
     pub(crate) user_interp_base: u64,
     pub(crate) user_is_dynamic: bool,
+    pub(crate) user_uid: u32,
+    pub(crate) user_gid: u32,
+    pub(crate) user_cwd_inode: u16,
     pub(crate) user_fd_kind: [u8; MAX_TASK_FDS],
     pub(crate) user_fd_inode: [u16; MAX_TASK_FDS],
     pub(crate) user_fd_offset: [u64; MAX_TASK_FDS],
@@ -149,6 +152,9 @@ pub fn init() {
             user_base_addr: 0,
             user_interp_base: 0,
             user_is_dynamic: false,
+            user_uid: 0,
+            user_gid: 0,
+            user_cwd_inode: fs::root_inode(),
             user_fd_kind: [USER_FD_KIND_EMPTY; MAX_TASK_FDS],
             user_fd_inode: [USER_FD_NONE; MAX_TASK_FDS],
             user_fd_offset: [0; MAX_TASK_FDS],
@@ -229,6 +235,9 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.user_base_addr = 0;
         task.user_interp_base = 0;
         task.user_is_dynamic = false;
+        task.user_uid = 0;
+        task.user_gid = 0;
+        task.user_cwd_inode = fs::root_inode();
         task.user_fd_kind = [USER_FD_KIND_EMPTY; MAX_TASK_FDS];
         task.user_fd_inode = [USER_FD_NONE; MAX_TASK_FDS];
         task.user_fd_offset = [0; MAX_TASK_FDS];
@@ -445,6 +454,9 @@ impl Task {
             user_base_addr: 0,
             user_interp_base: 0,
             user_is_dynamic: false,
+            user_uid: 0,
+            user_gid: 0,
+            user_cwd_inode: fs::root_inode(),
             user_fd_kind: [USER_FD_KIND_EMPTY; MAX_TASK_FDS],
             user_fd_inode: [USER_FD_NONE; MAX_TASK_FDS],
             user_fd_offset: [0; MAX_TASK_FDS],

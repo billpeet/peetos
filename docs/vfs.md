@@ -10,21 +10,26 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
 - `kernel/src/user.rs`
 
 **Scope Implemented**
-- In-kernel VFS state with inode-like records and path traversal.
+- In-kernel VFS state with inode-like records, path traversal, and a coarse global fs lock for synchronization.
 - Concrete tmpfs-backed regular files and directories.
 - Virtual filesystems backed by dedicated node behavior:
   - `devfs`: `/dev/null`, `/dev/zero`, `/dev/console`
   - `procfs`: `/proc/uptime`, `/proc/meminfo`, `/proc/mounts`, `/proc/version`
+- Mount table abstraction used by `/proc/mounts` (tmpfs/devfs/procfs baseline entries plus dynamic ext2 entry when mounted).
 - ext2 baseline importer:
   - `mount_ext2_image(path, image)` parses a raw ext2 image and imports files/dirs as ext2-backed VFS nodes.
   - The mounted ext2 image is kept as mutable fs state, and `export_ext2_image(out)` can snapshot the current mutated image bytes.
   - Kernel init mounts `user/sample_ext2.img` at `/mnt/ext2`.
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
+  - `mkdir`/`mkdirat`
   - `close`
   - `read`
   - `write`
   - `lseek`
+  - `readdir` (`getdents64`)
+  - `stat`/`fstat`/`newfstatat`
+  - `unlink`/`unlinkat`, `rmdir`/`unlinkat(AT_REMOVEDIR)`, `rename`/`renameat`
 
 **Default Filesystem Layout**
 On initialization, the kernel creates:
@@ -41,12 +46,13 @@ On initialization, the kernel creates:
   - `/dev/console`: opened as a console descriptor; kernel routes writes to serial
 - `procfs` behavior:
   - `/proc/uptime` and `/proc/meminfo` are generated from runtime kernel stats
-  - `/proc/mounts` reflects ext2 only when the ext2 sample is actually mounted
+  - `/proc/mounts` is generated from the mount table and reflects mounted ext2 entries
   - proc files are read-only (`-EROFS` on write)
 - ext2 behavior:
-  - Imported files/directories support baseline mutable regular-file and directory operations (`read`, `write`, `truncate`, `create`, `mkdir`) through the existing VFS file APIs.
+  - Imported files/directories support baseline mutable regular-file and directory operations (`read`, `write`, `truncate`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`) through the existing VFS file APIs.
   - Ext2 reads/writes operate on ext2 inode/data structures in the mounted image (not copied tmpfs file blobs), and size/offset tracking follows ext2 inode state.
   - `create`/`mkdir` allocate ext2 inodes/blocks, update inode/block bitmaps and free counters, and insert directory entries in parent directories.
+  - inode metadata (`mode`, `uid`, `gid`, link count, basic timestamps) is tracked and surfaced via `stat` paths.
   - `/proc/mounts` reports ext2 as `rw` when mounted.
   - Mount import is rollback-safe: on parse/import failure, partially imported nodes are removed.
 
@@ -54,19 +60,25 @@ On initialization, the kernel creates:
 - Linux-numbered file syscalls are dispatched through the VFS layer:
   - `open` (`2`)
   - `close` (`3`)
+  - `fstat` (`5`)
   - `lseek` (`8`)
+  - `getdents64` (`217`)
   - `openat` (`257`)
+  - `mkdirat` (`258`)
+  - `newfstatat` (`262`)
+  - `unlinkat` (`263`)
+  - `renameat` (`264`)
   - `read` (`0`)
   - `write` (`1`)
 - Per-task FD tables track kind/inode/offset/flags.
-- User stdio (`fd 0/1/2`) is pre-seeded as console descriptors.
+- User stdio (`fd 0/1/2`) is pre-seeded as console descriptors, and each user task tracks a cwd inode (currently rooted at `/`).
 
 Limitations / Simplifications
-- VFS storage model remains static-capacity and single-address-space; no dynamic mount table abstraction yet.
-- No permissions/UID/GID enforcement, timestamps, links, unlink/rmdir, or rename yet.
-- `openat` currently supports only `AT_FDCWD` with absolute paths.
-- `readdir`, `stat`, and broader metadata syscalls are not implemented yet.
+- VFS storage model remains static-capacity and single-address-space.
+- Synchronization is a single global fs lock; no finer-grained inode/dentry locking yet.
+- Metadata plumbing exists (`mode`/`uid`/`gid`/timestamps), but full POSIX permission policy and ownership-changing syscalls (`chmod`/`chown`) are not implemented yet.
+- `rename` currently behaves as no-replace (`EEXIST` if destination exists) rather than full Linux overwrite semantics.
+- Hard links and symbolic links are not implemented yet.
 - Console input is not implemented yet; console reads currently return EOF.
-- No explicit synchronization/locking in fs state (single-core assumption).
-- ext2 importer is intentionally minimal: regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, no ownership/permission metadata mapping, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
+- ext2 importer is intentionally minimal: regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
 - ext2 mutation durability is currently scoped to the mounted image buffer in RAM; there is no block-device flush path yet, so persistence across boots requires explicitly exporting the mutated image and reusing it.

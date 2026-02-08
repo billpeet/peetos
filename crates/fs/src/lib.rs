@@ -1,5 +1,9 @@
 #![no_std]
 
+use core::cell::UnsafeCell;
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 pub const VFS_MAX_PATH: usize = 256;
 pub const VFS_MAX_NAME: usize = 64;
 pub const VFS_MAX_INODES: usize = 256;
@@ -32,10 +36,28 @@ pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
 pub const EROFS: i64 = 30;
 pub const ENAMETOOLONG: i64 = 36;
+pub const EBUSY: i64 = 16;
+pub const ENOTEMPTY: i64 = 39;
 
 const ROOT_INODE: u16 = 0;
 const PROCFS_BUFFER_MAX: usize = 512;
 const PROC_TICK_HZ: u64 = 100;
+const MOUNT_MAX: usize = 8;
+
+const STAT_S_IFMT: u32 = 0xF000;
+const STAT_S_IFDIR: u32 = 0x4000;
+const STAT_S_IFREG: u32 = 0x8000;
+const STAT_S_IRUSR: u32 = 0o400;
+const STAT_S_IWUSR: u32 = 0o200;
+const STAT_S_IXUSR: u32 = 0o100;
+const STAT_S_IRGRP: u32 = 0o040;
+const STAT_S_IXGRP: u32 = 0o010;
+const STAT_S_IROTH: u32 = 0o004;
+const STAT_S_IXOTH: u32 = 0o001;
+
+pub const DT_UNKNOWN: u8 = 0;
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
 
 const EXT2_SUPERBLOCK_OFFSET: usize = 1024;
 const EXT2_SUPER_MAGIC: u16 = 0xEF53;
@@ -89,6 +111,43 @@ pub struct WriteResult {
     pub new_offset: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStat {
+    pub ino: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub file_type: FileType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    pub ino: u64,
+    pub next_offset: u64,
+    pub d_type: u8,
+    pub name_len: usize,
+    pub name: [u8; VFS_MAX_NAME],
+}
+
+impl DirEntry {
+    const fn empty() -> Self {
+        Self {
+            ino: 0,
+            next_offset: 0,
+            d_type: DT_UNKNOWN,
+            name_len: 0,
+            name: [0; VFS_MAX_NAME],
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Inode {
     used: bool,
@@ -102,6 +161,13 @@ struct Inode {
     children: [u16; VFS_MAX_CHILDREN],
     data: [u8; TMPFS_MAX_FILE_SIZE],
     ext2_ino: u32,
+    mode: u16,
+    uid: u16,
+    gid: u16,
+    links_count: u16,
+    atime: u64,
+    mtime: u64,
+    ctime: u64,
 }
 
 impl Inode {
@@ -118,6 +184,38 @@ impl Inode {
             children: [0; VFS_MAX_CHILDREN],
             data: [0; TMPFS_MAX_FILE_SIZE],
             ext2_ino: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            links_count: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MountEntry {
+    used: bool,
+    mount_inode: u16,
+    path_len: u16,
+    path: [u8; VFS_MAX_PATH],
+    fs_name_len: u8,
+    fs_name: [u8; 8],
+    readonly: bool,
+}
+
+impl MountEntry {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            mount_inode: ROOT_INODE,
+            path_len: 0,
+            path: [0; VFS_MAX_PATH],
+            fs_name_len: 0,
+            fs_name: [0; 8],
+            readonly: false,
         }
     }
 }
@@ -129,6 +227,8 @@ struct VfsState {
     proc_total_bytes: u64,
     proc_free_bytes: u64,
     proc_used_bytes: u64,
+    clock_ticks: u64,
+    mounts: [MountEntry; MOUNT_MAX],
     ext2_mounted: bool,
     ext2_mount_inode: u16,
     ext2_meta: Ext2Meta,
@@ -145,6 +245,8 @@ impl VfsState {
             proc_total_bytes: 0,
             proc_free_bytes: 0,
             proc_used_bytes: 0,
+            clock_ticks: 0,
+            mounts: [MountEntry::empty(); MOUNT_MAX],
             ext2_mounted: false,
             ext2_mount_inode: ROOT_INODE,
             ext2_meta: Ext2Meta::empty(),
@@ -154,7 +256,36 @@ impl VfsState {
     }
 }
 
-static mut VFS_STATE: VfsState = VfsState::new();
+struct LockedVfsState {
+    lock: AtomicBool,
+    state: UnsafeCell<VfsState>,
+}
+
+impl LockedVfsState {
+    const fn new() -> Self {
+        Self {
+            lock: AtomicBool::new(false),
+            state: UnsafeCell::new(VfsState::new()),
+        }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut VfsState) -> R) -> R {
+        while self
+            .lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+        let result = f(unsafe { &mut *self.state.get() });
+        self.lock.store(false, Ordering::Release);
+        result
+    }
+}
+
+unsafe impl Sync for LockedVfsState {}
+
+static VFS_STATE: LockedVfsState = LockedVfsState::new();
 
 #[derive(Clone, Copy)]
 struct Ext2Meta {
@@ -188,14 +319,112 @@ impl Ext2Meta {
 #[derive(Clone, Copy)]
 struct Ext2Inode {
     mode: u16,
+    uid: u16,
     size: u32,
+    atime: u32,
+    ctime: u32,
+    mtime: u32,
     links_count: u16,
+    gid: u16,
     block_count_512: u32,
     blocks: [u32; 15],
 }
 
-fn state() -> &'static mut VfsState {
-    unsafe { &mut VFS_STATE }
+fn with_state<R>(f: impl FnOnce(&mut VfsState) -> R) -> R {
+    VFS_STATE.with(f)
+}
+
+fn fs_time_tick(state: &mut VfsState) -> u64 {
+    state.clock_ticks = state.clock_ticks.saturating_add(1);
+    state.clock_ticks
+}
+
+fn touch_inode_metadata(state: &mut VfsState, inode: u16, access: bool, modify: bool, change: bool) {
+    if (inode as usize) >= VFS_MAX_INODES {
+        return;
+    }
+    let now = fs_time_tick(state);
+    let node = &mut state.inodes[inode as usize];
+    if !node.used {
+        return;
+    }
+    if access {
+        node.atime = now;
+    }
+    if modify {
+        node.mtime = now;
+    }
+    if change {
+        node.ctime = now;
+    }
+}
+
+fn mount_table_reset(state: &mut VfsState) {
+    state.mounts.fill(MountEntry::empty());
+}
+
+fn mount_table_set(
+    state: &mut VfsState,
+    mount_inode: u16,
+    path: &str,
+    fs_name: &str,
+    readonly: bool,
+) -> Result<(), i64> {
+    if path.is_empty() || path.len() >= VFS_MAX_PATH || fs_name.is_empty() || fs_name.len() > 8 {
+        return Err(EINVAL);
+    }
+
+    let mut free_slot = None;
+    let mut idx = 0usize;
+    while idx < MOUNT_MAX {
+        let entry = &state.mounts[idx];
+        if entry.used
+            && entry.mount_inode == mount_inode
+            && entry.path_len as usize == path.len()
+            && entry.path[..path.len()] == path.as_bytes()[..]
+        {
+            free_slot = Some(idx);
+            break;
+        }
+        if free_slot.is_none() && !entry.used {
+            free_slot = Some(idx);
+        }
+        idx += 1;
+    }
+
+    let slot = free_slot.ok_or(ENOSPC)?;
+    let entry = &mut state.mounts[slot];
+    *entry = MountEntry::empty();
+    entry.used = true;
+    entry.mount_inode = mount_inode;
+    entry.path_len = path.len() as u16;
+    entry.path[..path.len()].copy_from_slice(path.as_bytes());
+    entry.fs_name_len = fs_name.len() as u8;
+    entry.fs_name[..fs_name.len()].copy_from_slice(fs_name.as_bytes());
+    entry.readonly = readonly;
+    Ok(())
+}
+
+fn mount_table_remove_by_inode(state: &mut VfsState, mount_inode: u16) {
+    let mut idx = 0usize;
+    while idx < MOUNT_MAX {
+        if state.mounts[idx].used && state.mounts[idx].mount_inode == mount_inode {
+            state.mounts[idx] = MountEntry::empty();
+        }
+        idx += 1;
+    }
+}
+
+fn inode_is_mount_root(state: &VfsState, inode: u16) -> bool {
+    let mut idx = 0usize;
+    while idx < MOUNT_MAX {
+        let entry = &state.mounts[idx];
+        if entry.used && entry.mount_inode == inode {
+            return true;
+        }
+        idx += 1;
+    }
+    false
 }
 
 fn clear_inode(inode: &mut Inode) {
@@ -210,6 +439,13 @@ fn clear_inode(inode: &mut Inode) {
     inode.children.fill(0);
     inode.data.fill(0);
     inode.ext2_ino = 0;
+    inode.mode = 0;
+    inode.uid = 0;
+    inode.gid = 0;
+    inode.links_count = 0;
+    inode.atime = 0;
+    inode.mtime = 0;
+    inode.ctime = 0;
 }
 
 fn reset(state: &mut VfsState) {
@@ -220,6 +456,8 @@ fn reset(state: &mut VfsState) {
     state.proc_total_bytes = 0;
     state.proc_free_bytes = 0;
     state.proc_used_bytes = 0;
+    state.clock_ticks = 0;
+    mount_table_reset(state);
     state.ext2_mounted = false;
     state.ext2_mount_inode = ROOT_INODE;
     state.ext2_meta = Ext2Meta::empty();
@@ -236,6 +474,11 @@ fn setup_root(state: &mut VfsState) {
     root.backend = NodeBackend::Tmpfs;
     root.parent = ROOT_INODE;
     root.name_len = 0;
+    root.mode = (STAT_S_IFDIR | 0o755) as u16;
+    root.links_count = 2;
+    root.atime = 1;
+    root.mtime = 1;
+    root.ctime = 1;
 }
 
 fn ensure_init(state: &mut VfsState) {
@@ -260,6 +503,14 @@ fn ensure_init(state: &mut VfsState) {
     let _ = create_virtual_file_inner(state, "/proc/meminfo", NodeBackend::ProcMeminfo);
     let _ = create_virtual_file_inner(state, "/proc/mounts", NodeBackend::ProcMounts);
     let _ = create_virtual_file_inner(state, "/proc/version", NodeBackend::ProcVersion);
+
+    let _ = mount_table_set(state, ROOT_INODE, "/", "tmpfs", false);
+    if let Ok(dev_inode) = lookup_path_inner(state, "/dev") {
+        let _ = mount_table_set(state, dev_inode, "/dev", "devfs", false);
+    }
+    if let Ok(proc_inode) = lookup_path_inner(state, "/proc") {
+        let _ = mount_table_set(state, proc_inode, "/proc", "procfs", true);
+    }
 }
 
 fn name_eq(inode: &Inode, name: &[u8]) -> bool {
@@ -298,6 +549,34 @@ fn add_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
     Ok(())
 }
 
+fn remove_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
+    if (dir as usize) >= VFS_MAX_INODES {
+        return Err(ENOENT);
+    }
+    let parent = &mut state.inodes[dir as usize];
+    if parent.file_type != FileType::Directory {
+        return Err(ENOTDIR);
+    }
+
+    let mut idx = 0usize;
+    while idx < parent.child_count as usize {
+        if parent.children[idx] == child {
+            let mut move_idx = idx + 1;
+            while move_idx < parent.child_count as usize {
+                parent.children[move_idx - 1] = parent.children[move_idx];
+                move_idx += 1;
+            }
+            let last = parent.child_count.saturating_sub(1) as usize;
+            parent.children[last] = 0;
+            parent.child_count = parent.child_count.saturating_sub(1);
+            return Ok(());
+        }
+        idx += 1;
+    }
+
+    Err(ENOENT)
+}
+
 fn alloc_inode(
     state: &mut VfsState,
     file_type: FileType,
@@ -312,6 +591,7 @@ fn alloc_inode(
     let mut slot = 1usize;
     while slot < VFS_MAX_INODES {
         if !state.inodes[slot].used {
+            let now = fs_time_tick(state);
             let inode = &mut state.inodes[slot];
             clear_inode(inode);
             inode.used = true;
@@ -320,6 +600,17 @@ fn alloc_inode(
             inode.parent = parent;
             inode.name_len = name.len() as u8;
             inode.name[..name.len()].copy_from_slice(name);
+            inode.mode = match file_type {
+                FileType::Directory => (STAT_S_IFDIR | 0o755) as u16,
+                FileType::Regular => (STAT_S_IFREG | 0o644) as u16,
+                FileType::None => 0,
+            };
+            inode.uid = 0;
+            inode.gid = 0;
+            inode.links_count = if file_type == FileType::Directory { 2 } else { 1 };
+            inode.atime = now;
+            inode.mtime = now;
+            inode.ctime = now;
             return Ok(slot as u16);
         }
         slot += 1;
@@ -379,7 +670,7 @@ fn has_remaining_component(path: &[u8], mut cursor: usize) -> bool {
     false
 }
 
-fn lookup_path_inner(state: &VfsState, path: &str) -> Result<u16, i64> {
+fn lookup_path_from_inner(state: &VfsState, start: u16, path: &str) -> Result<u16, i64> {
     if path.is_empty() {
         return Err(EINVAL);
     }
@@ -389,8 +680,12 @@ fn lookup_path_inner(state: &VfsState, path: &str) -> Result<u16, i64> {
     }
 
     let bytes = path.as_bytes();
-    let mut cursor = if bytes[0] == b'/' { 1usize } else { 0usize };
-    let mut current = ROOT_INODE;
+    let absolute = bytes[0] == b'/';
+    let mut cursor = if absolute { 1usize } else { 0usize };
+    let mut current = if absolute { ROOT_INODE } else { start };
+    if current as usize >= VFS_MAX_INODES || !state.inodes[current as usize].used {
+        return Err(ENOENT);
+    }
     let mut name = [0u8; VFS_MAX_NAME];
 
     loop {
@@ -423,8 +718,13 @@ fn lookup_path_inner(state: &VfsState, path: &str) -> Result<u16, i64> {
     Ok(current)
 }
 
-fn resolve_parent_inner(
+fn lookup_path_inner(state: &VfsState, path: &str) -> Result<u16, i64> {
+    lookup_path_from_inner(state, ROOT_INODE, path)
+}
+
+fn resolve_parent_from_inner(
     state: &VfsState,
+    start: u16,
     path: &str,
     out_name: &mut [u8; VFS_MAX_NAME],
 ) -> Result<(u16, usize), i64> {
@@ -433,8 +733,12 @@ fn resolve_parent_inner(
     }
 
     let bytes = path.as_bytes();
-    let mut cursor = if bytes[0] == b'/' { 1usize } else { 0usize };
-    let mut current = ROOT_INODE;
+    let absolute = bytes[0] == b'/';
+    let mut cursor = if absolute { 1usize } else { 0usize };
+    let mut current = if absolute { ROOT_INODE } else { start };
+    if current as usize >= VFS_MAX_INODES || !state.inodes[current as usize].used {
+        return Err(ENOENT);
+    }
     let mut component = [0u8; VFS_MAX_NAME];
 
     loop {
@@ -480,9 +784,17 @@ fn resolve_parent_inner(
     }
 }
 
-fn create_regular_inner(state: &mut VfsState, path: &str) -> Result<u16, i64> {
+fn resolve_parent_inner(
+    state: &VfsState,
+    path: &str,
+    out_name: &mut [u8; VFS_MAX_NAME],
+) -> Result<(u16, usize), i64> {
+    resolve_parent_from_inner(state, ROOT_INODE, path, out_name)
+}
+
+fn create_regular_at_inner(state: &mut VfsState, start: u16, path: &str) -> Result<u16, i64> {
     let mut name = [0u8; VFS_MAX_NAME];
-    let (parent, name_len) = resolve_parent_inner(state, path, &mut name)?;
+    let (parent, name_len) = resolve_parent_from_inner(state, start, path, &mut name)?;
 
     let parent_backend = state.inodes[parent as usize].backend;
     if !matches!(parent_backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
@@ -522,17 +834,19 @@ fn create_regular_inner(state: &mut VfsState, path: &str) -> Result<u16, i64> {
         node.ext2_ino = ext2_ino;
         node.size = ext2_size;
         add_child(state, parent, inode)?;
+        touch_inode_metadata(state, parent, true, true, true);
         return Ok(inode);
     }
 
     let inode = alloc_inode(state, FileType::Regular, NodeBackend::Tmpfs, parent, &name[..name_len])?;
     add_child(state, parent, inode)?;
+    touch_inode_metadata(state, parent, true, true, true);
     Ok(inode)
 }
 
-fn mkdir_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
+fn mkdir_at_inner(state: &mut VfsState, start: u16, path: &str) -> Result<(), i64> {
     let mut name = [0u8; VFS_MAX_NAME];
-    let (parent, name_len) = resolve_parent_inner(state, path, &mut name)?;
+    let (parent, name_len) = resolve_parent_from_inner(state, start, path, &mut name)?;
 
     let parent_backend = state.inodes[parent as usize].backend;
     if !matches!(parent_backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
@@ -572,12 +886,18 @@ fn mkdir_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
         node.ext2_ino = ext2_ino;
         node.size = ext2_size;
         add_child(state, parent, inode)?;
+        touch_inode_metadata(state, parent, true, true, true);
         return Ok(());
     }
 
     let inode = alloc_inode(state, FileType::Directory, NodeBackend::Tmpfs, parent, &name[..name_len])?;
     add_child(state, parent, inode)?;
+    touch_inode_metadata(state, parent, true, true, true);
     Ok(())
+}
+
+fn mkdir_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
+    mkdir_at_inner(state, ROOT_INODE, path)
 }
 
 fn mkdir_virtual_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
@@ -612,6 +932,19 @@ fn create_virtual_file_inner(
     }
 
     let inode = alloc_inode(state, FileType::Regular, backend, parent, &name[..name_len])?;
+    {
+        let node = &mut state.inodes[inode as usize];
+        node.mode = match backend {
+            NodeBackend::ProcUptime
+            | NodeBackend::ProcMeminfo
+            | NodeBackend::ProcMounts
+            | NodeBackend::ProcVersion => (STAT_S_IFREG | 0o444) as u16,
+            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
+                (STAT_S_IFREG | 0o666) as u16
+            }
+            _ => node.mode,
+        };
+    }
     add_child(state, parent, inode)?;
     Ok(inode)
 }
@@ -659,12 +992,33 @@ fn append_u64_fixed_2(out: &mut [u8], cursor: &mut usize, value: u64) {
     append_bytes(out, cursor, &[b'0' + tens, b'0' + ones]);
 }
 
-fn has_ext2_mount(state: &VfsState) -> bool {
-    if !state.ext2_mounted || (state.ext2_mount_inode as usize) >= VFS_MAX_INODES {
-        return false;
+fn append_mount_line(out: &mut [u8], cursor: &mut usize, entry: &MountEntry) {
+    if !entry.used || entry.path_len == 0 || entry.fs_name_len == 0 {
+        return;
     }
-    let mount = &state.inodes[state.ext2_mount_inode as usize];
-    mount.used && mount.file_type == FileType::Directory && mount.backend == NodeBackend::Ext2
+    append_bytes(out, cursor, &entry.fs_name[..entry.fs_name_len as usize]);
+    append_str(out, cursor, " ");
+    append_bytes(out, cursor, &entry.path[..entry.path_len as usize]);
+    append_str(out, cursor, " ");
+    append_bytes(out, cursor, &entry.fs_name[..entry.fs_name_len as usize]);
+    append_str(out, cursor, " ");
+    if entry.readonly {
+        append_str(out, cursor, "ro");
+    } else {
+        append_str(out, cursor, "rw");
+    }
+    append_str(out, cursor, " 0 0\n");
+}
+
+fn append_mounts(state: &VfsState, out: &mut [u8], cursor: &mut usize) {
+    let mut idx = 0usize;
+    while idx < MOUNT_MAX {
+        let entry = &state.mounts[idx];
+        if entry.used {
+            append_mount_line(out, cursor, entry);
+        }
+        idx += 1;
+    }
 }
 
 fn format_proc_payload(state: &VfsState, backend: NodeBackend, out: &mut [u8]) -> usize {
@@ -674,12 +1028,7 @@ fn format_proc_payload(state: &VfsState, backend: NodeBackend, out: &mut [u8]) -
             append_str(out, &mut cursor, "PeetOS-Rust 0.1\n");
         }
         NodeBackend::ProcMounts => {
-            append_str(out, &mut cursor, "tmpfs / tmpfs rw 0 0\n");
-            append_str(out, &mut cursor, "devfs /dev devfs rw 0 0\n");
-            append_str(out, &mut cursor, "proc /proc procfs ro 0 0\n");
-            if has_ext2_mount(state) {
-                append_str(out, &mut cursor, "ext2 /mnt/ext2 ext2 rw 0 0\n");
-            }
+            append_mounts(state, out, &mut cursor);
         }
         NodeBackend::ProcUptime => {
             let secs = state.proc_uptime_ticks / PROC_TICK_HZ;
@@ -885,7 +1234,12 @@ fn ext2_read_inode(image: &[u8], meta: &Ext2Meta, ino: u32) -> Result<Ext2Inode,
     }
 
     let mode = read_u16_le(image, inode_offset)?;
+    let uid = read_u16_le(image, inode_offset + 2)?;
     let size = read_u32_le(image, inode_offset + 4)?;
+    let atime = read_u32_le(image, inode_offset + 8)?;
+    let ctime = read_u32_le(image, inode_offset + 12)?;
+    let mtime = read_u32_le(image, inode_offset + 16)?;
+    let gid = read_u16_le(image, inode_offset + 24)?;
     let links_count = read_u16_le(image, inode_offset + 26)?;
     let block_count_512 = read_u32_le(image, inode_offset + 28)?;
 
@@ -898,8 +1252,13 @@ fn ext2_read_inode(image: &[u8], meta: &Ext2Meta, ino: u32) -> Result<Ext2Inode,
 
     Ok(Ext2Inode {
         mode,
+        uid,
         size,
+        atime,
+        ctime,
+        mtime,
         links_count,
+        gid,
         block_count_512,
         blocks,
     })
@@ -994,7 +1353,12 @@ fn ext2_write_inode(
     }
 
     write_u16_le(image, inode_offset, inode.mode)?;
+    write_u16_le(image, inode_offset + 2, inode.uid)?;
     write_u32_le(image, inode_offset + 4, inode.size)?;
+    write_u32_le(image, inode_offset + 8, inode.atime)?;
+    write_u32_le(image, inode_offset + 12, inode.ctime)?;
+    write_u32_le(image, inode_offset + 16, inode.mtime)?;
+    write_u16_le(image, inode_offset + 24, inode.gid)?;
     write_u16_le(image, inode_offset + 26, inode.links_count)?;
     write_u32_le(image, inode_offset + 28, inode.block_count_512)?;
 
@@ -1496,6 +1860,10 @@ fn ext2_write_file(
     if end > inode.size as usize {
         inode.size = end as u32;
     }
+    let now = fs_time_tick(state) as u32;
+    inode.mtime = now;
+    inode.ctime = now;
+    inode.atime = now;
     inode.block_count_512 = ext2_recalc_inode_block_count_512(&meta, &inode);
     ext2_write_inode_to_state(state, ino, &inode)?;
 
@@ -1521,6 +1889,10 @@ fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
 
     inode.size = 0;
     inode.block_count_512 = 0;
+    let now = fs_time_tick(state) as u32;
+    inode.mtime = now;
+    inode.ctime = now;
+    inode.atime = now;
     let _ = meta; // keep read/write behavior explicit for future extensions
     ext2_write_inode_to_state(state, ino, &inode)?;
     Ok(())
@@ -1656,6 +2028,137 @@ fn ext2_add_dir_entry(
     Err(ENOSPC)
 }
 
+fn ext2_remove_dir_entry(state: &mut VfsState, parent_ino: u32, name: &[u8]) -> Result<u32, i64> {
+    if name.is_empty() || name == b"." || name == b".." {
+        return Err(EINVAL);
+    }
+    let meta = state.ext2_meta;
+    let parent = ext2_read_inode_from_state(state, parent_ino)?;
+    if ext2_mode_to_filetype(parent.mode) != Some(FileType::Directory) {
+        return Err(ENOTDIR);
+    }
+
+    let mut idx = 0usize;
+    while idx < EXT2_INODE_DIRECT_COUNT {
+        let block_no = parent.blocks[idx];
+        idx += 1;
+        if block_no == 0 {
+            continue;
+        }
+
+        let mut removed = None;
+        {
+            let image = &mut state.ext2_image[..state.ext2_image_len];
+            let blk = ext2_block_slice_mut(image, &meta, block_no)?;
+            let mut pos = 0usize;
+            let mut prev_pos = None;
+            let mut prev_rec_len = 0usize;
+
+            while pos + 8 <= blk.len() {
+                let inode_no = read_u32_le(blk, pos)?;
+                let rec_len = read_u16_le(blk, pos + 4)? as usize;
+                let name_len = blk[pos + 6] as usize;
+
+                if rec_len < 8 || (rec_len & 0x3) != 0 || pos + rec_len > blk.len() {
+                    return Err(EIO);
+                }
+
+                if inode_no != 0 && 8 + name_len <= rec_len {
+                    let entry_name = &blk[pos + 8..pos + 8 + name_len];
+                    if entry_name == name {
+                        if let Some(prev) = prev_pos {
+                            let new_rec_len = prev_rec_len.saturating_add(rec_len);
+                            if new_rec_len > u16::MAX as usize {
+                                return Err(EIO);
+                            }
+                            write_u16_le(blk, prev + 4, new_rec_len as u16)?;
+                        } else {
+                            write_u32_le(blk, pos, 0)?;
+                        }
+                        removed = Some(inode_no);
+                        break;
+                    }
+                }
+
+                prev_pos = Some(pos);
+                prev_rec_len = rec_len;
+                pos += rec_len;
+            }
+        }
+
+        if let Some(ino) = removed {
+            return Ok(ino);
+        }
+    }
+
+    Err(ENOENT)
+}
+
+fn ext2_directory_is_empty(state: &VfsState, ino: u32) -> Result<bool, i64> {
+    let meta = state.ext2_meta;
+    let image = &state.ext2_image[..state.ext2_image_len];
+    let inode = ext2_read_inode(image, &meta, ino)?;
+    if ext2_mode_to_filetype(inode.mode) != Some(FileType::Directory) {
+        return Err(ENOTDIR);
+    }
+
+    let mut non_dot = false;
+    ext2_for_each_dir_entry(image, &meta, &inode, |_child_ino, _ft, child_name| {
+        if child_name != b"." && child_name != b".." {
+            non_dot = true;
+        }
+        Ok(())
+    })?;
+    Ok(!non_dot)
+}
+
+fn ext2_free_inode_blocks(state: &mut VfsState, inode: &mut Ext2Inode) -> Result<(), i64> {
+    let mut idx = 0usize;
+    while idx < EXT2_INODE_DIRECT_COUNT {
+        let block = inode.blocks[idx];
+        if block != 0 {
+            ext2_free_block(state, block)?;
+            inode.blocks[idx] = 0;
+        }
+        idx += 1;
+    }
+    inode.size = 0;
+    inode.block_count_512 = 0;
+    Ok(())
+}
+
+fn ext2_patch_dotdot(state: &mut VfsState, dir_ino: u32, parent_ino: u32) -> Result<(), i64> {
+    let meta = state.ext2_meta;
+    let inode = ext2_read_inode_from_state(state, dir_ino)?;
+    if ext2_mode_to_filetype(inode.mode) != Some(FileType::Directory) {
+        return Err(ENOTDIR);
+    }
+    let block = inode.blocks[0];
+    if block == 0 {
+        return Err(EIO);
+    }
+
+    let image = &mut state.ext2_image[..state.ext2_image_len];
+    let blk = ext2_block_slice_mut(image, &meta, block)?;
+    let mut pos = 0usize;
+    while pos + 8 <= blk.len() {
+        let rec_len = read_u16_le(blk, pos + 4)? as usize;
+        let name_len = blk[pos + 6] as usize;
+        if rec_len < 8 || (rec_len & 0x3) != 0 || pos + rec_len > blk.len() {
+            return Err(EIO);
+        }
+        if 8 + name_len <= rec_len {
+            let name = &blk[pos + 8..pos + 8 + name_len];
+            if name == b".." {
+                write_u32_le(blk, pos, parent_ino)?;
+                return Ok(());
+            }
+        }
+        pos += rec_len;
+    }
+    Err(EIO)
+}
+
 fn ext2_create_child_on_disk(
     state: &mut VfsState,
     parent_ino: u32,
@@ -1665,6 +2168,7 @@ fn ext2_create_child_on_disk(
     let is_dir = file_type == FileType::Directory;
     let ino = ext2_alloc_inode(state, is_dir)?;
     let meta = state.ext2_meta;
+    let now = fs_time_tick(state) as u32;
 
     let mut inode = Ext2Inode {
         mode: match file_type {
@@ -1672,8 +2176,13 @@ fn ext2_create_child_on_disk(
             FileType::Directory => EXT2_DEF_DIR_MODE,
             FileType::None => return Err(EINVAL),
         },
+        uid: 0,
         size: 0,
+        atime: now,
+        ctime: now,
+        mtime: now,
         links_count: if is_dir { 2 } else { 1 },
+        gid: 0,
         block_count_512: 0,
         blocks: [0; 15],
     };
@@ -1737,6 +2246,41 @@ fn ext2_mode_to_filetype(mode: u16) -> Option<FileType> {
         EXT2_S_IFREG => Some(FileType::Regular),
         _ => None,
     }
+}
+
+fn filetype_to_dtype(file_type: FileType) -> u8 {
+    match file_type {
+        FileType::Directory => DT_DIR,
+        FileType::Regular => DT_REG,
+        FileType::None => DT_UNKNOWN,
+    }
+}
+
+fn inode_mode_for_stat(node: &Inode) -> u32 {
+    let mut mode = node.mode as u32;
+    if (mode & STAT_S_IFMT) == 0 {
+        mode |= match node.file_type {
+            FileType::Directory => STAT_S_IFDIR,
+            FileType::Regular => STAT_S_IFREG,
+            FileType::None => 0,
+        };
+    }
+    if (mode & (STAT_S_IRUSR | STAT_S_IWUSR | STAT_S_IXUSR)) == 0 {
+        mode |= match node.file_type {
+            FileType::Directory => {
+                STAT_S_IRUSR
+                    | STAT_S_IWUSR
+                    | STAT_S_IXUSR
+                    | STAT_S_IRGRP
+                    | STAT_S_IXGRP
+                    | STAT_S_IROTH
+                    | STAT_S_IXOTH
+            }
+            FileType::Regular => STAT_S_IRUSR | STAT_S_IWUSR | STAT_S_IRGRP | STAT_S_IROTH,
+            FileType::None => 0,
+        };
+    }
+    mode
 }
 
 fn ensure_dir_path_tmpfs(state: &mut VfsState, path: &str) -> Result<u16, i64> {
@@ -1821,6 +2365,13 @@ fn ext2_import_node(
         let node_ref = &mut state.inodes[node as usize];
         node_ref.ext2_ino = inode_num;
         node_ref.size = ext2_inode.size;
+        node_ref.mode = ext2_inode.mode;
+        node_ref.uid = ext2_inode.uid;
+        node_ref.gid = ext2_inode.gid;
+        node_ref.links_count = ext2_inode.links_count;
+        node_ref.atime = ext2_inode.atime as u64;
+        node_ref.mtime = ext2_inode.mtime as u64;
+        node_ref.ctime = ext2_inode.ctime as u64;
     }
 
     match file_type {
@@ -1890,7 +2441,10 @@ fn rollback_ext2_mount_import(state: &mut VfsState, mount_inode: u16) {
     mount.ext2_ino = 0;
     mount.child_count = 0;
     mount.children = [0; VFS_MAX_CHILDREN];
+    mount.size = 0;
+    mount.links_count = 2;
 
+    mount_table_remove_by_inode(state, mount_inode);
     state.ext2_mounted = false;
     state.ext2_mount_inode = ROOT_INODE;
     state.ext2_meta = Ext2Meta::empty();
@@ -1898,115 +2452,32 @@ fn rollback_ext2_mount_import(state: &mut VfsState, mount_inode: u16) {
     state.ext2_image.fill(0);
 }
 
-pub fn init() {
-    let state = state();
-    reset(state);
-    ensure_init(state);
-}
-
-pub fn set_proc_uptime_ticks(ticks: u64) {
-    let state = state();
-    ensure_init(state);
-    state.proc_uptime_ticks = ticks;
-}
-
-pub fn set_proc_meminfo(total_bytes: u64, free_bytes: u64, used_bytes: u64) {
-    let state = state();
-    ensure_init(state);
-    state.proc_total_bytes = total_bytes;
-    state.proc_free_bytes = free_bytes;
-    state.proc_used_bytes = used_bytes;
-}
-
-pub fn mount_ext2_image(mount_path: &str, image: &[u8]) -> Result<(), i64> {
-    let state = state();
-    ensure_init(state);
-
-    let mount_inode = ensure_dir_path_tmpfs(state, mount_path)?;
-    if state.inodes[mount_inode as usize].file_type != FileType::Directory {
-        return Err(ENOTDIR);
-    }
-
-    if state.inodes[mount_inode as usize].child_count != 0 {
-        return Err(EEXIST);
-    }
-
-    if image.is_empty() || image.len() > EXT2_MAX_IMAGE_SIZE {
-        return Err(ENOSPC);
-    }
-
-    state.ext2_image[..image.len()].copy_from_slice(image);
-    state.ext2_image_len = image.len();
-
-    let meta = ext2_parse_meta(&state.ext2_image[..state.ext2_image_len])?;
-    if meta.blocks_per_group == 0 {
-        state.ext2_image_len = 0;
-        return Err(EINVAL);
-    }
-
-    let root = ext2_read_inode(&state.ext2_image[..state.ext2_image_len], &meta, EXT2_ROOT_INODE)?;
-    if ext2_mode_to_filetype(root.mode) != Some(FileType::Directory) {
-        state.ext2_image_len = 0;
-        return Err(EIO);
-    }
-
-    state.ext2_meta = meta;
-    state.ext2_mounted = true;
-    state.ext2_mount_inode = mount_inode;
-
-    match ext2_for_each_dir_entry(image, &meta, &root, |child_ino, _file_type, name| {
-        ext2_import_node(state, mount_inode, name, image, &meta, child_ino, 0)
-    }) {
-        Ok(()) => {
-            let mount = &mut state.inodes[mount_inode as usize];
-            mount.backend = NodeBackend::Ext2;
-            mount.ext2_ino = EXT2_ROOT_INODE;
-            mount.size = root.size;
-            Ok(())
-        }
-        Err(err) => {
-            rollback_ext2_mount_import(state, mount_inode);
-            Err(err)
-        }
+fn inode_number(node: &Inode, inode_idx: u16) -> u64 {
+    if node.backend == NodeBackend::Ext2 && node.ext2_ino != 0 {
+        node.ext2_ino as u64
+    } else {
+        inode_idx as u64 + 1
     }
 }
 
-pub fn export_ext2_image(out: &mut [u8]) -> Result<usize, i64> {
-    let state = state();
-    ensure_init(state);
-    if !state.ext2_mounted {
-        return Err(ENOENT);
-    }
-    if out.len() < state.ext2_image_len {
-        return Err(ENOSPC);
-    }
-    out[..state.ext2_image_len].copy_from_slice(&state.ext2_image[..state.ext2_image_len]);
-    Ok(state.ext2_image_len)
+fn backend_mutable(backend: NodeBackend) -> bool {
+    matches!(backend, NodeBackend::Tmpfs | NodeBackend::Ext2)
 }
 
-pub fn mkdir(path: &str) -> Result<(), i64> {
-    let state = state();
-    ensure_init(state);
-    mkdir_inner(state, path)
-}
-
-pub fn open(path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
-    let state = state();
-    ensure_init(state);
-
+fn open_at_inner(state: &mut VfsState, start: u16, path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
     let access = flags & O_ACCMODE;
     if access > O_RDWR {
         return Err(EINVAL);
     }
 
-    let inode_idx = match lookup_path_inner(state, path) {
+    let inode_idx = match lookup_path_from_inner(state, start, path) {
         Ok(inode) => {
             if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
                 return Err(EEXIST);
             }
             inode
         }
-        Err(ENOENT) if (flags & O_CREAT) != 0 => create_regular_inner(state, path)?,
+        Err(ENOENT) if (flags & O_CREAT) != 0 => create_regular_at_inner(state, start, path)?,
         Err(err) => return Err(err),
     };
 
@@ -2020,13 +2491,14 @@ pub fn open(path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
     }
 
     if (flags & O_TRUNC) != 0 && inode_info.file_type == FileType::Regular && access != O_RDONLY {
-        if !matches!(inode_info.backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
+        if !backend_mutable(inode_info.backend) {
             return Err(EROFS);
         }
 
         match inode_info.backend {
             NodeBackend::Tmpfs => {
                 state.inodes[inode_idx as usize].size = 0;
+                touch_inode_metadata(state, inode_idx, true, true, true);
             }
             NodeBackend::Ext2 => {
                 if inode_info.ext2_ino == 0 {
@@ -2034,6 +2506,7 @@ pub fn open(path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
                 }
                 ext2_truncate_to_zero(state, inode_info.ext2_ino)?;
                 state.inodes[inode_idx as usize].size = 0;
+                touch_inode_metadata(state, inode_idx, true, true, true);
             }
             _ => {}
         }
@@ -2048,254 +2521,735 @@ pub fn open(path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
     })
 }
 
-pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
-    let state = state();
-    ensure_init(state);
-
-    if inode as usize >= VFS_MAX_INODES {
+fn dir_entry_at_offset(state: &VfsState, inode: u16, offset: u64) -> Result<Option<DirEntry>, i64> {
+    if (inode as usize) >= VFS_MAX_INODES {
         return Err(ENOENT);
     }
-
     let node = &state.inodes[inode as usize];
     if !node.used {
         return Err(ENOENT);
     }
-    if node.file_type == FileType::Directory {
-        return Err(EISDIR);
+    if node.file_type != FileType::Directory {
+        return Err(ENOTDIR);
     }
 
-    match node.backend {
-        NodeBackend::Tmpfs => {
-            if dst.is_empty() {
-                return Ok(0);
-            }
-
-            let file_size = node.size as usize;
-            if offset as usize >= file_size {
-                return Ok(0);
-            }
-
-            let start = offset as usize;
-            let available = file_size - start;
-            let count = core::cmp::min(dst.len(), available);
-            dst[..count].copy_from_slice(&node.data[start..start + count]);
-            Ok(count)
+    let mut entry = DirEntry::empty();
+    match offset {
+        0 => {
+            entry.ino = inode_number(node, inode);
+            entry.next_offset = 1;
+            entry.d_type = DT_DIR;
+            entry.name_len = 1;
+            entry.name[0] = b'.';
+            Ok(Some(entry))
         }
-        NodeBackend::Ext2 => {
-            if node.ext2_ino == 0 {
-                return Err(EIO);
+        1 => {
+            let parent = node.parent;
+            let parent_node = &state.inodes[parent as usize];
+            entry.ino = inode_number(parent_node, parent);
+            entry.next_offset = 2;
+            entry.d_type = DT_DIR;
+            entry.name_len = 2;
+            entry.name[0] = b'.';
+            entry.name[1] = b'.';
+            Ok(Some(entry))
+        }
+        _ => {
+            let idx = (offset - 2) as usize;
+            if idx >= node.child_count as usize {
+                return Ok(None);
             }
-            ext2_read_file(state, node.ext2_ino, offset, dst)
+            let child = node.children[idx];
+            let child_node = &state.inodes[child as usize];
+            if !child_node.used {
+                return Ok(None);
+            }
+            entry.ino = inode_number(child_node, child);
+            entry.next_offset = offset + 1;
+            entry.d_type = filetype_to_dtype(child_node.file_type);
+            entry.name_len = child_node.name_len as usize;
+            entry.name[..entry.name_len].copy_from_slice(&child_node.name[..entry.name_len]);
+            Ok(Some(entry))
         }
-        NodeBackend::DevNull => Ok(0),
-        NodeBackend::DevZero => {
-            dst.fill(0);
-            Ok(dst.len())
-        }
-        NodeBackend::DevConsole => Ok(0),
-        NodeBackend::ProcUptime
-        | NodeBackend::ProcMeminfo
-        | NodeBackend::ProcMounts
-        | NodeBackend::ProcVersion => read_proc(node, state, offset, dst),
     }
 }
 
-pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteResult, i64> {
-    let state = state();
-    ensure_init(state);
-
-    if inode as usize >= VFS_MAX_INODES {
+fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
+    if (inode as usize) >= VFS_MAX_INODES {
         return Err(ENOENT);
     }
-
     let node = &state.inodes[inode as usize];
     if !node.used {
         return Err(ENOENT);
     }
-    if node.file_type == FileType::Directory {
+
+    let mut stat = FileStat {
+        ino: inode_number(node, inode),
+        mode: inode_mode_for_stat(node),
+        uid: node.uid as u32,
+        gid: node.gid as u32,
+        nlink: core::cmp::max(1, node.links_count as u32),
+        size: node.size as u64,
+        blksize: 4096,
+        blocks: ((node.size as u64) + 511) / 512,
+        atime: node.atime,
+        mtime: node.mtime,
+        ctime: node.ctime,
+        file_type: node.file_type,
+    };
+
+    if node.backend == NodeBackend::Ext2 {
+        if node.ext2_ino == 0 {
+            return Err(EIO);
+        }
+        let ext = ext2_read_inode_from_state(state, node.ext2_ino)?;
+        stat.ino = node.ext2_ino as u64;
+        stat.mode = ext.mode as u32;
+        stat.uid = ext.uid as u32;
+        stat.gid = ext.gid as u32;
+        stat.nlink = core::cmp::max(1, ext.links_count as u32);
+        stat.size = ext.size as u64;
+        stat.blksize = state.ext2_meta.block_size as u32;
+        stat.blocks = ext.block_count_512 as u64;
+        stat.atime = ext.atime as u64;
+        stat.mtime = ext.mtime as u64;
+        stat.ctime = ext.ctime as u64;
+    }
+
+    Ok(stat)
+}
+
+fn unlink_at_inner(state: &mut VfsState, start: u16, path: &str, remove_dir: bool) -> Result<(), i64> {
+    let mut name = [0u8; VFS_MAX_NAME];
+    let (parent, name_len) = resolve_parent_from_inner(state, start, path, &mut name)?;
+    let child = find_child(state, parent, &name[..name_len]).ok_or(ENOENT)?;
+    if inode_is_mount_root(state, child) {
+        return Err(EBUSY);
+    }
+
+    let parent_backend = state.inodes[parent as usize].backend;
+    if !backend_mutable(parent_backend) {
+        return Err(EROFS);
+    }
+
+    let child_node = state.inodes[child as usize];
+    if remove_dir {
+        if child_node.file_type != FileType::Directory {
+            return Err(ENOTDIR);
+        }
+        if child_node.child_count != 0 {
+            return Err(ENOTEMPTY);
+        }
+    } else if child_node.file_type == FileType::Directory {
         return Err(EISDIR);
     }
 
-    match node.backend {
-        NodeBackend::Tmpfs => {
-            let node = &mut state.inodes[inode as usize];
-            let mut start = if append {
-                node.size as usize
+    if parent_backend == NodeBackend::Ext2 {
+        if state.inodes[parent as usize].ext2_ino == 0 || child_node.ext2_ino == 0 {
+            return Err(EIO);
+        }
+        let parent_ino = state.inodes[parent as usize].ext2_ino;
+        let removed = ext2_remove_dir_entry(state, parent_ino, &name[..name_len])?;
+        if removed != child_node.ext2_ino {
+            return Err(EIO);
+        }
+
+        let mut child_ext = ext2_read_inode_from_state(state, child_node.ext2_ino)?;
+        if remove_dir {
+            if !ext2_directory_is_empty(state, child_node.ext2_ino)? {
+                return Err(ENOTEMPTY);
+            }
+            ext2_free_inode_blocks(state, &mut child_ext)?;
+            ext2_free_inode(state, child_node.ext2_ino, true)?;
+            let mut parent_ext = ext2_read_inode_from_state(state, parent_ino)?;
+            parent_ext.links_count = parent_ext.links_count.saturating_sub(1);
+            parent_ext.mtime = fs_time_tick(state) as u32;
+            parent_ext.ctime = parent_ext.mtime;
+            ext2_write_inode_to_state(state, parent_ino, &parent_ext)?;
+        } else {
+            if child_ext.links_count > 1 {
+                child_ext.links_count -= 1;
+                let now = fs_time_tick(state) as u32;
+                child_ext.ctime = now;
+                child_ext.mtime = now;
+                ext2_write_inode_to_state(state, child_node.ext2_ino, &child_ext)?;
             } else {
-                match usize::try_from(offset) {
-                    Ok(v) => v,
-                    Err(_) => return Err(EINVAL),
-                }
-            };
-
-            if start > TMPFS_MAX_FILE_SIZE {
-                return Err(ENOSPC);
+                ext2_free_inode_blocks(state, &mut child_ext)?;
+                ext2_free_inode(state, child_node.ext2_ino, false)?;
             }
-
-            if src.is_empty() {
-                return Ok(WriteResult {
-                    written: 0,
-                    new_offset: start as u64,
-                });
-            }
-
-            let current_size = node.size as usize;
-            if start > current_size {
-                node.data[current_size..start].fill(0);
-            }
-
-            let remaining = TMPFS_MAX_FILE_SIZE - start;
-            if remaining == 0 {
-                return Err(ENOSPC);
-            }
-
-            let count = core::cmp::min(src.len(), remaining);
-            node.data[start..start + count].copy_from_slice(&src[..count]);
-
-            start += count;
-            if start > node.size as usize {
-                node.size = start as u32;
-            }
-
-            Ok(WriteResult {
-                written: count,
-                new_offset: start as u64,
-            })
         }
-        NodeBackend::Ext2 => {
-            if node.ext2_ino == 0 {
-                return Err(EIO);
-            }
-            let result = ext2_write_file(state, node.ext2_ino, offset, src, append)?;
-            state.inodes[inode as usize].size = core::cmp::max(
-                state.inodes[inode as usize].size,
-                result.new_offset as u32,
-            );
-            Ok(result)
+    }
+
+    remove_child(state, parent, child)?;
+    clear_inode(&mut state.inodes[child as usize]);
+    touch_inode_metadata(state, parent, true, true, true);
+    Ok(())
+}
+
+fn is_descendant_of(state: &VfsState, ancestor: u16, node: u16) -> bool {
+    let mut cur = node;
+    loop {
+        if cur == ancestor {
+            return true;
         }
-        NodeBackend::ProcUptime
-        | NodeBackend::ProcMeminfo
-        | NodeBackend::ProcMounts
-        | NodeBackend::ProcVersion => Err(EROFS),
-        NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
-            let next = offset.saturating_add(src.len() as u64);
-            Ok(WriteResult {
-                written: src.len(),
-                new_offset: next,
-            })
+        if cur == ROOT_INODE {
+            return false;
         }
+        let parent = state.inodes[cur as usize].parent;
+        if parent == cur {
+            return false;
+        }
+        cur = parent;
     }
 }
 
-pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i64> {
-    let state = state();
-    ensure_init(state);
+fn rename_at_inner(
+    state: &mut VfsState,
+    old_start: u16,
+    old_path: &str,
+    new_start: u16,
+    new_path: &str,
+) -> Result<(), i64> {
+    let mut old_name = [0u8; VFS_MAX_NAME];
+    let mut new_name = [0u8; VFS_MAX_NAME];
+    let (old_parent, old_len) = resolve_parent_from_inner(state, old_start, old_path, &mut old_name)?;
+    let (new_parent, new_len) = resolve_parent_from_inner(state, new_start, new_path, &mut new_name)?;
+    let child = find_child(state, old_parent, &old_name[..old_len]).ok_or(ENOENT)?;
 
-    if inode as usize >= VFS_MAX_INODES {
-        return Err(ENOENT);
+    if old_parent == new_parent && old_len == new_len && old_name[..old_len] == new_name[..new_len] {
+        return Ok(());
     }
 
-    let node = &state.inodes[inode as usize];
-    if !node.used {
-        return Err(ENOENT);
+    if inode_is_mount_root(state, child) {
+        return Err(EBUSY);
     }
-    if node.file_type == FileType::Directory {
-        return Err(EISDIR);
+    if find_child(state, new_parent, &new_name[..new_len]).is_some() {
+        return Err(EEXIST);
     }
 
-    let end = match node.backend {
-        NodeBackend::Tmpfs => node.size as u64,
-        NodeBackend::Ext2 => {
-            if node.ext2_ino == 0 {
-                return Err(EIO);
-            }
-            ext2_read_inode_from_state(state, node.ext2_ino)?.size as u64
-        }
-        NodeBackend::ProcUptime
-        | NodeBackend::ProcMeminfo
-        | NodeBackend::ProcMounts
-        | NodeBackend::ProcVersion => {
-            let mut buf = [0u8; PROCFS_BUFFER_MAX];
-            format_proc_payload(state, node.backend, &mut buf) as u64
-        }
-        NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => current,
-    };
+    let old_backend = state.inodes[old_parent as usize].backend;
+    let new_backend = state.inodes[new_parent as usize].backend;
+    if old_backend != new_backend {
+        return Err(EINVAL);
+    }
+    if !backend_mutable(old_backend) {
+        return Err(EROFS);
+    }
 
-    let base = match whence {
-        SEEK_SET => 0i128,
-        SEEK_CUR => current as i128,
-        SEEK_END => end as i128,
-        _ => return Err(EINVAL),
-    };
-
-    let target = base + offset as i128;
-    if target < 0 {
+    let child_node = state.inodes[child as usize];
+    if child_node.file_type == FileType::Directory && is_descendant_of(state, child, new_parent) {
         return Err(EINVAL);
     }
 
-    match node.backend {
-        NodeBackend::Tmpfs => {
-            if target > TMPFS_MAX_FILE_SIZE as i128 {
-                return Err(EINVAL);
-            }
+    if old_backend == NodeBackend::Ext2 {
+        let old_parent_ino = state.inodes[old_parent as usize].ext2_ino;
+        let new_parent_ino = state.inodes[new_parent as usize].ext2_ino;
+        if old_parent_ino == 0 || new_parent_ino == 0 || child_node.ext2_ino == 0 {
+            return Err(EIO);
         }
-        NodeBackend::Ext2 => {
-            let max_size =
-                core::cmp::min(TMPFS_MAX_FILE_SIZE, EXT2_INODE_DIRECT_COUNT * state.ext2_meta.block_size);
-            if target > max_size as i128 {
-                return Err(EINVAL);
-            }
+
+        let removed = ext2_remove_dir_entry(state, old_parent_ino, &old_name[..old_len])?;
+        if removed != child_node.ext2_ino {
+            return Err(EIO);
         }
-        NodeBackend::ProcUptime
-        | NodeBackend::ProcMeminfo
-        | NodeBackend::ProcMounts
-        | NodeBackend::ProcVersion => {
-            if target > end as i128 {
-                return Err(EINVAL);
-            }
+        if let Err(err) = ext2_add_dir_entry(
+            state,
+            new_parent_ino,
+            child_node.ext2_ino,
+            &new_name[..new_len],
+            child_node.file_type,
+        ) {
+            let _ = ext2_add_dir_entry(
+                state,
+                old_parent_ino,
+                child_node.ext2_ino,
+                &old_name[..old_len],
+                child_node.file_type,
+            );
+            return Err(err);
         }
-        NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
-            if target > u64::MAX as i128 {
-                return Err(EINVAL);
-            }
+
+        if child_node.file_type == FileType::Directory && old_parent_ino != new_parent_ino {
+            ext2_patch_dotdot(state, child_node.ext2_ino, new_parent_ino)?;
+            let mut old_parent_inode = ext2_read_inode_from_state(state, old_parent_ino)?;
+            old_parent_inode.links_count = old_parent_inode.links_count.saturating_sub(1);
+            ext2_write_inode_to_state(state, old_parent_ino, &old_parent_inode)?;
+
+            let mut new_parent_inode = ext2_read_inode_from_state(state, new_parent_ino)?;
+            new_parent_inode.links_count = new_parent_inode.links_count.saturating_add(1);
+            ext2_write_inode_to_state(state, new_parent_ino, &new_parent_inode)?;
         }
+
+        let mut ext_child = ext2_read_inode_from_state(state, child_node.ext2_ino)?;
+        let now = fs_time_tick(state) as u32;
+        ext_child.ctime = now;
+        ext_child.mtime = now;
+        ext2_write_inode_to_state(state, child_node.ext2_ino, &ext_child)?;
     }
 
-    Ok(target as u64)
+    remove_child(state, old_parent, child)?;
+    add_child(state, new_parent, child)?;
+    let node = &mut state.inodes[child as usize];
+    node.parent = new_parent;
+    node.name_len = new_len as u8;
+    node.name.fill(0);
+    node.name[..new_len].copy_from_slice(&new_name[..new_len]);
+    touch_inode_metadata(state, old_parent, true, true, true);
+    touch_inode_metadata(state, new_parent, true, true, true);
+    touch_inode_metadata(state, child, false, false, true);
+    Ok(())
+}
+
+pub fn root_inode() -> u16 {
+    ROOT_INODE
+}
+
+pub fn init() {
+    with_state(|state| {
+        reset(state);
+        ensure_init(state);
+    });
+}
+
+pub fn set_proc_uptime_ticks(ticks: u64) {
+    with_state(|state| {
+        ensure_init(state);
+        state.proc_uptime_ticks = ticks;
+    });
+}
+
+pub fn set_proc_meminfo(total_bytes: u64, free_bytes: u64, used_bytes: u64) {
+    with_state(|state| {
+        ensure_init(state);
+        state.proc_total_bytes = total_bytes;
+        state.proc_free_bytes = free_bytes;
+        state.proc_used_bytes = used_bytes;
+    });
+}
+
+pub fn lookup(path: &str) -> Result<u16, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        lookup_path_inner(state, path)
+    })
+}
+
+pub fn lookupat(start: u16, path: &str) -> Result<u16, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        lookup_path_from_inner(state, start, path)
+    })
+}
+
+pub fn inode_is_dir(inode: u16) -> Result<bool, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        if (inode as usize) >= VFS_MAX_INODES || !state.inodes[inode as usize].used {
+            return Err(ENOENT);
+        }
+        Ok(state.inodes[inode as usize].file_type == FileType::Directory)
+    })
+}
+
+pub fn mount_ext2_image(mount_path: &str, image: &[u8]) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+
+        let mount_inode = ensure_dir_path_tmpfs(state, mount_path)?;
+        if state.inodes[mount_inode as usize].file_type != FileType::Directory {
+            return Err(ENOTDIR);
+        }
+
+        if state.inodes[mount_inode as usize].child_count != 0 {
+            return Err(EEXIST);
+        }
+
+        if image.is_empty() || image.len() > EXT2_MAX_IMAGE_SIZE {
+            return Err(ENOSPC);
+        }
+
+        state.ext2_image[..image.len()].copy_from_slice(image);
+        state.ext2_image_len = image.len();
+
+        let meta = ext2_parse_meta(&state.ext2_image[..state.ext2_image_len])?;
+        if meta.blocks_per_group == 0 {
+            state.ext2_image_len = 0;
+            return Err(EINVAL);
+        }
+
+        let root = ext2_read_inode(&state.ext2_image[..state.ext2_image_len], &meta, EXT2_ROOT_INODE)?;
+        if ext2_mode_to_filetype(root.mode) != Some(FileType::Directory) {
+            state.ext2_image_len = 0;
+            return Err(EIO);
+        }
+
+        state.ext2_meta = meta;
+        state.ext2_mounted = true;
+        state.ext2_mount_inode = mount_inode;
+
+        match ext2_for_each_dir_entry(image, &meta, &root, |child_ino, _file_type, name| {
+            ext2_import_node(state, mount_inode, name, image, &meta, child_ino, 0)
+        }) {
+            Ok(()) => {
+                let mount = &mut state.inodes[mount_inode as usize];
+                mount.backend = NodeBackend::Ext2;
+                mount.ext2_ino = EXT2_ROOT_INODE;
+                mount.size = root.size;
+                mount.mode = root.mode;
+                mount.links_count = root.links_count;
+                mount.uid = root.uid;
+                mount.gid = root.gid;
+                mount.atime = root.atime as u64;
+                mount.mtime = root.mtime as u64;
+                mount.ctime = root.ctime as u64;
+                mount_table_set(state, mount_inode, mount_path, "ext2", false)?;
+                Ok(())
+            }
+            Err(err) => {
+                rollback_ext2_mount_import(state, mount_inode);
+                Err(err)
+            }
+        }
+    })
+}
+
+pub fn export_ext2_image(out: &mut [u8]) -> Result<usize, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        if !state.ext2_mounted {
+            return Err(ENOENT);
+        }
+        if out.len() < state.ext2_image_len {
+            return Err(ENOSPC);
+        }
+        out[..state.ext2_image_len].copy_from_slice(&state.ext2_image[..state.ext2_image_len]);
+        Ok(state.ext2_image_len)
+    })
+}
+
+pub fn mkdir(path: &str) -> Result<(), i64> {
+    mkdirat(ROOT_INODE, path)
+}
+
+pub fn mkdirat(start: u16, path: &str) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        mkdir_at_inner(state, start, path)
+    })
+}
+
+pub fn open(path: &str, flags: u32, mode: u32) -> Result<OpenResult, i64> {
+    openat(ROOT_INODE, path, flags, mode)
+}
+
+pub fn openat(start: u16, path: &str, flags: u32, mode: u32) -> Result<OpenResult, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        open_at_inner(state, start, path, flags, mode)
+    })
+}
+
+pub fn stat(inode: u16) -> Result<FileStat, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        stat_inner(state, inode)
+    })
+}
+
+pub fn readdir(inode: u16, offset: u64) -> Result<Option<DirEntry>, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        dir_entry_at_offset(state, inode, offset)
+    })
+}
+
+pub fn unlink(path: &str) -> Result<(), i64> {
+    unlinkat(ROOT_INODE, path)
+}
+
+pub fn unlinkat(start: u16, path: &str) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        unlink_at_inner(state, start, path, false)
+    })
+}
+
+pub fn rmdir(path: &str) -> Result<(), i64> {
+    rmdirat(ROOT_INODE, path)
+}
+
+pub fn rmdirat(start: u16, path: &str) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        unlink_at_inner(state, start, path, true)
+    })
+}
+
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), i64> {
+    renameat(ROOT_INODE, old_path, ROOT_INODE, new_path)
+}
+
+pub fn renameat(old_start: u16, old_path: &str, new_start: u16, new_path: &str) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        rename_at_inner(state, old_start, old_path, new_start, new_path)
+    })
+}
+
+pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
+    with_state(|state| {
+        ensure_init(state);
+
+        if inode as usize >= VFS_MAX_INODES {
+            return Err(ENOENT);
+        }
+
+        let node = state.inodes[inode as usize];
+        if !node.used {
+            return Err(ENOENT);
+        }
+        if node.file_type == FileType::Directory {
+            return Err(EISDIR);
+        }
+
+        let out = match node.backend {
+            NodeBackend::Tmpfs => {
+                if dst.is_empty() {
+                    return Ok(0);
+                }
+
+                let file_size = node.size as usize;
+                if offset as usize >= file_size {
+                    return Ok(0);
+                }
+
+                let start = offset as usize;
+                let available = file_size - start;
+                let count = core::cmp::min(dst.len(), available);
+                dst[..count].copy_from_slice(&node.data[start..start + count]);
+                count
+            }
+            NodeBackend::Ext2 => {
+                if node.ext2_ino == 0 {
+                    return Err(EIO);
+                }
+                ext2_read_file(state, node.ext2_ino, offset, dst)?
+            }
+            NodeBackend::DevNull => 0,
+            NodeBackend::DevZero => {
+                dst.fill(0);
+                dst.len()
+            }
+            NodeBackend::DevConsole => 0,
+            NodeBackend::ProcUptime
+            | NodeBackend::ProcMeminfo
+            | NodeBackend::ProcMounts
+            | NodeBackend::ProcVersion => read_proc(&node, state, offset, dst)?,
+        };
+        touch_inode_metadata(state, inode, true, false, false);
+        Ok(out)
+    })
+}
+
+pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteResult, i64> {
+    with_state(|state| {
+        ensure_init(state);
+
+        if inode as usize >= VFS_MAX_INODES {
+            return Err(ENOENT);
+        }
+
+        let node = state.inodes[inode as usize];
+        if !node.used {
+            return Err(ENOENT);
+        }
+        if node.file_type == FileType::Directory {
+            return Err(EISDIR);
+        }
+
+        let result = match node.backend {
+            NodeBackend::Tmpfs => {
+                let node_ref = &mut state.inodes[inode as usize];
+                let mut start = if append {
+                    node_ref.size as usize
+                } else {
+                    match usize::try_from(offset) {
+                        Ok(v) => v,
+                        Err(_) => return Err(EINVAL),
+                    }
+                };
+
+                if start > TMPFS_MAX_FILE_SIZE {
+                    return Err(ENOSPC);
+                }
+
+                if src.is_empty() {
+                    return Ok(WriteResult {
+                        written: 0,
+                        new_offset: start as u64,
+                    });
+                }
+
+                let current_size = node_ref.size as usize;
+                if start > current_size {
+                    node_ref.data[current_size..start].fill(0);
+                }
+
+                let remaining = TMPFS_MAX_FILE_SIZE - start;
+                if remaining == 0 {
+                    return Err(ENOSPC);
+                }
+
+                let count = core::cmp::min(src.len(), remaining);
+                node_ref.data[start..start + count].copy_from_slice(&src[..count]);
+
+                start += count;
+                if start > node_ref.size as usize {
+                    node_ref.size = start as u32;
+                }
+
+                WriteResult {
+                    written: count,
+                    new_offset: start as u64,
+                }
+            }
+            NodeBackend::Ext2 => {
+                if node.ext2_ino == 0 {
+                    return Err(EIO);
+                }
+                let result = ext2_write_file(state, node.ext2_ino, offset, src, append)?;
+                state.inodes[inode as usize].size =
+                    core::cmp::max(state.inodes[inode as usize].size, result.new_offset as u32);
+                result
+            }
+            NodeBackend::ProcUptime
+            | NodeBackend::ProcMeminfo
+            | NodeBackend::ProcMounts
+            | NodeBackend::ProcVersion => return Err(EROFS),
+            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
+                let next = offset.saturating_add(src.len() as u64);
+                WriteResult {
+                    written: src.len(),
+                    new_offset: next,
+                }
+            }
+        };
+        touch_inode_metadata(state, inode, false, true, true);
+        Ok(result)
+    })
+}
+
+pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i64> {
+    with_state(|state| {
+        ensure_init(state);
+
+        if inode as usize >= VFS_MAX_INODES {
+            return Err(ENOENT);
+        }
+
+        let node = &state.inodes[inode as usize];
+        if !node.used {
+            return Err(ENOENT);
+        }
+        if node.file_type == FileType::Directory {
+            return Err(EISDIR);
+        }
+
+        let end = match node.backend {
+            NodeBackend::Tmpfs => node.size as u64,
+            NodeBackend::Ext2 => {
+                if node.ext2_ino == 0 {
+                    return Err(EIO);
+                }
+                ext2_read_inode_from_state(state, node.ext2_ino)?.size as u64
+            }
+            NodeBackend::ProcUptime
+            | NodeBackend::ProcMeminfo
+            | NodeBackend::ProcMounts
+            | NodeBackend::ProcVersion => {
+                let mut buf = [0u8; PROCFS_BUFFER_MAX];
+                format_proc_payload(state, node.backend, &mut buf) as u64
+            }
+            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => current,
+        };
+
+        let base = match whence {
+            SEEK_SET => 0i128,
+            SEEK_CUR => current as i128,
+            SEEK_END => end as i128,
+            _ => return Err(EINVAL),
+        };
+
+        let target = base + offset as i128;
+        if target < 0 {
+            return Err(EINVAL);
+        }
+
+        match node.backend {
+            NodeBackend::Tmpfs => {
+                if target > TMPFS_MAX_FILE_SIZE as i128 {
+                    return Err(EINVAL);
+                }
+            }
+            NodeBackend::Ext2 => {
+                let max_size =
+                    core::cmp::min(TMPFS_MAX_FILE_SIZE, EXT2_INODE_DIRECT_COUNT * state.ext2_meta.block_size);
+                if target > max_size as i128 {
+                    return Err(EINVAL);
+                }
+            }
+            NodeBackend::ProcUptime
+            | NodeBackend::ProcMeminfo
+            | NodeBackend::ProcMounts
+            | NodeBackend::ProcVersion => {
+                if target > end as i128 {
+                    return Err(EINVAL);
+                }
+            }
+            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
+                if target > u64::MAX as i128 {
+                    return Err(EINVAL);
+                }
+            }
+        }
+
+        Ok(target as u64)
+    })
 }
 
 pub fn file_size(inode: u16) -> Result<u64, i64> {
-    let state = state();
-    ensure_init(state);
+    with_state(|state| {
+        ensure_init(state);
 
-    if inode as usize >= VFS_MAX_INODES {
-        return Err(ENOENT);
-    }
+        if inode as usize >= VFS_MAX_INODES {
+            return Err(ENOENT);
+        }
 
-    let node = &state.inodes[inode as usize];
-    if !node.used {
-        return Err(ENOENT);
-    }
+        let node = &state.inodes[inode as usize];
+        if !node.used {
+            return Err(ENOENT);
+        }
 
-    let size = match node.backend {
-        NodeBackend::Tmpfs => node.size as u64,
-        NodeBackend::Ext2 => {
-            if node.ext2_ino == 0 {
-                return Err(EIO);
+        let size = match node.backend {
+            NodeBackend::Tmpfs => node.size as u64,
+            NodeBackend::Ext2 => {
+                if node.ext2_ino == 0 {
+                    return Err(EIO);
+                }
+                ext2_read_inode_from_state(state, node.ext2_ino)?.size as u64
             }
-            ext2_read_inode_from_state(state, node.ext2_ino)?.size as u64
-        }
-        NodeBackend::ProcUptime
-        | NodeBackend::ProcMeminfo
-        | NodeBackend::ProcMounts
-        | NodeBackend::ProcVersion => {
-            let mut buf = [0u8; PROCFS_BUFFER_MAX];
-            format_proc_payload(state, node.backend, &mut buf) as u64
-        }
-        NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => 0,
-    };
+            NodeBackend::ProcUptime
+            | NodeBackend::ProcMeminfo
+            | NodeBackend::ProcMounts
+            | NodeBackend::ProcVersion => {
+                let mut buf = [0u8; PROCFS_BUFFER_MAX];
+                format_proc_payload(state, node.backend, &mut buf) as u64
+            }
+            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => 0,
+        };
 
-    Ok(size)
+        Ok(size)
+    })
 }
 
 #[cfg(test)]
@@ -2540,5 +3494,89 @@ mod tests {
         let nested = open("/mnt/ext2/persist_dir/new.txt", O_CREAT | O_RDWR, 0)
             .expect("create in persisted dir");
         let _ = write(nested.inode, 0, b"x", false).expect("write nested");
+    }
+
+    #[test]
+    fn openat_readdir_and_stat_work() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        mkdir("/tmp/atdir").expect("mkdir /tmp/atdir");
+        let dir = lookup("/tmp/atdir").expect("lookup /tmp/atdir");
+        let file = openat(dir, "child.txt", O_CREAT | O_RDWR, 0).expect("openat create child");
+        let _ = write(file.inode, 0, b"abc", false).expect("write child");
+
+        let mut off = 0u64;
+        let first = readdir(dir, off).expect("readdir first").expect("dot entry");
+        assert_eq!(&first.name[..first.name_len], b".");
+        off = first.next_offset;
+
+        let second = readdir(dir, off).expect("readdir second").expect("dotdot entry");
+        assert_eq!(&second.name[..second.name_len], b"..");
+        off = second.next_offset;
+
+        let third = readdir(dir, off).expect("readdir child").expect("child entry");
+        assert_eq!(&third.name[..third.name_len], b"child.txt");
+        assert_eq!(third.d_type, DT_REG);
+
+        let st = stat(file.inode).expect("stat child");
+        assert_eq!(st.size, 3);
+        assert_eq!(st.file_type, FileType::Regular);
+        assert_ne!(st.mode & STAT_S_IFMT, 0);
+    }
+
+    #[test]
+    fn tmpfs_unlink_rmdir_and_rename_work() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let file = open("/tmp/old.txt", O_CREAT | O_RDWR, 0).expect("create /tmp/old.txt");
+        let _ = write(file.inode, 0, b"x", false).expect("write old");
+        rename("/tmp/old.txt", "/tmp/new.txt").expect("rename tmpfs file");
+        assert_eq!(open("/tmp/old.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+        let newf = open("/tmp/new.txt", O_RDONLY, 0).expect("open renamed file");
+        let mut buf = [0u8; 2];
+        let n = read(newf.inode, 0, &mut buf).expect("read renamed file");
+        assert_eq!(&buf[..n], b"x");
+
+        unlink("/tmp/new.txt").expect("unlink renamed file");
+        assert_eq!(open("/tmp/new.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+
+        mkdir("/tmp/dir").expect("mkdir dir");
+        let _ = open("/tmp/dir/inner.txt", O_CREAT | O_RDWR, 0).expect("create nested");
+        assert_eq!(rmdir("/tmp/dir").unwrap_err(), ENOTEMPTY);
+        unlink("/tmp/dir/inner.txt").expect("unlink nested");
+        rmdir("/tmp/dir").expect("rmdir empty");
+    }
+
+    #[test]
+    fn ext2_unlink_rmdir_and_rename_persist() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        mount_ext2_image("/mnt/ext2", SAMPLE_EXT2).expect("mount ext2");
+
+        rename("/mnt/ext2/hello.txt", "/mnt/ext2/hello2.txt").expect("rename ext2 file");
+        assert_eq!(open("/mnt/ext2/hello.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+        let renamed = open("/mnt/ext2/hello2.txt", O_RDONLY, 0).expect("open renamed ext2");
+        assert!(stat(renamed.inode).unwrap().size > 0);
+
+        let todel = open("/mnt/ext2/todel.txt", O_CREAT | O_RDWR, 0).expect("create todel");
+        let _ = write(todel.inode, 0, b"remove", false).expect("write todel");
+        unlink("/mnt/ext2/todel.txt").expect("unlink ext2 file");
+        assert_eq!(open("/mnt/ext2/todel.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+
+        mkdir("/mnt/ext2/todir").expect("mkdir ext2 dir");
+        rmdir("/mnt/ext2/todir").expect("rmdir ext2 dir");
+        assert_eq!(open("/mnt/ext2/todir", O_RDONLY | O_DIRECTORY, 0).unwrap_err(), ENOENT);
+
+        let mut exported = [0u8; EXT2_MAX_IMAGE_SIZE];
+        let image_len = export_ext2_image(&mut exported).expect("export");
+
+        init();
+        mount_ext2_image("/mnt/ext2", &exported[..image_len]).expect("remount exported");
+        let _ = open("/mnt/ext2/hello2.txt", O_RDONLY, 0).expect("renamed survives remount");
+        assert_eq!(open("/mnt/ext2/hello.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+        assert_eq!(open("/mnt/ext2/todel.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+        assert_eq!(open("/mnt/ext2/todir", O_RDONLY | O_DIRECTORY, 0).unwrap_err(), ENOENT);
     }
 }
