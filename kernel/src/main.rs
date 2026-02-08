@@ -9,10 +9,12 @@ use core::panic::PanicInfo;
 
 mod elf;
 mod exception;
+mod ipc;
 mod memory;
 mod qemu;
 mod sched;
 mod serial;
+mod sync;
 mod syscall;
 mod task;
 mod user;
@@ -62,6 +64,9 @@ pub extern "C" fn kmain() -> ! {
 
     sched::init();
     serial_println!("[SCHED] Initialized");
+
+    ipc::init();
+    serial_println!("[IPC] Initialized");
 
     pit::set_tick_hook(sched::tick);
     idt::set_post_handler_hook(sched::isr_hook);

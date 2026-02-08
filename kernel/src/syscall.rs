@@ -6,6 +6,7 @@ use arch_x86_64::idt::InterruptFrame;
 use arch_x86_64::pit;
 use arch_x86_64::syscall::SyscallFrame;
 
+use crate::ipc;
 use crate::memory::{pmm, vmm};
 use crate::task::{self, TaskState, TASK_FLAG_USER};
 
@@ -28,6 +29,7 @@ const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
 const EIO: i64 = 5;
 const EBADF: i64 = 9;
+const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
@@ -37,6 +39,7 @@ const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ESPIPE: i64 = 29;
 const EROFS: i64 = 30;
+const EPIPE: i64 = 32;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const ENOTEMPTY: i64 = 39;
@@ -50,11 +53,13 @@ const SYS_CLOSE: u64 = 3;
 const SYS_FSTAT: u64 = 5;
 const SYS_LSEEK: u64 = 8;
 const SYS_BRK: u64 = 12;
+const SYS_PIPE: u64 = 22;
 const SYS_YIELD: u64 = 24;
 const SYS_GETPID: u64 = 39;
 const SYS_EXIT: u64 = 60;
 const SYS_GETPPID: u64 = 110;
 const SYS_GETTID: u64 = 186;
+const SYS_FUTEX: u64 = 202;
 const SYS_SET_TID_ADDRESS: u64 = 218;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_EXIT_GROUP: u64 = 231;
@@ -63,6 +68,7 @@ const SYS_MKDIRAT: u64 = 258;
 const SYS_NEWFSTATAT: u64 = 262;
 const SYS_UNLINKAT: u64 = 263;
 const SYS_RENAMEAT: u64 = 264;
+const SYS_PIPE2: u64 = 293;
 
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_EMPTY_PATH: u32 = 0x1000;
@@ -173,6 +179,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_CLOSE, "close", SyscallMode::UserTask, sys_close),
     syscall_def(SYS_FSTAT, "fstat", SyscallMode::UserTask, sys_fstat),
     syscall_def(SYS_LSEEK, "lseek", SyscallMode::UserTask, sys_lseek),
+    syscall_def(SYS_PIPE, "pipe", SyscallMode::UserTask, sys_pipe),
     syscall_def(SYS_BRK, "brk", SyscallMode::UserTask, sys_brk),
     syscall_def(SYS_YIELD, "sched_yield", SyscallMode::AnyTask, sys_yield),
     syscall_def(SYS_GETPID, "getpid", SyscallMode::AnyTask, sys_getpid),
@@ -192,11 +199,13 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_exit_group,
     ),
     syscall_def(SYS_GETDENTS64, "getdents64", SyscallMode::UserTask, sys_getdents64),
+    syscall_def(SYS_FUTEX, "futex", SyscallMode::UserTask, sys_futex),
     syscall_def(SYS_OPENAT, "openat", SyscallMode::UserTask, sys_openat),
     syscall_def(SYS_MKDIRAT, "mkdirat", SyscallMode::UserTask, sys_mkdirat),
     syscall_def(SYS_NEWFSTATAT, "newfstatat", SyscallMode::UserTask, sys_newfstatat),
     syscall_def(SYS_UNLINKAT, "unlinkat", SyscallMode::UserTask, sys_unlinkat),
     syscall_def(SYS_RENAMEAT, "renameat", SyscallMode::UserTask, sys_renameat),
+    syscall_def(SYS_PIPE2, "pipe2", SyscallMode::UserTask, sys_pipe2),
 ];
 
 #[inline]
@@ -238,6 +247,17 @@ fn fs_to_errno(err: i64) -> i64 {
     }
 }
 
+fn ipc_to_errno(err: i64) -> i64 {
+    match err {
+        ipc::EINVAL => EINVAL,
+        ipc::ENOSPC => ENOSPC,
+        ipc::EPIPE => EPIPE,
+        ipc::EAGAIN => EAGAIN,
+        ipc::ENOENT => ENOENT,
+        _ => EIO,
+    }
+}
+
 #[inline]
 fn fd_index(fd: i32) -> Result<usize, i64> {
     if fd < 0 || fd as usize >= task::MAX_TASK_FDS {
@@ -259,7 +279,9 @@ fn fd_alloc(task_ptr: *mut task::Task, kind: u8, inode: u16, flags: u32) -> Resu
         if unsafe { (*task_ptr).user_fd_kind[idx] == task::USER_FD_KIND_EMPTY } {
             unsafe {
                 (*task_ptr).user_fd_kind[idx] = kind;
-                (*task_ptr).user_fd_inode[idx] = if kind == task::USER_FD_KIND_VFS {
+                (*task_ptr).user_fd_inode[idx] = if kind == task::USER_FD_KIND_VFS
+                    || kind == task::USER_FD_KIND_PIPE
+                {
                     inode
                 } else {
                     task::USER_FD_NONE
@@ -283,6 +305,22 @@ fn fd_close(task_ptr: *mut task::Task, fd: i32) -> Result<(), i64> {
         return Err(-EBADF);
     }
 
+    let (kind, inode, flags) = unsafe {
+        (
+            (*task_ptr).user_fd_kind[idx],
+            (*task_ptr).user_fd_inode[idx],
+            (*task_ptr).user_fd_flags[idx],
+        )
+    };
+
+    if kind == task::USER_FD_KIND_PIPE {
+        let close_read = fd_can_read(flags);
+        let close_write = fd_can_write(flags);
+        if inode != task::USER_FD_NONE {
+            let _ = ipc::pipe_close(inode, close_read, close_write);
+        }
+    }
+
     unsafe {
         (*task_ptr).user_fd_kind[idx] = task::USER_FD_KIND_EMPTY;
         (*task_ptr).user_fd_inode[idx] = task::USER_FD_NONE;
@@ -290,6 +328,18 @@ fn fd_close(task_ptr: *mut task::Task, fd: i32) -> Result<(), i64> {
         (*task_ptr).user_fd_flags[idx] = 0;
     }
     Ok(())
+}
+
+fn close_all_fds(task_ptr: *mut task::Task) {
+    if task_ptr.is_null() {
+        return;
+    }
+
+    let mut fd = 0usize;
+    while fd < task::MAX_TASK_FDS {
+        let _ = fd_close(task_ptr, fd as i32);
+        fd += 1;
+    }
 }
 
 fn fd_access_mode(flags: u32) -> u32 {
@@ -695,6 +745,57 @@ fn sys_mkdirat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
+fn write_pipe_fds(task_ptr: *mut task::Task, user_dst: u64, read_fd: i32, write_fd: i32) -> Result<(), i64> {
+    let mut raw = [0u8; 8];
+    raw[..4].copy_from_slice(&read_fd.to_ne_bytes());
+    raw[4..8].copy_from_slice(&write_fd.to_ne_bytes());
+    copy_to_user_task(task_ptr, user_dst, &raw)
+}
+
+fn sys_pipe2(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let user_pipefd = call.arg(0);
+    let flags = call.arg(1) as u32;
+    if flags != 0 {
+        return -EINVAL;
+    }
+
+    let pipe_id = match ipc::pipe_open() {
+        Ok(id) => id,
+        Err(err) => return -ipc_to_errno(err),
+    };
+
+    let read_fd = match fd_alloc(ctx.current, task::USER_FD_KIND_PIPE, pipe_id, fs::O_RDONLY) {
+        Ok(fd) => fd as i32,
+        Err(err) => {
+            let _ = ipc::pipe_close(pipe_id, true, true);
+            return err;
+        }
+    };
+    let write_fd = match fd_alloc(ctx.current, task::USER_FD_KIND_PIPE, pipe_id, fs::O_WRONLY) {
+        Ok(fd) => fd as i32,
+        Err(err) => {
+            let _ = fd_close(ctx.current, read_fd);
+            return err;
+        }
+    };
+
+    if let Err(err) = write_pipe_fds(ctx.current, user_pipefd, read_fd, write_fd) {
+        let _ = fd_close(ctx.current, read_fd);
+        let _ = fd_close(ctx.current, write_fd);
+        return -err;
+    }
+
+    0
+}
+
+fn sys_pipe(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let wrapped = SyscallArgs {
+        num: SYS_PIPE2,
+        args: [call.arg(0), 0, 0, 0, 0, 0],
+    };
+    sys_pipe2(ctx, &wrapped)
+}
+
 fn write_stat_to_user(task_ptr: *mut task::Task, dst: u64, stat: fs::FileStat) -> i64 {
     let raw = LinuxStat::from_fs(stat);
     let bytes = unsafe {
@@ -718,12 +819,42 @@ fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EBADF;
     }
 
-    let inode = unsafe {
-        if (*ctx.current).user_fd_kind[idx] != task::USER_FD_KIND_VFS {
-            return -EBADF;
-        }
-        (*ctx.current).user_fd_inode[idx]
-    };
+    let (kind, inode) = unsafe { ((*ctx.current).user_fd_kind[idx], (*ctx.current).user_fd_inode[idx]) };
+    if kind == task::USER_FD_KIND_PIPE {
+        let pipe_stat = LinuxStat {
+            st_dev: 0,
+            st_ino: inode as u64 + 1,
+            st_nlink: 1,
+            st_mode: 0x1000 | 0o600,
+            st_uid: 0,
+            st_gid: 0,
+            __pad0: 0,
+            st_rdev: 0,
+            st_size: 0,
+            st_blksize: 4096,
+            st_blocks: 0,
+            st_atime: 0,
+            st_atime_nsec: 0,
+            st_mtime: 0,
+            st_mtime_nsec: 0,
+            st_ctime: 0,
+            st_ctime_nsec: 0,
+            __unused: [0; 3],
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&pipe_stat as *const LinuxStat) as *const u8,
+                core::mem::size_of::<LinuxStat>(),
+            )
+        };
+        return match copy_to_user_task(ctx.current, call.arg(1), bytes) {
+            Ok(()) => 0,
+            Err(err) => -err,
+        };
+    }
+    if kind != task::USER_FD_KIND_VFS {
+        return -EBADF;
+    }
     let stat = match fs::stat(inode) {
         Ok(stat) => stat,
         Err(err) => return -fs_to_errno(err),
@@ -860,6 +991,44 @@ fn sys_getdents64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     total as i64
 }
 
+fn read_user_u32(task_ptr: *mut task::Task, user_src: u64) -> Result<u32, i64> {
+    let mut raw = [0u8; 4];
+    copy_from_user_task(task_ptr, user_src, &mut raw)?;
+    Ok(u32::from_ne_bytes(raw))
+}
+
+fn sys_futex(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let uaddr = call.arg(0);
+    if !user_range_ok(uaddr, 4) {
+        return -EFAULT;
+    }
+
+    let op = call.arg(1) as u32;
+    let cmd = op & 0x7F;
+    let val = call.arg(2) as u32;
+
+    match cmd {
+        ipc::FUTEX_WAIT => {
+            if call.arg(3) != 0 {
+                return -EINVAL;
+            }
+            let current = match read_user_u32(ctx.current, uaddr) {
+                Ok(v) => v,
+                Err(err) => return -err,
+            };
+            if current != val {
+                return -EAGAIN;
+            }
+            match ipc::futex_wait(ctx.current, uaddr) {
+                Ok(()) => 0,
+                Err(err) => -ipc_to_errno(err),
+            }
+        }
+        ipc::FUTEX_WAKE => ipc::futex_wake(uaddr, val) as i64,
+        _ => -EINVAL,
+    }
+}
+
 fn sys_unlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let flags = call.arg(2) as u32;
     if flags & !AT_REMOVEDIR != 0 {
@@ -978,6 +1147,16 @@ fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                     return -fs_to_errno(err);
                 }
             }
+        } else if kind == task::USER_FD_KIND_PIPE {
+            match ipc::pipe_read(ctx.current, inode, &mut chunk[..take]) {
+                Ok(n) => n,
+                Err(err) => {
+                    if read_total > 0 {
+                        return read_total as i64;
+                    }
+                    return -ipc_to_errno(err);
+                }
+            }
         } else {
             return -EBADF;
         };
@@ -1068,29 +1247,50 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             continue;
         }
 
-        if kind != task::USER_FD_KIND_VFS {
-            return -EBADF;
-        }
-
-        let append = (flags & fs::O_APPEND) != 0;
-        let write_res = match fs::write(inode, offset, &chunk[..take], append) {
-            Ok(result) => result,
-            Err(err) => {
-                if written > 0 {
-                    return written as i64;
+        if kind == task::USER_FD_KIND_VFS {
+            let append = (flags & fs::O_APPEND) != 0;
+            let write_res = match fs::write(inode, offset, &chunk[..take], append) {
+                Ok(result) => result,
+                Err(err) => {
+                    if written > 0 {
+                        return written as i64;
+                    }
+                    return -fs_to_errno(err);
                 }
-                return -fs_to_errno(err);
+            };
+
+            if write_res.written == 0 {
+                break;
             }
-        };
 
-        if write_res.written == 0 {
-            break;
+            unsafe {
+                (*ctx.current).user_fd_offset[idx] = write_res.new_offset;
+            }
+            written += write_res.written;
+            continue;
         }
 
-        unsafe {
-            (*ctx.current).user_fd_offset[idx] = write_res.new_offset;
+        if kind == task::USER_FD_KIND_PIPE {
+            let wrote = match ipc::pipe_write(ctx.current, inode, &chunk[..take]) {
+                Ok(n) => n,
+                Err(err) => {
+                    if written > 0 {
+                        return written as i64;
+                    }
+                    return -ipc_to_errno(err);
+                }
+            };
+            if wrote == 0 {
+                break;
+            }
+            unsafe {
+                (*ctx.current).user_fd_offset[idx] = offset.saturating_add(wrote as u64);
+            }
+            written += wrote;
+            continue;
         }
-        written += write_res.written;
+
+        return -EBADF;
     }
 
     written as i64
@@ -1113,7 +1313,7 @@ fn sys_lseek(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             (*ctx.current).user_fd_offset[idx],
         )
     };
-    if kind == task::USER_FD_KIND_CONSOLE {
+    if kind == task::USER_FD_KIND_CONSOLE || kind == task::USER_FD_KIND_PIPE {
         return -ESPIPE;
     }
     if kind != task::USER_FD_KIND_VFS {
@@ -1182,8 +1382,7 @@ fn clear_child_tid(ctx: &SyscallContext) {
 
     let zero = [0u8; CLEAR_TID_SIZE];
     let _ = copy_to_user_task(ctx.current, clear_tid, &zero);
-
-    // Full Linux semantics also require a futex wake at this address.
+    let _ = ipc::futex_wake(clear_tid, 1);
     unsafe {
         (*ctx.current).user_clear_tid = 0;
     }
@@ -1195,6 +1394,8 @@ fn sys_exit_common(ctx: &SyscallContext, code: i32) -> i64 {
     }
 
     clear_child_tid(ctx);
+    close_all_fds(ctx.current);
+    ipc::remove_task_waiters(ctx.current);
 
     unsafe {
         (*ctx.current).exit_code = code;
@@ -1301,11 +1502,14 @@ mod tests {
 
     #[test]
     fn syscall_lookup_includes_vfs_extensions() {
+        assert_eq!(lookup_syscall(SYS_PIPE).map(|d| d.name), Some("pipe"));
         assert_eq!(lookup_syscall(SYS_MKDIRAT).map(|d| d.name), Some("mkdirat"));
+        assert_eq!(lookup_syscall(SYS_FUTEX).map(|d| d.name), Some("futex"));
         assert_eq!(lookup_syscall(SYS_NEWFSTATAT).map(|d| d.name), Some("newfstatat"));
         assert_eq!(lookup_syscall(SYS_GETDENTS64).map(|d| d.name), Some("getdents64"));
         assert_eq!(lookup_syscall(SYS_UNLINKAT).map(|d| d.name), Some("unlinkat"));
         assert_eq!(lookup_syscall(SYS_RENAMEAT).map(|d| d.name), Some("renameat"));
+        assert_eq!(lookup_syscall(SYS_PIPE2).map(|d| d.name), Some("pipe2"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub const TASK_FLAG_IDLE: u32 = 0x04;
 pub const USER_FD_KIND_EMPTY: u8 = 0;
 pub const USER_FD_KIND_CONSOLE: u8 = 1;
 pub const USER_FD_KIND_VFS: u8 = 2;
+pub const USER_FD_KIND_PIPE: u8 = 3;
 pub const USER_FD_NONE: u16 = u16::MAX;
 
 const KERNEL_CS: u64 = 0x08;

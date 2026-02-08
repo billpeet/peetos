@@ -41,11 +41,13 @@ For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed i
 
 Limitations / Simplifications
 - The `int 0x80` path currently shares the same Linux-numbered dispatcher as the SYSCALL path and supports a baseline subset:
-  - `SYS_OPEN`, `SYS_OPENAT`, `SYS_CLOSE`, `SYS_READ`, `SYS_WRITE`, `SYS_LSEEK`
+  - `SYS_OPEN`, `SYS_OPENAT`, `SYS_MKDIRAT`, `SYS_CLOSE`, `SYS_READ`, `SYS_WRITE`, `SYS_LSEEK`
+  - `SYS_FSTAT`, `SYS_NEWFSTATAT`, `SYS_GETDENTS64`, `SYS_UNLINKAT`, `SYS_RENAMEAT`
+  - `SYS_PIPE`, `SYS_PIPE2`, `SYS_FUTEX`
   - `SYS_EXIT`, `SYS_EXIT_GROUP`
   - `SYS_YIELD`
   - `SYS_GETPID`, `SYS_GETPPID`, `SYS_GETTID`
-  - `SYS_SET_TID_ADDRESS` (stores per-task clear-tid pointer for future thread-exit/futex wiring)
+  - `SYS_SET_TID_ADDRESS` (stores per-task clear-tid pointer)
   - `SYS_BRK`
 - The int 0x80 path is temporary and will be replaced by a full SYSCALL/SYSRET flow with stack switching.
 
@@ -54,19 +56,21 @@ Limitations / Simplifications
 
 Current implemented handlers:
 - `open/openat/close/read/write/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
+- `pipe/pipe2` via in-kernel anonymous pipe state and per-task fd tables
+- `futex` (`WAIT`/`WAKE` baseline ops only)
 - `exit(status)` and `exit_group(status)`
 - `sched_yield()`
 - `getpid()`, `getppid()`, `gettid()`
-- `set_tid_address(ptr)` (clear-tid pointer tracking; best-effort zeroing on exit)
+- `set_tid_address(ptr)` (clear-tid pointer tracking; best-effort zeroing + wake on exit)
 - `brk(addr)` with per-task program-break metadata and page mapping/unmapping
 
 Limitations / Simplifications
 - Most Linux syscall numbers are still unimplemented and return `-ENOSYS`.
-- VFS integration is baseline-only: `openat` currently supports `AT_FDCWD` with absolute paths; no full mount namespace/path-root semantics.
+- VFS integration is baseline-only: `openat` supports absolute paths plus relative lookups from `AT_FDCWD` or a directory fd, but there is no mount namespace/chroot/path-root isolation.
 - `devfs`/`procfs` are minimal virtual backends (`/dev/null`, `/dev/zero`, `/dev/console`, `/proc/{uptime,meminfo,mounts,version}`) and are not yet full Linux-compatible implementations.
 - Console I/O is simplified: stdio descriptors are pre-seeded for user tasks, console writes go to serial, and console reads currently return EOF.
 - `brk` only manages simple per-task heap growth/shrink and does not yet integrate with full userspace allocator semantics (no `mmap` fallback, no overcommit policy, no guard pages).
-- `set_tid_address` does not yet perform futex wakeups for robust thread teardown semantics.
+- `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.
 
 **Integration**
 `kernel/src/main.rs` calls `arch_syscall::init()` (MSR setup) and `syscall::init()` (dispatcher state init) during early boot.

@@ -67,7 +67,7 @@ Limitations / Simplifications
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Address space switching and `TSS.rsp0` updates are minimal; no per-task TLS (FS/GS).
 - Task metadata for user processes is tracked, but there is no `/proc` or userspace-visible tooling for inspecting it yet.
-- `user_clear_tid` is tracked for future threading semantics, but robust futex wake-on-exit behavior is not implemented yet.
+- `user_clear_tid` zeroing now performs a best-effort futex wake for one waiter at thread exit, but robust-list semantics and thread-group teardown are not implemented yet.
 - No FPU/SSE save/restore per task.
 - Task cleanup is minimal; zombie tasks are not reaped automatically.
 - Run queue operations are protected only by interrupt masking (single-core assumption).

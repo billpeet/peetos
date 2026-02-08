@@ -1,0 +1,65 @@
+# IPC and Synchronization
+
+This document describes the phase-6 baseline IPC/synchronization implementation currently wired into the kernel.
+
+**Where It Lives**
+- `kernel/src/sync.rs`
+- `kernel/src/ipc.rs`
+- `kernel/src/syscall.rs`
+- `kernel/src/main.rs`
+- `kernel/src/task.rs`
+
+**Synchronization Primitives**
+- `SpinLock<T>`: atomic compare/exchange lock with guard-based unlock.
+- `Mutex<T>`: thin wrapper over `SpinLock<T>` for a stable higher-level API surface.
+- `Semaphore`: atomic count with:
+  - `try_down()` non-blocking acquire
+  - `down()` looping acquire with scheduler yield
+  - `up()` release
+
+**IPC State**
+- Global in-kernel IPC state protected by `SpinLock`:
+  - Fixed-size pipe table (`IPC_MAX_PIPES`)
+  - Fixed-size waiter table (`IPC_MAX_WAITERS`)
+- Waiters are keyed by:
+  - pipe-readable condition
+  - pipe-writable condition
+  - futex user address
+
+**Pipes**
+- `pipe_open()` allocates an anonymous pipe with one read end and one write end.
+- `pipe_read()`:
+  - returns available bytes from ring buffer
+  - returns EOF when no writers remain
+  - blocks when empty and writers still exist
+- `pipe_write()`:
+  - writes into ring buffer
+  - returns `EPIPE` when no readers remain
+  - blocks when buffer is full
+- `pipe_close()` decrements read/write endpoint counts and wakes blocked peers.
+
+**Futex**
+- `futex_wait(task, addr)` registers a waiter keyed by user address and blocks.
+- `futex_wake(addr, count)` wakes up to `count` waiters for that address.
+- `remove_task_waiters(task)` removes stale waiters during task teardown.
+
+**Syscall Integration**
+- Added syscall numbers and handlers:
+  - `pipe` (`22`)
+  - `futex` (`202`)
+  - `pipe2` (`293`)
+- FD wiring:
+  - new task fd kind for pipes (`USER_FD_KIND_PIPE`)
+  - `read`/`write` route pipe fds to IPC backend
+  - `lseek` on pipes returns `-ESPIPE`
+  - `close` tears down pipe endpoints
+- Exit behavior:
+  - `clear_child_tid` now does best-effort zero + `futex_wake(addr, 1)`
+  - task exit removes pending IPC waiters for the exiting task
+
+Limitations / Simplifications
+- Single-core assumptions still apply; synchronization is designed for current non-SMP kernel flow.
+- IPC capacities are static (`IPC_MAX_PIPES`, `IPC_MAX_WAITERS`, fixed pipe buffer size).
+- Pipe semantics are baseline only: no `poll`/`epoll`, no `O_NONBLOCK`, no `splice`/`tee`, no `SIGPIPE` delivery.
+- Futex support is limited to `FUTEX_WAIT`/`FUTEX_WAKE` with no timeout, bitset, requeue, priority inheritance, or robust-list handling.
+- No signal, shared-memory, or message-queue IPC primitives are implemented yet.
