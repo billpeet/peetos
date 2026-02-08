@@ -6,7 +6,11 @@ This document describes the ELF loader used for the Phase 4 user-mode bring-up. 
 - `kernel/src/elf.rs`
 - `kernel/src/user.rs`
 - `user/hello.asm`
+- `user/hello_dyn.asm`
+- `user/ld_peetos.asm`
 - `user/hello.elf`
+- `user/hello_dyn.elf`
+- `user/ld-peetos.so`
 - `scripts/build_user.sh`
 
 **Supported Format**
@@ -14,19 +18,20 @@ The loader supports ELF64 for `x86_64` little-endian. `elf::load()` accepts `ET_
 
 **Load Flow**
 1. `user::spawn_init()` creates a new address space (`vmm::create_address_space()`).
-2. `elf::load()` validates the ELF header and program headers (`e_version`, header sizes, `PT_LOAD` bounds/alignment rules, malformed/duplicate `PT_INTERP`, and rejects RWX load segments).
+2. The main image is validated and loaded (`elf::load_at()` for PIE `ET_DYN` init image, or `elf::load()` for `ET_EXEC` fallback). Validation covers header sizes, `PT_LOAD` bounds/alignment rules, malformed/duplicate `PT_INTERP`, and rejects RWX load segments.
 3. For each `PT_LOAD` segment:
    - The virtual address range is aligned to 4KB pages.
    - Physical pages are allocated via `pmm::alloc_page()` and mapped with `vmm::map_page_in()`.
    - Pages are zeroed, then segment bytes are copied from the ELF image into the mapped pages.
-4. Before committing load success, the loader verifies the final entry point is inside an executable user `PT_LOAD` range.
-5. The loader records program header metadata (PHDR address/count/size), detects dynamic metadata (`ET_DYN`, `PT_INTERP`, `PT_DYNAMIC`), and returns the entry point (`e_entry`) plus the top of the loaded image (`program_break`) for future heap work.
-6. `user::spawn_init()` sets up a 32KB user stack, writes a Linux-style initial stack image (`argc`, `argv`, `envp`, `auxv` with `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_BASE`/`AT_ENTRY`), and builds an `InterruptFrame` to enter ring 3 at the ELF entry point.
+4. If the main image has `PT_INTERP`, the interpreter path is resolved against embedded images (`/lib/ld-peetos.so` currently) and loaded with `elf::load_at()` at a fixed user base.
+5. Before committing load success, the loader verifies each final entry point is inside an executable user `PT_LOAD` range.
+6. The loader records program header metadata (PHDR address/count/size), detects dynamic metadata (`ET_DYN`, `PT_INTERP`, `PT_DYNAMIC`), and returns the entry point (`e_entry`) plus the top of the loaded image (`program_break`) for future heap work.
+7. `user::spawn_init()` sets up a 32KB user stack, writes a Linux-style initial stack image (`argc`, `argv`, `envp`, `auxv` with `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_BASE`/`AT_ENTRY`), and builds an `InterruptFrame` that starts at the interpreter entry (when present) or the main entry.
 
 Limitations / Simplifications
 - `elf::load_at()` accepts PIE/`ET_DYN`, but relocations and `PT_DYNAMIC` entry parsing are not implemented.
-- `PT_INTERP` is detected and stored, but the interpreter is not loaded yet.
-- No dynamic linking or symbol resolution.
+- `PT_INTERP` mapping is currently a minimal bootstrap: only embedded interpreter images are supported (no filesystem lookup or shebang-style resolution).
+- Dynamic symbol resolution/relocations are still not implemented (`PT_DYNAMIC` is metadata-only at this stage).
 - Segment permissions set `PTE_NO_EXECUTE`, and `EFER.NXE` is enabled during syscall/MSR setup.
 - Segment-level W^X is enforced by rejecting `PF_W | PF_X` `PT_LOAD` segments, but there is no SMEP/SMAP integration.
 - User address checks are stricter than the initial baseline (checked arithmetic + entrypoint-in-exec-range checks), but there is still no ASLR.

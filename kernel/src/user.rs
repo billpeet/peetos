@@ -14,10 +14,14 @@ use crate::task::{self, TaskState, TASK_FLAG_USER};
 const USER_STACK_TOP: u64 = 0x7FFF_FF00_0000;
 const USER_STACK_SIZE: u64 = 32 * 1024;
 const USER_STACK_PAGES: usize = (USER_STACK_SIZE / PAGE_SIZE) as usize;
+const INIT_LOAD_BASE: u64 = 0x0040_0000;
+const INIT_INTERP_BASE: u64 = 0x7000_0000;
+const ELF_INTERP_MAX: usize = 256;
 
 const INIT_ARGV0: &[u8] = b"/init\0";
 const INIT_ENV_PATH: &[u8] = b"PATH=/bin\0";
 const INIT_ENV_TERM: &[u8] = b"TERM=peetos\0";
+const INIT_INTERP_PATH: &[u8] = b"/lib/ld-peetos.so";
 
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
@@ -27,7 +31,8 @@ const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 
-static HELLO_ELF: &[u8] = include_bytes!("../../user/hello.elf");
+static HELLO_DYN_ELF: &[u8] = include_bytes!("../../user/hello_dyn.elf");
+static LD_PEETOS_SO: &[u8] = include_bytes!("../../user/ld-peetos.so");
 
 #[derive(Clone, Copy)]
 struct UserStackPlan<const ARGC: usize, const ENVC: usize> {
@@ -43,6 +48,30 @@ struct UserStackPlan<const ARGC: usize, const ENVC: usize> {
 #[inline]
 fn align_down(value: u64, align: u64) -> u64 {
     value & !(align - 1)
+}
+
+fn cstr_bytes_len(buf: &[u8]) -> Option<usize> {
+    for (idx, byte) in buf.iter().enumerate() {
+        if *byte == 0 {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn interp_path_bytes(buf: &[u8; ELF_INTERP_MAX]) -> Option<&[u8]> {
+    let len = cstr_bytes_len(buf)?;
+    if len == 0 {
+        return None;
+    }
+    Some(&buf[..len])
+}
+
+fn resolve_interp_image(path: &[u8]) -> Option<&'static [u8]> {
+    if path == INIT_INTERP_PATH {
+        return Some(LD_PEETOS_SO);
+    }
+    None
 }
 
 fn user_range_ok(start: u64, len: usize) -> bool {
@@ -260,12 +289,40 @@ pub fn spawn_init() {
         return;
     }
 
-    let elf_result = elf::load(HELLO_ELF, pml4);
+    let mut elf_result = if elf::is_dynamic(HELLO_DYN_ELF) {
+        elf::load_at(HELLO_DYN_ELF, pml4, INIT_LOAD_BASE)
+    } else {
+        elf::load(HELLO_DYN_ELF, pml4)
+    };
     if !elf_result.success {
-        serial_println!("[USER] ERROR: failed to load ELF");
+        serial_println!("[USER] ERROR: failed to load init ELF");
         vmm::destroy_address_space(pml4);
         return;
     }
+
+    let mut entry_rip = elf_result.entry_point;
+    let mut interp_base = 0u64;
+    if let Some(path) = interp_path_bytes(&elf_result.interp_path) {
+        let interp_image = match resolve_interp_image(path) {
+            Some(image) => image,
+            None => {
+                serial_println!("[USER] ERROR: unsupported PT_INTERP path");
+                vmm::destroy_address_space(pml4);
+                return;
+            }
+        };
+
+        let interp_result = elf::load_at(interp_image, pml4, INIT_INTERP_BASE);
+        if !interp_result.success {
+            serial_println!("[USER] ERROR: failed to load PT_INTERP image");
+            vmm::destroy_address_space(pml4);
+            return;
+        }
+
+        interp_base = interp_result.base_addr;
+        entry_rip = interp_result.entry_point;
+    }
+    elf_result.interp_base = interp_base;
 
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
     for i in 0..USER_STACK_PAGES {
@@ -303,7 +360,7 @@ pub fn spawn_init() {
         (AT_PHENT, elf_result.phdr_size as u64),
         (AT_PHNUM, elf_result.phdr_count as u64),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_BASE, elf_result.interp_base),
+        (AT_BASE, interp_base),
         (AT_ENTRY, elf_result.entry_point),
     ];
     let stack_plan = match populate_user_stack::<1, 2, 6>(
@@ -346,7 +403,7 @@ pub fn spawn_init() {
         (*task_ptr).user_phdr_count = elf_result.phdr_count;
         (*task_ptr).user_phdr_size = elf_result.phdr_size;
         (*task_ptr).user_base_addr = elf_result.base_addr;
-        (*task_ptr).user_interp_base = elf_result.interp_base;
+        (*task_ptr).user_interp_base = interp_base;
         (*task_ptr).user_is_dynamic = elf_result.is_dynamic;
 
         let stack_top = (*task_ptr).kernel_stack_top;
@@ -360,7 +417,7 @@ pub fn spawn_init() {
         (*frame).rsp = stack_plan.initial_rsp;
         (*frame).rflags = 0x202;
         (*frame).cs = gdt::USER_CS as u64;
-        (*frame).rip = elf_result.entry_point;
+        (*frame).rip = entry_rip;
         (*frame).int_no = 0;
         (*frame).error_code = 0;
 
@@ -371,8 +428,9 @@ pub fn spawn_init() {
     crate::sched::add_task(task_ptr);
 
     serial_println!(
-        "[USER] User task ready (entry=0x{:x}, rsp=0x{:x})",
+        "[USER] User task ready (entry=0x{:x}, start=0x{:x}, rsp=0x{:x})",
         elf_result.entry_point,
+        entry_rip,
         stack_plan.initial_rsp
     );
 }
@@ -415,5 +473,27 @@ mod tests {
             [b"PATH=/bin\0", b"TERM=peetos\0"],
         )
         .is_none());
+    }
+
+    #[test]
+    fn interp_path_extracts_expected_bytes() {
+        let mut raw = [0u8; ELF_INTERP_MAX];
+        raw[..INIT_INTERP_PATH.len()].copy_from_slice(INIT_INTERP_PATH);
+        raw[INIT_INTERP_PATH.len()] = 0;
+
+        let path = interp_path_bytes(&raw).expect("path should parse");
+        assert_eq!(path, INIT_INTERP_PATH);
+    }
+
+    #[test]
+    fn interp_path_empty_returns_none() {
+        let raw = [0u8; ELF_INTERP_MAX];
+        assert!(interp_path_bytes(&raw).is_none());
+    }
+
+    #[test]
+    fn resolve_interp_image_matches_known_path() {
+        assert!(resolve_interp_image(INIT_INTERP_PATH).is_some());
+        assert!(resolve_interp_image(b"/bad/interp").is_none());
     }
 }

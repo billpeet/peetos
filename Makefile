@@ -14,11 +14,17 @@ BOOT_BIN   := $(BUILD_DIR)/boot.bin
 STAGE2_BIN := $(BUILD_DIR)/stage2.bin
 ENTRY_OBJ  := $(BUILD_DIR)/entry.o
 USER_OBJ   := $(BUILD_DIR)/user_hello.o
+USER_DYN_OBJ := $(BUILD_DIR)/user_hello_dyn.o
+USER_INTERP_OBJ := $(BUILD_DIR)/user_ld_peetos.o
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 KERNEL_BIN := $(BUILD_DIR)/kernel.bin
 USER_ELF   := user/hello.elf
+USER_DYN_ELF := user/hello_dyn.elf
+USER_INTERP_SO := user/ld-peetos.so
 USER_ASM   := user/hello.asm
+USER_DYN_ASM := user/hello_dyn.asm
+USER_INTERP_ASM := user/ld_peetos.asm
 
 PROFILE ?= release
 ifeq ($(PROFILE),release)
@@ -76,9 +82,19 @@ $(USER_ELF): $(USER_ASM) | $(BUILD_DIR)
 	$(LD) -nostdlib -static -z max-page-size=0x1000 -Ttext 0x400000 \
 		-o $@ $(USER_OBJ)
 
-user: $(USER_ELF)
+$(USER_DYN_ELF): $(USER_DYN_ASM) | $(BUILD_DIR)
+	$(ASM) -f elf64 -g -o $(USER_DYN_OBJ) $<
+	$(LD) -nostdlib -pie -z max-page-size=0x1000 --dynamic-linker /lib/ld-peetos.so \
+		-o $@ $(USER_DYN_OBJ)
 
-kernel: $(ENTRY_OBJ) $(USER_ELF)
+$(USER_INTERP_SO): $(USER_INTERP_ASM) | $(BUILD_DIR)
+	$(ASM) -f elf64 -g -o $(USER_INTERP_OBJ) $<
+	$(LD) -nostdlib -shared -z max-page-size=0x1000 -e _start \
+		-o $@ $(USER_INTERP_OBJ)
+
+user: $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO)
+
+kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@cp $(KERNEL_TARGET) $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)

@@ -31,12 +31,13 @@ The boot task represents the current execution context and is created in `task::
 **User Task Bring-Up**
 `kernel/src/user.rs` creates a minimal user task by:
 - Creating a fresh address space with `vmm::create_address_space()`.
-- Loading an embedded ELF64 image (`user/hello.elf`) into the new address space.
+- Loading an embedded ELF64 image (`user/hello_dyn.elf`) into the new address space.
+- If `PT_INTERP` is present, loading the embedded interpreter (`user/ld-peetos.so`) and entering user mode at the interpreter entry.
 - Mapping a 32KB user stack at `USER_STACK_TOP = 0x7FFF_FF00_0000`.
 - Writing a Linux-style initial stack (`argc`, `argv`, `envp`, `auxv`) before first ring-3 entry.
 - Building an `InterruptFrame` that returns to ring 3 via `iretq`.
 
-The initial user program is a small ELF that invokes `int 0x80` to call Linux `SYS_EXIT` (`60`).
+The initial user program is a small dynamic ELF that writes to stdout then exits via `int 0x80`.
 
 **Scheduler**
 `kernel/src/sched.rs` provides a simple round-robin scheduler:
@@ -59,7 +60,8 @@ The initial user program is a small ELF that invokes `int 0x80` to call Linux `S
 
 Limitations / Simplifications
 - User mode is minimal: a single hardcoded user task with a fixed embedded ELF.
-- No `exec`/`fork` and no dynamic linker; `argv`/`envp` are currently fixed at spawn time for the embedded init ELF.
+- No `exec`/`fork`; `argv`/`envp` are currently fixed at spawn time for the embedded init ELF.
+- Dynamic-linking support is bootstrap-only (embedded `PT_INTERP` image, no reloc/symbol resolution).
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Address space switching and `TSS.rsp0` updates are minimal; no per-task TLS (FS/GS).
 - Task metadata for user processes is tracked, but there is no `/proc` or userspace-visible tooling for inspecting it yet.
