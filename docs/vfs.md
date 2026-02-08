@@ -16,7 +16,7 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
   - `devfs`: `/dev/null`, `/dev/zero`, `/dev/console`
   - `procfs`: `/proc/uptime`, `/proc/meminfo`, `/proc/mounts`, `/proc/version`
 - ext2 baseline importer:
-  - `mount_ext2_image(path, image)` parses a raw ext2 image and imports files/dirs as read-only VFS nodes.
+  - `mount_ext2_image(path, image)` parses a raw ext2 image and imports files/dirs as ext2-backed VFS nodes.
   - Kernel init mounts `user/sample_ext2.img` at `/mnt/ext2`.
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
@@ -43,7 +43,8 @@ On initialization, the kernel creates:
   - `/proc/mounts` reflects ext2 only when the ext2 sample is actually mounted
   - proc files are read-only (`-EROFS` on write)
 - ext2 behavior:
-  - Imported files/directories are exposed as read-only nodes (`-EROFS` on write/truncate/create under mount).
+  - Imported files/directories support baseline mutable regular-file and directory operations (`read`, `write`, `truncate`, `create`, `mkdir`) through the existing VFS file APIs.
+  - `/proc/mounts` reports ext2 as `rw` when mounted.
   - Mount import is rollback-safe: on parse/import failure, partially imported nodes are removed.
 
 **Syscall Integration**
@@ -64,4 +65,5 @@ Limitations / Simplifications
 - `readdir`, `stat`, and broader metadata syscalls are not implemented yet.
 - Console input is not implemented yet; console reads currently return EOF.
 - No explicit synchronization/locking in fs state (single-core assumption).
-- ext2 importer is intentionally minimal: read-only, regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, no ownership/permission metadata mapping, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
+- ext2 importer is intentionally minimal: regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, no ownership/permission metadata mapping, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
+- ext2 writes are currently in-memory only after import; they do not write back to the source ext2 image and do not update on-disk ext2 metadata structures.

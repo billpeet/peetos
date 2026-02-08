@@ -60,7 +60,7 @@ pub enum FileType {
 #[repr(u8)]
 enum NodeBackend {
     Tmpfs = 0,
-    Ext2Ro = 1,
+    Ext2 = 1,
     DevNull = 2,
     DevZero = 3,
     DevConsole = 4,
@@ -160,9 +160,22 @@ fn state() -> &'static mut VfsState {
     unsafe { &mut VFS_STATE }
 }
 
+fn clear_inode(inode: &mut Inode) {
+    inode.used = false;
+    inode.file_type = FileType::None;
+    inode.backend = NodeBackend::Tmpfs;
+    inode.parent = ROOT_INODE;
+    inode.name.fill(0);
+    inode.name_len = 0;
+    inode.size = 0;
+    inode.child_count = 0;
+    inode.children.fill(0);
+    inode.data.fill(0);
+}
+
 fn reset(state: &mut VfsState) {
     for slot in state.inodes.iter_mut() {
-        *slot = Inode::empty();
+        clear_inode(slot);
     }
     state.proc_uptime_ticks = 0;
     state.proc_total_bytes = 0;
@@ -173,7 +186,7 @@ fn reset(state: &mut VfsState) {
 
 fn setup_root(state: &mut VfsState) {
     let root = &mut state.inodes[ROOT_INODE as usize];
-    *root = Inode::empty();
+    clear_inode(root);
     root.used = true;
     root.file_type = FileType::Directory;
     root.backend = NodeBackend::Tmpfs;
@@ -256,7 +269,7 @@ fn alloc_inode(
     while slot < VFS_MAX_INODES {
         if !state.inodes[slot].used {
             let inode = &mut state.inodes[slot];
-            *inode = Inode::empty();
+            clear_inode(inode);
             inode.used = true;
             inode.file_type = file_type;
             inode.backend = backend;
@@ -416,7 +429,8 @@ fn create_regular_inner(state: &mut VfsState, path: &str) -> Result<u16, i64> {
     let mut name = [0u8; VFS_MAX_NAME];
     let (parent, name_len) = resolve_parent_inner(state, path, &mut name)?;
 
-    if state.inodes[parent as usize].backend != NodeBackend::Tmpfs {
+    let parent_backend = state.inodes[parent as usize].backend;
+    if !matches!(parent_backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
         return Err(EROFS);
     }
 
@@ -427,7 +441,7 @@ fn create_regular_inner(state: &mut VfsState, path: &str) -> Result<u16, i64> {
     let inode = alloc_inode(
         state,
         FileType::Regular,
-        NodeBackend::Tmpfs,
+        parent_backend,
         parent,
         &name[..name_len],
     )?;
@@ -439,7 +453,8 @@ fn mkdir_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
     let mut name = [0u8; VFS_MAX_NAME];
     let (parent, name_len) = resolve_parent_inner(state, path, &mut name)?;
 
-    if state.inodes[parent as usize].backend != NodeBackend::Tmpfs {
+    let parent_backend = state.inodes[parent as usize].backend;
+    if !matches!(parent_backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
         return Err(EROFS);
     }
 
@@ -450,7 +465,7 @@ fn mkdir_inner(state: &mut VfsState, path: &str) -> Result<(), i64> {
     let inode = alloc_inode(
         state,
         FileType::Directory,
-        NodeBackend::Tmpfs,
+        parent_backend,
         parent,
         &name[..name_len],
     )?;
@@ -544,7 +559,7 @@ fn has_ext2_mount(state: &VfsState) -> bool {
     };
 
     let mount = &state.inodes[mount_inode as usize];
-    mount.used && mount.file_type == FileType::Directory && mount.backend == NodeBackend::Ext2Ro
+    mount.used && mount.file_type == FileType::Directory && mount.backend == NodeBackend::Ext2
 }
 
 fn format_proc_payload(state: &VfsState, backend: NodeBackend, out: &mut [u8]) -> usize {
@@ -558,7 +573,7 @@ fn format_proc_payload(state: &VfsState, backend: NodeBackend, out: &mut [u8]) -
             append_str(out, &mut cursor, "devfs /dev devfs rw 0 0\n");
             append_str(out, &mut cursor, "proc /proc procfs ro 0 0\n");
             if has_ext2_mount(state) {
-                append_str(out, &mut cursor, "ext2 /mnt/ext2 ext2 ro 0 0\n");
+                append_str(out, &mut cursor, "ext2 /mnt/ext2 ext2 rw 0 0\n");
             }
         }
         NodeBackend::ProcUptime => {
@@ -930,7 +945,7 @@ fn ext2_import_node(
         None => return Ok(()),
     };
 
-    let node = alloc_inode(state, file_type, NodeBackend::Ext2Ro, parent, name)?;
+    let node = alloc_inode(state, file_type, NodeBackend::Ext2, parent, name)?;
     add_child(state, parent, node)?;
 
     match file_type {
@@ -980,7 +995,7 @@ fn clear_inode_subtree(state: &mut VfsState, inode: u16) {
         idx += 1;
     }
 
-    state.inodes[inode as usize] = Inode::empty();
+    clear_inode(&mut state.inodes[inode as usize]);
 }
 
 fn rollback_ext2_mount_import(state: &mut VfsState, mount_inode: u16) {
@@ -1055,7 +1070,7 @@ pub fn mount_ext2_image(mount_path: &str, image: &[u8]) -> Result<(), i64> {
         ext2_import_node(state, mount_inode, name, image, &meta, child_ino, 0)
     }) {
         Ok(()) => {
-            state.inodes[mount_inode as usize].backend = NodeBackend::Ext2Ro;
+            state.inodes[mount_inode as usize].backend = NodeBackend::Ext2;
             Ok(())
         }
         Err(err) => {
@@ -1101,7 +1116,7 @@ pub fn open(path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
     }
 
     if (flags & O_TRUNC) != 0 && inode.file_type == FileType::Regular && access != O_RDONLY {
-        if inode.backend != NodeBackend::Tmpfs {
+        if !matches!(inode.backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
             return Err(EROFS);
         }
         inode.size = 0;
@@ -1131,7 +1146,7 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
     }
 
     match node.backend {
-        NodeBackend::Tmpfs | NodeBackend::Ext2Ro => {
+        NodeBackend::Tmpfs | NodeBackend::Ext2 => {
             if dst.is_empty() {
                 return Ok(0);
             }
@@ -1177,7 +1192,7 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
     }
 
     match node.backend {
-        NodeBackend::Tmpfs => {
+        NodeBackend::Tmpfs | NodeBackend::Ext2 => {
             let mut start = if append {
                 node.size as usize
             } else {
@@ -1221,8 +1236,7 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
                 new_offset: start as u64,
             })
         }
-        NodeBackend::Ext2Ro
-        | NodeBackend::ProcUptime
+        NodeBackend::ProcUptime
         | NodeBackend::ProcMeminfo
         | NodeBackend::ProcMounts
         | NodeBackend::ProcVersion => Err(EROFS),
@@ -1253,7 +1267,7 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
     }
 
     let end = match node.backend {
-        NodeBackend::Tmpfs | NodeBackend::Ext2Ro => node.size as u64,
+        NodeBackend::Tmpfs | NodeBackend::Ext2 => node.size as u64,
         NodeBackend::ProcUptime
         | NodeBackend::ProcMeminfo
         | NodeBackend::ProcMounts
@@ -1277,13 +1291,8 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
     }
 
     match node.backend {
-        NodeBackend::Tmpfs => {
+        NodeBackend::Tmpfs | NodeBackend::Ext2 => {
             if target > TMPFS_MAX_FILE_SIZE as i128 {
-                return Err(EINVAL);
-            }
-        }
-        NodeBackend::Ext2Ro => {
-            if target > end as i128 {
                 return Err(EINVAL);
             }
         }
@@ -1319,7 +1328,7 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
     }
 
     let size = match node.backend {
-        NodeBackend::Tmpfs | NodeBackend::Ext2Ro => node.size as u64,
+        NodeBackend::Tmpfs | NodeBackend::Ext2 => node.size as u64,
         NodeBackend::ProcUptime
         | NodeBackend::ProcMeminfo
         | NodeBackend::ProcMounts
@@ -1502,10 +1511,27 @@ mod tests {
         let mut mounts_buf = [0u8; 256];
         let mounts_n = read(mounts.inode, 0, &mut mounts_buf).expect("read mounts");
         let mounts_text = core::str::from_utf8(&mounts_buf[..mounts_n]).expect("utf8");
-        assert!(mounts_text.contains("ext2 /mnt/ext2 ext2 ro"));
+        assert!(mounts_text.contains("ext2 /mnt/ext2 ext2 rw"));
 
-        let err = write(file.inode, 0, b"nope", false).unwrap_err();
-        assert_eq!(err, EROFS);
+        let write_res = write(file.inode, 0, b"Hey", false).expect("ext2 write works");
+        assert_eq!(write_res.written, 3);
+
+        let mut updated = [0u8; 8];
+        let updated_n = read(file.inode, 0, &mut updated).expect("read updated");
+        assert_eq!(&updated[..updated_n], b"Heylo fr");
+
+        let created = open("/mnt/ext2/new.txt", O_CREAT | O_RDWR, 0).expect("create ext2 file");
+        let wrote_new = write(created.inode, 0, b"fresh", false).expect("write new ext2");
+        assert_eq!(wrote_new.written, 5);
+
+        let mut new_buf = [0u8; 8];
+        let new_n = read(created.inode, 0, &mut new_buf).expect("read new ext2");
+        assert_eq!(&new_buf[..new_n], b"fresh");
+
+        mkdir("/mnt/ext2/newdir").expect("mkdir ext2 dir");
+        let nested = open("/mnt/ext2/newdir/note.txt", O_CREAT | O_RDWR, 0).expect("create nested");
+        let nested_w = write(nested.inode, 0, b"vfs", false).expect("write nested");
+        assert_eq!(nested_w.written, 3);
     }
 
     #[test]

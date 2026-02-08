@@ -1,2 +1,2 @@
 Hello from ext2 sample image
-This file is mounted read-only via the Rust ext2 importer.
+This file is mounted with in-memory write support via the Rust ext2 importer.

@@ -35,7 +35,7 @@ Key references in the C project:
 - Dynamic user bootstrap now works for a minimal `PT_INTERP` flow: a PIE main image is loaded, its interpreter (`/lib/ld-peetos.so`) is mapped, and first user RIP starts in the interpreter with `AT_ENTRY`/`AT_BASE` set.
 - Syscall dispatch now uses a table-driven Linux-numbered stage-4/5 baseline (`open`, `openat`, `close`, `read`, `write`, `lseek`, `exit`, `exit_group`, `yield`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `brk`) with shared SYSCALL/int80 argument handling and per-task user metadata (`brk`, stack bounds, argv/envp/auxv pointers, ELF PHDR info, FD table state).
 - Initial user bootstrap now builds a conventional process stack (`argc`, `argv`, `envp`, `auxv`) so libc-facing usermode setup has a stable base for future `execve` work.
-- A phase-5 baseline VFS is now active with concrete tmpfs behavior, virtual `devfs`/`procfs` nodes, and a read-only ext2 image importer mounted at `/mnt/ext2`.
+- A phase-5 baseline VFS is now active with concrete tmpfs behavior, virtual `devfs`/`procfs` nodes, and an ext2 image importer mounted at `/mnt/ext2` with in-memory write support.
 - Subsystem crates (`drivers`, `net`, `syscall`, `userabi`) remain placeholders; device drivers and full user space are not yet implemented.
 
 ## Documentation
