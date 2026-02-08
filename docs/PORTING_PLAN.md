@@ -11,7 +11,7 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 - Phase 0: Complete. Workspace, subsystem crates, bootloader/linker reuse, Makefile, `.cargo/config.toml`, and kernel entry assembly are present.
 - Phase 1: Complete. The kernel boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a loop. The panic handler reports over serial before halting.
 - Phase 2: Complete (baseline). Added `arch_x86_64` port I/O helpers, interrupt enable/disable wrappers (plus RAII guard), GDT/IDT setup with interrupt stubs and handler registration, PIC remap, PIT timer init, syscall entry/MSR setup, and a serial exception report.
-- Phase 3: In progress. Added typed address helpers and a bitmap-based PMM init/allocation path; VMM and heap allocator still pending.
+- Phase 3: Complete (baseline). Added typed address helpers, bitmap-based PMM, VMM mapping/address-space support, and a kernel heap allocator.
 - Phases 4–10: Not started.
 
 ## Phase 0: Project Scaffolding
@@ -39,10 +39,10 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 
 ## Phase 3: Memory Management
 
-- Physical frame allocator (bitmap allocator) - initial implementation done.
-- Virtual memory manager (4-level paging, higher-half kernel) - pending.
-- Kernel heap allocator with safe wrappers - pending.
-- Introduce typed addresses (`PhysAddr`, `VirtAddr`) and RAII mappings - typed addresses done; RAII mappings pending.
+- Physical frame allocator (bitmap allocator) - done.
+- Virtual memory manager (4-level paging, higher-half kernel) - done.
+- Kernel heap allocator with safe wrappers - done.
+- Introduce typed addresses (`PhysAddr`, `VirtAddr`) and RAII mappings - done.
 
 ## Phase 4: Tasking + Syscalls
 

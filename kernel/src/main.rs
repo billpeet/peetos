@@ -14,7 +14,7 @@ mod syscall;
 mod memory;
 
 use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall};
-use memory::pmm;
+use memory::{heap, pmm, vmm};
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
@@ -38,6 +38,12 @@ pub extern "C" fn kmain() -> ! {
 
     pmm::init();
     serial_println!("[PMM] Initialized");
+
+    vmm::init();
+    serial_println!("[VMM] Initialized");
+
+    heap::init();
+    serial_println!("[KMALLOC] Initialized");
 
     arch_syscall::init();
     serial_println!("[SYSCALL] MSRs configured");
