@@ -32,7 +32,8 @@ Key references in the C project:
 - GDT/IDT setup is wired in with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, a default exception report (serial-only for now), and memory management (bitmap PMM, VMM, kernel heap).
 - Kernel tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption) with a minimal user-mode task loaded from an embedded ELF.
 - ELF loading is now hardened with stricter header/segment validation (alignment checks, malformed `PT_INTERP` rejection, RWX-segment rejection, entrypoint-in-exec checks), and NXE is enabled so non-executable mappings are effective.
-- Syscall dispatch now has a Linux-numbered stage-4 baseline (`write`, `exit`, `exit_group`, `yield`, `getpid`, `getppid`, `brk`) with shared SYSCALL/int80 argument handling and per-task user metadata (`brk`, stack bounds, ELF PHDR info).
+- Syscall dispatch now uses a table-driven Linux-numbered stage-4 baseline (`write`, `exit`, `exit_group`, `yield`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `brk`) with shared SYSCALL/int80 argument handling and per-task user metadata (`brk`, stack bounds, argv/envp/auxv pointers, ELF PHDR info).
+- Initial user bootstrap now builds a conventional process stack (`argc`, `argv`, `envp`, `auxv`) so libc-facing usermode setup has a stable base for future `execve` work.
 - Subsystem crates (`drivers`, `fs`, `net`, `syscall`, `userabi`) are placeholders; device drivers and user space are not yet implemented.
 
 ## Documentation

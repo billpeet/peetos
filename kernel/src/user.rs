@@ -1,7 +1,8 @@
+use core::cmp;
 use core::mem::size_of;
 use core::ptr;
 
-use arch_x86_64::addr::{VirtAddr, PAGE_SIZE};
+use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
 use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
 
@@ -14,7 +15,241 @@ const USER_STACK_TOP: u64 = 0x7FFF_FF00_0000;
 const USER_STACK_SIZE: u64 = 32 * 1024;
 const USER_STACK_PAGES: usize = (USER_STACK_SIZE / PAGE_SIZE) as usize;
 
+const INIT_ARGV0: &[u8] = b"/init\0";
+const INIT_ENV_PATH: &[u8] = b"PATH=/bin\0";
+const INIT_ENV_TERM: &[u8] = b"TERM=peetos\0";
+
+const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
+const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
+const AT_ENTRY: u64 = 9;
+
 static HELLO_ELF: &[u8] = include_bytes!("../../user/hello.elf");
+
+#[derive(Clone, Copy)]
+struct UserStackPlan<const ARGC: usize, const ENVC: usize> {
+    initial_rsp: u64,
+    argc: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    auxv_ptr: u64,
+    argv_addrs: [u64; ARGC],
+    env_addrs: [u64; ENVC],
+}
+
+#[inline]
+fn align_down(value: u64, align: u64) -> u64 {
+    value & !(align - 1)
+}
+
+fn user_range_ok(start: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if start >= KERNEL_VIRT_BASE {
+        return false;
+    }
+    let end = match start.checked_add((len as u64).saturating_sub(1)) {
+        Some(v) => v,
+        None => return false,
+    };
+    end < KERNEL_VIRT_BASE
+}
+
+fn write_user_bytes(pml4: PhysAddr, user_dst: u64, src: &[u8]) -> bool {
+    if src.is_empty() {
+        return true;
+    }
+    if !user_range_ok(user_dst, src.len()) {
+        return false;
+    }
+
+    let mut remaining = src.len();
+    let mut written = 0usize;
+    while remaining > 0 {
+        let vaddr = user_dst + written as u64;
+        let page_vaddr = vaddr & !(PAGE_SIZE - 1);
+        let page_off = (vaddr & (PAGE_SIZE - 1)) as usize;
+        let bytes_in_page = cmp::min(remaining, PAGE_SIZE as usize - page_off);
+
+        let page_phys = match vmm::get_physical_in(pml4, VirtAddr::new(page_vaddr)) {
+            Some(phys) => phys,
+            None => return false,
+        };
+        let dst_ptr = (PhysAddr::new(page_phys.as_u64() + page_off as u64)
+            .to_virt()
+            .as_u64()) as *mut u8;
+
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr().add(written), dst_ptr, bytes_in_page);
+        }
+
+        remaining -= bytes_in_page;
+        written += bytes_in_page;
+    }
+
+    true
+}
+
+fn write_user_u64(pml4: PhysAddr, user_dst: u64, value: u64) -> bool {
+    write_user_bytes(pml4, user_dst, &value.to_le_bytes())
+}
+
+fn plan_user_stack<const ARGC: usize, const ENVC: usize, const AUXC: usize>(
+    stack_bottom: u64,
+    stack_top: u64,
+    argv: [&[u8]; ARGC],
+    env: [&[u8]; ENVC],
+) -> Option<UserStackPlan<ARGC, ENVC>> {
+    if stack_bottom >= stack_top {
+        return None;
+    }
+
+    let mut sp = stack_top;
+    let mut argv_addrs = [0u64; ARGC];
+    let mut env_addrs = [0u64; ENVC];
+
+    for idx in (0..ENVC).rev() {
+        if env[idx].is_empty() || env[idx][env[idx].len() - 1] != 0 {
+            return None;
+        }
+        let len = env[idx].len() as u64;
+        sp = sp.checked_sub(len)?;
+        if sp < stack_bottom {
+            return None;
+        }
+        env_addrs[idx] = sp;
+    }
+
+    for idx in (0..ARGC).rev() {
+        if argv[idx].is_empty() || argv[idx][argv[idx].len() - 1] != 0 {
+            return None;
+        }
+        let len = argv[idx].len() as u64;
+        sp = sp.checked_sub(len)?;
+        if sp < stack_bottom {
+            return None;
+        }
+        argv_addrs[idx] = sp;
+    }
+
+    sp = align_down(sp, 16);
+    if sp < stack_bottom {
+        return None;
+    }
+
+    let aux_qwords = (AUXC + 1).checked_mul(2)?;
+    let qwords = 1usize
+        .checked_add(ARGC.checked_add(1)?)?
+        .checked_add(ENVC.checked_add(1)?)?
+        .checked_add(aux_qwords)?;
+
+    if (qwords & 1) != 0 {
+        sp = sp.checked_sub(size_of::<u64>() as u64)?;
+        if sp < stack_bottom {
+            return None;
+        }
+    }
+
+    let table_bytes = (qwords as u64).checked_mul(size_of::<u64>() as u64)?;
+    let initial_rsp = sp.checked_sub(table_bytes)?;
+    if initial_rsp < stack_bottom {
+        return None;
+    }
+
+    let mut cursor = initial_rsp.checked_add(size_of::<u64>() as u64)?;
+    let argv_ptr = cursor;
+    cursor = cursor.checked_add(((ARGC + 1) * size_of::<u64>()) as u64)?;
+    let envp_ptr = cursor;
+    cursor = cursor.checked_add(((ENVC + 1) * size_of::<u64>()) as u64)?;
+    let auxv_ptr = cursor;
+    let aux_bytes = ((AUXC + 1) * 2 * size_of::<u64>()) as u64;
+    if auxv_ptr.checked_add(aux_bytes)? > sp {
+        return None;
+    }
+
+    Some(UserStackPlan {
+        initial_rsp,
+        argc: ARGC as u64,
+        argv_ptr,
+        envp_ptr,
+        auxv_ptr,
+        argv_addrs,
+        env_addrs,
+    })
+}
+
+fn populate_user_stack<const ARGC: usize, const ENVC: usize, const AUXC: usize>(
+    pml4: PhysAddr,
+    stack_bottom: u64,
+    stack_top: u64,
+    argv: [&[u8]; ARGC],
+    env: [&[u8]; ENVC],
+    aux: [(u64, u64); AUXC],
+) -> Option<UserStackPlan<ARGC, ENVC>> {
+    let plan = plan_user_stack::<ARGC, ENVC, AUXC>(stack_bottom, stack_top, argv, env)?;
+
+    for idx in 0..ARGC {
+        if !write_user_bytes(pml4, plan.argv_addrs[idx], argv[idx]) {
+            return None;
+        }
+    }
+    for idx in 0..ENVC {
+        if !write_user_bytes(pml4, plan.env_addrs[idx], env[idx]) {
+            return None;
+        }
+    }
+
+    if !write_user_u64(pml4, plan.initial_rsp, plan.argc) {
+        return None;
+    }
+
+    let mut cursor = plan.argv_ptr;
+    for ptr in plan.argv_addrs {
+        if !write_user_u64(pml4, cursor, ptr) {
+            return None;
+        }
+        cursor += size_of::<u64>() as u64;
+    }
+    if !write_user_u64(pml4, cursor, 0) {
+        return None;
+    }
+
+    cursor = plan.envp_ptr;
+    for ptr in plan.env_addrs {
+        if !write_user_u64(pml4, cursor, ptr) {
+            return None;
+        }
+        cursor += size_of::<u64>() as u64;
+    }
+    if !write_user_u64(pml4, cursor, 0) {
+        return None;
+    }
+
+    cursor = plan.auxv_ptr;
+    for (kind, value) in aux {
+        if !write_user_u64(pml4, cursor, kind) {
+            return None;
+        }
+        cursor += size_of::<u64>() as u64;
+        if !write_user_u64(pml4, cursor, value) {
+            return None;
+        }
+        cursor += size_of::<u64>() as u64;
+    }
+    if !write_user_u64(pml4, cursor, AT_NULL) {
+        return None;
+    }
+    cursor += size_of::<u64>() as u64;
+    if !write_user_u64(pml4, cursor, 0) {
+        return None;
+    }
+
+    Some(plan)
+}
 
 pub fn spawn_init() {
     serial_println!("[USER] Setting up initial user task...");
@@ -54,7 +289,7 @@ pub fn spawn_init() {
             pml4,
             VirtAddr::new(page_vaddr),
             page_phys,
-            vmm::PTE_PRESENT | vmm::PTE_WRITE | vmm::PTE_USER,
+            vmm::PTE_PRESENT | vmm::PTE_WRITE | vmm::PTE_USER | vmm::PTE_NO_EXECUTE,
         ) != 0
         {
             serial_println!("[USER] ERROR: failed to map user stack");
@@ -62,6 +297,30 @@ pub fn spawn_init() {
             return;
         }
     }
+
+    let auxv = [
+        (AT_PHDR, elf_result.phdr_addr),
+        (AT_PHENT, elf_result.phdr_size as u64),
+        (AT_PHNUM, elf_result.phdr_count as u64),
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_BASE, elf_result.interp_base),
+        (AT_ENTRY, elf_result.entry_point),
+    ];
+    let stack_plan = match populate_user_stack::<1, 2, 6>(
+        pml4,
+        stack_bottom,
+        USER_STACK_TOP,
+        [INIT_ARGV0],
+        [INIT_ENV_PATH, INIT_ENV_TERM],
+        auxv,
+    ) {
+        Some(plan) => plan,
+        None => {
+            serial_println!("[USER] ERROR: failed to build user stack");
+            vmm::destroy_address_space(pml4);
+            return;
+        }
+    };
 
     let task_ptr = task::task_alloc("init", TASK_FLAG_USER);
     if task_ptr.is_null() {
@@ -75,6 +334,12 @@ pub fn spawn_init() {
         (*task_ptr).user_entry = elf_result.entry_point;
         (*task_ptr).user_stack_bottom = stack_bottom;
         (*task_ptr).user_stack_top = USER_STACK_TOP;
+        (*task_ptr).user_stack_ptr = stack_plan.initial_rsp;
+        (*task_ptr).user_argc = stack_plan.argc;
+        (*task_ptr).user_argv = stack_plan.argv_ptr;
+        (*task_ptr).user_envp = stack_plan.envp_ptr;
+        (*task_ptr).user_auxv = stack_plan.auxv_ptr;
+        (*task_ptr).user_clear_tid = 0;
         (*task_ptr).user_brk_start = elf_result.program_break;
         (*task_ptr).user_brk = elf_result.program_break;
         (*task_ptr).user_phdr_addr = elf_result.phdr_addr;
@@ -92,7 +357,7 @@ pub fn spawn_init() {
         ptr::write_bytes(frame as *mut u8, 0, size_of::<InterruptFrame>());
 
         (*frame).ss = gdt::USER_DS as u64;
-        (*frame).rsp = USER_STACK_TOP - 8;
+        (*frame).rsp = stack_plan.initial_rsp;
         (*frame).rflags = 0x202;
         (*frame).cs = gdt::USER_CS as u64;
         (*frame).rip = elf_result.entry_point;
@@ -106,7 +371,49 @@ pub fn spawn_init() {
     crate::sched::add_task(task_ptr);
 
     serial_println!(
-        "[USER] User task ready (entry=0x{:x})",
-        elf_result.entry_point
+        "[USER] User task ready (entry=0x{:x}, rsp=0x{:x})",
+        elf_result.entry_point,
+        stack_plan.initial_rsp
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_user_stack_aligns_rsp_and_tables() {
+        let plan = plan_user_stack::<1, 2, 6>(
+            0x7fff_0000_0000,
+            0x7fff_0000_4000,
+            [b"/init\0"],
+            [b"PATH=/bin\0", b"TERM=peetos\0"],
+        )
+        .expect("stack plan should fit");
+
+        assert_eq!(plan.argc, 1);
+        assert_eq!(plan.initial_rsp & 0xF, 0);
+        assert!(plan.argv_addrs[0] < 0x7fff_0000_4000);
+        assert_eq!(plan.envp_ptr - plan.argv_ptr, 16);
+        assert_eq!(plan.auxv_ptr - plan.envp_ptr, 24);
+    }
+
+    #[test]
+    fn plan_user_stack_rejects_non_nul_strings() {
+        assert!(
+            plan_user_stack::<1, 0, 1>(0x1000, 0x4000, [b"/init"], []).is_none(),
+            "argv entry must be NUL-terminated"
+        );
+    }
+
+    #[test]
+    fn plan_user_stack_rejects_tiny_stack() {
+        assert!(plan_user_stack::<1, 2, 6>(
+            0x2000,
+            0x2050,
+            [b"/init\0"],
+            [b"PATH=/bin\0", b"TERM=peetos\0"],
+        )
+        .is_none());
+    }
 }

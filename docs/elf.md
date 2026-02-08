@@ -21,7 +21,7 @@ The loader supports ELF64 for `x86_64` little-endian. `elf::load()` accepts `ET_
    - Pages are zeroed, then segment bytes are copied from the ELF image into the mapped pages.
 4. Before committing load success, the loader verifies the final entry point is inside an executable user `PT_LOAD` range.
 5. The loader records program header metadata (PHDR address/count/size), detects dynamic metadata (`ET_DYN`, `PT_INTERP`, `PT_DYNAMIC`), and returns the entry point (`e_entry`) plus the top of the loaded image (`program_break`) for future heap work.
-6. `user::spawn_init()` sets up a 32KB user stack and builds an `InterruptFrame` to enter ring 3 at the ELF entry point.
+6. `user::spawn_init()` sets up a 32KB user stack, writes a Linux-style initial stack image (`argc`, `argv`, `envp`, `auxv` with `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_BASE`/`AT_ENTRY`), and builds an `InterruptFrame` to enter ring 3 at the ELF entry point.
 
 Limitations / Simplifications
 - `elf::load_at()` accepts PIE/`ET_DYN`, but relocations and `PT_DYNAMIC` entry parsing are not implemented.
@@ -31,5 +31,6 @@ Limitations / Simplifications
 - Segment-level W^X is enforced by rejecting `PF_W | PF_X` `PT_LOAD` segments, but there is no SMEP/SMAP integration.
 - User address checks are stricter than the initial baseline (checked arithmetic + entrypoint-in-exec-range checks), but there is still no ASLR.
 - `program_break` is now consumed by per-task `brk` state, but the full userspace allocator contract (`mmap`, overcommit, guard pages) is not implemented yet.
+- Initial `argv`/`envp` values are currently fixed for the embedded init task; there is no `execve` path to supply caller-provided vectors yet.
 - Load failure rollback is still minimal; pages mapped before a late failure are not fully unwound.
 - The embedded ELF is rebuilt automatically via the Makefile; `scripts/build_user.sh` remains a manual helper.

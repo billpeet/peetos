@@ -51,6 +51,12 @@ pub struct Task {
     pub(crate) user_entry: u64,
     pub(crate) user_stack_bottom: u64,
     pub(crate) user_stack_top: u64,
+    pub(crate) user_stack_ptr: u64,
+    pub(crate) user_argc: u64,
+    pub(crate) user_argv: u64,
+    pub(crate) user_envp: u64,
+    pub(crate) user_auxv: u64,
+    pub(crate) user_clear_tid: u64,
     pub(crate) user_brk_start: u64,
     pub(crate) user_brk: u64,
     pub(crate) user_phdr_addr: u64,
@@ -119,6 +125,12 @@ pub fn init() {
             user_entry: 0,
             user_stack_bottom: 0,
             user_stack_top: 0,
+            user_stack_ptr: 0,
+            user_argc: 0,
+            user_argv: 0,
+            user_envp: 0,
+            user_auxv: 0,
+            user_clear_tid: 0,
             user_brk_start: 0,
             user_brk: 0,
             user_phdr_addr: 0,
@@ -189,6 +201,12 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.user_entry = 0;
         task.user_stack_bottom = 0;
         task.user_stack_top = 0;
+        task.user_stack_ptr = 0;
+        task.user_argc = 0;
+        task.user_argv = 0;
+        task.user_envp = 0;
+        task.user_auxv = 0;
+        task.user_clear_tid = 0;
         task.user_brk_start = 0;
         task.user_brk = 0;
         task.user_phdr_addr = 0;
@@ -367,6 +385,12 @@ impl Task {
             user_entry: 0,
             user_stack_bottom: 0,
             user_stack_top: 0,
+            user_stack_ptr: 0,
+            user_argc: 0,
+            user_argv: 0,
+            user_envp: 0,
+            user_auxv: 0,
+            user_clear_tid: 0,
             user_brk_start: 0,
             user_brk: 0,
             user_phdr_addr: 0,

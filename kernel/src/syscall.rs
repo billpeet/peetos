@@ -37,10 +37,13 @@ const SYS_YIELD: u64 = 24;
 const SYS_GETPID: u64 = 39;
 const SYS_EXIT: u64 = 60;
 const SYS_GETPPID: u64 = 110;
+const SYS_GETTID: u64 = 186;
+const SYS_SET_TID_ADDRESS: u64 = 218;
 const SYS_EXIT_GROUP: u64 = 231;
 
 const WRITE_CHUNK_SIZE: usize = 128;
 const UNKNOWN_SYSCALL_LOG_LIMIT: u32 = 8;
+const CLEAR_TID_SIZE: usize = 4;
 
 static mut UNKNOWN_SYSCALL_LOG_COUNT: u32 = 0;
 
@@ -49,6 +52,115 @@ struct SyscallArgs {
     num: u64,
     args: [u64; 6],
 }
+
+impl SyscallArgs {
+    #[inline]
+    fn arg(&self, idx: usize) -> u64 {
+        self.args[idx]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyscallMode {
+    AnyTask,
+    UserTask,
+}
+
+type SyscallHandler = fn(&SyscallContext, &SyscallArgs) -> i64;
+
+#[derive(Clone, Copy)]
+struct SyscallDef {
+    num: u64,
+    name: &'static str,
+    mode: SyscallMode,
+    handler: SyscallHandler,
+}
+
+#[derive(Clone, Copy)]
+struct SyscallContext {
+    current: *mut task::Task,
+}
+
+impl SyscallContext {
+    #[inline]
+    fn new(current: *mut task::Task) -> Self {
+        Self { current }
+    }
+
+    #[inline]
+    fn has_task(&self) -> bool {
+        !self.current.is_null()
+    }
+
+    #[inline]
+    fn is_user_task(&self) -> bool {
+        self.has_task() && unsafe { ((*self.current).flags & TASK_FLAG_USER) != 0 }
+    }
+
+    #[inline]
+    fn pid(&self) -> Result<i64, i64> {
+        if !self.has_task() {
+            return Err(-ESRCH);
+        }
+        Ok(unsafe { (*self.current).pid as i64 })
+    }
+
+    #[inline]
+    fn ppid(&self) -> Result<i64, i64> {
+        if !self.has_task() {
+            return Err(-ESRCH);
+        }
+        Ok(unsafe { (*self.current).ppid as i64 })
+    }
+
+    fn user_pml4(&self) -> Result<PhysAddr, i64> {
+        if !self.has_task() {
+            return Err(-ESRCH);
+        }
+        let pml4 = unsafe { PhysAddr::new((*self.current).pml4_phys) };
+        if pml4.as_u64() == 0 {
+            return Err(-EINVAL);
+        }
+        Ok(pml4)
+    }
+}
+
+const fn syscall_def(
+    num: u64,
+    name: &'static str,
+    mode: SyscallMode,
+    handler: SyscallHandler,
+) -> SyscallDef {
+    SyscallDef {
+        num,
+        name,
+        mode,
+        handler,
+    }
+}
+
+const SYSCALL_TABLE: &[SyscallDef] = &[
+    syscall_def(SYS_READ, "read", SyscallMode::UserTask, sys_read),
+    syscall_def(SYS_WRITE, "write", SyscallMode::UserTask, sys_write),
+    syscall_def(SYS_BRK, "brk", SyscallMode::UserTask, sys_brk),
+    syscall_def(SYS_YIELD, "sched_yield", SyscallMode::AnyTask, sys_yield),
+    syscall_def(SYS_GETPID, "getpid", SyscallMode::AnyTask, sys_getpid),
+    syscall_def(SYS_GETPPID, "getppid", SyscallMode::AnyTask, sys_getppid),
+    syscall_def(SYS_GETTID, "gettid", SyscallMode::AnyTask, sys_gettid),
+    syscall_def(
+        SYS_SET_TID_ADDRESS,
+        "set_tid_address",
+        SyscallMode::UserTask,
+        sys_set_tid_address,
+    ),
+    syscall_def(SYS_EXIT, "exit", SyscallMode::UserTask, sys_exit),
+    syscall_def(
+        SYS_EXIT_GROUP,
+        "exit_group",
+        SyscallMode::UserTask,
+        sys_exit_group,
+    ),
+];
 
 #[inline]
 fn to_sysret(value: i64) -> u64 {
@@ -60,6 +172,15 @@ fn page_align_up(value: u64) -> Option<u64> {
     value
         .checked_add(PAGE_SIZE - 1)
         .map(|v| v & !(PAGE_SIZE - 1))
+}
+
+fn lookup_syscall(num: u64) -> Option<&'static SyscallDef> {
+    for def in SYSCALL_TABLE {
+        if def.num == num {
+            return Some(def);
+        }
+    }
+    None
 }
 
 fn user_range_ok(start: u64, len: usize) -> bool {
@@ -79,31 +200,27 @@ fn user_range_ok(start: u64, len: usize) -> bool {
     end < KERNEL_VIRT_BASE
 }
 
-fn copy_from_user(task_ptr: *mut task::Task, user_src: u64, dst: &mut [u8]) -> Result<(), i64> {
-    if dst.is_empty() {
+fn copy_user_bytes(
+    pml4: PhysAddr,
+    user_addr: u64,
+    kernel_buf: *mut u8,
+    len: usize,
+    to_user: bool,
+) -> Result<(), i64> {
+    if len == 0 {
         return Ok(());
     }
-
-    if task_ptr.is_null() {
-        return Err(ESRCH);
-    }
-
-    if !user_range_ok(user_src, dst.len()) {
+    if !user_range_ok(user_addr, len) {
         return Err(EFAULT);
     }
 
-    let pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
-    if pml4.as_u64() == 0 {
-        return Err(EINVAL);
-    }
-
-    let mut remaining = dst.len();
+    let mut remaining = len;
     let mut copied = 0usize;
 
     while remaining > 0 {
-        let src_vaddr = user_src + copied as u64;
-        let page_vaddr = src_vaddr & !(PAGE_SIZE - 1);
-        let page_off = (src_vaddr & (PAGE_SIZE - 1)) as usize;
+        let vaddr = user_addr + copied as u64;
+        let page_vaddr = vaddr & !(PAGE_SIZE - 1);
+        let page_off = (vaddr & (PAGE_SIZE - 1)) as usize;
         let bytes_in_page = cmp::min(remaining, PAGE_SIZE as usize - page_off);
 
         let page_phys = match vmm::get_physical_in(pml4, VirtAddr::new(page_vaddr)) {
@@ -111,11 +228,17 @@ fn copy_from_user(task_ptr: *mut task::Task, user_src: u64, dst: &mut [u8]) -> R
             None => return Err(EFAULT),
         };
 
-        let src_phys = page_phys.as_u64() + page_off as u64;
-        let src_ptr = PhysAddr::new(src_phys).to_virt().as_u64() as *const u8;
+        let page_ptr = (PhysAddr::new(page_phys.as_u64() + page_off as u64)
+            .to_virt()
+            .as_u64()) as *mut u8;
+        let kernel_ptr = unsafe { kernel_buf.add(copied) };
 
         unsafe {
-            ptr::copy_nonoverlapping(src_ptr, dst.as_mut_ptr().add(copied), bytes_in_page);
+            if to_user {
+                ptr::copy_nonoverlapping(kernel_ptr as *const u8, page_ptr, bytes_in_page);
+            } else {
+                ptr::copy_nonoverlapping(page_ptr as *const u8, kernel_ptr, bytes_in_page);
+            }
         }
 
         copied += bytes_in_page;
@@ -125,15 +248,71 @@ fn copy_from_user(task_ptr: *mut task::Task, user_src: u64, dst: &mut [u8]) -> R
     Ok(())
 }
 
+fn copy_from_user_task(
+    task_ptr: *mut task::Task,
+    user_src: u64,
+    dst: &mut [u8],
+) -> Result<(), i64> {
+    if task_ptr.is_null() {
+        return Err(ESRCH);
+    }
+    let pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
+    if pml4.as_u64() == 0 {
+        return Err(EINVAL);
+    }
+    copy_user_bytes(pml4, user_src, dst.as_mut_ptr(), dst.len(), false)
+}
+
+fn copy_to_user_task(task_ptr: *mut task::Task, user_dst: u64, src: &[u8]) -> Result<(), i64> {
+    if task_ptr.is_null() {
+        return Err(ESRCH);
+    }
+    let pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
+    if pml4.as_u64() == 0 {
+        return Err(EINVAL);
+    }
+    copy_user_bytes(pml4, user_dst, src.as_ptr() as *mut u8, src.len(), true)
+}
+
+pub(crate) fn copy_from_user_current(user_src: u64, dst: &mut [u8]) -> Result<(), i64> {
+    copy_from_user_task(task::current(), user_src, dst)
+}
+
+pub(crate) fn copy_to_user_current(user_dst: u64, src: &[u8]) -> Result<(), i64> {
+    copy_to_user_task(task::current(), user_dst, src)
+}
+
+pub(crate) fn copy_cstr_from_user_current(user_src: u64, out: &mut [u8]) -> Result<usize, i64> {
+    if out.is_empty() {
+        return Err(EINVAL);
+    }
+
+    for (idx, dst_byte) in out.iter_mut().enumerate() {
+        let mut byte = [0u8; 1];
+        copy_from_user_current(user_src + idx as u64, &mut byte)?;
+        *dst_byte = byte[0];
+        if byte[0] == 0 {
+            return Ok(idx);
+        }
+    }
+
+    Err(EINVAL)
+}
+
+fn ensure_user_pages_unmapped(pml4: PhysAddr, start: u64, end: u64) -> Result<(), i64> {
+    let mut addr = start;
+    while addr < end {
+        if vmm::get_physical_in(pml4, VirtAddr::new(addr)).is_some() {
+            return Err(ENOMEM);
+        }
+        addr += PAGE_SIZE;
+    }
+    Ok(())
+}
+
 fn map_user_pages(pml4: PhysAddr, start: u64, end: u64) -> Result<(), i64> {
     let mut addr = start;
     while addr < end {
-        let virt = VirtAddr::new(addr);
-        if vmm::get_physical_in(pml4, virt).is_some() {
-            addr += PAGE_SIZE;
-            continue;
-        }
-
         let phys = pmm::alloc_page();
         if phys.as_u64() == 0 {
             return Err(ENOMEM);
@@ -143,13 +322,13 @@ fn map_user_pages(pml4: PhysAddr, start: u64, end: u64) -> Result<(), i64> {
             ptr::write_bytes(phys.to_virt().as_u64() as *mut u8, 0, PAGE_SIZE as usize);
         }
 
-        let map_result = vmm::map_page_in(
+        if vmm::map_page_in(
             pml4,
-            virt,
+            VirtAddr::new(addr),
             phys,
             vmm::PTE_PRESENT | vmm::PTE_WRITE | vmm::PTE_USER | vmm::PTE_NO_EXECUTE,
-        );
-        if map_result != 0 {
+        ) != 0
+        {
             pmm::free_page(phys);
             return Err(ENOMEM);
         }
@@ -173,27 +352,21 @@ fn unmap_user_pages(pml4: PhysAddr, start: u64, end: u64) {
     }
 }
 
-fn set_program_break(task_ptr: *mut task::Task, requested: u64) -> i64 {
-    if task_ptr.is_null() {
-        return -ESRCH;
-    }
+fn set_program_break(ctx: &SyscallContext, requested: u64) -> i64 {
+    let pml4 = match ctx.user_pml4() {
+        Ok(pml4) => pml4,
+        Err(err) => return err,
+    };
 
-    unsafe {
-        if ((*task_ptr).flags & TASK_FLAG_USER) == 0 {
-            return -EPERM;
-        }
-    }
-
-    let (current, start, stack_bottom, pml4) = unsafe {
+    let (current, start, stack_bottom) = unsafe {
         (
-            (*task_ptr).user_brk,
-            (*task_ptr).user_brk_start,
-            (*task_ptr).user_stack_bottom,
-            PhysAddr::new((*task_ptr).pml4_phys),
+            (*ctx.current).user_brk,
+            (*ctx.current).user_brk_start,
+            (*ctx.current).user_stack_bottom,
         )
     };
 
-    if current == 0 || start == 0 || stack_bottom == 0 || pml4.as_u64() == 0 {
+    if current == 0 || start == 0 || stack_bottom == 0 {
         return -EINVAL;
     }
 
@@ -216,6 +389,9 @@ fn set_program_break(task_ptr: *mut task::Task, requested: u64) -> i64 {
     };
 
     if new_pages_end > old_pages_end {
+        if ensure_user_pages_unmapped(pml4, old_pages_end, new_pages_end).is_err() {
+            return current as i64;
+        }
         if map_user_pages(pml4, old_pages_end, new_pages_end).is_err() {
             unmap_user_pages(pml4, old_pages_end, new_pages_end);
             return current as i64;
@@ -225,53 +401,22 @@ fn set_program_break(task_ptr: *mut task::Task, requested: u64) -> i64 {
     }
 
     unsafe {
-        (*task_ptr).user_brk = requested;
+        (*ctx.current).user_brk = requested;
     }
     requested as i64
 }
 
-fn sys_exit(code: i32) {
-    let task = task::current();
-    if task.is_null() {
-        sys_log!("[SYSCALL] sys_exit: no current task");
-        return;
-    }
-
-    unsafe {
-        (*task).exit_code = code;
-        (*task).state = TaskState::Zombie;
-    }
-
-    crate::sched::request_preempt();
+fn sys_read(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    -ENOSYS
 }
 
-fn sys_yield() -> i64 {
-    crate::sched::request_preempt();
-    0
-}
-
-fn sys_getpid() -> i64 {
-    let task = task::current();
-    if task.is_null() {
-        return -ESRCH;
-    }
-    unsafe { (*task).pid as i64 }
-}
-
-fn sys_getppid() -> i64 {
-    let task = task::current();
-    if task.is_null() {
-        return -ESRCH;
-    }
-    unsafe { (*task).ppid as i64 }
-}
-
-fn sys_write(fd: i32, user_buf: u64, count: u64) -> i64 {
+fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
     if fd != 1 && fd != 2 {
         return -EBADF;
     }
 
-    let len = match usize::try_from(count) {
+    let len = match usize::try_from(call.arg(2)) {
         Ok(v) => v,
         Err(_) => return -EINVAL,
     };
@@ -279,23 +424,13 @@ fn sys_write(fd: i32, user_buf: u64, count: u64) -> i64 {
         return 0;
     }
 
-    let task = task::current();
-    if task.is_null() {
-        return -ESRCH;
-    }
-
-    let is_user = unsafe { ((*task).flags & TASK_FLAG_USER) != 0 };
-    if !is_user {
-        return -EPERM;
-    }
-
     let mut chunk = [0u8; WRITE_CHUNK_SIZE];
     let mut written = 0usize;
 
     while written < len {
         let take = cmp::min(chunk.len(), len - written);
-        let src = user_buf + written as u64;
-        let copy_res = copy_from_user(task, src, &mut chunk[..take]);
+        let src = call.arg(1) + written as u64;
+        let copy_res = copy_from_user_task(ctx.current, src, &mut chunk[..take]);
         if let Err(err) = copy_res {
             if written > 0 {
                 return written as i64;
@@ -308,6 +443,87 @@ fn sys_write(fd: i32, user_buf: u64, count: u64) -> i64 {
     }
 
     written as i64
+}
+
+fn sys_brk(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    set_program_break(ctx, call.arg(0))
+}
+
+fn sys_yield(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    crate::sched::request_preempt();
+    0
+}
+
+fn sys_getpid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    match ctx.pid() {
+        Ok(pid) => pid,
+        Err(err) => err,
+    }
+}
+
+fn sys_getppid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    match ctx.ppid() {
+        Ok(ppid) => ppid,
+        Err(err) => err,
+    }
+}
+
+fn sys_gettid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    match ctx.pid() {
+        Ok(tid) => tid,
+        Err(err) => err,
+    }
+}
+
+fn sys_set_tid_address(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let clear_tid = call.arg(0);
+    if clear_tid != 0 && !user_range_ok(clear_tid, CLEAR_TID_SIZE) {
+        return -EFAULT;
+    }
+
+    unsafe {
+        (*ctx.current).user_clear_tid = clear_tid;
+    }
+
+    sys_gettid(ctx, call)
+}
+
+fn clear_child_tid(ctx: &SyscallContext) {
+    let clear_tid = unsafe { (*ctx.current).user_clear_tid };
+    if clear_tid == 0 {
+        return;
+    }
+
+    let zero = [0u8; CLEAR_TID_SIZE];
+    let _ = copy_to_user_task(ctx.current, clear_tid, &zero);
+
+    // Full Linux semantics also require a futex wake at this address.
+    unsafe {
+        (*ctx.current).user_clear_tid = 0;
+    }
+}
+
+fn sys_exit_common(ctx: &SyscallContext, code: i32) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+
+    clear_child_tid(ctx);
+
+    unsafe {
+        (*ctx.current).exit_code = code;
+        (*ctx.current).state = TaskState::Zombie;
+    }
+    crate::sched::request_preempt();
+    0
+}
+
+fn sys_exit(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    sys_exit_common(ctx, call.arg(0) as i32)
+}
+
+fn sys_exit_group(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    sys_exit_common(ctx, call.arg(0) as i32)
 }
 
 fn log_unknown_syscall(num: u64) {
@@ -323,22 +539,21 @@ fn log_unknown_syscall(num: u64) {
 }
 
 fn dispatch_syscall(call: SyscallArgs) -> i64 {
-    match call.num {
-        SYS_READ => -ENOSYS,
-        SYS_WRITE => sys_write(call.args[0] as i32, call.args[1], call.args[2]),
-        SYS_BRK => set_program_break(task::current(), call.args[0]),
-        SYS_YIELD => sys_yield(),
-        SYS_GETPID => sys_getpid(),
-        SYS_GETPPID => sys_getppid(),
-        SYS_EXIT | SYS_EXIT_GROUP => {
-            sys_exit(call.args[0] as i32);
-            0
-        }
-        _ => {
+    let ctx = SyscallContext::new(task::current());
+    let def = match lookup_syscall(call.num) {
+        Some(def) => def,
+        None => {
             log_unknown_syscall(call.num);
-            -ENOSYS
+            return -ENOSYS;
         }
+    };
+
+    if def.mode == SyscallMode::UserTask && !ctx.is_user_task() {
+        return -EPERM;
     }
+
+    let _ = def.name;
+    (def.handler)(&ctx, &call)
 }
 
 fn call_from_syscall_frame(frame: &SyscallFrame) -> SyscallArgs {
@@ -356,6 +571,12 @@ fn call_from_int80_frame(frame: &InterruptFrame) -> SyscallArgs {
         args: [
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ],
+    }
+}
+
+pub fn init() {
+    unsafe {
+        UNKNOWN_SYSCALL_LOG_COUNT = 0;
     }
 }
 
@@ -387,12 +608,36 @@ mod tests {
     }
 
     #[test]
+    fn syscall_lookup_finds_known_entry() {
+        let def = lookup_syscall(SYS_GETPID).expect("syscall should exist");
+        assert_eq!(def.name, "getpid");
+    }
+
+    #[test]
     fn unknown_syscall_returns_enosys() {
         let ret = dispatch_syscall(SyscallArgs {
             num: 0xFFFF,
             args: [0; 6],
         });
         assert_eq!(ret, -ENOSYS);
+    }
+
+    #[test]
+    fn user_only_syscall_requires_user_task() {
+        let ret = dispatch_syscall(SyscallArgs {
+            num: SYS_BRK,
+            args: [0; 6],
+        });
+        assert_eq!(ret, -EPERM);
+    }
+
+    #[test]
+    fn set_tid_requires_user_task() {
+        let ret = dispatch_syscall(SyscallArgs {
+            num: SYS_SET_TID_ADDRESS,
+            args: [0; 6],
+        });
+        assert_eq!(ret, -EPERM);
     }
 
     #[test]

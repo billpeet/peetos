@@ -44,27 +44,30 @@ Limitations / Simplifications
   - `SYS_WRITE` (fd `1`/`2` to serial)
   - `SYS_EXIT`, `SYS_EXIT_GROUP`
   - `SYS_YIELD`
-  - `SYS_GETPID`, `SYS_GETPPID`
+  - `SYS_GETPID`, `SYS_GETPPID`, `SYS_GETTID`
+  - `SYS_SET_TID_ADDRESS` (stores per-task clear-tid pointer for future thread-exit/futex wiring)
   - `SYS_BRK`
 - The int 0x80 path is temporary and will be replaced by a full SYSCALL/SYSRET flow with stack switching.
 
 **Syscall Handler**
-`kernel/src/syscall.rs` now implements a structured dispatcher shared by both the SYSCALL and int 0x80 paths. Arguments are normalized into a small `SyscallArgs` struct, unknown syscall logs are rate-limited, and return values use Linux-style negative errno.
+`kernel/src/syscall.rs` now implements a table-driven dispatcher shared by both the SYSCALL and int 0x80 paths. Arguments are normalized into a small `SyscallArgs` struct, syscall entries carry mode metadata (any task vs user task), unknown syscall logs are rate-limited, and return values use Linux-style negative errno.
 
 Current implemented handlers:
 - `write(1|2, buf, len)` to serial output
 - `exit(status)` and `exit_group(status)`
 - `sched_yield()`
-- `getpid()`, `getppid()`
+- `getpid()`, `getppid()`, `gettid()`
+- `set_tid_address(ptr)` (clear-tid pointer tracking; best-effort zeroing on exit)
 - `brk(addr)` with per-task program-break metadata and page mapping/unmapping
 
 Limitations / Simplifications
 - Most Linux syscall numbers are still unimplemented and return `-ENOSYS`.
 - `write` is intentionally narrow right now (only stdout/stderr serial sink; no VFS file-descriptor layer yet).
 - `brk` only manages simple per-task heap growth/shrink and does not yet integrate with full userspace allocator semantics (no `mmap` fallback, no overcommit policy, no guard pages).
+- `set_tid_address` does not yet perform futex wakeups for robust thread teardown semantics.
 
 **Integration**
-`kernel/src/main.rs` calls `arch_syscall::init()` during early boot.
+`kernel/src/main.rs` calls `arch_syscall::init()` (MSR setup) and `syscall::init()` (dispatcher state init) during early boot.
 
 **Status Notes**
 - This is a minimal stub for future user-mode support.

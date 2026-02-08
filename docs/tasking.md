@@ -18,6 +18,7 @@ This document describes the baseline tasking and scheduler implementation introd
 - Saved interrupt-frame stack pointer (`saved_rsp`)
 - Kernel stack base/top
 - User-process metadata (`pml4_phys`, user entry point, user stack bounds)
+- Initial user bootstrap metadata (`user_stack_ptr`, `user_argc`, `user_argv`, `user_envp`, `user_auxv`, `user_clear_tid`)
 - Per-task ELF/program metadata (`phdr_*`, `base_addr`, dynamic-linker flags)
 - Per-task program break tracking (`user_brk_start`, `user_brk`)
 - Scheduling metadata (time slice, tick counters, sleep deadline)
@@ -32,6 +33,7 @@ The boot task represents the current execution context and is created in `task::
 - Creating a fresh address space with `vmm::create_address_space()`.
 - Loading an embedded ELF64 image (`user/hello.elf`) into the new address space.
 - Mapping a 32KB user stack at `USER_STACK_TOP = 0x7FFF_FF00_0000`.
+- Writing a Linux-style initial stack (`argc`, `argv`, `envp`, `auxv`) before first ring-3 entry.
 - Building an `InterruptFrame` that returns to ring 3 via `iretq`.
 
 The initial user program is a small ELF that invokes `int 0x80` to call Linux `SYS_EXIT` (`60`).
@@ -57,10 +59,11 @@ The initial user program is a small ELF that invokes `int 0x80` to call Linux `S
 
 Limitations / Simplifications
 - User mode is minimal: a single hardcoded user task with a fixed embedded ELF.
-- No `exec`/`fork`, no dynamic linker, and no argv/envp setup for the user stack.
+- No `exec`/`fork` and no dynamic linker; `argv`/`envp` are currently fixed at spawn time for the embedded init ELF.
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Address space switching and `TSS.rsp0` updates are minimal; no per-task TLS (FS/GS).
 - Task metadata for user processes is tracked, but there is no `/proc` or userspace-visible tooling for inspecting it yet.
+- `user_clear_tid` is tracked for future threading semantics, but robust futex wake-on-exit behavior is not implemented yet.
 - No FPU/SSE save/restore per task.
 - Task cleanup is minimal; zombie tasks are not reaped automatically.
 - Run queue operations are protected only by interrupt masking (single-core assumption).

@@ -67,6 +67,7 @@ pub extern "C" fn kmain() -> ! {
     user::spawn_init();
 
     arch_syscall::init();
+    syscall::init();
     serial_println!("[SYSCALL] MSRs configured");
 
     interrupts::enable();
