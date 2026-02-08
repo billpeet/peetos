@@ -14,6 +14,7 @@ mod syscall;
 mod memory;
 mod task;
 mod sched;
+mod elf;
 mod user;
 
 use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall, tss};

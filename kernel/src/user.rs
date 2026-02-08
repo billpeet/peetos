@@ -5,20 +5,16 @@ use arch_x86_64::addr::{VirtAddr, PAGE_SIZE};
 use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
 
+use crate::elf;
 use crate::memory::{pmm, vmm};
 use crate::serial_println;
 use crate::task::{self, TaskState, TASK_FLAG_USER};
 
-const USER_CODE_ADDR: u64 = 0x0000_0000_0040_0000;
-const USER_STACK_TOP: u64 = 0x0000_0000_0080_0000;
+const USER_STACK_TOP: u64 = 0x7FFF_FF00_0000;
+const USER_STACK_SIZE: u64 = 32 * 1024;
+const USER_STACK_PAGES: usize = (USER_STACK_SIZE / PAGE_SIZE) as usize;
 
-const USER_PROG: &[u8] = &[
-    0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (SYS_EXIT)
-    0x48, 0xC7, 0xC7, 0x2A, 0x00, 0x00, 0x00, // mov rdi, 42
-    0xCD, 0x80, // int 0x80
-    0xF4,       // hlt
-    0xEB, 0xFE, // jmp .
-];
+static HELLO_ELF: &[u8] = include_bytes!("../../user/hello.elf");
 
 pub fn spawn_init() {
     serial_println!("[USER] Setting up initial user task...");
@@ -29,38 +25,44 @@ pub fn spawn_init() {
         return;
     }
 
-    let code_phys = pmm::alloc_page();
-    if code_phys.as_u64() == 0 {
-        serial_println!("[USER] ERROR: failed to allocate code page");
+    let elf_result = elf::load(HELLO_ELF, pml4);
+    if !elf_result.success {
+        serial_println!("[USER] ERROR: failed to load ELF");
+        vmm::destroy_address_space(pml4);
         return;
     }
 
-    unsafe {
-        let code_ptr = code_phys.to_virt().as_u64() as *mut u8;
-        ptr::write_bytes(code_ptr, 0, PAGE_SIZE as usize);
-        ptr::copy_nonoverlapping(USER_PROG.as_ptr(), code_ptr, USER_PROG.len());
-    }
+    let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
+    for i in 0..USER_STACK_PAGES {
+        let page_phys = pmm::alloc_page();
+        if page_phys.as_u64() == 0 {
+            serial_println!("[USER] ERROR: failed to allocate user stack");
+            vmm::destroy_address_space(pml4);
+            return;
+        }
 
-    if vmm::map_page_in(pml4, VirtAddr::new(USER_CODE_ADDR), code_phys, vmm::VMM_FLAG_USER_RO) != 0 {
-        serial_println!("[USER] ERROR: failed to map code page");
-        return;
-    }
+        unsafe {
+            ptr::write_bytes(page_phys.to_virt().as_u64() as *mut u8, 0, PAGE_SIZE as usize);
+        }
 
-    let stack_phys = pmm::alloc_page();
-    if stack_phys.as_u64() == 0 {
-        serial_println!("[USER] ERROR: failed to allocate stack page");
-        return;
-    }
-
-    let stack_base = USER_STACK_TOP - PAGE_SIZE;
-    if vmm::map_page_in(pml4, VirtAddr::new(stack_base), stack_phys, vmm::VMM_FLAG_USER_RW) != 0 {
-        serial_println!("[USER] ERROR: failed to map stack page");
-        return;
+        let page_vaddr = stack_bottom + (i as u64 * PAGE_SIZE);
+        if vmm::map_page_in(
+            pml4,
+            VirtAddr::new(page_vaddr),
+            page_phys,
+            vmm::PTE_PRESENT | vmm::PTE_WRITE | vmm::PTE_USER,
+        ) != 0
+        {
+            serial_println!("[USER] ERROR: failed to map user stack");
+            vmm::destroy_address_space(pml4);
+            return;
+        }
     }
 
     let task_ptr = task::task_alloc("init", TASK_FLAG_USER);
     if task_ptr.is_null() {
         serial_println!("[USER] ERROR: failed to allocate task");
+        vmm::destroy_address_space(pml4);
         return;
     }
 
@@ -75,10 +77,10 @@ pub fn spawn_init() {
         ptr::write_bytes(frame as *mut u8, 0, size_of::<InterruptFrame>());
 
         (*frame).ss = gdt::USER_DS as u64;
-        (*frame).rsp = USER_STACK_TOP - 16;
+        (*frame).rsp = USER_STACK_TOP - 8;
         (*frame).rflags = 0x202;
         (*frame).cs = gdt::USER_CS as u64;
-        (*frame).rip = USER_CODE_ADDR;
+        (*frame).rip = elf_result.entry_point;
         (*frame).int_no = 0;
         (*frame).error_code = 0;
 
@@ -88,5 +90,5 @@ pub fn spawn_init() {
 
     crate::sched::add_task(task_ptr);
 
-    serial_println!("[USER] User task ready");
+    serial_println!("[USER] User task ready (entry=0x{:x})", elf_result.entry_point);
 }

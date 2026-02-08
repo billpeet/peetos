@@ -27,10 +27,11 @@ The boot task represents the current execution context and is created in `task::
 **User Task Bring-Up**
 `kernel/src/user.rs` creates a minimal user task by:
 - Creating a fresh address space with `vmm::create_address_space()`.
-- Mapping a single code page at `0x0040_0000` and a single stack page at `0x0080_0000`.
+- Loading an embedded ELF64 image (`user/hello.elf`) into the new address space.
+- Mapping a 32KB user stack at `USER_STACK_TOP = 0x7FFF_FF00_0000`.
 - Building an `InterruptFrame` that returns to ring 3 via `iretq`.
 
-The initial user program is a small in-memory blob that invokes `int 0x80` to call `SYS_EXIT`.
+The initial user program is a small ELF that invokes `int 0x80` to call `SYS_EXIT`.
 
 **Scheduler**
 `kernel/src/sched.rs` provides a simple round-robin scheduler:
@@ -52,8 +53,9 @@ The initial user program is a small in-memory blob that invokes `int 0x80` to ca
 4. `user::spawn_init()`
 
 Limitations / Simplifications
-- User mode is minimal: a single hardcoded user task with one code page and one stack page.
-- No ELF loader or user binary loading yet.
+- User mode is minimal: a single hardcoded user task with a fixed embedded ELF.
+- No `exec`/`fork`, no dynamic linker, and no argv/envp setup for the user stack.
+- No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Address space switching and `TSS.rsp0` updates are minimal; no per-task TLS (FS/GS).
 - No FPU/SSE save/restore per task.
 - Task cleanup is minimal; zombie tasks are not reaped automatically.

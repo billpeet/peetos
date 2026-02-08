@@ -12,7 +12,7 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 - Phase 1: Complete. The kernel boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a loop. The panic handler reports over serial before halting.
 - Phase 2: Complete (baseline). Added `arch_x86_64` port I/O helpers, interrupt enable/disable wrappers (plus RAII guard), GDT/IDT setup with interrupt stubs and handler registration, PIC remap, PIT timer init, syscall entry/MSR setup, and a serial exception report.
 - Phase 3: Complete (baseline). Added typed address helpers, bitmap-based PMM, VMM mapping/address-space support, and a kernel heap allocator.
-- Phase 4: In progress. Baseline tasking + scheduler (kernel threads, run queue, PIT-driven preemption, yield/block/sleep paths) are in place. A minimal user-mode task now boots via `int 0x80` with a stub syscall surface. ELF loading, robust syscall dispatch, and per-process user tooling remain outstanding.
+- Phase 4: In progress. Baseline tasking + scheduler (kernel threads, run queue, PIT-driven preemption, yield/block/sleep paths) are in place. A minimal user-mode task now boots via `int 0x80` with a stub syscall surface. A basic ELF loader (`ET_EXEC`, `PT_LOAD`) is now wired in for the embedded user image. Robust syscall dispatch and per-process user tooling remain outstanding.
 - Phases 5–10: Not started.
 
 ## Phase 0: Project Scaffolding

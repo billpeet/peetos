@@ -24,13 +24,13 @@ Key references in the C project:
 - `docs/PORTING_PLAN.md` High-level implementation roadmap.
 - `docs/` Implementation docs grouped by subsystem, each with a limitations/simplifications section.
 
-## Current Status (Last reviewed: 2026-02-07)
+## Current Status (Last reviewed: 2026-02-08)
 
 - Boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a `hlt` loop.
 - Panic handler prints over serial, then halts with `cli; hlt`.
 - `arch_x86_64` now provides basic port I/O helpers and interrupt enable/disable wrappers.
 - GDT/IDT setup is wired in with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, a default exception report (serial-only for now), and memory management (bitmap PMM, VMM, kernel heap).
-- Kernel tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption) with a minimal user-mode task stub.
+- Kernel tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption) with a minimal user-mode task loaded from an embedded ELF.
 - Subsystem crates (`drivers`, `fs`, `net`, `syscall`, `userabi`) are placeholders; device drivers and user space are not yet implemented.
 
 ## Documentation
@@ -38,6 +38,7 @@ Key references in the C project:
 - `docs/boot.md` Boot flow, entry sequence, and `kmain()` initialization order.
 - `docs/interrupts.md` GDT/IDT setup, PIC/PIT configuration, and interrupt handling.
 - `docs/memory.md` Typed addresses, PMM, VMM, and kernel heap allocator.
+- `docs/elf.md` Minimal ELF loader and embedded user image bring-up.
 - `docs/syscall.md` SYSCALL/MSR setup and the current syscall stub.
 - `docs/tasking.md` Task structures, kernel threads, and scheduler behavior.
 - `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.

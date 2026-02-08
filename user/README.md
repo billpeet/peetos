@@ -1,0 +1,11 @@
+# User Programs (Embedded)
+
+`user/hello.elf` is a minimal static ELF64 binary used for early user-mode bring-up. It simply invokes `int 0x80` with `SYS_EXIT`.
+
+Regenerate the binary if needed:
+
+```bash
+scripts/build_user.sh
+```
+
+This binary is embedded in the kernel via `include_bytes!`.
