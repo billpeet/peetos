@@ -40,8 +40,8 @@ Limitations / Simplifications
 For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed in the IDT. The handler uses the `InterruptFrame` to extract syscall arguments and write the return value to `RAX`.
 
 Limitations / Simplifications
-- The `int 0x80` path currently shares the same Linux-numbered dispatcher as the SYSCALL path and supports a small stage-4 subset:
-  - `SYS_WRITE` (fd `1`/`2` to serial)
+- The `int 0x80` path currently shares the same Linux-numbered dispatcher as the SYSCALL path and supports a baseline subset:
+  - `SYS_OPEN`, `SYS_OPENAT`, `SYS_CLOSE`, `SYS_READ`, `SYS_WRITE`, `SYS_LSEEK`
   - `SYS_EXIT`, `SYS_EXIT_GROUP`
   - `SYS_YIELD`
   - `SYS_GETPID`, `SYS_GETPPID`, `SYS_GETTID`
@@ -53,7 +53,7 @@ Limitations / Simplifications
 `kernel/src/syscall.rs` now implements a table-driven dispatcher shared by both the SYSCALL and int 0x80 paths. Arguments are normalized into a small `SyscallArgs` struct, syscall entries carry mode metadata (any task vs user task), unknown syscall logs are rate-limited, and return values use Linux-style negative errno.
 
 Current implemented handlers:
-- `write(1|2, buf, len)` to serial output
+- `open/openat/close/read/write/lseek` via baseline tmpfs-backed VFS descriptors
 - `exit(status)` and `exit_group(status)`
 - `sched_yield()`
 - `getpid()`, `getppid()`, `gettid()`
@@ -62,7 +62,8 @@ Current implemented handlers:
 
 Limitations / Simplifications
 - Most Linux syscall numbers are still unimplemented and return `-ENOSYS`.
-- `write` is intentionally narrow right now (only stdout/stderr serial sink; no VFS file-descriptor layer yet).
+- VFS integration is baseline-only: `openat` currently supports `AT_FDCWD` with absolute paths; no full mount namespace/path-root semantics.
+- Console I/O is simplified: stdio descriptors are pre-seeded for user tasks, console writes go to serial, and console reads currently return EOF.
 - `brk` only manages simple per-task heap growth/shrink and does not yet integrate with full userspace allocator semantics (no `mmap` fallback, no overcommit policy, no guard pages).
 - `set_tid_address` does not yet perform futex wakeups for robust thread teardown semantics.
 

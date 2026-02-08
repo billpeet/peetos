@@ -7,15 +7,16 @@ extern crate std;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
-mod serial;
-mod qemu;
-mod exception;
-mod syscall;
-mod memory;
-mod task;
-mod sched;
 mod elf;
+mod exception;
+mod memory;
+mod qemu;
+mod sched;
+mod serial;
+mod syscall;
+mod task;
 mod user;
+mod vfs;
 
 use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall, tss};
 use memory::{heap, pmm, vmm};
@@ -54,6 +55,8 @@ pub extern "C" fn kmain() -> ! {
     heap::init();
     serial_println!("[KMALLOC] Initialized");
 
+    vfs::init();
+
     task::init();
     serial_println!("[TASK] Initialized");
 
@@ -76,7 +79,9 @@ pub extern "C" fn kmain() -> ! {
     qemu::exit_success();
 
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }
 
@@ -87,7 +92,9 @@ fn panic(info: &PanicInfo) -> ! {
     serial_println!("KERNEL PANIC: {}", info);
 
     loop {
-        unsafe { core::arch::asm!("cli; hlt"); }
+        unsafe {
+            core::arch::asm!("cli; hlt");
+        }
     }
 }
 
@@ -96,6 +103,8 @@ extern "C" fn default_exception_handler(frame: &mut idt::InterruptFrame) {
     exception::report(frame);
 
     loop {
-        unsafe { core::arch::asm!("cli; hlt"); }
+        unsafe {
+            core::arch::asm!("cli; hlt");
+        }
     }
 }

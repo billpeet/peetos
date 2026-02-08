@@ -21,6 +21,7 @@ This document describes the baseline tasking and scheduler implementation introd
 - Initial user bootstrap metadata (`user_stack_ptr`, `user_argc`, `user_argv`, `user_envp`, `user_auxv`, `user_clear_tid`)
 - Per-task ELF/program metadata (`phdr_*`, `base_addr`, dynamic-linker flags)
 - Per-task program break tracking (`user_brk_start`, `user_brk`)
+- Per-task file descriptor table metadata (`kind`, inode handle, file offset, open flags)
 - Scheduling metadata (time slice, tick counters, sleep deadline)
 
 The boot task represents the current execution context and is created in `task::init()`.
@@ -62,6 +63,7 @@ Limitations / Simplifications
 - User mode is minimal: a single hardcoded user task with a fixed embedded ELF.
 - No `exec`/`fork`; `argv`/`envp` are currently fixed at spawn time for the embedded init ELF.
 - Dynamic-linking support is bootstrap-only (embedded `PT_INTERP` image, no reloc/symbol resolution).
+- Per-task FD state exists and is used by baseline VFS syscalls, but advanced descriptor semantics (`dup*`, `fcntl`, CLOEXEC semantics on `exec`) are not implemented yet.
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Address space switching and `TSS.rsp0` updates are minimal; no per-task TLS (FS/GS).
 - Task metadata for user processes is tracked, but there is no `/proc` or userspace-visible tooling for inspecting it yet.

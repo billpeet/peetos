@@ -15,10 +15,16 @@ pub const TASK_NAME_MAX: usize = 32;
 pub const KERNEL_STACK_SIZE: u64 = 16 * 1024;
 pub const KERNEL_STACK_PAGES: usize = (KERNEL_STACK_SIZE / 4096) as usize;
 pub const MAX_TASKS: usize = 64;
+pub const MAX_TASK_FDS: usize = 32;
 
 pub const TASK_FLAG_KERNEL: u32 = 0x01;
 pub const TASK_FLAG_USER: u32 = 0x02;
 pub const TASK_FLAG_IDLE: u32 = 0x04;
+
+pub const USER_FD_KIND_EMPTY: u8 = 0;
+pub const USER_FD_KIND_CONSOLE: u8 = 1;
+pub const USER_FD_KIND_VFS: u8 = 2;
+pub const USER_FD_NONE: u16 = u16::MAX;
 
 const KERNEL_CS: u64 = 0x08;
 const KERNEL_DS: u64 = 0x10;
@@ -65,6 +71,10 @@ pub struct Task {
     pub(crate) user_base_addr: u64,
     pub(crate) user_interp_base: u64,
     pub(crate) user_is_dynamic: bool,
+    pub(crate) user_fd_kind: [u8; MAX_TASK_FDS],
+    pub(crate) user_fd_inode: [u16; MAX_TASK_FDS],
+    pub(crate) user_fd_offset: [u64; MAX_TASK_FDS],
+    pub(crate) user_fd_flags: [u32; MAX_TASK_FDS],
     pub(crate) time_slice: u64,
     pub(crate) total_ticks: u64,
     pub(crate) sleep_until: u64,
@@ -139,6 +149,10 @@ pub fn init() {
             user_base_addr: 0,
             user_interp_base: 0,
             user_is_dynamic: false,
+            user_fd_kind: [USER_FD_KIND_EMPTY; MAX_TASK_FDS],
+            user_fd_inode: [USER_FD_NONE; MAX_TASK_FDS],
+            user_fd_offset: [0; MAX_TASK_FDS],
+            user_fd_flags: [0; MAX_TASK_FDS],
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,
@@ -215,6 +229,10 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.user_base_addr = 0;
         task.user_interp_base = 0;
         task.user_is_dynamic = false;
+        task.user_fd_kind = [USER_FD_KIND_EMPTY; MAX_TASK_FDS];
+        task.user_fd_inode = [USER_FD_NONE; MAX_TASK_FDS];
+        task.user_fd_offset = [0; MAX_TASK_FDS];
+        task.user_fd_flags = [0; MAX_TASK_FDS];
         task.time_slice = 0;
         task.total_ticks = 0;
         task.sleep_until = 0;
@@ -368,6 +386,34 @@ pub fn kthread_exit(exit_code: i32) -> ! {
     }
 }
 
+pub fn user_stdio_init(task: *mut Task) {
+    if task.is_null() {
+        return;
+    }
+
+    unsafe {
+        if ((*task).flags & TASK_FLAG_USER) == 0 {
+            return;
+        }
+
+        (*task).user_fd_kind[0] = USER_FD_KIND_CONSOLE;
+        (*task).user_fd_kind[1] = USER_FD_KIND_CONSOLE;
+        (*task).user_fd_kind[2] = USER_FD_KIND_CONSOLE;
+
+        (*task).user_fd_inode[0] = USER_FD_NONE;
+        (*task).user_fd_inode[1] = USER_FD_NONE;
+        (*task).user_fd_inode[2] = USER_FD_NONE;
+
+        (*task).user_fd_offset[0] = 0;
+        (*task).user_fd_offset[1] = 0;
+        (*task).user_fd_offset[2] = 0;
+
+        (*task).user_fd_flags[0] = fs::O_RDONLY;
+        (*task).user_fd_flags[1] = fs::O_WRONLY;
+        (*task).user_fd_flags[2] = fs::O_WRONLY;
+    }
+}
+
 #[cfg(test)]
 impl Task {
     pub(crate) fn for_test(pid: Pid) -> Self {
@@ -399,6 +445,10 @@ impl Task {
             user_base_addr: 0,
             user_interp_base: 0,
             user_is_dynamic: false,
+            user_fd_kind: [USER_FD_KIND_EMPTY; MAX_TASK_FDS],
+            user_fd_inode: [USER_FD_NONE; MAX_TASK_FDS],
+            user_fd_offset: [0; MAX_TASK_FDS],
+            user_fd_flags: [0; MAX_TASK_FDS],
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,

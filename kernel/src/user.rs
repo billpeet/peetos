@@ -425,6 +425,8 @@ pub fn spawn_init() {
         (*task_ptr).state = TaskState::Ready;
     }
 
+    task::user_stdio_init(task_ptr);
+
     crate::sched::add_task(task_ptr);
 
     serial_println!(

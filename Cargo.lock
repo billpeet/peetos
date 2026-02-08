@@ -19,6 +19,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "arch_x86_64",
+ "fs",
 ]
 
 [[package]]
