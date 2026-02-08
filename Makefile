@@ -22,9 +22,11 @@ KERNEL_BIN := $(BUILD_DIR)/kernel.bin
 USER_ELF   := user/hello.elf
 USER_DYN_ELF := user/hello_dyn.elf
 USER_INTERP_SO := user/ld-peetos.so
+USER_EXT2_IMG := user/sample_ext2.img
 USER_ASM   := user/hello.asm
 USER_DYN_ASM := user/hello_dyn.asm
 USER_INTERP_ASM := user/ld_peetos.asm
+USER_EXT2_SCRIPT := scripts/build_ext2_sample.sh
 
 PROFILE ?= release
 ifeq ($(PROFILE),release)
@@ -51,7 +53,7 @@ else
 CARGO_FEATURES :=
 endif
 
-.PHONY: all image bootloader kernel user clean run test
+.PHONY: all image bootloader kernel user clean run test ext2-image
 
 all: image
 
@@ -92,9 +94,12 @@ $(USER_INTERP_SO): $(USER_INTERP_ASM) | $(BUILD_DIR)
 	$(LD) -nostdlib -shared -z max-page-size=0x1000 -e _start \
 		-o $@ $(USER_INTERP_OBJ)
 
-user: $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO)
+$(USER_EXT2_IMG):
+	$(USER_EXT2_SCRIPT)
 
-kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO)
+user: $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG)
+
+kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@cp $(KERNEL_TARGET) $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
@@ -115,6 +120,9 @@ run: image
 
 test:
 	@tests/run.sh
+
+ext2-image: $(USER_EXT2_SCRIPT) user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt
+	$(USER_EXT2_SCRIPT)
 
 clean:
 	@rm -rf $(BUILD_DIR)
