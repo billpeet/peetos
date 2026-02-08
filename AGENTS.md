@@ -24,6 +24,7 @@ This repo is the Rust reimplementation of the PeetOS C kernel (source of truth l
 - Always update docs for new features:
   - `README.md` for user-facing behavior and how to run things.
   - `docs/PORTING_PLAN.md` for phase/status tracking.
+- Keep subsystem docs in `docs/` up to date. Each section must include a "Limitations / Simplifications" subsection describing known gaps, shortcuts, or future hardening needs.
 - Keep the default build clean and minimal; gate test-only behavior behind features.
 - Preserve the existing boot flow and linker setup unless there is a strong reason to change it.
 

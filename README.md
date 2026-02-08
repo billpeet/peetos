@@ -22,6 +22,7 @@ Key references in the C project:
 - `crates/` Subsystem crates (currently `arch_x86_64` provides port I/O and interrupt wrappers; others are placeholders).
 - `linker/` Linker script for the kernel.
 - `docs/PORTING_PLAN.md` High-level implementation roadmap.
+- `docs/` Implementation docs grouped by subsystem, each with a limitations/simplifications section.
 
 ## Current Status (Last reviewed: 2026-02-07)
 
@@ -29,7 +30,16 @@ Key references in the C project:
 - Panic handler prints over serial, then halts with `cli; hlt`.
 - `arch_x86_64` now provides basic port I/O helpers and interrupt enable/disable wrappers.
 - GDT/IDT setup is wired in with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, a default exception report (serial-only for now), and memory management (bitmap PMM, VMM, kernel heap).
-- Subsystem crates are placeholders beyond `arch_x86_64`; interrupts, memory management, drivers, and user space are not yet implemented.
+- Subsystem crates (`drivers`, `fs`, `net`, `syscall`, `userabi`) are placeholders; device drivers and user space are not yet implemented.
+
+## Documentation
+
+- `docs/boot.md` Boot flow, entry sequence, and `kmain()` initialization order.
+- `docs/interrupts.md` GDT/IDT setup, PIC/PIT configuration, and interrupt handling.
+- `docs/memory.md` Typed addresses, PMM, VMM, and kernel heap allocator.
+- `docs/syscall.md` SYSCALL/MSR setup and the current syscall stub.
+- `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.
+- `docs/subsystems.md` Placeholder subsystem crates and intended usage.
 
 ## Build Prerequisites
 
