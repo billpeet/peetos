@@ -10,7 +10,7 @@ This document describes the current syscall entry implementation. It is a minima
 
 **MSR Setup**
 `arch_x86_64::syscall::init()` configures the syscall MSRs:
-- `IA32_EFER`: sets `EFER_SCE` to enable `SYSCALL`/`SYSRET`.
+- `IA32_EFER`: sets `EFER_SCE` to enable `SYSCALL`/`SYSRET`, and `EFER_NXE` so page-table NX bits are honored.
 - `IA32_STAR`: uses the GDT layout where user data is at 0x18 and user code at 0x20. The base is set to `GDT_KERNEL_DS` (0x10) so SYSRET computes:
   - SS = 0x10 + 8 = 0x18
   - CS = 0x10 + 16 = 0x20

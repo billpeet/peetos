@@ -31,6 +31,7 @@ Key references in the C project:
 - `arch_x86_64` now provides basic port I/O helpers and interrupt enable/disable wrappers.
 - GDT/IDT setup is wired in with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, a default exception report (serial-only for now), and memory management (bitmap PMM, VMM, kernel heap).
 - Kernel tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption) with a minimal user-mode task loaded from an embedded ELF.
+- ELF loading is now hardened with stricter header/segment validation (alignment checks, malformed `PT_INTERP` rejection, RWX-segment rejection, entrypoint-in-exec checks), and NXE is enabled so non-executable mappings are effective.
 - Subsystem crates (`drivers`, `fs`, `net`, `syscall`, `userabi`) are placeholders; device drivers and user space are not yet implemented.
 
 ## Documentation

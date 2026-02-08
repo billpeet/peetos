@@ -7,6 +7,7 @@ use crate::gdt::{GDT_KERNEL_CS, GDT_KERNEL_DS};
 use crate::msr;
 
 pub const EFER_SCE: u64 = 1 << 0;
+pub const EFER_NXE: u64 = 1 << 11;
 
 pub const RFLAGS_IF: u64 = 1 << 9;
 pub const RFLAGS_TF: u64 = 1 << 8;
@@ -29,7 +30,7 @@ pub struct SyscallFrame {
 pub fn init() {
     unsafe {
         let mut efer = msr::read(msr::IA32_EFER);
-        efer |= EFER_SCE;
+        efer |= EFER_SCE | EFER_NXE;
         msr::write(msr::IA32_EFER, efer);
 
         let star = ((GDT_KERNEL_DS as u64) << 48) | ((GDT_KERNEL_CS as u64) << 32);
