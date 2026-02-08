@@ -28,7 +28,7 @@ Key references in the C project:
 - Boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a `hlt` loop.
 - Panic handler prints over serial, then halts with `cli; hlt`.
 - `arch_x86_64` now provides basic port I/O helpers and interrupt enable/disable wrappers.
-- GDT/IDT setup is wired in with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, and a default exception report (serial-only for now).
+- GDT/IDT setup is wired in with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, a default exception report (serial-only for now), and a bitmap-based PMM.
 - Subsystem crates are placeholders beyond `arch_x86_64`; interrupts, memory management, drivers, and user space are not yet implemented.
 
 ## Build Prerequisites
