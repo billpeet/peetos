@@ -17,6 +17,9 @@ This document describes the baseline tasking and scheduler implementation introd
 - State and flags
 - Saved interrupt-frame stack pointer (`saved_rsp`)
 - Kernel stack base/top
+- User-process metadata (`pml4_phys`, user entry point, user stack bounds)
+- Per-task ELF/program metadata (`phdr_*`, `base_addr`, dynamic-linker flags)
+- Per-task program break tracking (`user_brk_start`, `user_brk`)
 - Scheduling metadata (time slice, tick counters, sleep deadline)
 
 The boot task represents the current execution context and is created in `task::init()`.
@@ -31,7 +34,7 @@ The boot task represents the current execution context and is created in `task::
 - Mapping a 32KB user stack at `USER_STACK_TOP = 0x7FFF_FF00_0000`.
 - Building an `InterruptFrame` that returns to ring 3 via `iretq`.
 
-The initial user program is a small ELF that invokes `int 0x80` to call `SYS_EXIT`.
+The initial user program is a small ELF that invokes `int 0x80` to call Linux `SYS_EXIT` (`60`).
 
 **Scheduler**
 `kernel/src/sched.rs` provides a simple round-robin scheduler:
@@ -57,6 +60,7 @@ Limitations / Simplifications
 - No `exec`/`fork`, no dynamic linker, and no argv/envp setup for the user stack.
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Address space switching and `TSS.rsp0` updates are minimal; no per-task TLS (FS/GS).
+- Task metadata for user processes is tracked, but there is no `/proc` or userspace-visible tooling for inspecting it yet.
 - No FPU/SSE save/restore per task.
 - Task cleanup is minimal; zombie tasks are not reaped automatically.
 - Run queue operations are protected only by interrupt masking (single-core assumption).

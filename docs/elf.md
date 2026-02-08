@@ -30,6 +30,6 @@ Limitations / Simplifications
 - Segment permissions set `PTE_NO_EXECUTE`, and `EFER.NXE` is enabled during syscall/MSR setup.
 - Segment-level W^X is enforced by rejecting `PF_W | PF_X` `PT_LOAD` segments, but there is no SMEP/SMAP integration.
 - User address checks are stricter than the initial baseline (checked arithmetic + entrypoint-in-exec-range checks), but there is still no ASLR.
-- `program_break` is reported but not wired into a `brk`/heap syscall yet.
+- `program_break` is now consumed by per-task `brk` state, but the full userspace allocator contract (`mmap`, overcommit, guard pages) is not implemented yet.
 - Load failure rollback is still minimal; pages mapped before a late failure are not fully unwound.
 - The embedded ELF is rebuilt automatically via the Makefile; `scripts/build_user.sh` remains a manual helper.

@@ -48,6 +48,17 @@ pub struct Task {
     pub(crate) kernel_stack_base: u64,
     pub(crate) kernel_stack_top: u64,
     pub(crate) pml4_phys: u64,
+    pub(crate) user_entry: u64,
+    pub(crate) user_stack_bottom: u64,
+    pub(crate) user_stack_top: u64,
+    pub(crate) user_brk_start: u64,
+    pub(crate) user_brk: u64,
+    pub(crate) user_phdr_addr: u64,
+    pub(crate) user_phdr_count: u16,
+    pub(crate) user_phdr_size: u16,
+    pub(crate) user_base_addr: u64,
+    pub(crate) user_interp_base: u64,
+    pub(crate) user_is_dynamic: bool,
     pub(crate) time_slice: u64,
     pub(crate) total_ticks: u64,
     pub(crate) sleep_until: u64,
@@ -105,6 +116,17 @@ pub fn init() {
             kernel_stack_base: 0,
             kernel_stack_top: 0,
             pml4_phys: 0,
+            user_entry: 0,
+            user_stack_bottom: 0,
+            user_stack_top: 0,
+            user_brk_start: 0,
+            user_brk: 0,
+            user_phdr_addr: 0,
+            user_phdr_count: 0,
+            user_phdr_size: 0,
+            user_base_addr: 0,
+            user_interp_base: 0,
+            user_is_dynamic: false,
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,
@@ -164,6 +186,17 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.kernel_stack_base = stack_base;
         task.kernel_stack_top = stack_top;
         task.pml4_phys = 0;
+        task.user_entry = 0;
+        task.user_stack_bottom = 0;
+        task.user_stack_top = 0;
+        task.user_brk_start = 0;
+        task.user_brk = 0;
+        task.user_phdr_addr = 0;
+        task.user_phdr_count = 0;
+        task.user_phdr_size = 0;
+        task.user_base_addr = 0;
+        task.user_interp_base = 0;
+        task.user_is_dynamic = false;
         task.time_slice = 0;
         task.total_ticks = 0;
         task.sleep_until = 0;
@@ -175,7 +208,9 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         TASK_COUNT = TASK_COUNT.saturating_add(1);
     }
 
-    serial_println!("[TASK] Created task '{}' PID={}", name, unsafe { (*task_ptr).pid });
+    serial_println!("[TASK] Created task '{}' PID={}", name, unsafe {
+        (*task_ptr).pid
+    });
     task_ptr
 }
 
@@ -295,7 +330,9 @@ pub fn kthread_exit(exit_code: i32) -> ! {
     let task = current();
     if task.is_null() {
         loop {
-            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
+            }
         }
     }
 
@@ -307,7 +344,9 @@ pub fn kthread_exit(exit_code: i32) -> ! {
     crate::sched::yield_now();
 
     loop {
-        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 
@@ -325,6 +364,17 @@ impl Task {
             kernel_stack_base: 0,
             kernel_stack_top: 0,
             pml4_phys: 0,
+            user_entry: 0,
+            user_stack_bottom: 0,
+            user_stack_top: 0,
+            user_brk_start: 0,
+            user_brk: 0,
+            user_phdr_addr: 0,
+            user_phdr_count: 0,
+            user_phdr_size: 0,
+            user_base_addr: 0,
+            user_interp_base: 0,
+            user_is_dynamic: false,
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,

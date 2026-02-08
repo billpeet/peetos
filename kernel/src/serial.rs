@@ -86,6 +86,17 @@ pub fn _print(args: fmt::Arguments) {
     }
 }
 
+pub fn write_bytes(bytes: &[u8]) {
+    unsafe {
+        for &byte in bytes {
+            if byte == b'\n' {
+                SERIAL1.write_byte(b'\r');
+            }
+            SERIAL1.write_byte(byte);
+        }
+    }
+}
+
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {

@@ -1,6 +1,6 @@
 # User Programs (Embedded)
 
-`user/hello.elf` is a minimal static ELF64 binary used for early user-mode bring-up. It simply invokes `int 0x80` with `SYS_EXIT`.
+`user/hello.elf` is a minimal static ELF64 binary used for early user-mode bring-up. It invokes `int 0x80` with Linux x86_64 `SYS_EXIT` (`60`).
 
 Regenerate the binary if needed:
 

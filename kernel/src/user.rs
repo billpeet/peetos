@@ -42,7 +42,11 @@ pub fn spawn_init() {
         }
 
         unsafe {
-            ptr::write_bytes(page_phys.to_virt().as_u64() as *mut u8, 0, PAGE_SIZE as usize);
+            ptr::write_bytes(
+                page_phys.to_virt().as_u64() as *mut u8,
+                0,
+                PAGE_SIZE as usize,
+            );
         }
 
         let page_vaddr = stack_bottom + (i as u64 * PAGE_SIZE);
@@ -68,6 +72,17 @@ pub fn spawn_init() {
 
     unsafe {
         (*task_ptr).pml4_phys = pml4.as_u64();
+        (*task_ptr).user_entry = elf_result.entry_point;
+        (*task_ptr).user_stack_bottom = stack_bottom;
+        (*task_ptr).user_stack_top = USER_STACK_TOP;
+        (*task_ptr).user_brk_start = elf_result.program_break;
+        (*task_ptr).user_brk = elf_result.program_break;
+        (*task_ptr).user_phdr_addr = elf_result.phdr_addr;
+        (*task_ptr).user_phdr_count = elf_result.phdr_count;
+        (*task_ptr).user_phdr_size = elf_result.phdr_size;
+        (*task_ptr).user_base_addr = elf_result.base_addr;
+        (*task_ptr).user_interp_base = elf_result.interp_base;
+        (*task_ptr).user_is_dynamic = elf_result.is_dynamic;
 
         let stack_top = (*task_ptr).kernel_stack_top;
         let mut frame_addr = stack_top - size_of::<InterruptFrame>() as u64;
@@ -90,5 +105,8 @@ pub fn spawn_init() {
 
     crate::sched::add_task(task_ptr);
 
-    serial_println!("[USER] User task ready (entry=0x{:x})", elf_result.entry_point);
+    serial_println!(
+        "[USER] User task ready (entry=0x{:x})",
+        elf_result.entry_point
+    );
 }
