@@ -9,16 +9,19 @@ This document summarizes the interrupt-related infrastructure in the Rust port, 
 - `crates/arch_x86_64/src/idt.rs`
 - `crates/arch_x86_64/src/pic.rs`
 - `crates/arch_x86_64/src/pit.rs`
+- `crates/arch_x86_64/src/tss.rs`
 - `kernel/src/main.rs`
 - `kernel/src/exception.rs`
 
 **Initialization Order (Kernel)**
 1. `gdt::init()`
-2. `idt::init()`
-3. Register default exception handlers for vectors 0..31
-4. `pic::init()`
-5. `pit::init()`
-6. `interrupts::enable()`
+2. `tss::init()`
+3. `idt::init()`
+4. Register default exception handlers for vectors 0..31
+5. Install the `int 0x80` syscall gate and handler
+6. `pic::init()`
+7. `pit::init()`
+8. `interrupts::enable()`
 
 See `kernel/src/main.rs` for the current boot sequence.
 
@@ -49,16 +52,24 @@ Limitations / Simplifications
 - 0x20: User code (64-bit)
 - 0x28: TSS descriptor (spans two entries)
 
-`gdt::init()` builds the table, loads it with `lgdt`, reloads segment registers, and uses `retfq` to reload CS. TSS helpers exist (`set_tss_base`, `load_tss`) but are not wired to a TSS yet.
+`gdt::init()` builds the table, loads it with `lgdt`, reloads segment registers, and uses `retfq` to reload CS. A minimal TSS is initialized after GDT load to support ring transitions.
 
 Limitations / Simplifications
 - There is no per-CPU GDT or TSS, and no Interrupt Stack Table (IST) support yet.
-- The TSS descriptor is reserved but not populated with stack pointers.
+- Only `RSP0` is used; no alternate stacks for faults/exceptions.
+
+**TSS**
+`crates/arch_x86_64/src/tss.rs` provides a minimal TSS with `RSP0` support. The scheduler updates `RSP0` on every task switch so that user-to-kernel transitions land on the correct kernel stack.
+
+Limitations / Simplifications
+- Only `RSP0` is used; IST entries are not configured.
+- The I/O permission bitmap is disabled (offset set to end of TSS).
 
 **IDT and ISR Stubs**
 `crates/arch_x86_64/src/idt.rs` builds a 256-entry IDT. It installs:
 - Exception handlers for vectors 0..31
 - IRQ stubs for vectors 32..47
+- A user-accessible `int 0x80` gate for syscalls
 
 The stubs are defined via `global_asm!` and push an interrupt number and error code (dummy for non-error-code exceptions). They save GP registers, call `isr_handler`, restore registers, and `iretq`.
 

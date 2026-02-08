@@ -12,3 +12,4 @@ pub mod port;
 pub mod msr;
 pub mod syscall;
 pub mod addr;
+pub mod tss;

@@ -1,11 +1,14 @@
 use core::ptr;
 
+use arch_x86_64::addr::PhysAddr;
 use arch_x86_64::interrupts;
 use arch_x86_64::idt::InterruptFrame;
+use arch_x86_64::tss;
 use arch_x86_64::pit;
 
 use crate::serial_println;
 use crate::task::{self, Task, TaskState, TASK_FLAG_IDLE};
+use crate::memory::vmm;
 
 pub const DEFAULT_TIME_SLICE: u64 = 5;
 
@@ -198,6 +201,12 @@ pub fn tick() {
     }
 }
 
+pub fn request_preempt() {
+    unsafe {
+        PREEMPT_PENDING = true;
+    }
+}
+
 pub fn yield_now() {
     if !is_running() {
         return;
@@ -342,6 +351,16 @@ fn schedule_from(current_rsp: u64, requeue_current: bool) -> u64 {
         (*next).time_slice = DEFAULT_TIME_SLICE;
         CURRENT_TASK = next;
         STAT_CONTEXT_SWITCHES = STAT_CONTEXT_SWITCHES.saturating_add(1);
+
+        if (*next).kernel_stack_top != 0 {
+            tss::set_rsp0((*next).kernel_stack_top);
+        }
+
+        if (*next).pml4_phys != 0 {
+            vmm::switch(PhysAddr::new((*next).pml4_phys));
+        } else {
+            vmm::switch(PhysAddr::new(0));
+        }
 
         (*next).saved_rsp
     }

@@ -36,11 +36,18 @@ Limitations / Simplifications
 - No stack switching, GS base swap, or per-task kernel stack support.
 - No SMEP/SMAP toggling or user pointer validation.
 
-**Syscall Handler**
-`kernel/src/syscall.rs` implements a placeholder handler that logs the syscall number and returns `-ENOSYS`.
+**INT 0x80 Path**
+For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed in the IDT. The handler uses the `InterruptFrame` to extract syscall arguments and write the return value to `RAX`.
 
 Limitations / Simplifications
-- No syscall table or dispatch; all syscalls are rejected.
+- Only a tiny syscall surface is implemented (`SYS_EXIT`, `SYS_YIELD`).
+- The int 0x80 path is temporary and will be replaced by a full SYSCALL/SYSRET flow with stack switching.
+
+**Syscall Handler**
+`kernel/src/syscall.rs` implements a minimal dispatcher shared by both the SYSCALL and int 0x80 paths. It currently supports `SYS_EXIT` and `SYS_YIELD` and returns `-ENOSYS` for anything else.
+
+Limitations / Simplifications
+- Only a minimal dispatch table exists; unhandled syscalls return `-ENOSYS`.
 - No argument validation or errno translation beyond `-ENOSYS`.
 
 **Integration**

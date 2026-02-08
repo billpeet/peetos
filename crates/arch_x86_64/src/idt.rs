@@ -17,6 +17,7 @@ pub const IDT_GATE_USER: u8 = 0xEE;
 
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const EXCEPTION_PAGE_FAULT: u8 = 14;
+pub const SYSCALL_VECTOR: u8 = 0x80;
 
 pub type InterruptHandler = extern "C" fn(frame: &mut InterruptFrame);
 pub type PostHandlerHook = fn(frame: &mut InterruptFrame) -> u64;
@@ -165,6 +166,19 @@ pub fn set_post_handler_hook(hook: PostHandlerHook) {
         POST_HANDLER_HOOK = Some(hook);
     }
 }
+
+#[cfg(target_os = "none")]
+pub fn install_syscall_gate() {
+    set_gate(
+        SYSCALL_VECTOR,
+        isr128 as *const () as u64,
+        KERNEL_CODE_SELECTOR,
+        IDT_GATE_USER,
+    );
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn install_syscall_gate() {}
 
 #[cfg(target_os = "none")]
 pub fn init() {
@@ -326,6 +340,8 @@ ISR_ERR 29
 ISR_ERR 30
 ISR_NOERR 31
 
+ISR_NOERR 128
+
 IRQ 0, 32
 IRQ 1, 33
 IRQ 2, 34
@@ -421,6 +437,7 @@ extern "C" {
     fn isr29();
     fn isr30();
     fn isr31();
+    fn isr128();
 
     fn irq0();
     fn irq1();

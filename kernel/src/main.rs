@@ -14,8 +14,9 @@ mod syscall;
 mod memory;
 mod task;
 mod sched;
+mod user;
 
-use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall};
+use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall, tss};
 use memory::{heap, pmm, vmm};
 
 #[no_mangle]
@@ -26,10 +27,15 @@ pub extern "C" fn kmain() -> ! {
     gdt::init();
     serial_println!("[GDT] Loaded");
 
+    tss::init();
+    serial_println!("[TSS] Loaded");
+
     idt::init();
     for vector in 0u8..32u8 {
         idt::register_handler(vector, default_exception_handler);
     }
+    idt::install_syscall_gate();
+    idt::register_handler(idt::SYSCALL_VECTOR, syscall::syscall_int80_handler);
     serial_println!("[IDT] Loaded");
 
     pic::init();
@@ -55,6 +61,9 @@ pub extern "C" fn kmain() -> ! {
 
     pit::set_tick_hook(sched::tick);
     idt::set_post_handler_hook(sched::isr_hook);
+
+    #[cfg(not(feature = "test-exit"))]
+    user::spawn_init();
 
     arch_syscall::init();
     serial_println!("[SYSCALL] MSRs configured");

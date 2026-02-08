@@ -509,62 +509,68 @@ pub fn create_address_space() -> PhysAddr {
         }
     }
 
-    let new_pdpt = alloc_page_table();
-    if new_pdpt.as_u64() == 0 {
-        pmm::free_page(new_pml4);
-        return PhysAddr::new(0);
-    }
+    let kernel_entry0 = unsafe { ptr::read(kernel_table) };
+    let mut new_pdpt = PhysAddr::new(0);
 
-    let new_pdpt_table = table_ptr(new_pdpt);
-    let kernel_pdpt = pte_addr(unsafe { ptr::read(kernel_table) });
-    let kernel_pdpt_table = table_ptr(kernel_pdpt);
-
-    for i in 0..VMM_ENTRIES_PER_TABLE {
-        let pdpte = unsafe { ptr::read(kernel_pdpt_table.add(i)) };
-        if !pte_present(pdpte) {
-            unsafe { ptr::write(new_pdpt_table.add(i), 0) };
-            continue;
+    if pte_present(kernel_entry0) {
+        new_pdpt = alloc_page_table();
+        if new_pdpt.as_u64() == 0 {
+            pmm::free_page(new_pml4);
+            return PhysAddr::new(0);
         }
 
-        let kernel_pd = pte_addr(pdpte);
-        let kernel_pd_table = table_ptr(kernel_pd);
+        let new_pdpt_table = table_ptr(new_pdpt);
+        let kernel_pdpt = pte_addr(kernel_entry0);
+        let kernel_pdpt_table = table_ptr(kernel_pdpt);
 
-        let mut has_only_large = true;
-        for j in 0..VMM_ENTRIES_PER_TABLE {
-            let pde = unsafe { ptr::read(kernel_pd_table.add(j)) };
-            if pte_present(pde) && (pde & PTE_LARGE) == 0 {
-                has_only_large = false;
-                break;
-            }
-        }
-
-        if has_only_large {
-            unsafe { ptr::write(new_pdpt_table.add(i), pdpte) };
-        } else {
-            let new_pd = alloc_page_table();
-            if new_pd.as_u64() == 0 {
-                serial_println!("[VMM] ERROR: Failed to allocate PD");
+        for i in 0..VMM_ENTRIES_PER_TABLE {
+            let pdpte = unsafe { ptr::read(kernel_pdpt_table.add(i)) };
+            if !pte_present(pdpte) {
+                unsafe { ptr::write(new_pdpt_table.add(i), 0) };
                 continue;
             }
-            let new_pd_table = table_ptr(new_pd);
 
+            let kernel_pd = pte_addr(pdpte);
+            let kernel_pd_table = table_ptr(kernel_pd);
+
+            let mut has_only_large = true;
             for j in 0..VMM_ENTRIES_PER_TABLE {
                 let pde = unsafe { ptr::read(kernel_pd_table.add(j)) };
-                if pte_present(pde) && (pde & PTE_LARGE) != 0 {
-                    unsafe { ptr::write(new_pd_table.add(j), pde) };
-                } else {
-                    unsafe { ptr::write(new_pd_table.add(j), 0) };
+                if pte_present(pde) && (pde & PTE_LARGE) == 0 {
+                    has_only_large = false;
+                    break;
                 }
             }
 
-            let new_pdpte = new_pd.as_u64() | (pdpte & PTE_FLAGS_MASK);
-            unsafe { ptr::write(new_pdpt_table.add(i), new_pdpte) };
+            if has_only_large {
+                unsafe { ptr::write(new_pdpt_table.add(i), pdpte) };
+            } else {
+                let new_pd = alloc_page_table();
+                if new_pd.as_u64() == 0 {
+                    serial_println!("[VMM] ERROR: Failed to allocate PD");
+                    continue;
+                }
+                let new_pd_table = table_ptr(new_pd);
+
+                for j in 0..VMM_ENTRIES_PER_TABLE {
+                    let pde = unsafe { ptr::read(kernel_pd_table.add(j)) };
+                    if pte_present(pde) && (pde & PTE_LARGE) != 0 {
+                        unsafe { ptr::write(new_pd_table.add(j), pde) };
+                    } else {
+                        unsafe { ptr::write(new_pd_table.add(j), 0) };
+                    }
+                }
+
+                let new_pdpte = new_pd.as_u64() | (pdpte & PTE_FLAGS_MASK);
+                unsafe { ptr::write(new_pdpt_table.add(i), new_pdpte) };
+            }
         }
     }
 
     unsafe {
-        let kernel_entry0 = ptr::read(kernel_table);
-        ptr::write(new_table, new_pdpt.as_u64() | (kernel_entry0 & PTE_FLAGS_MASK));
+        if pte_present(kernel_entry0) {
+            ptr::write(new_table, new_pdpt.as_u64() | (kernel_entry0 & PTE_FLAGS_MASK));
+        }
 
         for i in 256..VMM_ENTRIES_PER_TABLE {
             ptr::write(new_table.add(i), ptr::read(kernel_table.add(i)));
