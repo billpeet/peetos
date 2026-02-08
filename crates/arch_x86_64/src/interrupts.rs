@@ -65,9 +65,34 @@ where
     result
 }
 
+pub struct InterruptGuard {
+    was_enabled: bool,
+}
+
+impl InterruptGuard {
+    pub fn new() -> Self {
+        let was_enabled = are_enabled();
+        disable();
+        Self { was_enabled }
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        if self.was_enabled {
+            enable();
+        }
+    }
+}
+
+#[inline]
+pub fn guard() -> InterruptGuard {
+    InterruptGuard::new()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{are_enabled, disable, enable, without_interrupts};
+    use super::{are_enabled, disable, enable, guard, without_interrupts};
 
     #[test]
     fn without_interrupts_restores_enabled_state() {
@@ -88,6 +113,27 @@ mod tests {
         assert!(!inside);
         assert!(!are_enabled());
 
+        enable();
+    }
+
+    #[test]
+    fn guard_restores_enabled_state() {
+        enable();
+        {
+            let _guard = guard();
+            assert!(!are_enabled());
+        }
+        assert!(are_enabled());
+    }
+
+    #[test]
+    fn guard_keeps_disabled_state() {
+        disable();
+        {
+            let _guard = guard();
+            assert!(!are_enabled());
+        }
+        assert!(!are_enabled());
         enable();
     }
 }

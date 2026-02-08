@@ -9,3 +9,5 @@ pub mod idt;
 pub mod pic;
 pub mod pit;
 pub mod port;
+pub mod msr;
+pub mod syscall;

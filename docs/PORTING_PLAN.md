@@ -10,7 +10,7 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 
 - Phase 0: Complete. Workspace, subsystem crates, bootloader/linker reuse, Makefile, `.cargo/config.toml`, and kernel entry assembly are present.
 - Phase 1: Complete. The kernel boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a loop. The panic handler reports over serial before halting.
-- Phase 2: In progress. Added `arch_x86_64` port I/O helpers, interrupt enable/disable wrappers, GDT/IDT setup with interrupt stubs and handler registration, PIC remap, PIT timer init, and a serial exception report; syscall entry is still pending.
+- Phase 2: Complete (baseline). Added `arch_x86_64` port I/O helpers, interrupt enable/disable wrappers (plus RAII guard), GDT/IDT setup with interrupt stubs and handler registration, PIC remap, PIT timer init, syscall entry/MSR setup, and a serial exception report.
 - Phases 3–10: Not started.
 
 ## Phase 0: Project Scaffolding
@@ -28,8 +28,10 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 ## Phase 2: CPU + Interrupts
 
 - Port I/O helpers and safe interrupt enable/disable wrappers.
+- RAII-style critical section guard for interrupt masking.
 - GDT/IDT setup with interrupt stubs and handler registration.
 - PIC remap and PIT timer init (IRQ0).
+- Syscall entry stub and MSR setup.
 - Exception handling details (serial report; VGA optional).
 - Syscall entry stub and interrupt context framing.
 - Establish safe Rust wrappers for interrupt enable/disable and critical sections (basic `enable`/`disable` + `without_interrupts` done; scoped guards pending).

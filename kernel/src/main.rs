@@ -10,8 +10,9 @@ use core::panic::PanicInfo;
 mod serial;
 mod qemu;
 mod exception;
+mod syscall;
 
-use arch_x86_64::{gdt, idt, interrupts, pic, pit};
+use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall};
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
@@ -32,6 +33,9 @@ pub extern "C" fn kmain() -> ! {
 
     pit::init();
     serial_println!("[PIT] Initialized");
+
+    arch_syscall::init();
+    serial_println!("[SYSCALL] MSRs configured");
 
     interrupts::enable();
 
