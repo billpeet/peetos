@@ -12,6 +12,8 @@ mod qemu;
 mod exception;
 mod syscall;
 mod memory;
+mod task;
+mod sched;
 
 use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall};
 use memory::{heap, pmm, vmm};
@@ -44,6 +46,15 @@ pub extern "C" fn kmain() -> ! {
 
     heap::init();
     serial_println!("[KMALLOC] Initialized");
+
+    task::init();
+    serial_println!("[TASK] Initialized");
+
+    sched::init();
+    serial_println!("[SCHED] Initialized");
+
+    pit::set_tick_hook(sched::tick);
+    idt::set_post_handler_hook(sched::isr_hook);
 
     arch_syscall::init();
     serial_println!("[SYSCALL] MSRs configured");

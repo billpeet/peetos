@@ -19,6 +19,7 @@ pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const EXCEPTION_PAGE_FAULT: u8 = 14;
 
 pub type InterruptHandler = extern "C" fn(frame: &mut InterruptFrame);
+pub type PostHandlerHook = fn(frame: &mut InterruptFrame) -> u64;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -85,6 +86,7 @@ static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
 #[cfg(target_os = "none")]
 static mut IDTR: Idtr = Idtr { limit: 0, base: 0 };
 static mut HANDLERS: [Option<InterruptHandler>; IDT_ENTRIES] = [None; IDT_ENTRIES];
+static mut POST_HANDLER_HOOK: Option<PostHandlerHook> = None;
 
 static EXCEPTION_NAMES: [&str; 32] = [
     "Divide Error (#DE)",
@@ -158,6 +160,12 @@ pub fn register_handler(vector: u8, handler: InterruptHandler) {
     }
 }
 
+pub fn set_post_handler_hook(hook: PostHandlerHook) {
+    unsafe {
+        POST_HANDLER_HOOK = Some(hook);
+    }
+}
+
 #[cfg(target_os = "none")]
 pub fn init() {
     unsafe {
@@ -205,29 +213,36 @@ pub fn init() {
 
 #[cfg(target_os = "none")]
 #[no_mangle]
-pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
+pub extern "C" fn isr_handler(frame: &mut InterruptFrame) -> u64 {
     interrupts::disable();
 
     let int_no = unsafe { ptr::read_unaligned(ptr::addr_of!(frame.int_no)) };
     let vector = int_no as usize;
     let handler = unsafe { HANDLERS[vector] };
+    let mut handled = false;
 
     if let Some(handler) = handler {
         handler(frame);
-        return;
+        handled = true;
     }
 
-    if (32..48).contains(&int_no) {
+    if !handled && (32..48).contains(&int_no) {
         let irq = (int_no - 32) as u8;
         if !pic::is_spurious(irq) {
             pic::send_eoi(irq);
         }
-        return;
+        handled = true;
     }
 
-    if int_no < 32 {
+    if !handled && int_no < 32 {
         default_exception_handler(frame);
     }
+
+    if let Some(hook) = unsafe { POST_HANDLER_HOOK } {
+        return hook(frame);
+    }
+
+    0
 }
 
 #[cfg(target_os = "none")]
@@ -241,7 +256,9 @@ fn default_exception_handler(_frame: &mut InterruptFrame) -> ! {
 
 #[cfg(not(target_os = "none"))]
 #[allow(dead_code)]
-pub extern "C" fn isr_handler(_frame: &mut InterruptFrame) {}
+pub extern "C" fn isr_handler(_frame: &mut InterruptFrame) -> u64 {
+    0
+}
 
 #[cfg(target_os = "none")]
 unsafe fn lidt(idtr: *const Idtr) {
@@ -345,6 +362,10 @@ isr_common_stub:
 
     mov rdi, rsp
     call isr_handler
+    test rax, rax
+    jz .no_switch
+    mov rsp, rax
+.no_switch:
 
     pop r15
     pop r14

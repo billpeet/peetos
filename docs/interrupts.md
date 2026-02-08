@@ -67,6 +67,7 @@ The stubs are defined via `global_asm!` and push an interrupt number and error c
 2. Checks for a registered handler in the vector table.
 3. For IRQs 32..47, it sends EOI via the PIC (with spurious detection for IRQ7/IRQ15).
 4. For exceptions, it invokes the default exception handler (halts in a loop).
+5. If configured, it invokes a post-handler hook for scheduling/preemption.
 
 The default exception path uses `kernel/src/exception.rs` to print a structured serial report (including CR2 decode for page faults).
 
@@ -88,6 +89,7 @@ Limitations / Simplifications
 
 **PIT (8253/8254)**
 `crates/arch_x86_64/src/pit.rs` configures channel 0 in mode 2 at 100 Hz (`TIMER_FREQUENCY`). It registers an IRQ0 handler that increments an atomic tick counter and sends EOI. Helpers provide tick-based sleep with `hlt` and uptime calculations.
+If a tick hook is registered, the handler invokes it after incrementing the tick counter. The scheduler uses this hook to drive preemptive scheduling.
 
 Limitations / Simplifications
 - Fixed 100 Hz rate with no calibration against TSC/HPET.

@@ -30,6 +30,7 @@ Key references in the C project:
 - Panic handler prints over serial, then halts with `cli; hlt`.
 - `arch_x86_64` now provides basic port I/O helpers and interrupt enable/disable wrappers.
 - GDT/IDT setup is wired in with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, a default exception report (serial-only for now), and memory management (bitmap PMM, VMM, kernel heap).
+- Kernel tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption). User mode is not implemented yet.
 - Subsystem crates (`drivers`, `fs`, `net`, `syscall`, `userabi`) are placeholders; device drivers and user space are not yet implemented.
 
 ## Documentation
@@ -38,6 +39,7 @@ Key references in the C project:
 - `docs/interrupts.md` GDT/IDT setup, PIC/PIT configuration, and interrupt handling.
 - `docs/memory.md` Typed addresses, PMM, VMM, and kernel heap allocator.
 - `docs/syscall.md` SYSCALL/MSR setup and the current syscall stub.
+- `docs/tasking.md` Task structures, kernel threads, and scheduler behavior.
 - `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.
 - `docs/subsystems.md` Placeholder subsystem crates and intended usage.
 

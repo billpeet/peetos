@@ -19,6 +19,8 @@ pub const PIT_FREQUENCY: u32 = 1_193_182;
 pub const TIMER_FREQUENCY: u32 = 100;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static mut TICK_HOOK: Option<fn()> = None;
 
 #[inline]
 pub const fn pit_divisor(freq: u32) -> u16 {
@@ -28,6 +30,9 @@ pub const fn pit_divisor(freq: u32) -> u16 {
 #[cfg(target_os = "none")]
 extern "C" fn timer_handler(_frame: &mut InterruptFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    if let Some(hook) = unsafe { TICK_HOOK } {
+        hook();
+    }
     pic::send_eoi(pic::IRQ_TIMER);
 }
 
@@ -48,6 +53,16 @@ pub fn init() {
 
 #[cfg(not(target_os = "none"))]
 pub fn init() {}
+
+#[cfg(target_os = "none")]
+pub fn set_tick_hook(hook: fn()) {
+    unsafe {
+        TICK_HOOK = Some(hook);
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_tick_hook(_hook: fn()) {}
 
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
