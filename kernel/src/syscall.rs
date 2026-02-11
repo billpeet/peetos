@@ -34,6 +34,7 @@ const EIO: i64 = 5;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
+const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
 const EEXIST: i64 = 17;
@@ -55,6 +56,9 @@ const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_FSTAT: u64 = 5;
 const SYS_LSEEK: u64 = 8;
+const SYS_MMAP: u64 = 9;
+const SYS_MPROTECT: u64 = 10;
+const SYS_MUNMAP: u64 = 11;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_RT_SIGRETURN: u64 = 15;
@@ -83,6 +87,23 @@ const SYS_PIPE2: u64 = 293;
 
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_EMPTY_PATH: u32 = 0x1000;
+
+const PROT_NONE: u32 = 0x0;
+const PROT_READ: u32 = 0x1;
+const PROT_WRITE: u32 = 0x2;
+const PROT_EXEC: u32 = 0x4;
+
+const MAP_SHARED: u32 = 0x01;
+const MAP_PRIVATE: u32 = 0x02;
+const MAP_FIXED: u32 = 0x10;
+const MAP_ANONYMOUS: u32 = 0x20;
+const MAP_DENYWRITE: u32 = 0x0800;
+const MAP_EXECUTABLE: u32 = 0x1000;
+const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+
+const MMAP_BASE_ADDR: u64 = 0x0000_0001_0000_0000;
+const MMAP_BRK_GAP: u64 = 0x0020_0000;
+const MMAP_STACK_GUARD: u64 = 0x0020_0000;
 
 const WRITE_CHUNK_SIZE: usize = 128;
 const READ_CHUNK_SIZE: usize = 128;
@@ -192,6 +213,14 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_CLOSE, "close", SyscallMode::UserTask, sys_close),
     syscall_def(SYS_FSTAT, "fstat", SyscallMode::UserTask, sys_fstat),
     syscall_def(SYS_LSEEK, "lseek", SyscallMode::UserTask, sys_lseek),
+    syscall_def(SYS_MMAP, "mmap", SyscallMode::UserTask, sys_mmap),
+    syscall_def(
+        SYS_MPROTECT,
+        "mprotect",
+        SyscallMode::UserTask,
+        sys_mprotect,
+    ),
+    syscall_def(SYS_MUNMAP, "munmap", SyscallMode::UserTask, sys_munmap),
     syscall_def(
         SYS_RT_SIGACTION,
         "rt_sigaction",
@@ -789,6 +818,166 @@ fn unmap_user_pages(pml4: PhysAddr, start: u64, end: u64) {
     }
 }
 
+fn mmap_flags_are_supported(flags: u32) -> bool {
+    let supported = MAP_SHARED
+        | MAP_PRIVATE
+        | MAP_FIXED
+        | MAP_ANONYMOUS
+        | MAP_DENYWRITE
+        | MAP_EXECUTABLE
+        | MAP_FIXED_NOREPLACE;
+    (flags & !supported) == 0
+}
+
+fn mmap_prot_to_pte_flags(prot: u32) -> Result<u64, i64> {
+    if (prot & !(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 {
+        return Err(-EINVAL);
+    }
+
+    let mut flags = vmm::PTE_PRESENT;
+    if prot != PROT_NONE {
+        flags |= vmm::PTE_USER;
+    }
+    if (prot & PROT_WRITE) != 0 {
+        flags |= vmm::PTE_WRITE;
+    }
+    if (prot & PROT_EXEC) == 0 {
+        flags |= vmm::PTE_NO_EXECUTE;
+    }
+
+    Ok(flags)
+}
+
+fn mmap_range_unmapped(pml4: PhysAddr, start: u64, end: u64) -> bool {
+    let mut addr = start;
+    while addr < end {
+        if vmm::get_physical_in(pml4, VirtAddr::new(addr)).is_some() {
+            return false;
+        }
+        addr += PAGE_SIZE;
+    }
+    true
+}
+
+fn mmap_find_range(ctx: &SyscallContext, pml4: PhysAddr, hint: u64, len: u64) -> Result<u64, i64> {
+    let (brk, stack_bottom) =
+        unsafe { ((*ctx.current).user_brk, (*ctx.current).user_stack_bottom) };
+    if stack_bottom == 0 {
+        return Err(-ENOMEM);
+    }
+
+    let brk_start = page_align_up(brk.saturating_add(MMAP_BRK_GAP)).unwrap_or(MMAP_BASE_ADDR);
+    let search_base = cmp::max(MMAP_BASE_ADDR, brk_start);
+    let search_end = stack_bottom.saturating_sub(MMAP_STACK_GUARD);
+    if search_end <= search_base {
+        return Err(-ENOMEM);
+    }
+
+    let mut cursor = if hint == 0 {
+        search_base
+    } else {
+        cmp::max(search_base, align_down(hint, PAGE_SIZE))
+    };
+
+    while cursor < search_end {
+        let end = match cursor.checked_add(len) {
+            Some(end) => end,
+            None => break,
+        };
+        if end > search_end || end >= KERNEL_VIRT_BASE || cursor < PAGE_SIZE {
+            break;
+        }
+        if mmap_range_unmapped(pml4, cursor, end) {
+            return Ok(cursor);
+        }
+        cursor = match cursor.checked_add(PAGE_SIZE) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+
+    Err(-ENOMEM)
+}
+
+fn mmap_file_inode(
+    task_ptr: *mut task::Task,
+    fd: i32,
+    require_readable: bool,
+) -> Result<(u16, u32), i64> {
+    let idx = fd_index(fd)?;
+    if !fd_slot_is_open(task_ptr, idx) {
+        return Err(-EBADF);
+    }
+
+    let (kind, inode, fd_flags) = unsafe {
+        (
+            (*task_ptr).user_fd_kind[idx],
+            (*task_ptr).user_fd_inode[idx],
+            (*task_ptr).user_fd_flags[idx],
+        )
+    };
+    if kind != task::USER_FD_KIND_VFS {
+        return Err(-EBADF);
+    }
+    if require_readable && !fd_can_read(fd_flags) {
+        return Err(-EACCES);
+    }
+
+    Ok((inode, fd_flags))
+}
+
+fn mmap_map_pages(
+    pml4: PhysAddr,
+    start: u64,
+    len: u64,
+    pte_flags: u64,
+    file_src: Option<(u16, u64)>,
+) -> Result<(), i64> {
+    let end = start.checked_add(len).ok_or(-EINVAL)?;
+    let mut addr = start;
+
+    while addr < end {
+        let page_phys = pmm::alloc_page();
+        if page_phys.as_u64() == 0 {
+            unmap_user_pages(pml4, start, addr);
+            return Err(-ENOMEM);
+        }
+
+        let page_ptr = page_phys.to_virt().as_u64() as *mut u8;
+        unsafe {
+            ptr::write_bytes(page_ptr, 0, PAGE_SIZE as usize);
+        }
+
+        if let Some((inode, file_off)) = file_src {
+            let map_delta = addr - start;
+            let page_off = file_off.checked_add(map_delta).ok_or(-EINVAL)?;
+            let to_read = cmp::min(PAGE_SIZE, end - addr) as usize;
+            if to_read > 0 {
+                let page_slice =
+                    unsafe { core::slice::from_raw_parts_mut(page_ptr, PAGE_SIZE as usize) };
+                match fs::read(inode, page_off, &mut page_slice[..to_read]) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        pmm::free_page(page_phys);
+                        unmap_user_pages(pml4, start, addr);
+                        return Err(-fs_to_errno(err));
+                    }
+                }
+            }
+        }
+
+        if vmm::map_page_in(pml4, VirtAddr::new(addr), page_phys, pte_flags) != 0 {
+            pmm::free_page(page_phys);
+            unmap_user_pages(pml4, start, addr);
+            return Err(-ENOMEM);
+        }
+
+        addr += PAGE_SIZE;
+    }
+
+    Ok(())
+}
+
 fn set_program_break(ctx: &SyscallContext, requested: u64) -> i64 {
     let pml4 = match ctx.user_pml4() {
         Ok(pml4) => pml4,
@@ -841,6 +1030,183 @@ fn set_program_break(ctx: &SyscallContext, requested: u64) -> i64 {
         (*ctx.current).user_brk = requested;
     }
     requested as i64
+}
+
+fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let addr_hint = call.arg(0);
+    let length = call.arg(1);
+    let prot = call.arg(2) as u32;
+    let flags = call.arg(3) as u32;
+    let fd_raw = call.arg(4) as i64;
+    let offset = call.arg(5);
+
+    if length == 0 {
+        return -EINVAL;
+    }
+    if !mmap_flags_are_supported(flags) {
+        return -EINVAL;
+    }
+
+    let is_private = (flags & MAP_PRIVATE) != 0;
+    let is_shared = (flags & MAP_SHARED) != 0;
+    if !is_private || is_shared {
+        return -EINVAL;
+    }
+
+    let is_anon = (flags & MAP_ANONYMOUS) != 0;
+    let is_fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
+    let is_fixed = (flags & MAP_FIXED) != 0 || is_fixed_noreplace;
+
+    let len = match page_align_up(length) {
+        Some(v) if v > 0 => v,
+        _ => return -EINVAL,
+    };
+    let pte_flags = match mmap_prot_to_pte_flags(prot) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let pml4 = match ctx.user_pml4() {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
+    let file_src = if is_anon {
+        if fd_raw != -1 {
+            return -EINVAL;
+        }
+        if offset != 0 {
+            return -EINVAL;
+        }
+        None
+    } else {
+        if fd_raw < 0 || fd_raw > i32::MAX as i64 {
+            return -EBADF;
+        }
+        if (offset & (PAGE_SIZE - 1)) != 0 {
+            return -EINVAL;
+        }
+        let fd = fd_raw as i32;
+        match mmap_file_inode(ctx.current, fd, true) {
+            Ok((inode, _)) => Some((inode, offset)),
+            Err(err) => return err,
+        }
+    };
+
+    let start = if is_fixed {
+        if (addr_hint & (PAGE_SIZE - 1)) != 0 || addr_hint < MMAP_BASE_ADDR {
+            return -EINVAL;
+        }
+        let end = match addr_hint.checked_add(len) {
+            Some(v) => v,
+            None => return -EINVAL,
+        };
+        if end >= KERNEL_VIRT_BASE {
+            return -EINVAL;
+        }
+
+        if is_fixed_noreplace {
+            if !mmap_range_unmapped(pml4, addr_hint, end) {
+                return -EEXIST;
+            }
+        } else {
+            unmap_user_pages(pml4, addr_hint, end);
+        }
+        addr_hint
+    } else {
+        let hint = if addr_hint == 0 {
+            0
+        } else {
+            align_down(addr_hint, PAGE_SIZE)
+        };
+        match mmap_find_range(ctx, pml4, hint, len) {
+            Ok(addr) => addr,
+            Err(err) => return err,
+        }
+    };
+
+    match mmap_map_pages(pml4, start, len, pte_flags, file_src) {
+        Ok(()) => start as i64,
+        Err(err) => err,
+    }
+}
+
+fn sys_munmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let addr = call.arg(0);
+    let length = call.arg(1);
+    if length == 0 {
+        return -EINVAL;
+    }
+    if (addr & (PAGE_SIZE - 1)) != 0 || addr < MMAP_BASE_ADDR {
+        return -EINVAL;
+    }
+
+    let len = match page_align_up(length) {
+        Some(v) if v > 0 => v,
+        _ => return -EINVAL,
+    };
+    let end = match addr.checked_add(len) {
+        Some(v) => v,
+        None => return -EINVAL,
+    };
+    if end >= KERNEL_VIRT_BASE {
+        return -EINVAL;
+    }
+
+    let pml4 = match ctx.user_pml4() {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    unmap_user_pages(pml4, addr, end);
+    0
+}
+
+fn sys_mprotect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let addr = call.arg(0);
+    let length = call.arg(1);
+    let prot = call.arg(2) as u32;
+
+    if length == 0 {
+        return 0;
+    }
+    if (addr & (PAGE_SIZE - 1)) != 0 || addr < MMAP_BASE_ADDR {
+        return -EINVAL;
+    }
+
+    let len = match page_align_up(length) {
+        Some(v) if v > 0 => v,
+        _ => return -EINVAL,
+    };
+    let end = match addr.checked_add(len) {
+        Some(v) => v,
+        None => return -EINVAL,
+    };
+    if end >= KERNEL_VIRT_BASE {
+        return -EINVAL;
+    }
+
+    let pte_flags = match mmap_prot_to_pte_flags(prot) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let pml4 = match ctx.user_pml4() {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
+    let mut page = addr;
+    while page < end {
+        let phys = match vmm::get_physical_in(pml4, VirtAddr::new(page)) {
+            Some(phys) => PhysAddr::new(phys.as_u64() & !(PAGE_SIZE - 1)),
+            None => return -ENOMEM,
+        };
+
+        if vmm::map_page_in(pml4, VirtAddr::new(page), phys, pte_flags) != 0 {
+            return -ENOMEM;
+        }
+        page += PAGE_SIZE;
+    }
+
+    0
 }
 
 fn sys_open(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -2139,6 +2505,12 @@ mod tests {
     fn syscall_lookup_includes_vfs_extensions() {
         assert_eq!(lookup_syscall(SYS_PIPE).map(|d| d.name), Some("pipe"));
         assert_eq!(lookup_syscall(SYS_KILL).map(|d| d.name), Some("kill"));
+        assert_eq!(lookup_syscall(SYS_MMAP).map(|d| d.name), Some("mmap"));
+        assert_eq!(
+            lookup_syscall(SYS_MPROTECT).map(|d| d.name),
+            Some("mprotect")
+        );
+        assert_eq!(lookup_syscall(SYS_MUNMAP).map(|d| d.name), Some("munmap"));
         assert_eq!(
             lookup_syscall(SYS_RT_SIGACTION).map(|d| d.name),
             Some("rt_sigaction")
@@ -2174,6 +2546,28 @@ mod tests {
             Some("renameat")
         );
         assert_eq!(lookup_syscall(SYS_PIPE2).map(|d| d.name), Some("pipe2"));
+    }
+
+    #[test]
+    fn mmap_prot_translation_sets_expected_bits() {
+        let rw = mmap_prot_to_pte_flags(PROT_READ | PROT_WRITE).expect("rw flags");
+        assert_ne!(rw & vmm::PTE_USER, 0);
+        assert_ne!(rw & vmm::PTE_WRITE, 0);
+        assert_ne!(rw & vmm::PTE_NO_EXECUTE, 0);
+
+        let rx = mmap_prot_to_pte_flags(PROT_READ | PROT_EXEC).expect("rx flags");
+        assert_ne!(rx & vmm::PTE_USER, 0);
+        assert_eq!(rx & vmm::PTE_WRITE, 0);
+        assert_eq!(rx & vmm::PTE_NO_EXECUTE, 0);
+
+        let none = mmap_prot_to_pte_flags(PROT_NONE).expect("none flags");
+        assert_eq!(none & vmm::PTE_USER, 0);
+    }
+
+    #[test]
+    fn mmap_flag_validation_rejects_unknown_bits() {
+        assert!(mmap_flags_are_supported(MAP_PRIVATE | MAP_ANONYMOUS));
+        assert!(!mmap_flags_are_supported(MAP_PRIVATE | 0x8000_0000));
     }
 
     #[test]
