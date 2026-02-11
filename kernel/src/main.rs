@@ -14,6 +14,7 @@ mod memory;
 mod qemu;
 mod sched;
 mod serial;
+mod signal;
 mod shm;
 mod sync;
 mod syscall;

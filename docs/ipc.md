@@ -57,12 +57,29 @@ This document describes the phase-6 baseline IPC/synchronization implementation 
   - `shm_detach(task, addr)` unmaps and decrements refcount
   - `cleanup_task(task)` detaches all remaining mappings during task exit
 
+**Signals (Initial Baseline)**
+- Per-task signal state:
+  - pending mask (`sig_pending`)
+  - blocked mask (`signal_blocked`)
+  - per-signal action table (`SIG_DFL`/`SIG_IGN` baseline)
+- Signal control syscalls:
+  - `kill(pid, sig)` for directed signal delivery
+  - `rt_sigaction` for action read/write (currently accepts `SIG_DFL`/`SIG_IGN`)
+  - `rt_sigprocmask` for block/unblock/set mask operations
+- Delivery model:
+  - pending signals are consumed at syscall-return boundaries
+  - default actions currently implemented as terminate/ignore policy
+  - `SIGPIPE` is generated on broken-pipe write paths (`EPIPE`)
+
 **Syscall Integration**
 - Added syscall numbers and handlers:
+  - `rt_sigaction` (`13`)
+  - `rt_sigprocmask` (`14`)
   - `pipe` (`22`)
   - `shmget` (`29`)
   - `shmat` (`30`)
   - `shmctl` (`31`, `IPC_RMID` only)
+  - `kill` (`62`)
   - `shmdt` (`67`)
   - `futex` (`202`)
   - `pipe2` (`293`)
@@ -81,4 +98,5 @@ Limitations / Simplifications
 - Pipe semantics are baseline only: no `poll`/`epoll`, no `O_NONBLOCK`, no `splice`/`tee`, no `SIGPIPE` delivery.
 - Futex support is limited to `FUTEX_WAIT`/`FUTEX_WAKE` with no timeout, bitset, requeue, priority inheritance, or robust-list handling.
 - Shared memory is a baseline System V subset only: no permission checks, no `IPC_STAT`/`IPC_SET`, no `SHM_REMAP`/`SHM_EXEC`, and no `fork`/`exec` inheritance semantics yet.
-- No signal or message-queue IPC primitives are implemented yet.
+- Signal handling is currently control-plane focused: user-installed handler execution/trampoline/sigreturn context restore is not implemented yet (only `SIG_DFL`/`SIG_IGN` actions are accepted), and delivery happens on syscall-return boundaries.
+- No message-queue IPC primitives are implemented yet.

@@ -8,6 +8,7 @@ use arch_x86_64::syscall::SyscallFrame;
 
 use crate::ipc;
 use crate::memory::{pmm, vmm};
+use crate::signal;
 use crate::shm;
 use crate::task::{self, TaskState, TASK_FLAG_USER};
 
@@ -53,6 +54,8 @@ const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_FSTAT: u64 = 5;
 const SYS_LSEEK: u64 = 8;
+const SYS_RT_SIGACTION: u64 = 13;
+const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_BRK: u64 = 12;
 const SYS_PIPE: u64 = 22;
 const SYS_YIELD: u64 = 24;
@@ -61,6 +64,7 @@ const SYS_SHMAT: u64 = 30;
 const SYS_SHMCTL: u64 = 31;
 const SYS_GETPID: u64 = 39;
 const SYS_EXIT: u64 = 60;
+const SYS_KILL: u64 = 62;
 const SYS_SHMDT: u64 = 67;
 const SYS_GETPPID: u64 = 110;
 const SYS_GETTID: u64 = 186;
@@ -184,6 +188,18 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_CLOSE, "close", SyscallMode::UserTask, sys_close),
     syscall_def(SYS_FSTAT, "fstat", SyscallMode::UserTask, sys_fstat),
     syscall_def(SYS_LSEEK, "lseek", SyscallMode::UserTask, sys_lseek),
+    syscall_def(
+        SYS_RT_SIGACTION,
+        "rt_sigaction",
+        SyscallMode::UserTask,
+        sys_rt_sigaction,
+    ),
+    syscall_def(
+        SYS_RT_SIGPROCMASK,
+        "rt_sigprocmask",
+        SyscallMode::UserTask,
+        sys_rt_sigprocmask,
+    ),
     syscall_def(SYS_PIPE, "pipe", SyscallMode::UserTask, sys_pipe),
     syscall_def(SYS_SHMGET, "shmget", SyscallMode::UserTask, sys_shmget),
     syscall_def(SYS_SHMAT, "shmat", SyscallMode::UserTask, sys_shmat),
@@ -191,6 +207,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_BRK, "brk", SyscallMode::UserTask, sys_brk),
     syscall_def(SYS_YIELD, "sched_yield", SyscallMode::AnyTask, sys_yield),
     syscall_def(SYS_GETPID, "getpid", SyscallMode::AnyTask, sys_getpid),
+    syscall_def(SYS_KILL, "kill", SyscallMode::UserTask, sys_kill),
     syscall_def(SYS_SHMDT, "shmdt", SyscallMode::UserTask, sys_shmdt),
     syscall_def(SYS_GETPPID, "getppid", SyscallMode::AnyTask, sys_getppid),
     syscall_def(SYS_GETTID, "gettid", SyscallMode::AnyTask, sys_gettid),
@@ -294,6 +311,15 @@ fn shm_to_errno(err: i64) -> i64 {
         shm::EEXIST => EEXIST,
         shm::EINVAL => EINVAL,
         shm::ENOSPC => ENOSPC,
+        _ => EIO,
+    }
+}
+
+fn signal_to_errno(err: i64) -> i64 {
+    match err {
+        signal::EINVAL => EINVAL,
+        signal::ESRCH => ESRCH,
+        signal::ENOSYS => ENOSYS,
         _ => EIO,
     }
 }
@@ -427,6 +453,15 @@ struct LinuxStat {
     st_ctime: i64,
     st_ctime_nsec: i64,
     __unused: [i64; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSigAction {
+    sa_handler: u64,
+    sa_flags: u64,
+    sa_restorer: u64,
+    sa_mask: u64,
 }
 
 impl LinuxStat {
@@ -801,6 +836,37 @@ fn write_pipe_fds(
     copy_to_user_task(task_ptr, user_dst, &raw)
 }
 
+fn read_sigaction_from_user(task_ptr: *mut task::Task, user_src: u64) -> Result<LinuxSigAction, i64> {
+    let mut raw = [0u8; core::mem::size_of::<LinuxSigAction>()];
+    copy_from_user_task(task_ptr, user_src, &mut raw)?;
+    let ptr = raw.as_ptr() as *const LinuxSigAction;
+    Ok(unsafe { ptr.read_unaligned() })
+}
+
+fn write_sigaction_to_user(
+    task_ptr: *mut task::Task,
+    user_dst: u64,
+    action: LinuxSigAction,
+) -> Result<(), i64> {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&action as *const LinuxSigAction) as *const u8,
+            core::mem::size_of::<LinuxSigAction>(),
+        )
+    };
+    copy_to_user_task(task_ptr, user_dst, bytes)
+}
+
+fn read_u64_from_user(task_ptr: *mut task::Task, user_src: u64) -> Result<u64, i64> {
+    let mut raw = [0u8; 8];
+    copy_from_user_task(task_ptr, user_src, &mut raw)?;
+    Ok(u64::from_ne_bytes(raw))
+}
+
+fn write_u64_to_user(task_ptr: *mut task::Task, user_dst: u64, value: u64) -> Result<(), i64> {
+    copy_to_user_task(task_ptr, user_dst, &value.to_ne_bytes())
+}
+
 fn sys_pipe2(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let user_pipefd = call.arg(0);
     let flags = call.arg(1) as u32;
@@ -843,6 +909,106 @@ fn sys_pipe(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         args: [call.arg(0), 0, 0, 0, 0, 0],
     };
     sys_pipe2(ctx, &wrapped)
+}
+
+fn sys_kill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let pid = call.arg(0) as i64;
+    let sig = call.arg(1) as i64;
+
+    if pid <= 0 {
+        return -EINVAL;
+    }
+    if sig < 0 {
+        return -EINVAL;
+    }
+
+    let target = task::get_by_pid(pid as i32);
+    if target.is_null() {
+        return -ESRCH;
+    }
+    if sig == 0 {
+        return 0;
+    }
+
+    match signal::send(target, sig as u32) {
+        Ok(()) => 0,
+        Err(err) => -signal_to_errno(err),
+    }
+}
+
+fn sys_rt_sigaction(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let signum = call.arg(0) as u32;
+    let act_ptr = call.arg(1);
+    let oldact_ptr = call.arg(2);
+    let sigsetsize = call.arg(3);
+
+    if sigsetsize != 8 {
+        return -EINVAL;
+    }
+
+    if oldact_ptr != 0 {
+        let old = match signal::read_action(ctx.current, signum) {
+            Ok(old) => old,
+            Err(err) => return -signal_to_errno(err),
+        };
+        let old_linux = LinuxSigAction {
+            sa_handler: old.handler,
+            sa_flags: old.flags,
+            sa_restorer: old.restorer,
+            sa_mask: old.mask,
+        };
+        if let Err(err) = write_sigaction_to_user(ctx.current, oldact_ptr, old_linux) {
+            return -err;
+        }
+    }
+
+    if act_ptr != 0 {
+        let act = match read_sigaction_from_user(ctx.current, act_ptr) {
+            Ok(act) => act,
+            Err(err) => return -err,
+        };
+        let new_action = signal::SigAction {
+            handler: act.sa_handler,
+            flags: act.sa_flags,
+            restorer: act.sa_restorer,
+            mask: act.sa_mask,
+        };
+        if let Err(err) = signal::write_action(ctx.current, signum, new_action) {
+            return -signal_to_errno(err);
+        }
+    }
+
+    0
+}
+
+fn sys_rt_sigprocmask(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let how = call.arg(0) as i32;
+    let set_ptr = call.arg(1);
+    let oldset_ptr = call.arg(2);
+    let sigsetsize = call.arg(3);
+
+    if sigsetsize != 8 {
+        return -EINVAL;
+    }
+
+    if oldset_ptr != 0 {
+        let mask = signal::current_mask(ctx.current);
+        if let Err(err) = write_u64_to_user(ctx.current, oldset_ptr, mask) {
+            return -err;
+        }
+    }
+
+    if set_ptr != 0 {
+        let set = match read_u64_from_user(ctx.current, set_ptr) {
+            Ok(set) => set,
+            Err(err) => return -err,
+        };
+        if let Err(err) = signal::update_mask(ctx.current, how, set) {
+            return -signal_to_errno(err);
+        }
+    }
+
+    0
 }
 
 fn sys_shmget(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -1367,6 +1533,9 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             let wrote = match ipc::pipe_write(ctx.current, inode, &chunk[..take]) {
                 Ok(n) => n,
                 Err(err) => {
+                    if err == ipc::EPIPE {
+                        let _ = signal::send(ctx.current, signal::SIGPIPE);
+                    }
                     if written > 0 {
                         return written as i64;
                     }
@@ -1534,7 +1703,33 @@ fn dispatch_syscall(call: SyscallArgs) -> i64 {
     }
 
     let _ = def.name;
-    (def.handler)(&ctx, &call)
+    let result = (def.handler)(&ctx, &call);
+    apply_pending_signals()
+        .unwrap_or(result)
+}
+
+fn apply_pending_signals() -> Option<i64> {
+    let current = task::current();
+    if current.is_null() {
+        return None;
+    }
+
+    unsafe {
+        if (*current).state == TaskState::Zombie || (*current).state == TaskState::Dead {
+            return None;
+        }
+    }
+
+    loop {
+        match signal::consume_next(current) {
+            signal::DeliveryAction::None => return None,
+            signal::DeliveryAction::Ignore => continue,
+            signal::DeliveryAction::Terminate(code) => {
+                let ctx = SyscallContext::new(current);
+                return Some(sys_exit_common(&ctx, code));
+            }
+        }
+    }
 }
 
 fn call_from_syscall_frame(frame: &SyscallFrame) -> SyscallArgs {
@@ -1597,6 +1792,15 @@ mod tests {
     #[test]
     fn syscall_lookup_includes_vfs_extensions() {
         assert_eq!(lookup_syscall(SYS_PIPE).map(|d| d.name), Some("pipe"));
+        assert_eq!(lookup_syscall(SYS_KILL).map(|d| d.name), Some("kill"));
+        assert_eq!(
+            lookup_syscall(SYS_RT_SIGACTION).map(|d| d.name),
+            Some("rt_sigaction")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_RT_SIGPROCMASK).map(|d| d.name),
+            Some("rt_sigprocmask")
+        );
         assert_eq!(lookup_syscall(SYS_SHMGET).map(|d| d.name), Some("shmget"));
         assert_eq!(lookup_syscall(SYS_SHMAT).map(|d| d.name), Some("shmat"));
         assert_eq!(lookup_syscall(SYS_SHMDT).map(|d| d.name), Some("shmdt"));

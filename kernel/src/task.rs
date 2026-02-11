@@ -17,6 +17,7 @@ pub const KERNEL_STACK_PAGES: usize = (KERNEL_STACK_SIZE / 4096) as usize;
 pub const MAX_TASKS: usize = 64;
 pub const MAX_TASK_FDS: usize = 32;
 pub const MAX_TASK_SHM_ATTACH: usize = 8;
+pub const SIG_MAX_TASK_SIGNALS: usize = 32;
 
 pub const TASK_FLAG_KERNEL: u32 = 0x01;
 pub const TASK_FLAG_USER: u32 = 0x02;
@@ -84,6 +85,12 @@ pub struct Task {
     pub(crate) user_shm_addr: [u64; MAX_TASK_SHM_ATTACH],
     pub(crate) user_shm_size: [u64; MAX_TASK_SHM_ATTACH],
     pub(crate) user_shm_flags: [u32; MAX_TASK_SHM_ATTACH],
+    pub(crate) sig_pending: u64,
+    pub(crate) signal_blocked: u64,
+    pub(crate) signal_handlers: [u64; SIG_MAX_TASK_SIGNALS],
+    pub(crate) signal_flags: [u64; SIG_MAX_TASK_SIGNALS],
+    pub(crate) signal_mask_saved: [u64; SIG_MAX_TASK_SIGNALS],
+    pub(crate) signal_restorer: u64,
     pub(crate) time_slice: u64,
     pub(crate) total_ticks: u64,
     pub(crate) sleep_until: u64,
@@ -169,6 +176,12 @@ pub fn init() {
             user_shm_addr: [0; MAX_TASK_SHM_ATTACH],
             user_shm_size: [0; MAX_TASK_SHM_ATTACH],
             user_shm_flags: [0; MAX_TASK_SHM_ATTACH],
+            sig_pending: 0,
+            signal_blocked: 0,
+            signal_handlers: [0; SIG_MAX_TASK_SIGNALS],
+            signal_flags: [0; SIG_MAX_TASK_SIGNALS],
+            signal_mask_saved: [0; SIG_MAX_TASK_SIGNALS],
+            signal_restorer: 0,
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,
@@ -256,6 +269,12 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.user_shm_addr = [0; MAX_TASK_SHM_ATTACH];
         task.user_shm_size = [0; MAX_TASK_SHM_ATTACH];
         task.user_shm_flags = [0; MAX_TASK_SHM_ATTACH];
+        task.sig_pending = 0;
+        task.signal_blocked = 0;
+        task.signal_handlers = [0; SIG_MAX_TASK_SIGNALS];
+        task.signal_flags = [0; SIG_MAX_TASK_SIGNALS];
+        task.signal_mask_saved = [0; SIG_MAX_TASK_SIGNALS];
+        task.signal_restorer = 0;
         task.time_slice = 0;
         task.total_ticks = 0;
         task.sleep_until = 0;
@@ -479,6 +498,12 @@ impl Task {
             user_shm_addr: [0; MAX_TASK_SHM_ATTACH],
             user_shm_size: [0; MAX_TASK_SHM_ATTACH],
             user_shm_flags: [0; MAX_TASK_SHM_ATTACH],
+            sig_pending: 0,
+            signal_blocked: 0,
+            signal_handlers: [0; SIG_MAX_TASK_SIGNALS],
+            signal_flags: [0; SIG_MAX_TASK_SIGNALS],
+            signal_mask_saved: [0; SIG_MAX_TASK_SIGNALS],
+            signal_restorer: 0,
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,
