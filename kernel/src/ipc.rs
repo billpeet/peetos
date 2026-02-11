@@ -404,9 +404,13 @@ pub fn remove_task_waiters(task: *mut Task) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn pipe_roundtrip_and_eof() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
         init();
         let pipe = pipe_open().expect("pipe alloc");
 
@@ -424,6 +428,7 @@ mod tests {
 
     #[test]
     fn pipe_write_fails_without_readers() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
         init();
         let pipe = pipe_open().expect("pipe alloc");
         pipe_close(pipe, true, false).expect("close readers");
@@ -433,6 +438,7 @@ mod tests {
 
     #[test]
     fn futex_wake_clears_waiters() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
         init();
         let addr = 0x1000u64;
         let t1 = 0x1111usize as *mut Task;

@@ -14,6 +14,7 @@ mod memory;
 mod qemu;
 mod sched;
 mod serial;
+mod shm;
 mod sync;
 mod syscall;
 mod task;
@@ -67,6 +68,9 @@ pub extern "C" fn kmain() -> ! {
 
     ipc::init();
     serial_println!("[IPC] Initialized");
+
+    shm::init();
+    serial_println!("[SHM] Initialized");
 
     pit::set_tick_hook(sched::tick);
     idt::set_post_handler_hook(sched::isr_hook);

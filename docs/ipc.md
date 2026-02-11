@@ -43,9 +43,27 @@ This document describes the phase-6 baseline IPC/synchronization implementation 
 - `futex_wake(addr, count)` wakes up to `count` waiters for that address.
 - `remove_task_waiters(task)` removes stale waiters during task teardown.
 
+**Shared Memory (System V Baseline)**
+- Global in-kernel shared-memory table protected by `SpinLock`:
+  - Fixed-size segment table (`SHM_MAX_SEGMENTS`, currently 16)
+  - Per-segment physical-page list (up to `SHM_MAX_SIZE`, currently 1 MiB)
+- Segment lifecycle:
+  - `shm_get(key, size, flags)` creates/looks up a segment (`IPC_CREAT`/`IPC_EXCL` semantics)
+  - `shm_ctl(shmid, IPC_RMID)` marks a segment for deletion
+  - Segment pages are reclaimed when `IPC_RMID` is set and refcount reaches zero
+- Per-task attachment tracking:
+  - Fixed-size per-task attachment table (`MAX_TASK_SHM_ATTACH`, currently 8)
+  - `shm_attach(task, shmid, addr, flags)` maps the segment into the task address space
+  - `shm_detach(task, addr)` unmaps and decrements refcount
+  - `cleanup_task(task)` detaches all remaining mappings during task exit
+
 **Syscall Integration**
 - Added syscall numbers and handlers:
   - `pipe` (`22`)
+  - `shmget` (`29`)
+  - `shmat` (`30`)
+  - `shmctl` (`31`, `IPC_RMID` only)
+  - `shmdt` (`67`)
   - `futex` (`202`)
   - `pipe2` (`293`)
 - FD wiring:
@@ -55,11 +73,12 @@ This document describes the phase-6 baseline IPC/synchronization implementation 
   - `close` tears down pipe endpoints
 - Exit behavior:
   - `clear_child_tid` now does best-effort zero + `futex_wake(addr, 1)`
-  - task exit removes pending IPC waiters for the exiting task
+  - task exit removes pending IPC waiters for the exiting task and detaches shared-memory mappings
 
 Limitations / Simplifications
 - Single-core assumptions still apply; synchronization is designed for current non-SMP kernel flow.
 - IPC capacities are static (`IPC_MAX_PIPES`, `IPC_MAX_WAITERS`, fixed pipe buffer size).
 - Pipe semantics are baseline only: no `poll`/`epoll`, no `O_NONBLOCK`, no `splice`/`tee`, no `SIGPIPE` delivery.
 - Futex support is limited to `FUTEX_WAIT`/`FUTEX_WAKE` with no timeout, bitset, requeue, priority inheritance, or robust-list handling.
-- No signal, shared-memory, or message-queue IPC primitives are implemented yet.
+- Shared memory is a baseline System V subset only: no permission checks, no `IPC_STAT`/`IPC_SET`, no `SHM_REMAP`/`SHM_EXEC`, and no `fork`/`exec` inheritance semantics yet.
+- No signal or message-queue IPC primitives are implemented yet.

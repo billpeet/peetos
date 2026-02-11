@@ -16,6 +16,7 @@ pub const KERNEL_STACK_SIZE: u64 = 16 * 1024;
 pub const KERNEL_STACK_PAGES: usize = (KERNEL_STACK_SIZE / 4096) as usize;
 pub const MAX_TASKS: usize = 64;
 pub const MAX_TASK_FDS: usize = 32;
+pub const MAX_TASK_SHM_ATTACH: usize = 8;
 
 pub const TASK_FLAG_KERNEL: u32 = 0x01;
 pub const TASK_FLAG_USER: u32 = 0x02;
@@ -79,6 +80,10 @@ pub struct Task {
     pub(crate) user_fd_inode: [u16; MAX_TASK_FDS],
     pub(crate) user_fd_offset: [u64; MAX_TASK_FDS],
     pub(crate) user_fd_flags: [u32; MAX_TASK_FDS],
+    pub(crate) user_shm_id: [i32; MAX_TASK_SHM_ATTACH],
+    pub(crate) user_shm_addr: [u64; MAX_TASK_SHM_ATTACH],
+    pub(crate) user_shm_size: [u64; MAX_TASK_SHM_ATTACH],
+    pub(crate) user_shm_flags: [u32; MAX_TASK_SHM_ATTACH],
     pub(crate) time_slice: u64,
     pub(crate) total_ticks: u64,
     pub(crate) sleep_until: u64,
@@ -160,6 +165,10 @@ pub fn init() {
             user_fd_inode: [USER_FD_NONE; MAX_TASK_FDS],
             user_fd_offset: [0; MAX_TASK_FDS],
             user_fd_flags: [0; MAX_TASK_FDS],
+            user_shm_id: [0; MAX_TASK_SHM_ATTACH],
+            user_shm_addr: [0; MAX_TASK_SHM_ATTACH],
+            user_shm_size: [0; MAX_TASK_SHM_ATTACH],
+            user_shm_flags: [0; MAX_TASK_SHM_ATTACH],
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,
@@ -243,6 +252,10 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.user_fd_inode = [USER_FD_NONE; MAX_TASK_FDS];
         task.user_fd_offset = [0; MAX_TASK_FDS];
         task.user_fd_flags = [0; MAX_TASK_FDS];
+        task.user_shm_id = [0; MAX_TASK_SHM_ATTACH];
+        task.user_shm_addr = [0; MAX_TASK_SHM_ATTACH];
+        task.user_shm_size = [0; MAX_TASK_SHM_ATTACH];
+        task.user_shm_flags = [0; MAX_TASK_SHM_ATTACH];
         task.time_slice = 0;
         task.total_ticks = 0;
         task.sleep_until = 0;
@@ -462,6 +475,10 @@ impl Task {
             user_fd_inode: [USER_FD_NONE; MAX_TASK_FDS],
             user_fd_offset: [0; MAX_TASK_FDS],
             user_fd_flags: [0; MAX_TASK_FDS],
+            user_shm_id: [0; MAX_TASK_SHM_ATTACH],
+            user_shm_addr: [0; MAX_TASK_SHM_ATTACH],
+            user_shm_size: [0; MAX_TASK_SHM_ATTACH],
+            user_shm_flags: [0; MAX_TASK_SHM_ATTACH],
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,

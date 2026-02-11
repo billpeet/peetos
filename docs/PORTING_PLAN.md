@@ -6,15 +6,15 @@ This document captures a high-level roadmap to reimplement the existing PeetOS C
 
 The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the kernel sources in `../peetos/kernel/src`. The Rust port should aim for parity with Stages 1–9 before attempting Stage 10 optimizations.
 
-## Current Status (Last reviewed: 2026-02-08)
+## Current Status (Last reviewed: 2026-02-11)
 
 - Phase 0: Complete. Workspace, subsystem crates, bootloader/linker reuse, Makefile, `.cargo/config.toml`, and kernel entry assembly are present.
 - Phase 1: Complete. The kernel boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a loop. The panic handler reports over serial before halting.
 - Phase 2: Complete (baseline). Added `arch_x86_64` port I/O helpers, interrupt enable/disable wrappers (plus RAII guard), GDT/IDT setup with interrupt stubs and handler registration, PIC remap, PIT timer init, syscall entry/MSR setup, and a serial exception report.
 - Phase 3: Complete (baseline). Added typed address helpers, bitmap-based PMM, VMM mapping/address-space support, and a kernel heap allocator.
-- Phase 4: In progress. Baseline tasking + scheduler (kernel threads, run queue, PIT-driven preemption, yield/block/sleep paths) are in place. A minimal user-mode task now boots via `int 0x80` with a Linux-numbered syscall subset (`open`/`openat`, `mkdirat`, `close`, `read`, `write`, `lseek`, `fstat`, `newfstatat`, `getdents64`, `unlinkat`, `renameat`, `exit`/`exit_group`, `yield`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `brk`) backed by a table-driven shared SYSCALL/int80 dispatcher and per-task user metadata (`brk`, stack bounds, initial stack pointers, ELF PHDR/base/dynamic flags, per-task FD table, cwd inode). Initial user bootstrap now builds `argc`/`argv`/`envp`/`auxv` for ring-3 entry, and a minimal dynamic-linking bootstrap is wired (`PT_INTERP` mapping + interpreter-first entry with `AT_ENTRY`/`AT_BASE`). The ELF loader includes stricter header/segment validation (alignment checks, malformed `PT_INTERP` rejection, RWX-segment rejection, entrypoint-in-exec-range checks), plus `ET_EXEC` loading and `ET_DYN` metadata support (`PT_INTERP`, `PT_DYNAMIC`, `load_at`). NXE is enabled in `IA32_EFER` so non-executable mappings are enforced. Full musl/toybox syscall coverage and full reloc/symbol dynamic linker semantics remain outstanding.
+- Phase 4: In progress. Baseline tasking + scheduler (kernel threads, run queue, PIT-driven preemption, yield/block/sleep paths) are in place. A minimal user-mode task now boots via `int 0x80` with a Linux-numbered syscall subset (`open`/`openat`, `mkdirat`, `close`, `read`, `write`, `lseek`, `fstat`, `newfstatat`, `getdents64`, `unlinkat`, `renameat`, `shmget`, `shmat`, `shmdt`, `shmctl`, `exit`/`exit_group`, `yield`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `brk`) backed by a table-driven shared SYSCALL/int80 dispatcher and per-task user metadata (`brk`, stack bounds, initial stack pointers, ELF PHDR/base/dynamic flags, per-task FD table, cwd inode). Initial user bootstrap now builds `argc`/`argv`/`envp`/`auxv` for ring-3 entry, and a minimal dynamic-linking bootstrap is wired (`PT_INTERP` mapping + interpreter-first entry with `AT_ENTRY`/`AT_BASE`). The ELF loader includes stricter header/segment validation (alignment checks, malformed `PT_INTERP` rejection, RWX-segment rejection, entrypoint-in-exec-range checks), plus `ET_EXEC` loading and `ET_DYN` metadata support (`PT_INTERP`, `PT_DYNAMIC`, `load_at`). NXE is enabled in `IA32_EFER` so non-executable mappings are enforced. Full musl/toybox syscall coverage and full reloc/symbol dynamic linker semantics remain outstanding.
 - Phase 5: In progress (expanded baseline). Added a minimal VFS with concrete tmpfs regular-file behavior, virtual fs backends for `devfs` (`/dev/null`, `/dev/zero`, `/dev/console`) and `procfs` (`/proc/uptime`, `/proc/meminfo`, `/proc/mounts`, `/proc/version`), a mount table abstraction, and a baseline ext2 importer (`mount_ext2_image`) used to mount an embedded sample image at `/mnt/ext2` with direct-block ext2 read/write/create/mkdir/truncate/unlink/rmdir/rename support that updates inode/block bitmaps and ext2 metadata in the mounted image. Syscall wiring for baseline file-descriptor and metadata operations is in place over these backends.
-- Phase 6: In progress (baseline). Added in-kernel synchronization primitives (`SpinLock`, `Mutex`, `Semaphore`) plus initial IPC plumbing for anonymous pipes and futex wait/wake. Syscall integration now includes `pipe`/`pipe2` and `futex`, with fd-close teardown for pipe endpoints and best-effort `clear_child_tid` wake on task exit.
+- Phase 6: In progress (baseline). Added in-kernel synchronization primitives (`SpinLock`, `Mutex`, `Semaphore`) plus initial IPC plumbing for anonymous pipes, System V-style shared memory, and futex wait/wake. Syscall integration now includes `pipe`/`pipe2`, `shmget`/`shmat`/`shmdt`/`shmctl(IPC_RMID)`, and `futex`, with fd-close teardown for pipe endpoints, shared-memory detach on task exit, and best-effort `clear_child_tid` wake on task exit.
 - Phases 7–10: Not started.
 
 ## Phase 0: Project Scaffolding
@@ -64,7 +64,8 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 ## Phase 6: IPC + Sync
 
 - Spinlocks, mutexes, semaphores.
-- Signals, pipes, shared memory, futexes.
+- Pipes, shared memory, and futexes baseline done.
+- Signals pending.
 
 ## Phase 7: Device Drivers
 

@@ -42,6 +42,7 @@ For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed i
 Limitations / Simplifications
 - The `int 0x80` path currently shares the same Linux-numbered dispatcher as the SYSCALL path and supports a baseline subset:
   - `SYS_OPEN`, `SYS_OPENAT`, `SYS_MKDIRAT`, `SYS_CLOSE`, `SYS_READ`, `SYS_WRITE`, `SYS_LSEEK`
+  - `SYS_SHMGET`, `SYS_SHMAT`, `SYS_SHMDT`, `SYS_SHMCTL` (baseline System V shared memory)
   - `SYS_FSTAT`, `SYS_NEWFSTATAT`, `SYS_GETDENTS64`, `SYS_UNLINKAT`, `SYS_RENAMEAT`
   - `SYS_PIPE`, `SYS_PIPE2`, `SYS_FUTEX`
   - `SYS_EXIT`, `SYS_EXIT_GROUP`
@@ -58,6 +59,7 @@ Current implemented handlers:
 - `open/openat/close/read/write/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
 - `pipe/pipe2` via in-kernel anonymous pipe state and per-task fd tables
 - `futex` (`WAIT`/`WAKE` baseline ops only)
+- `shmget/shmat/shmdt/shmctl(IPC_RMID)` via baseline in-kernel System V shared-memory segments
 - `exit(status)` and `exit_group(status)`
 - `sched_yield()`
 - `getpid()`, `getppid()`, `gettid()`
@@ -71,6 +73,7 @@ Limitations / Simplifications
 - Console I/O is simplified: stdio descriptors are pre-seeded for user tasks, console writes go to serial, and console reads currently return EOF.
 - `brk` only manages simple per-task heap growth/shrink and does not yet integrate with full userspace allocator semantics (no `mmap` fallback, no overcommit policy, no guard pages).
 - `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.
+- Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, no permission enforcement, and no inheritance semantics across `fork`/`exec` yet.
 
 **Integration**
 `kernel/src/main.rs` calls `arch_syscall::init()` (MSR setup) and `syscall::init()` (dispatcher state init) during early boot.

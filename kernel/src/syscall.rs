@@ -8,6 +8,7 @@ use arch_x86_64::syscall::SyscallFrame;
 
 use crate::ipc;
 use crate::memory::{pmm, vmm};
+use crate::shm;
 use crate::task::{self, TaskState, TASK_FLAG_USER};
 
 #[cfg(not(test))]
@@ -55,8 +56,12 @@ const SYS_LSEEK: u64 = 8;
 const SYS_BRK: u64 = 12;
 const SYS_PIPE: u64 = 22;
 const SYS_YIELD: u64 = 24;
+const SYS_SHMGET: u64 = 29;
+const SYS_SHMAT: u64 = 30;
+const SYS_SHMCTL: u64 = 31;
 const SYS_GETPID: u64 = 39;
 const SYS_EXIT: u64 = 60;
+const SYS_SHMDT: u64 = 67;
 const SYS_GETPPID: u64 = 110;
 const SYS_GETTID: u64 = 186;
 const SYS_FUTEX: u64 = 202;
@@ -180,9 +185,13 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_FSTAT, "fstat", SyscallMode::UserTask, sys_fstat),
     syscall_def(SYS_LSEEK, "lseek", SyscallMode::UserTask, sys_lseek),
     syscall_def(SYS_PIPE, "pipe", SyscallMode::UserTask, sys_pipe),
+    syscall_def(SYS_SHMGET, "shmget", SyscallMode::UserTask, sys_shmget),
+    syscall_def(SYS_SHMAT, "shmat", SyscallMode::UserTask, sys_shmat),
+    syscall_def(SYS_SHMCTL, "shmctl", SyscallMode::UserTask, sys_shmctl),
     syscall_def(SYS_BRK, "brk", SyscallMode::UserTask, sys_brk),
     syscall_def(SYS_YIELD, "sched_yield", SyscallMode::AnyTask, sys_yield),
     syscall_def(SYS_GETPID, "getpid", SyscallMode::AnyTask, sys_getpid),
+    syscall_def(SYS_SHMDT, "shmdt", SyscallMode::UserTask, sys_shmdt),
     syscall_def(SYS_GETPPID, "getppid", SyscallMode::AnyTask, sys_getppid),
     syscall_def(SYS_GETTID, "gettid", SyscallMode::AnyTask, sys_gettid),
     syscall_def(
@@ -198,13 +207,33 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_exit_group,
     ),
-    syscall_def(SYS_GETDENTS64, "getdents64", SyscallMode::UserTask, sys_getdents64),
+    syscall_def(
+        SYS_GETDENTS64,
+        "getdents64",
+        SyscallMode::UserTask,
+        sys_getdents64,
+    ),
     syscall_def(SYS_FUTEX, "futex", SyscallMode::UserTask, sys_futex),
     syscall_def(SYS_OPENAT, "openat", SyscallMode::UserTask, sys_openat),
     syscall_def(SYS_MKDIRAT, "mkdirat", SyscallMode::UserTask, sys_mkdirat),
-    syscall_def(SYS_NEWFSTATAT, "newfstatat", SyscallMode::UserTask, sys_newfstatat),
-    syscall_def(SYS_UNLINKAT, "unlinkat", SyscallMode::UserTask, sys_unlinkat),
-    syscall_def(SYS_RENAMEAT, "renameat", SyscallMode::UserTask, sys_renameat),
+    syscall_def(
+        SYS_NEWFSTATAT,
+        "newfstatat",
+        SyscallMode::UserTask,
+        sys_newfstatat,
+    ),
+    syscall_def(
+        SYS_UNLINKAT,
+        "unlinkat",
+        SyscallMode::UserTask,
+        sys_unlinkat,
+    ),
+    syscall_def(
+        SYS_RENAMEAT,
+        "renameat",
+        SyscallMode::UserTask,
+        sys_renameat,
+    ),
     syscall_def(SYS_PIPE2, "pipe2", SyscallMode::UserTask, sys_pipe2),
 ];
 
@@ -258,6 +287,17 @@ fn ipc_to_errno(err: i64) -> i64 {
     }
 }
 
+fn shm_to_errno(err: i64) -> i64 {
+    match err {
+        shm::ENOENT => ENOENT,
+        shm::ENOMEM => ENOMEM,
+        shm::EEXIST => EEXIST,
+        shm::EINVAL => EINVAL,
+        shm::ENOSPC => ENOSPC,
+        _ => EIO,
+    }
+}
+
 #[inline]
 fn fd_index(fd: i32) -> Result<usize, i64> {
     if fd < 0 || fd as usize >= task::MAX_TASK_FDS {
@@ -279,13 +319,12 @@ fn fd_alloc(task_ptr: *mut task::Task, kind: u8, inode: u16, flags: u32) -> Resu
         if unsafe { (*task_ptr).user_fd_kind[idx] == task::USER_FD_KIND_EMPTY } {
             unsafe {
                 (*task_ptr).user_fd_kind[idx] = kind;
-                (*task_ptr).user_fd_inode[idx] = if kind == task::USER_FD_KIND_VFS
-                    || kind == task::USER_FD_KIND_PIPE
-                {
-                    inode
-                } else {
-                    task::USER_FD_NONE
-                };
+                (*task_ptr).user_fd_inode[idx] =
+                    if kind == task::USER_FD_KIND_VFS || kind == task::USER_FD_KIND_PIPE {
+                        inode
+                    } else {
+                        task::USER_FD_NONE
+                    };
                 (*task_ptr).user_fd_offset[idx] = 0;
                 (*task_ptr).user_fd_flags[idx] = flags;
             }
@@ -428,7 +467,12 @@ fn resolve_dir_inode(ctx: &SyscallContext, dirfd: i32) -> Result<u16, i64> {
         return Err(-EBADF);
     }
 
-    let (kind, inode) = unsafe { ((*ctx.current).user_fd_kind[idx], (*ctx.current).user_fd_inode[idx]) };
+    let (kind, inode) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+        )
+    };
     if kind != task::USER_FD_KIND_VFS {
         return Err(-ENOTDIR);
     }
@@ -745,7 +789,12 @@ fn sys_mkdirat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
-fn write_pipe_fds(task_ptr: *mut task::Task, user_dst: u64, read_fd: i32, write_fd: i32) -> Result<(), i64> {
+fn write_pipe_fds(
+    task_ptr: *mut task::Task,
+    user_dst: u64,
+    read_fd: i32,
+    write_fd: i32,
+) -> Result<(), i64> {
     let mut raw = [0u8; 8];
     raw[..4].copy_from_slice(&read_fd.to_ne_bytes());
     raw[4..8].copy_from_slice(&write_fd.to_ne_bytes());
@@ -796,6 +845,43 @@ fn sys_pipe(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     sys_pipe2(ctx, &wrapped)
 }
 
+fn sys_shmget(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let key = call.arg(0) as i32;
+    let size = call.arg(1);
+    let flags = call.arg(2) as i32;
+    match shm::shm_get(key, size, flags) {
+        Ok(shmid) => shmid as i64,
+        Err(err) => -shm_to_errno(err),
+    }
+}
+
+fn sys_shmat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let shmid = call.arg(0) as i32;
+    let addr = call.arg(1);
+    let flags = call.arg(2) as i32;
+    match shm::shm_attach(ctx.current, shmid, addr, flags) {
+        Ok(vaddr) => vaddr as i64,
+        Err(err) => -shm_to_errno(err),
+    }
+}
+
+fn sys_shmdt(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let addr = call.arg(0);
+    match shm::shm_detach(ctx.current, addr) {
+        Ok(()) => 0,
+        Err(err) => -shm_to_errno(err),
+    }
+}
+
+fn sys_shmctl(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let shmid = call.arg(0) as i32;
+    let cmd = call.arg(1) as i32;
+    match shm::shm_ctl(shmid, cmd) {
+        Ok(()) => 0,
+        Err(err) => -shm_to_errno(err),
+    }
+}
+
 fn write_stat_to_user(task_ptr: *mut task::Task, dst: u64, stat: fs::FileStat) -> i64 {
     let raw = LinuxStat::from_fs(stat);
     let bytes = unsafe {
@@ -819,7 +905,12 @@ fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EBADF;
     }
 
-    let (kind, inode) = unsafe { ((*ctx.current).user_fd_kind[idx], (*ctx.current).user_fd_inode[idx]) };
+    let (kind, inode) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+        )
+    };
     if kind == task::USER_FD_KIND_PIPE {
         let pipe_stat = LinuxStat {
             st_dev: 0,
@@ -974,7 +1065,9 @@ fn sys_getdents64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         record[19..19 + entry.name_len].copy_from_slice(&entry.name[..entry.name_len]);
         record[19 + entry.name_len] = 0;
 
-        if let Err(err) = copy_to_user_task(ctx.current, call.arg(1) + total as u64, &record[..reclen]) {
+        if let Err(err) =
+            copy_to_user_task(ctx.current, call.arg(1) + total as u64, &record[..reclen])
+        {
             if total > 0 {
                 break;
             }
@@ -1395,6 +1488,7 @@ fn sys_exit_common(ctx: &SyscallContext, code: i32) -> i64 {
 
     clear_child_tid(ctx);
     close_all_fds(ctx.current);
+    shm::cleanup_task(ctx.current);
     ipc::remove_task_waiters(ctx.current);
 
     unsafe {
@@ -1503,12 +1597,28 @@ mod tests {
     #[test]
     fn syscall_lookup_includes_vfs_extensions() {
         assert_eq!(lookup_syscall(SYS_PIPE).map(|d| d.name), Some("pipe"));
+        assert_eq!(lookup_syscall(SYS_SHMGET).map(|d| d.name), Some("shmget"));
+        assert_eq!(lookup_syscall(SYS_SHMAT).map(|d| d.name), Some("shmat"));
+        assert_eq!(lookup_syscall(SYS_SHMDT).map(|d| d.name), Some("shmdt"));
+        assert_eq!(lookup_syscall(SYS_SHMCTL).map(|d| d.name), Some("shmctl"));
         assert_eq!(lookup_syscall(SYS_MKDIRAT).map(|d| d.name), Some("mkdirat"));
         assert_eq!(lookup_syscall(SYS_FUTEX).map(|d| d.name), Some("futex"));
-        assert_eq!(lookup_syscall(SYS_NEWFSTATAT).map(|d| d.name), Some("newfstatat"));
-        assert_eq!(lookup_syscall(SYS_GETDENTS64).map(|d| d.name), Some("getdents64"));
-        assert_eq!(lookup_syscall(SYS_UNLINKAT).map(|d| d.name), Some("unlinkat"));
-        assert_eq!(lookup_syscall(SYS_RENAMEAT).map(|d| d.name), Some("renameat"));
+        assert_eq!(
+            lookup_syscall(SYS_NEWFSTATAT).map(|d| d.name),
+            Some("newfstatat")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_GETDENTS64).map(|d| d.name),
+            Some("getdents64")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_UNLINKAT).map(|d| d.name),
+            Some("unlinkat")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_RENAMEAT).map(|d| d.name),
+            Some("renameat")
+        );
         assert_eq!(lookup_syscall(SYS_PIPE2).map(|d| d.name), Some("pipe2"));
     }
 
