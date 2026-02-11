@@ -25,7 +25,7 @@ Limitations / Simplifications
 
 **Syscall Entry Stub**
 `syscall_entry` is defined via `global_asm!` in `crates/arch_x86_64/src/syscall.rs`. It:
-1. Saves RCX (return RIP) and R11 (return RFLAGS).
+1. Saves user RSP, RCX (return RIP), and R11 (return RFLAGS).
 2. Saves the syscall number (RAX) and the standard SysV argument registers.
 3. Calls `syscall_handler` with a pointer to the `SyscallFrame`.
 4. Restores registers and returns via `sysretq`.
@@ -42,7 +42,7 @@ For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed i
 Limitations / Simplifications
 - The `int 0x80` path currently shares the same Linux-numbered dispatcher as the SYSCALL path and supports a baseline subset:
   - `SYS_OPEN`, `SYS_OPENAT`, `SYS_MKDIRAT`, `SYS_CLOSE`, `SYS_READ`, `SYS_WRITE`, `SYS_LSEEK`
-  - `SYS_RT_SIGACTION`, `SYS_RT_SIGPROCMASK`, `SYS_KILL` (initial signal control path)
+  - `SYS_RT_SIGACTION`, `SYS_RT_SIGPROCMASK`, `SYS_RT_SIGRETURN`, `SYS_KILL` (baseline signal path)
   - `SYS_SHMGET`, `SYS_SHMAT`, `SYS_SHMDT`, `SYS_SHMCTL` (baseline System V shared memory)
   - `SYS_FSTAT`, `SYS_NEWFSTATAT`, `SYS_GETDENTS64`, `SYS_UNLINKAT`, `SYS_RENAMEAT`
   - `SYS_PIPE`, `SYS_PIPE2`, `SYS_FUTEX`
@@ -58,7 +58,7 @@ Limitations / Simplifications
 
 Current implemented handlers:
 - `open/openat/close/read/write/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
-- `kill`, `rt_sigaction`, `rt_sigprocmask` for initial signal state and delivery control
+- `kill`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` for baseline signal control and user-handler return
 - `pipe/pipe2` via in-kernel anonymous pipe state and per-task fd tables
 - `futex` (`WAIT`/`WAKE` baseline ops only)
 - `shmget/shmat/shmdt/shmctl(IPC_RMID)` via baseline in-kernel System V shared-memory segments
@@ -76,7 +76,7 @@ Limitations / Simplifications
 - `brk` only manages simple per-task heap growth/shrink and does not yet integrate with full userspace allocator semantics (no `mmap` fallback, no overcommit policy, no guard pages).
 - `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.
 - Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, no permission enforcement, and no inheritance semantics across `fork`/`exec` yet.
-- Signal support is currently baseline-only: `rt_sigaction` accepts `SIG_DFL`/`SIG_IGN` actions, user-handler trampoline/sigreturn context restore is not implemented yet, and pending signals are consumed on syscall-return boundaries.
+- Signal support remains simplified: delivery is syscall-boundary based and user handlers currently require `SA_RESTORER`; `sigaltstack`, queued RT signal payloads/`siginfo_t`, and full Linux ucontext semantics are not implemented yet.
 
 **Integration**
 `kernel/src/main.rs` calls `arch_syscall::init()` (MSR setup) and `syscall::init()` (dispatcher state init) during early boot.

@@ -24,6 +24,7 @@ pub struct SyscallFrame {
     pub rax: u64,
     pub r11: u64,
     pub rcx: u64,
+    pub rsp: u64,
 }
 
 #[cfg(target_os = "none")]
@@ -55,6 +56,7 @@ core::arch::global_asm!(r#"
 
 .global syscall_entry
 syscall_entry:
+    push rsp
     push rcx
     push r11
 
@@ -70,17 +72,16 @@ syscall_entry:
     call syscall_handler
 
     mov [rsp + 48], rax
-
-    pop r9
-    pop r8
-    pop r10
-    pop rdx
-    pop rsi
-    pop rdi
-    pop rax
-
-    pop r11
-    pop rcx
+    mov r9, [rsp + 0]
+    mov r8, [rsp + 8]
+    mov r10, [rsp + 16]
+    mov rdx, [rsp + 24]
+    mov rsi, [rsp + 32]
+    mov rdi, [rsp + 40]
+    mov rax, [rsp + 48]
+    mov r11, [rsp + 56]
+    mov rcx, [rsp + 64]
+    mov rsp, [rsp + 72]
     sysretq
 "#);
 
@@ -90,6 +91,6 @@ mod tests {
 
     #[test]
     fn syscall_frame_size() {
-        assert_eq!(size_of::<SyscallFrame>(), 72);
+        assert_eq!(size_of::<SyscallFrame>(), 80);
     }
 }

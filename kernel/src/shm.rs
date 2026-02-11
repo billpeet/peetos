@@ -239,7 +239,12 @@ fn span_is_unmapped(_pml4: PhysAddr, _start: u64, _size: u64) -> bool {
 
 pub fn init() {
     let mut state = SHM_STATE.lock();
-    *state = ShmState::new();
+    state.next_id = 1;
+    let mut idx = 0usize;
+    while idx < SHM_MAX_SEGMENTS {
+        state.segments[idx] = ShmSegment::empty();
+        idx += 1;
+    }
     #[cfg(test)]
     unsafe {
         TEST_NEXT_PAGE = 0x0020_0000;

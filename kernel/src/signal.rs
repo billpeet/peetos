@@ -45,10 +45,19 @@ pub const SIG_SETMASK: i32 = 2;
 pub const SA_RESTORER: u64 = 0x0400_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserDelivery {
+    pub signum: u32,
+    pub handler: u64,
+    pub restorer: u64,
+    pub saved_mask: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryAction {
     None,
     Ignore,
     Terminate(i32),
+    Handle(UserDelivery),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,10 +205,6 @@ pub fn write_action(task: *mut Task, signum: u32, action: SigAction) -> Result<S
         return Err(EINVAL);
     }
 
-    if action.handler != SIG_DFL && action.handler != SIG_IGN {
-        return Err(ENOSYS);
-    }
-
     let idx = signum as usize;
     let old = read_action(task, signum)?;
     unsafe {
@@ -243,12 +248,50 @@ pub fn consume_next(task: *mut Task) -> DeliveryAction {
         if handler == SIG_IGN && can_catch(signum) {
             return DeliveryAction::Ignore;
         }
+        if handler != SIG_DFL {
+            let flags = (*task).signal_flags[idx];
+            let restorer = if (flags & SA_RESTORER) != 0 {
+                (*task).signal_restorer
+            } else {
+                0
+            };
+            if restorer == 0 {
+                return DeliveryAction::Terminate(128 + signum as i32);
+            }
+
+            let saved_mask = (*task).signal_blocked;
+            let mut next_mask = saved_mask | (*task).signal_mask_saved[idx];
+            next_mask |= signal_bit(signum);
+            next_mask &= !signal_bit(SIGKILL);
+            next_mask &= !signal_bit(SIGSTOP);
+            (*task).signal_blocked = next_mask;
+
+            return DeliveryAction::Handle(UserDelivery {
+                signum,
+                handler,
+                restorer,
+                saved_mask,
+            });
+        }
     }
 
     match default_action(signum) {
         SIG_ACTION_IGNORE => DeliveryAction::Ignore,
         _ => DeliveryAction::Terminate(128 + signum as i32),
     }
+}
+
+pub fn restore_mask(task: *mut Task, mask: u64) -> Result<(), i64> {
+    if task.is_null() {
+        return Err(ESRCH);
+    }
+
+    unsafe {
+        (*task).signal_blocked = mask;
+        (*task).signal_blocked &= !signal_bit(SIGKILL);
+        (*task).signal_blocked &= !signal_bit(SIGSTOP);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -304,11 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn custom_handlers_are_not_supported_yet() {
+    fn custom_handler_requires_restorer() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         let mut t = task::Task::for_test(1);
         let ptr = &mut t as *mut task::Task;
-        let err = write_action(
+        write_action(
             ptr,
             SIGUSR1,
             SigAction {
@@ -318,8 +361,49 @@ mod tests {
                 mask: 0,
             },
         )
-        .unwrap_err();
-        assert_eq!(err, ENOSYS);
+        .expect("set handler");
+        send(ptr, SIGUSR1).expect("send");
+        assert_eq!(
+            consume_next(ptr),
+            DeliveryAction::Terminate(128 + SIGUSR1 as i32)
+        );
+    }
+
+    #[test]
+    fn custom_handler_delivery_saves_and_restores_mask() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        let mut t = task::Task::for_test(1);
+        let ptr = &mut t as *mut task::Task;
+        let handler = 0x1234_u64;
+        let restorer = 0x5678_u64;
+        let extra_mask = signal_bit(SIGTERM);
+
+        write_action(
+            ptr,
+            SIGUSR1,
+            SigAction {
+                handler,
+                flags: SA_RESTORER,
+                restorer,
+                mask: extra_mask,
+            },
+        )
+        .expect("set handler");
+
+        send(ptr, SIGUSR1).expect("send");
+        let delivery = match consume_next(ptr) {
+            DeliveryAction::Handle(delivery) => delivery,
+            other => panic!("expected user delivery, got {:?}", other),
+        };
+
+        assert_eq!(delivery.signum, SIGUSR1);
+        assert_eq!(delivery.handler, handler);
+        assert_eq!(delivery.restorer, restorer);
+        assert_eq!(delivery.saved_mask, 0);
+        assert_eq!(current_mask(ptr), signal_bit(SIGUSR1) | extra_mask);
+
+        restore_mask(ptr, delivery.saved_mask).expect("restore mask");
+        assert_eq!(current_mask(ptr), 0);
     }
 
     #[test]

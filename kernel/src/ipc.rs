@@ -221,7 +221,16 @@ fn wake_task(task: *mut Task) {
 
 pub fn init() {
     let mut state = IPC_STATE.lock();
-    *state = IpcState::new();
+    let mut idx = 0usize;
+    while idx < IPC_MAX_PIPES {
+        state.pipes[idx] = Pipe::empty();
+        idx += 1;
+    }
+    idx = 0;
+    while idx < IPC_MAX_WAITERS {
+        state.waiters[idx] = Waiter::empty();
+        idx += 1;
+    }
 }
 
 pub fn pipe_open() -> Result<u16, i64> {

@@ -113,14 +113,18 @@ _start:
     ; Using linker symbols instead of hardcoded addresses ensures this code
     ; remains correct even when the kernel size changes.
 
-    ; Calculate BSS size and clear it using rep stosq
+    ; Calculate BSS size and clear it. We clear both full qwords and
+    ; the trailing 0..7 bytes so every .bss byte is initialized.
     mov rdi, __bss_start        ; Start address (from linker script)
-    mov rsi, __bss_end          ; End address (from linker script)
-    sub rsi, rdi                ; Size in bytes
-    shr rsi, 3                  ; Convert to qwords (divide by 8)
+    mov rcx, __bss_end          ; End address (from linker script)
+    sub rcx, rdi                ; Total size in bytes
+    mov rdx, rcx                ; Save byte count for tail clear
     xor rax, rax                ; Value to write (0)
-    mov rcx, rsi                ; Count for rep
+    shr rcx, 3                  ; Convert to qwords (divide by 8)
     rep stosq                   ; Store RAX to [RDI], repeat RCX times
+    mov rcx, rdx
+    and rcx, 7                  ; Remaining bytes
+    rep stosb
 
     ; Memory barrier to ensure all writes complete before proceeding
     mfence

@@ -1,4 +1,5 @@
 use core::cmp;
+use core::mem::{size_of, MaybeUninit};
 use core::ptr;
 
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
@@ -56,6 +57,7 @@ const SYS_FSTAT: u64 = 5;
 const SYS_LSEEK: u64 = 8;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_RT_SIGRETURN: u64 = 15;
 const SYS_BRK: u64 = 12;
 const SYS_PIPE: u64 = 22;
 const SYS_YIELD: u64 = 24;
@@ -86,6 +88,8 @@ const WRITE_CHUNK_SIZE: usize = 128;
 const READ_CHUNK_SIZE: usize = 128;
 const UNKNOWN_SYSCALL_LOG_LIMIT: u32 = 8;
 const CLEAR_TID_SIZE: usize = 4;
+const SIGNAL_FRAME_MAGIC_SYSCALL: u64 = 0x5352_4653_5953_0001;
+const SIGNAL_FRAME_MAGIC_INT80: u64 = 0x5352_4649_3830_0001;
 
 static mut UNKNOWN_SYSCALL_LOG_COUNT: u32 = 0;
 
@@ -200,6 +204,12 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_rt_sigprocmask,
     ),
+    syscall_def(
+        SYS_RT_SIGRETURN,
+        "rt_sigreturn",
+        SyscallMode::UserTask,
+        sys_rt_sigreturn,
+    ),
     syscall_def(SYS_PIPE, "pipe", SyscallMode::UserTask, sys_pipe),
     syscall_def(SYS_SHMGET, "shmget", SyscallMode::UserTask, sys_shmget),
     syscall_def(SYS_SHMAT, "shmat", SyscallMode::UserTask, sys_shmat),
@@ -264,6 +274,11 @@ fn page_align_up(value: u64) -> Option<u64> {
     value
         .checked_add(PAGE_SIZE - 1)
         .map(|v| v & !(PAGE_SIZE - 1))
+}
+
+#[inline]
+fn align_down(value: u64, align: u64) -> u64 {
+    value & !(align - 1)
 }
 
 fn lookup_syscall(num: u64) -> Option<&'static SyscallDef> {
@@ -464,6 +479,52 @@ struct LinuxSigAction {
     sa_mask: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserSignalFrameSyscall {
+    magic: u64,
+    saved_mask: u64,
+    signum: u64,
+    r9: u64,
+    r8: u64,
+    r10: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rax: u64,
+    r11: u64,
+    rcx: u64,
+    rsp: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserSignalFrameInt80 {
+    magic: u64,
+    saved_mask: u64,
+    signum: u64,
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rbp: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rcx: u64,
+    rbx: u64,
+    rax: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
 impl LinuxStat {
     fn from_fs(stat: fs::FileStat) -> Self {
         Self {
@@ -625,6 +686,23 @@ fn copy_to_user_task(task_ptr: *mut task::Task, user_dst: u64, src: &[u8]) -> Re
         return Err(EINVAL);
     }
     copy_user_bytes(pml4, user_dst, src.as_ptr() as *mut u8, src.len(), true)
+}
+
+fn write_struct_to_user<T: Copy>(
+    task_ptr: *mut task::Task,
+    user_dst: u64,
+    value: &T,
+) -> Result<(), i64> {
+    let bytes =
+        unsafe { core::slice::from_raw_parts((value as *const T) as *const u8, size_of::<T>()) };
+    copy_to_user_task(task_ptr, user_dst, bytes)
+}
+
+fn read_struct_from_user<T: Copy>(task_ptr: *mut task::Task, user_src: u64) -> Result<T, i64> {
+    let mut raw = MaybeUninit::<T>::uninit();
+    let bytes = unsafe { core::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, size_of::<T>()) };
+    copy_from_user_task(task_ptr, user_src, bytes)?;
+    Ok(unsafe { raw.assume_init() })
 }
 
 pub(crate) fn copy_from_user_current(user_src: u64, dst: &mut [u8]) -> Result<(), i64> {
@@ -1009,6 +1087,12 @@ fn sys_rt_sigprocmask(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     0
+}
+
+fn sys_rt_sigreturn(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    // rt_sigreturn requires direct access to the live trap frame and is
+    // handled in the entry stubs before table dispatch.
+    -ENOSYS
 }
 
 fn sys_shmget(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -1676,6 +1760,209 @@ fn sys_exit_group(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     sys_exit_common(ctx, call.arg(0) as i32)
 }
 
+fn install_user_signal_frame_syscall(
+    task_ptr: *mut task::Task,
+    frame: &mut SyscallFrame,
+    delivery: signal::UserDelivery,
+) -> Result<(), i64> {
+    let frame_size = size_of::<UserSignalFrameSyscall>() as u64;
+    let frame_rsp = frame.rsp.checked_sub(frame_size).ok_or(EFAULT)?;
+    let frame_rsp = align_down(frame_rsp, 16);
+    let return_rsp = frame_rsp.checked_sub(size_of::<u64>() as u64).ok_or(EFAULT)?;
+
+    let signal_frame = UserSignalFrameSyscall {
+        magic: SIGNAL_FRAME_MAGIC_SYSCALL,
+        saved_mask: delivery.saved_mask,
+        signum: delivery.signum as u64,
+        r9: frame.r9,
+        r8: frame.r8,
+        r10: frame.r10,
+        rdx: frame.rdx,
+        rsi: frame.rsi,
+        rdi: frame.rdi,
+        rax: frame.rax,
+        r11: frame.r11,
+        rcx: frame.rcx,
+        rsp: frame.rsp,
+    };
+
+    write_struct_to_user(task_ptr, frame_rsp, &signal_frame)?;
+    write_u64_to_user(task_ptr, return_rsp, delivery.restorer)?;
+
+    frame.rcx = delivery.handler;
+    frame.rsp = return_rsp;
+    frame.rdi = delivery.signum as u64;
+    Ok(())
+}
+
+fn install_user_signal_frame_int80(
+    task_ptr: *mut task::Task,
+    frame: &mut InterruptFrame,
+    delivery: signal::UserDelivery,
+) -> Result<(), i64> {
+    let frame_size = size_of::<UserSignalFrameInt80>() as u64;
+    let frame_rsp = frame.rsp.checked_sub(frame_size).ok_or(EFAULT)?;
+    let frame_rsp = align_down(frame_rsp, 16);
+    let return_rsp = frame_rsp.checked_sub(size_of::<u64>() as u64).ok_or(EFAULT)?;
+
+    let signal_frame = UserSignalFrameInt80 {
+        magic: SIGNAL_FRAME_MAGIC_INT80,
+        saved_mask: delivery.saved_mask,
+        signum: delivery.signum as u64,
+        r15: frame.r15,
+        r14: frame.r14,
+        r13: frame.r13,
+        r12: frame.r12,
+        r11: frame.r11,
+        r10: frame.r10,
+        r9: frame.r9,
+        r8: frame.r8,
+        rbp: frame.rbp,
+        rdi: frame.rdi,
+        rsi: frame.rsi,
+        rdx: frame.rdx,
+        rcx: frame.rcx,
+        rbx: frame.rbx,
+        rax: frame.rax,
+        rip: frame.rip,
+        cs: frame.cs,
+        rflags: frame.rflags,
+        rsp: frame.rsp,
+        ss: frame.ss,
+    };
+
+    write_struct_to_user(task_ptr, frame_rsp, &signal_frame)?;
+    write_u64_to_user(task_ptr, return_rsp, delivery.restorer)?;
+
+    frame.rip = delivery.handler;
+    frame.rsp = return_rsp;
+    frame.rdi = delivery.signum as u64;
+    Ok(())
+}
+
+fn restore_user_signal_frame_syscall(task_ptr: *mut task::Task, frame: &mut SyscallFrame) -> i64 {
+    let signal_frame = match read_struct_from_user::<UserSignalFrameSyscall>(task_ptr, frame.rsp) {
+        Ok(signal_frame) => signal_frame,
+        Err(err) => return -err,
+    };
+    if signal_frame.magic != SIGNAL_FRAME_MAGIC_SYSCALL {
+        return -EINVAL;
+    }
+    if !user_range_ok(signal_frame.rsp, 1) || !user_range_ok(signal_frame.rcx, 1) {
+        return -EFAULT;
+    }
+    if let Err(err) = signal::restore_mask(task_ptr, signal_frame.saved_mask) {
+        return -signal_to_errno(err);
+    }
+
+    frame.r9 = signal_frame.r9;
+    frame.r8 = signal_frame.r8;
+    frame.r10 = signal_frame.r10;
+    frame.rdx = signal_frame.rdx;
+    frame.rsi = signal_frame.rsi;
+    frame.rdi = signal_frame.rdi;
+    frame.rax = signal_frame.rax;
+    frame.r11 = signal_frame.r11;
+    frame.rcx = signal_frame.rcx;
+    frame.rsp = signal_frame.rsp;
+    0
+}
+
+fn restore_user_signal_frame_int80(task_ptr: *mut task::Task, frame: &mut InterruptFrame) -> i64 {
+    let signal_frame = match read_struct_from_user::<UserSignalFrameInt80>(task_ptr, frame.rsp) {
+        Ok(signal_frame) => signal_frame,
+        Err(err) => return -err,
+    };
+    if signal_frame.magic != SIGNAL_FRAME_MAGIC_INT80 {
+        return -EINVAL;
+    }
+    if !user_range_ok(signal_frame.rsp, 1) || !user_range_ok(signal_frame.rip, 1) {
+        return -EFAULT;
+    }
+    if let Err(err) = signal::restore_mask(task_ptr, signal_frame.saved_mask) {
+        return -signal_to_errno(err);
+    }
+
+    frame.r15 = signal_frame.r15;
+    frame.r14 = signal_frame.r14;
+    frame.r13 = signal_frame.r13;
+    frame.r12 = signal_frame.r12;
+    frame.r11 = signal_frame.r11;
+    frame.r10 = signal_frame.r10;
+    frame.r9 = signal_frame.r9;
+    frame.r8 = signal_frame.r8;
+    frame.rbp = signal_frame.rbp;
+    frame.rdi = signal_frame.rdi;
+    frame.rsi = signal_frame.rsi;
+    frame.rdx = signal_frame.rdx;
+    frame.rcx = signal_frame.rcx;
+    frame.rbx = signal_frame.rbx;
+    frame.rax = signal_frame.rax;
+    frame.rip = signal_frame.rip;
+    frame.cs = signal_frame.cs;
+    frame.rflags = signal_frame.rflags;
+    frame.rsp = signal_frame.rsp;
+    frame.ss = signal_frame.ss;
+    0
+}
+
+fn can_process_pending_signals(current: *mut task::Task) -> bool {
+    if current.is_null() {
+        return false;
+    }
+    unsafe { (*current).state != TaskState::Zombie && (*current).state != TaskState::Dead }
+}
+
+fn apply_pending_signals_syscall(frame: &mut SyscallFrame) -> Option<i64> {
+    let current = task::current();
+    if !can_process_pending_signals(current) {
+        return None;
+    }
+
+    loop {
+        match signal::consume_next(current) {
+            signal::DeliveryAction::None => return None,
+            signal::DeliveryAction::Ignore => continue,
+            signal::DeliveryAction::Terminate(code) => {
+                let ctx = SyscallContext::new(current);
+                return Some(sys_exit_common(&ctx, code));
+            }
+            signal::DeliveryAction::Handle(delivery) => {
+                if install_user_signal_frame_syscall(current, frame, delivery).is_err() {
+                    let ctx = SyscallContext::new(current);
+                    return Some(sys_exit_common(&ctx, 128 + signal::SIGSEGV as i32));
+                }
+                return None;
+            }
+        }
+    }
+}
+
+fn apply_pending_signals_int80(frame: &mut InterruptFrame) -> Option<i64> {
+    let current = task::current();
+    if !can_process_pending_signals(current) {
+        return None;
+    }
+
+    loop {
+        match signal::consume_next(current) {
+            signal::DeliveryAction::None => return None,
+            signal::DeliveryAction::Ignore => continue,
+            signal::DeliveryAction::Terminate(code) => {
+                let ctx = SyscallContext::new(current);
+                return Some(sys_exit_common(&ctx, code));
+            }
+            signal::DeliveryAction::Handle(delivery) => {
+                if install_user_signal_frame_int80(current, frame, delivery).is_err() {
+                    let ctx = SyscallContext::new(current);
+                    return Some(sys_exit_common(&ctx, 128 + signal::SIGSEGV as i32));
+                }
+                return None;
+            }
+        }
+    }
+}
+
 fn log_unknown_syscall(num: u64) {
     unsafe {
         if UNKNOWN_SYSCALL_LOG_COUNT < UNKNOWN_SYSCALL_LOG_LIMIT {
@@ -1703,33 +1990,7 @@ fn dispatch_syscall(call: SyscallArgs) -> i64 {
     }
 
     let _ = def.name;
-    let result = (def.handler)(&ctx, &call);
-    apply_pending_signals()
-        .unwrap_or(result)
-}
-
-fn apply_pending_signals() -> Option<i64> {
-    let current = task::current();
-    if current.is_null() {
-        return None;
-    }
-
-    unsafe {
-        if (*current).state == TaskState::Zombie || (*current).state == TaskState::Dead {
-            return None;
-        }
-    }
-
-    loop {
-        match signal::consume_next(current) {
-            signal::DeliveryAction::None => return None,
-            signal::DeliveryAction::Ignore => continue,
-            signal::DeliveryAction::Terminate(code) => {
-                let ctx = SyscallContext::new(current);
-                return Some(sys_exit_common(&ctx, code));
-            }
-        }
-    }
+    (def.handler)(&ctx, &call)
 }
 
 fn call_from_syscall_frame(frame: &SyscallFrame) -> SyscallArgs {
@@ -1758,11 +2019,52 @@ pub fn init() {
 
 #[no_mangle]
 pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
-    to_sysret(dispatch_syscall(call_from_syscall_frame(frame)))
+    let ctx = SyscallContext::new(task::current());
+    if frame.rax == SYS_RT_SIGRETURN {
+        if !ctx.is_user_task() {
+            return to_sysret(-EPERM);
+        }
+        let restore = restore_user_signal_frame_syscall(ctx.current, frame);
+        if restore < 0 {
+            return to_sysret(restore);
+        }
+        if let Some(ret) = apply_pending_signals_syscall(frame) {
+            frame.rax = to_sysret(ret);
+        }
+        return frame.rax;
+    }
+
+    let result = dispatch_syscall(call_from_syscall_frame(frame));
+    frame.rax = to_sysret(result);
+    if let Some(ret) = apply_pending_signals_syscall(frame) {
+        frame.rax = to_sysret(ret);
+    }
+    frame.rax
 }
 
 pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
+    let ctx = SyscallContext::new(task::current());
+    if frame.rax == SYS_RT_SIGRETURN {
+        frame.rax = if !ctx.is_user_task() {
+            to_sysret(-EPERM)
+        } else {
+            let restore = restore_user_signal_frame_int80(ctx.current, frame);
+            if restore < 0 {
+                to_sysret(restore)
+            } else {
+                frame.rax
+            }
+        };
+        if let Some(ret) = apply_pending_signals_int80(frame) {
+            frame.rax = to_sysret(ret);
+        }
+        return;
+    }
+
     frame.rax = to_sysret(dispatch_syscall(call_from_int80_frame(frame)));
+    if let Some(ret) = apply_pending_signals_int80(frame) {
+        frame.rax = to_sysret(ret);
+    }
 }
 
 #[cfg(test)]
@@ -1800,6 +2102,10 @@ mod tests {
         assert_eq!(
             lookup_syscall(SYS_RT_SIGPROCMASK).map(|d| d.name),
             Some("rt_sigprocmask")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_RT_SIGRETURN).map(|d| d.name),
+            Some("rt_sigreturn")
         );
         assert_eq!(lookup_syscall(SYS_SHMGET).map(|d| d.name), Some("shmget"));
         assert_eq!(lookup_syscall(SYS_SHMAT).map(|d| d.name), Some("shmat"));
