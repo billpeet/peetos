@@ -26,7 +26,7 @@ The loader supports ELF64 for `x86_64` little-endian. `elf::load()` accepts `ET_
 4. If the main image has `PT_INTERP`, the interpreter path is resolved and loaded with `elf::load_at()` at a fixed user base (`/lib/ld-peetos.so` is embedded for bootstrap; `execve` also supports VFS-backed interpreter lookup).
 5. Before committing load success, the loader verifies each final entry point is inside an executable user `PT_LOAD` range.
 6. The loader records program header metadata (PHDR address/count/size), detects dynamic metadata (`ET_DYN`, `PT_INTERP`, `PT_DYNAMIC`), and returns the entry point (`e_entry`) plus the top of the loaded image (`program_break`) for future heap work.
-7. `user::spawn_init()` sets up a 32KB user stack, writes a Linux-style initial stack image (`argc`, `argv`, `envp`, `auxv` with `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_BASE`/`AT_ENTRY`), and builds an `InterruptFrame` that starts at the interpreter entry (when present) or the main entry.
+7. `user::spawn_init()` sets up a 32KB user stack, writes a Linux-style initial stack image (`argc`, `argv`, `envp`, `auxv` with `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_BASE`/`AT_ENTRY` plus baseline identity/random entries like `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`/`AT_SECURE`/`AT_RANDOM`/`AT_EXECFN`), and builds an `InterruptFrame` that starts at the interpreter entry (when present) or the main entry.
 8. `execve` now reuses the same loader/stack path to replace the current task image from a VFS file and apply caller-provided `argv`/`envp`.
 
 Limitations / Simplifications

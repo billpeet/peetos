@@ -5,6 +5,7 @@ use core::ptr;
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
 use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
+use arch_x86_64::pit;
 use arch_x86_64::syscall as arch_syscall;
 
 use crate::elf;
@@ -35,6 +36,13 @@ const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
+const AT_EXECFN: u64 = 31;
 
 const EIO: i64 = 5;
 const ENOENT: i64 = 2;
@@ -394,6 +402,74 @@ fn resolve_exec_interp_image(path: &[u8]) -> Result<ExecImageSource, i64> {
     Ok(ExecImageSource::Owned(image))
 }
 
+#[inline]
+fn auxv_value_slot(auxv_ptr: u64, index: usize) -> Option<u64> {
+    auxv_ptr.checked_add((index as u64).checked_mul(16)? + 8)
+}
+
+fn write_auxv_value_at_index(pml4: PhysAddr, auxv_ptr: u64, index: usize, value: u64) -> bool {
+    let slot = match auxv_value_slot(auxv_ptr, index) {
+        Some(slot) => slot,
+        None => return false,
+    };
+    write_user_u64(pml4, slot, value)
+}
+
+fn fill_startup_random(buf: &mut [u8; 16]) {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ pit::ticks().wrapping_mul(0xA076_1D64_78BD_642F);
+    for chunk in buf.chunks_mut(8) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let sample = state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes();
+        chunk.copy_from_slice(&sample[..chunk.len()]);
+    }
+}
+
+fn install_auxv_runtime_data(
+    pml4: PhysAddr,
+    stack_bottom: u64,
+    initial_rsp: u64,
+    auxv_ptr: u64,
+    random_index: usize,
+    execfn_index: usize,
+    execfn: &[u8],
+) -> bool {
+    if execfn.is_empty() || execfn[execfn.len() - 1] != 0 {
+        return false;
+    }
+
+    let mut random = [0u8; 16];
+    fill_startup_random(&mut random);
+
+    let random_addr = match initial_rsp.checked_sub(random.len() as u64) {
+        Some(addr) => align_down(addr, 16),
+        None => return false,
+    };
+    let execfn_addr = match random_addr.checked_sub(execfn.len() as u64) {
+        Some(addr) => addr,
+        None => return false,
+    };
+    if execfn_addr < stack_bottom {
+        return false;
+    }
+
+    if !write_user_bytes(pml4, random_addr, &random) {
+        return false;
+    }
+    if !write_user_bytes(pml4, execfn_addr, execfn) {
+        return false;
+    }
+    if !write_auxv_value_at_index(pml4, auxv_ptr, random_index, random_addr) {
+        return false;
+    }
+    if !write_auxv_value_at_index(pml4, auxv_ptr, execfn_index, execfn_addr) {
+        return false;
+    }
+
+    true
+}
+
 fn user_range_ok(start: u64, len: usize) -> bool {
     if len == 0 {
         return true;
@@ -653,6 +729,8 @@ pub fn spawn_init() {
         }
     };
 
+    const AUX_IDX_RANDOM: usize = 11;
+    const AUX_IDX_EXECFN: usize = 12;
     let auxv = [
         (AT_PHDR, elf_result.phdr_addr),
         (AT_PHENT, elf_result.phdr_size as u64),
@@ -660,8 +738,15 @@ pub fn spawn_init() {
         (AT_PAGESZ, PAGE_SIZE),
         (AT_BASE, interp_base),
         (AT_ENTRY, elf_result.entry_point),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
+        (AT_SECURE, 0),
+        (AT_RANDOM, 0),
+        (AT_EXECFN, 0),
     ];
-    let stack_plan = match populate_user_stack::<1, 2, 6>(
+    let stack_plan = match populate_user_stack::<1, 2, 13>(
         pml4,
         stack_bottom,
         stack_top,
@@ -676,6 +761,19 @@ pub fn spawn_init() {
             return;
         }
     };
+    if !install_auxv_runtime_data(
+        pml4,
+        stack_bottom,
+        stack_plan.initial_rsp,
+        stack_plan.auxv_ptr,
+        AUX_IDX_RANDOM,
+        AUX_IDX_EXECFN,
+        INIT_ARGV0,
+    ) {
+        serial_println!("[USER] ERROR: failed to finalize user auxv");
+        free_address_space(pml4);
+        return;
+    }
 
     let task_ptr = task::task_alloc("init", TASK_FLAG_USER);
     if task_ptr.is_null() {
@@ -739,9 +837,13 @@ pub fn exec_current_image(
     image: &[u8],
     argv: &[&[u8]],
     env: &[&[u8]],
+    execfn: &[u8],
 ) -> Result<ExecImageStart, i64> {
     if argv.len() > EXEC_MAX_ARGV || env.len() > EXEC_MAX_ENVP {
         return Err(-E2BIG);
+    }
+    if execfn.is_empty() || execfn[execfn.len() - 1] != 0 {
+        return Err(-EINVAL);
     }
 
     let current = task::current();
@@ -795,6 +897,9 @@ pub fn exec_current_image(
         }
     };
 
+    let (uid, gid) = unsafe { ((*current).user_uid as u64, (*current).user_gid as u64) };
+    const AUX_IDX_RANDOM: usize = 11;
+    const AUX_IDX_EXECFN: usize = 12;
     let auxv = [
         (AT_PHDR, elf_result.phdr_addr),
         (AT_PHENT, elf_result.phdr_size as u64),
@@ -802,6 +907,13 @@ pub fn exec_current_image(
         (AT_PAGESZ, PAGE_SIZE),
         (AT_BASE, interp_base),
         (AT_ENTRY, elf_result.entry_point),
+        (AT_UID, uid),
+        (AT_EUID, uid),
+        (AT_GID, gid),
+        (AT_EGID, gid),
+        (AT_SECURE, 0),
+        (AT_RANDOM, 0),
+        (AT_EXECFN, 0),
     ];
 
     let mut argv_addrs = [0u64; EXEC_MAX_ARGV];
@@ -822,6 +934,18 @@ pub fn exec_current_image(
             return Err(-EINVAL);
         }
     };
+    if !install_auxv_runtime_data(
+        new_pml4,
+        stack_bottom,
+        stack_plan.initial_rsp,
+        stack_plan.auxv_ptr,
+        AUX_IDX_RANDOM,
+        AUX_IDX_EXECFN,
+        execfn,
+    ) {
+        free_address_space(new_pml4);
+        return Err(-EINVAL);
+    }
 
     let old_pml4 = unsafe { PhysAddr::new((*current).pml4_phys) };
 
@@ -969,5 +1093,27 @@ mod tests {
             &mut env_addrs,
         )
         .is_none());
+    }
+
+    #[test]
+    fn auxv_value_slot_tracks_value_word_offsets() {
+        assert_eq!(auxv_value_slot(0x4000, 0), Some(0x4008));
+        assert_eq!(auxv_value_slot(0x4000, 1), Some(0x4018));
+        assert_eq!(auxv_value_slot(0x4000, 2), Some(0x4028));
+    }
+
+    #[test]
+    fn auxv_value_slot_rejects_overflow() {
+        assert_eq!(auxv_value_slot(u64::MAX - 8, 0), Some(u64::MAX));
+        assert!(auxv_value_slot(u64::MAX - 7, 0).is_none());
+        assert!(auxv_value_slot(0x1000, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn startup_random_fills_nonzero_bytes() {
+        let mut random = [0u8; 16];
+        fill_startup_random(&mut random);
+        assert!(random.iter().any(|b| *b != 0));
+        assert_ne!(&random[..8], &random[8..]);
     }
 }

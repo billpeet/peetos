@@ -911,6 +911,9 @@ fn execve_common(
     if path.is_empty() {
         return Err(-ENOENT);
     }
+    if path.len() + 1 > fs::VFS_MAX_PATH {
+        return Err(-EINVAL);
+    }
 
     let mut argv_buf = [ExecCString::EMPTY; EXEC_MAX_ARGV];
     let argc = read_exec_cstr_vector(ctx.current, argv_ptr, &mut argv_buf)?;
@@ -929,7 +932,10 @@ fn execve_common(
     let dir_inode = resolve_dir_for_path(ctx, fs::AT_FDCWD, path)?;
     let inode = fs::lookupat(dir_inode, path).map_err(|err| -fs_to_errno(err))?;
     let image = read_exec_image_from_inode(inode)?;
-    let result = user::exec_current_image(image.as_slice(), &argv[..argc], &env[..envc]);
+    let execfn_len = path.len();
+    path_buf[execfn_len] = 0;
+    let execfn = &path_buf[..execfn_len + 1];
+    let result = user::exec_current_image(image.as_slice(), &argv[..argc], &env[..envc], execfn);
     heap::kfree(image.ptr);
     result
 }
