@@ -5,6 +5,7 @@ use core::ptr;
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
 use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
+use arch_x86_64::syscall as arch_syscall;
 
 use crate::elf;
 use crate::memory::{heap, pmm, vmm};
@@ -836,6 +837,7 @@ pub fn exec_current_image(
         (*current).user_argv = stack_plan.argv_ptr;
         (*current).user_envp = stack_plan.envp_ptr;
         (*current).user_auxv = stack_plan.auxv_ptr;
+        (*current).user_fs_base = 0;
         (*current).user_clear_tid = 0;
         (*current).user_brk_start = elf_result.program_break;
         (*current).user_brk = elf_result.program_break;
@@ -853,6 +855,7 @@ pub fn exec_current_image(
     }
 
     vmm::switch(new_pml4);
+    arch_syscall::set_user_fs_base(0);
     if old_pml4.as_u64() != 0 && old_pml4 != new_pml4 {
         free_address_space(old_pml4);
     }

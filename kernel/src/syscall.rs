@@ -5,7 +5,7 @@ use core::ptr;
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
 use arch_x86_64::idt::InterruptFrame;
 use arch_x86_64::pit;
-use arch_x86_64::syscall::SyscallFrame;
+use arch_x86_64::syscall::{self as arch_syscall, SyscallFrame};
 
 use crate::ipc;
 use crate::memory::{heap, pmm, vmm};
@@ -76,6 +76,7 @@ const SYS_EXIT: u64 = 60;
 const SYS_KILL: u64 = 62;
 const SYS_SHMDT: u64 = 67;
 const SYS_GETPPID: u64 = 110;
+const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_GETTID: u64 = 186;
 const SYS_FUTEX: u64 = 202;
 const SYS_SET_TID_ADDRESS: u64 = 218;
@@ -90,6 +91,11 @@ const SYS_PIPE2: u64 = 293;
 
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_EMPTY_PATH: u32 = 0x1000;
+
+const ARCH_SET_GS: u64 = 0x1001;
+const ARCH_SET_FS: u64 = 0x1002;
+const ARCH_GET_FS: u64 = 0x1003;
+const ARCH_GET_GS: u64 = 0x1004;
 
 const PROT_NONE: u32 = 0x0;
 const PROT_READ: u32 = 0x1;
@@ -257,6 +263,12 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_KILL, "kill", SyscallMode::UserTask, sys_kill),
     syscall_def(SYS_SHMDT, "shmdt", SyscallMode::UserTask, sys_shmdt),
     syscall_def(SYS_GETPPID, "getppid", SyscallMode::AnyTask, sys_getppid),
+    syscall_def(
+        SYS_ARCH_PRCTL,
+        "arch_prctl",
+        SyscallMode::UserTask,
+        sys_arch_prctl,
+    ),
     syscall_def(SYS_GETTID, "gettid", SyscallMode::AnyTask, sys_gettid),
     syscall_def(
         SYS_SET_TID_ADDRESS,
@@ -671,6 +683,10 @@ fn user_range_ok(start: u64, len: usize) -> bool {
     };
 
     end < KERNEL_VIRT_BASE
+}
+
+fn arch_prctl_set_fs_addr_ok(addr: u64) -> bool {
+    addr < KERNEL_VIRT_BASE
 }
 
 fn copy_user_bytes(
@@ -2273,6 +2289,38 @@ fn sys_gettid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     }
 }
 
+fn sys_arch_prctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let code = call.arg(0);
+    let addr = call.arg(1);
+
+    match code {
+        ARCH_SET_FS => {
+            if !arch_prctl_set_fs_addr_ok(addr) {
+                return -EINVAL;
+            }
+
+            unsafe {
+                (*ctx.current).user_fs_base = addr;
+            }
+            arch_syscall::set_user_fs_base(addr);
+            0
+        }
+        ARCH_GET_FS => {
+            if !user_range_ok(addr, size_of::<u64>()) {
+                return -EFAULT;
+            }
+
+            let fs_base = unsafe { (*ctx.current).user_fs_base };
+            match write_u64_to_user(ctx.current, addr, fs_base) {
+                Ok(()) => 0,
+                Err(err) => -err,
+            }
+        }
+        ARCH_SET_GS | ARCH_GET_GS => -EINVAL,
+        _ => -EINVAL,
+    }
+}
+
 fn sys_set_tid_address(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let clear_tid = call.arg(0);
     if clear_tid != 0 && !user_range_ok(clear_tid, CLEAR_TID_SIZE) {
@@ -2745,6 +2793,10 @@ mod tests {
         );
         assert_eq!(lookup_syscall(SYS_PIPE2).map(|d| d.name), Some("pipe2"));
         assert_eq!(lookup_syscall(SYS_EXECVE).map(|d| d.name), Some("execve"));
+        assert_eq!(
+            lookup_syscall(SYS_ARCH_PRCTL).map(|d| d.name),
+            Some("arch_prctl")
+        );
     }
 
     #[test]
@@ -2767,6 +2819,13 @@ mod tests {
     fn mmap_flag_validation_rejects_unknown_bits() {
         assert!(mmap_flags_are_supported(MAP_PRIVATE | MAP_ANONYMOUS));
         assert!(!mmap_flags_are_supported(MAP_PRIVATE | 0x8000_0000));
+    }
+
+    #[test]
+    fn arch_prctl_set_fs_rejects_kernel_addresses() {
+        assert!(arch_prctl_set_fs_addr_ok(0));
+        assert!(arch_prctl_set_fs_addr_ok(KERNEL_VIRT_BASE - 1));
+        assert!(!arch_prctl_set_fs_addr_ok(KERNEL_VIRT_BASE));
     }
 
     #[test]

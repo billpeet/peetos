@@ -45,6 +45,30 @@ pub fn init() {
 pub fn init() {}
 
 #[cfg(target_os = "none")]
+#[inline]
+pub fn set_user_fs_base(base: u64) {
+    unsafe {
+        msr::write(msr::IA32_FS_BASE, base);
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn set_user_fs_base(_base: u64) {}
+
+#[cfg(target_os = "none")]
+#[inline]
+pub fn user_fs_base() -> u64 {
+    unsafe { msr::read(msr::IA32_FS_BASE) }
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn user_fs_base() -> u64 {
+    0
+}
+
+#[cfg(target_os = "none")]
 extern "C" {
     fn syscall_entry();
 }

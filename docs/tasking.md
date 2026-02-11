@@ -18,7 +18,7 @@ This document describes the baseline tasking and scheduler implementation introd
 - Saved interrupt-frame stack pointer (`saved_rsp`)
 - Kernel stack base/top
 - User-process metadata (`pml4_phys`, user entry point, user stack bounds)
-- Initial user bootstrap metadata (`user_stack_ptr`, `user_argc`, `user_argv`, `user_envp`, `user_auxv`, `user_clear_tid`)
+- Initial user bootstrap metadata (`user_stack_ptr`, `user_argc`, `user_argv`, `user_envp`, `user_auxv`, `user_fs_base`, `user_clear_tid`)
 - Per-task ELF/program metadata (`phdr_*`, `base_addr`, dynamic-linker flags)
 - Per-task program break tracking (`user_brk_start`, `user_brk`)
 - Per-task file descriptor table metadata (`kind`, inode handle, file offset, open flags)
@@ -66,6 +66,7 @@ Limitations / Simplifications
 - Per-task FD state exists and is used by baseline VFS syscalls, but advanced descriptor semantics (`dup*`, `fcntl`, CLOEXEC semantics on `exec`) are not implemented yet.
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Address space switching and `TSS.rsp0` updates are minimal; no per-task TLS (FS/GS).
+- Per-task FS-base TLS state is now tracked/restored (`arch_prctl` `ARCH_SET_FS`/`ARCH_GET_FS`), but GS-base handling and full TLS model compatibility are still incomplete.
 - Task metadata for user processes is tracked, but there is no `/proc` or userspace-visible tooling for inspecting it yet.
 - `user_clear_tid` zeroing now performs a best-effort futex wake for one waiter at thread exit, but robust-list semantics and thread-group teardown are not implemented yet.
 - No FPU/SSE save/restore per task.

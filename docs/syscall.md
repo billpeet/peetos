@@ -48,6 +48,7 @@ Limitations / Simplifications
   - `SYS_FSTAT`, `SYS_NEWFSTATAT`, `SYS_GETDENTS64`, `SYS_UNLINKAT`, `SYS_RENAMEAT`
   - `SYS_PIPE`, `SYS_PIPE2`, `SYS_FUTEX`
   - `SYS_EXECVE` (image replacement with caller-provided `argv`/`envp`)
+  - `SYS_ARCH_PRCTL` (baseline `ARCH_SET_FS`/`ARCH_GET_FS`)
   - `SYS_EXIT`, `SYS_EXIT_GROUP`
   - `SYS_YIELD`
   - `SYS_GETPID`, `SYS_GETPPID`, `SYS_GETTID`
@@ -66,6 +67,7 @@ Current implemented handlers:
 - `futex` (`WAIT`/`WAKE` baseline ops only)
 - `shmget/shmat/shmdt/shmctl(IPC_RMID)` via baseline in-kernel System V shared-memory segments
 - `execve(path, argv, envp)` with in-kernel argument/environment copy, VFS-backed ELF load, and direct frame handoff to the new image entry
+- `arch_prctl(ARCH_SET_FS/ARCH_GET_FS)` with per-task FS-base tracking and scheduler restore on context switch
 - `exit(status)` and `exit_group(status)`
 - `sched_yield()`
 - `getpid()`, `getppid()`, `gettid()`
@@ -84,6 +86,7 @@ Limitations / Simplifications
 - `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.
 - Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, no permission enforcement, and no inheritance semantics across `fork`/`exec` yet.
 - `execve` is intentionally narrow: no `CLOEXEC` handling yet, no shebang/script loading, bounded `argv`/`envp` vector sizes, and no full Linux signal-reset semantics.
+- `arch_prctl` is intentionally narrow: only `ARCH_SET_FS` and `ARCH_GET_FS` are implemented; GS-base operations return `-EINVAL`.
 - Signal support remains simplified: delivery is syscall-boundary based and user handlers currently require `SA_RESTORER`; `sigaltstack`, queued RT signal payloads/`siginfo_t`, and full Linux ucontext semantics are not implemented yet.
 
 **Integration**

@@ -115,6 +115,7 @@ pub fn init() {
         (*boot).state = TaskState::Running;
         (*boot).time_slice = DEFAULT_TIME_SLICE;
     }
+    task::apply_user_tls_base(boot);
 
     let idle_pid = task::kthread_create("idle", idle_task_func, ptr::null_mut());
     if idle_pid == task::INVALID_PID {
@@ -381,6 +382,7 @@ fn schedule_from(current_rsp: u64, requeue_current: bool) -> u64 {
         } else {
             vmm::switch(PhysAddr::new(0));
         }
+        task::apply_user_tls_base(next);
 
         (*next).saved_rsp
     }

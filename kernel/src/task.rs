@@ -3,6 +3,7 @@ use core::ptr;
 
 use arch_x86_64::addr::VirtAddr;
 use arch_x86_64::idt::InterruptFrame;
+use arch_x86_64::syscall as arch_syscall;
 
 use crate::memory::pmm;
 use crate::serial_println;
@@ -65,6 +66,7 @@ pub struct Task {
     pub(crate) user_argv: u64,
     pub(crate) user_envp: u64,
     pub(crate) user_auxv: u64,
+    pub(crate) user_fs_base: u64,
     pub(crate) user_clear_tid: u64,
     pub(crate) user_brk_start: u64,
     pub(crate) user_brk: u64,
@@ -156,6 +158,7 @@ pub fn init() {
             user_argv: 0,
             user_envp: 0,
             user_auxv: 0,
+            user_fs_base: 0,
             user_clear_tid: 0,
             user_brk_start: 0,
             user_brk: 0,
@@ -247,6 +250,7 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.user_argv = 0;
         task.user_envp = 0;
         task.user_auxv = 0;
+        task.user_fs_base = 0;
         task.user_clear_tid = 0;
         task.user_brk_start = 0;
         task.user_brk = 0;
@@ -454,6 +458,16 @@ pub fn user_stdio_init(task: *mut Task) {
     }
 }
 
+pub fn apply_user_tls_base(task: *mut Task) {
+    if task.is_null() {
+        arch_syscall::set_user_fs_base(0);
+        return;
+    }
+
+    let fs_base = unsafe { (*task).user_fs_base };
+    arch_syscall::set_user_fs_base(fs_base);
+}
+
 #[cfg(test)]
 impl Task {
     pub(crate) fn for_test(pid: Pid) -> Self {
@@ -476,6 +490,7 @@ impl Task {
             user_argv: 0,
             user_envp: 0,
             user_auxv: 0,
+            user_fs_base: 0,
             user_clear_tid: 0,
             user_brk_start: 0,
             user_brk: 0,
