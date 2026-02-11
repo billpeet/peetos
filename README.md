@@ -19,7 +19,7 @@ Key references in the C project:
 
 - `boot/` Reused stage1 and stage2 bootloader assembly.
 - `kernel/` Rust kernel binary crate.
-- `crates/` Subsystem crates (currently `arch_x86_64` provides port I/O and interrupt wrappers; others are placeholders).
+- `crates/` Subsystem crates (`arch_x86_64`, `fs`, and now `drivers` for baseline PCI enumeration are active; `net`, `syscall`, and `userabi` remain placeholders).
 - `linker/` Linker script for the kernel.
 - `docs/PORTING_PLAN.md` High-level implementation roadmap.
 - `docs/` Implementation docs grouped by subsystem, each with a limitations/simplifications section.
@@ -37,7 +37,8 @@ Key references in the C project:
 - Phase-6 IPC/sync baseline is now present in-kernel: `SpinLock`/`Mutex`/`Semaphore`, anonymous pipes backed by in-kernel ring buffers, baseline System V-style shared memory segments, futex wait/wake keying used by `SYS_FUTEX` and `clear_child_tid` wake-on-exit, plus user-handler signal delivery (`kill` + `rt_sigaction` + `rt_sigprocmask` + `rt_sigreturn`, `SA_RESTORER`-based handler entry/return, and `SIGPIPE` generation on broken pipes).
 - Initial user bootstrap now builds a conventional process stack (`argc`, `argv`, `envp`, `auxv`) so libc-facing usermode setup has a stable base for future `execve` work.
 - A phase-5 baseline VFS is now active with concrete tmpfs behavior, virtual `devfs`/`procfs` nodes, a mount table-backed `/proc/mounts`, and an ext2 importer mounted at `/mnt/ext2` where file and directory mutations (`create`/`mkdir`/`unlink`/`rmdir`/`rename`/`write`) update ext2 data/metadata in the mounted image buffer.
-- Subsystem crates (`drivers`, `net`, `syscall`, `userabi`) remain placeholders; device drivers and full user space are not yet implemented.
+- A phase-7 baseline PCI enumerator is now active in `crates/drivers` (config mechanism #1, bus/device/function scan, bounded boot-time serial inventory output).
+- Remaining placeholder crates are `net`, `syscall`, and `userabi`; advanced device drivers and full user space are still pending.
 
 ## Documentation
 
@@ -49,8 +50,9 @@ Key references in the C project:
 - `docs/tasking.md` Task structures, kernel threads, and scheduler behavior.
 - `docs/vfs.md` Baseline VFS/tmpfs/devfs/procfs/ext2 design and syscall integration.
 - `docs/ipc.md` Phase-6 synchronization primitives and IPC baseline (`pipe`/`futex`/`shm*`/`signal`).
+- `docs/drivers.md` Phase-7 baseline PCI enumeration design and integration.
 - `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.
-- `docs/subsystems.md` Placeholder subsystem crates and intended usage.
+- `docs/subsystems.md` Subsystem crate status and intended usage.
 
 ## Build Prerequisites
 
@@ -98,7 +100,7 @@ Initial smoke test is a QEMU boot to the kernel `kmain()` loop. Use the repo tes
 make test
 ```
 
-`make test` runs host unit tests (currently serial formatting) and then boots QEMU with the `isa-debug-exit` device so the VM exits automatically after the kernel prints the serial banner.
+`make test` runs host unit tests (`arch_x86_64`, `drivers`, `fs`, `kernel`) and then boots QEMU with the `isa-debug-exit` device so the VM exits automatically after the kernel prints the serial banner.
 
 As features land, re-run the C project shell tests for parity:
 

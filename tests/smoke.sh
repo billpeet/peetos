@@ -31,3 +31,4 @@ if [[ "${status}" -eq 124 ]]; then
 fi
 
 grep -q "PeetOS Rust kernel: serial online" "${LOG_FILE}"
+grep -q "\\[PCI\\] Enumerated" "${LOG_FILE}"

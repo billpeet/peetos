@@ -30,13 +30,15 @@ Limitations / Simplifications
 
 **Kernel Initialization Sequence (`kmain`)**
 1. Initialize serial output and print the boot banner.
-2. Load the GDT and IDT, then register default exception handlers.
+2. Load the GDT/TSS/IDT, then register default exception + syscall handlers.
 3. Initialize the PIC and PIT.
 4. Initialize PMM, VMM, and the kernel heap.
-5. Configure syscall MSRs.
-6. Enable interrupts.
-7. Optionally exit QEMU when `test-exit` is enabled.
-8. Halt in an infinite loop.
+5. Run baseline PCI enumeration and print a bounded serial inventory.
+6. Initialize VFS, tasking/scheduler, IPC, and shared-memory subsystems.
+7. Configure syscall MSRs and dispatch state.
+8. Enable interrupts.
+9. Optionally exit QEMU when `test-exit` is enabled.
+10. Halt in an infinite loop.
 
 Limitations / Simplifications
 - Single-core bring-up only; there is no per-CPU initialization yet.

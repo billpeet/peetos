@@ -1,3 +1,6 @@
 #![no_std]
 
-// Placeholder crate for future subsystem implementations.
+#[cfg(test)]
+extern crate std;
+
+pub mod pci;

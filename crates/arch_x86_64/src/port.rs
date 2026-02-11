@@ -31,3 +31,15 @@ pub unsafe fn outl(port: u16, val: u32) {
         options(nomem, nostack, preserves_flags)
     );
 }
+
+#[inline]
+pub unsafe fn inl(port: u16) -> u32 {
+    let mut val: u32;
+    asm!(
+        "in eax, dx",
+        in("dx") port,
+        out("eax") val,
+        options(nomem, nostack, preserves_flags)
+    );
+    val
+}

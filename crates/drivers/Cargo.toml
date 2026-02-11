@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arch_x86_64 = { path = "../arch_x86_64" }
 
 [features]
 default = []

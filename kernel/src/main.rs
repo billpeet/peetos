@@ -14,8 +14,8 @@ mod memory;
 mod qemu;
 mod sched;
 mod serial;
-mod signal;
 mod shm;
+mod signal;
 mod sync;
 mod syscall;
 mod task;
@@ -23,7 +23,10 @@ mod user;
 mod vfs;
 
 use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall, tss};
+use drivers::pci;
 use memory::{heap, pmm, vmm};
+
+const PCI_LOG_LIMIT: usize = 16;
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
@@ -58,6 +61,33 @@ pub extern "C" fn kmain() -> ! {
 
     heap::init();
     serial_println!("[KMALLOC] Initialized");
+
+    let mut pci_devices = [pci::DeviceInfo::EMPTY; PCI_LOG_LIMIT];
+    let pci_summary = pci::enumerate(&mut pci_devices);
+    serial_println!(
+        "[PCI] Enumerated {} function(s) (showing {})",
+        pci_summary.total_devices,
+        pci_summary.stored_devices
+    );
+    for dev in pci_devices.iter().take(pci_summary.stored_devices) {
+        serial_println!(
+            "[PCI] {:02X}:{:02X}.{} vendor={:04X} device={:04X} class={:02X}:{:02X} prog_if={:02X}",
+            dev.bus,
+            dev.device,
+            dev.function,
+            dev.vendor_id,
+            dev.device_id,
+            dev.class_code,
+            dev.subclass,
+            dev.prog_if
+        );
+    }
+    if pci_summary.overflow {
+        serial_println!(
+            "[PCI] {} additional function(s) not shown",
+            pci_summary.total_devices - pci_summary.stored_devices
+        );
+    }
 
     vfs::init();
 

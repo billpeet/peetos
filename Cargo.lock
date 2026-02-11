@@ -9,6 +9,9 @@ version = "0.1.0"
 [[package]]
 name = "drivers"
 version = "0.1.0"
+dependencies = [
+ "arch_x86_64",
+]
 
 [[package]]
 name = "fs"
@@ -19,6 +22,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "arch_x86_64",
+ "drivers",
  "fs",
 ]
 
