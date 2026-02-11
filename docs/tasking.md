@@ -61,7 +61,7 @@ The initial user program is a small dynamic ELF that writes to stdout then exits
 
 Limitations / Simplifications
 - User mode is minimal: a single hardcoded user task with a fixed embedded ELF.
-- No `exec`/`fork`; `argv`/`envp` are currently fixed at spawn time for the embedded init ELF.
+- `execve` is now wired for single-task image replacement with caller-provided `argv`/`envp`, but `fork` and full multi-process lifecycle semantics are still missing.
 - Dynamic-linking support is bootstrap-only (embedded `PT_INTERP` image, no reloc/symbol resolution).
 - Per-task FD state exists and is used by baseline VFS syscalls, but advanced descriptor semantics (`dup*`, `fcntl`, CLOEXEC semantics on `exec`) are not implemented yet.
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.

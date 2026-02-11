@@ -7,8 +7,9 @@ use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
 
 use crate::elf;
-use crate::memory::{pmm, vmm};
+use crate::memory::{heap, pmm, vmm};
 use crate::serial_println;
+use crate::shm;
 use crate::task::{self, TaskState, TASK_FLAG_USER};
 
 const USER_STACK_TOP: u64 = 0x7FFF_FF00_0000;
@@ -17,6 +18,9 @@ const USER_STACK_PAGES: usize = (USER_STACK_SIZE / PAGE_SIZE) as usize;
 const INIT_LOAD_BASE: u64 = 0x0040_0000;
 const INIT_INTERP_BASE: u64 = 0x7000_0000;
 const ELF_INTERP_MAX: usize = 256;
+const EXEC_MAX_ARGV: usize = 64;
+const EXEC_MAX_ENVP: usize = 64;
+const EXEC_MAX_INTERP_IMAGE: usize = 2 * 1024 * 1024;
 
 const INIT_ARGV0: &[u8] = b"/init\0";
 const INIT_ENV_PATH: &[u8] = b"PATH=/bin\0";
@@ -31,6 +35,13 @@ const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 
+const EIO: i64 = 5;
+const ENOENT: i64 = 2;
+const ENOMEM: i64 = 12;
+const EINVAL: i64 = 22;
+const E2BIG: i64 = 7;
+const EACCES: i64 = 13;
+
 static HELLO_DYN_ELF: &[u8] = include_bytes!("../../user/hello_dyn.elf");
 static LD_PEETOS_SO: &[u8] = include_bytes!("../../user/ld-peetos.so");
 
@@ -43,6 +54,55 @@ struct UserStackPlan<const ARGC: usize, const ENVC: usize> {
     auxv_ptr: u64,
     argv_addrs: [u64; ARGC],
     env_addrs: [u64; ENVC],
+}
+
+#[derive(Clone, Copy)]
+struct DynamicUserStackPlan {
+    initial_rsp: u64,
+    argc: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    auxv_ptr: u64,
+}
+
+pub struct ExecImageStart {
+    pub entry_rip: u64,
+    pub stack_ptr: u64,
+}
+
+struct OwnedExecImage {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl OwnedExecImage {
+    fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for OwnedExecImage {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            heap::kfree(self.ptr);
+            self.ptr = ptr::null_mut();
+            self.len = 0;
+        }
+    }
+}
+
+enum ExecImageSource {
+    Embedded(&'static [u8]),
+    Owned(OwnedExecImage),
+}
+
+impl ExecImageSource {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            ExecImageSource::Embedded(data) => data,
+            ExecImageSource::Owned(data) => data.as_slice(),
+        }
+    }
 }
 
 #[inline]
@@ -72,6 +132,265 @@ fn resolve_interp_image(path: &[u8]) -> Option<&'static [u8]> {
         return Some(LD_PEETOS_SO);
     }
     None
+}
+
+fn fs_to_errno(err: i64) -> i64 {
+    match err {
+        fs::ENOENT => ENOENT,
+        fs::EIO => EIO,
+        fs::EISDIR => EACCES,
+        fs::EINVAL => EINVAL,
+        fs::ENOSPC => ENOMEM,
+        _ => EIO,
+    }
+}
+
+fn free_address_space(pml4: PhysAddr) {
+    if pml4.as_u64() == 0 {
+        return;
+    }
+    vmm::clear_user_space(pml4);
+    vmm::destroy_address_space(pml4);
+}
+
+fn map_user_stack(pml4: PhysAddr) -> Option<(u64, u64)> {
+    let stack_top = USER_STACK_TOP;
+    let stack_bottom = stack_top.checked_sub(USER_STACK_SIZE)?;
+
+    for i in 0..USER_STACK_PAGES {
+        let page_phys = pmm::alloc_page();
+        if page_phys.as_u64() == 0 {
+            return None;
+        }
+
+        unsafe {
+            ptr::write_bytes(
+                page_phys.to_virt().as_u64() as *mut u8,
+                0,
+                PAGE_SIZE as usize,
+            );
+        }
+
+        let page_vaddr = stack_bottom + (i as u64 * PAGE_SIZE);
+        if vmm::map_page_in(
+            pml4,
+            VirtAddr::new(page_vaddr),
+            page_phys,
+            vmm::PTE_PRESENT | vmm::PTE_WRITE | vmm::PTE_USER | vmm::PTE_NO_EXECUTE,
+        ) != 0
+        {
+            return None;
+        }
+    }
+
+    Some((stack_bottom, stack_top))
+}
+
+fn plan_user_stack_dynamic(
+    stack_bottom: u64,
+    stack_top: u64,
+    argv: &[&[u8]],
+    env: &[&[u8]],
+    aux_count: usize,
+    argv_addrs: &mut [u64],
+    env_addrs: &mut [u64],
+) -> Option<DynamicUserStackPlan> {
+    if stack_bottom >= stack_top {
+        return None;
+    }
+    if argv_addrs.len() < argv.len() || env_addrs.len() < env.len() {
+        return None;
+    }
+
+    let mut sp = stack_top;
+
+    for idx in (0..env.len()).rev() {
+        if env[idx].is_empty() || env[idx][env[idx].len() - 1] != 0 {
+            return None;
+        }
+        let len = env[idx].len() as u64;
+        sp = sp.checked_sub(len)?;
+        if sp < stack_bottom {
+            return None;
+        }
+        env_addrs[idx] = sp;
+    }
+
+    for idx in (0..argv.len()).rev() {
+        if argv[idx].is_empty() || argv[idx][argv[idx].len() - 1] != 0 {
+            return None;
+        }
+        let len = argv[idx].len() as u64;
+        sp = sp.checked_sub(len)?;
+        if sp < stack_bottom {
+            return None;
+        }
+        argv_addrs[idx] = sp;
+    }
+
+    sp = align_down(sp, 16);
+    if sp < stack_bottom {
+        return None;
+    }
+
+    let aux_qwords = (aux_count + 1).checked_mul(2)?;
+    let qwords = 1usize
+        .checked_add(argv.len().checked_add(1)?)?
+        .checked_add(env.len().checked_add(1)?)?
+        .checked_add(aux_qwords)?;
+
+    if (qwords & 1) != 0 {
+        sp = sp.checked_sub(size_of::<u64>() as u64)?;
+        if sp < stack_bottom {
+            return None;
+        }
+    }
+
+    let table_bytes = (qwords as u64).checked_mul(size_of::<u64>() as u64)?;
+    let initial_rsp = sp.checked_sub(table_bytes)?;
+    if initial_rsp < stack_bottom {
+        return None;
+    }
+
+    let mut cursor = initial_rsp.checked_add(size_of::<u64>() as u64)?;
+    let argv_ptr = cursor;
+    cursor = cursor.checked_add(((argv.len() + 1) * size_of::<u64>()) as u64)?;
+    let envp_ptr = cursor;
+    cursor = cursor.checked_add(((env.len() + 1) * size_of::<u64>()) as u64)?;
+    let auxv_ptr = cursor;
+    let aux_bytes = ((aux_count + 1) * 2 * size_of::<u64>()) as u64;
+    if auxv_ptr.checked_add(aux_bytes)? > sp {
+        return None;
+    }
+
+    Some(DynamicUserStackPlan {
+        initial_rsp,
+        argc: argv.len() as u64,
+        argv_ptr,
+        envp_ptr,
+        auxv_ptr,
+    })
+}
+
+fn populate_user_stack_dynamic(
+    pml4: PhysAddr,
+    stack_bottom: u64,
+    stack_top: u64,
+    argv: &[&[u8]],
+    env: &[&[u8]],
+    aux: &[(u64, u64)],
+    argv_addrs: &mut [u64],
+    env_addrs: &mut [u64],
+) -> Option<DynamicUserStackPlan> {
+    let plan = plan_user_stack_dynamic(
+        stack_bottom,
+        stack_top,
+        argv,
+        env,
+        aux.len(),
+        argv_addrs,
+        env_addrs,
+    )?;
+
+    for idx in 0..argv.len() {
+        if !write_user_bytes(pml4, argv_addrs[idx], argv[idx]) {
+            return None;
+        }
+    }
+    for idx in 0..env.len() {
+        if !write_user_bytes(pml4, env_addrs[idx], env[idx]) {
+            return None;
+        }
+    }
+
+    if !write_user_u64(pml4, plan.initial_rsp, plan.argc) {
+        return None;
+    }
+
+    let mut cursor = plan.argv_ptr;
+    for ptr in argv_addrs.iter().take(argv.len()) {
+        if !write_user_u64(pml4, cursor, *ptr) {
+            return None;
+        }
+        cursor += size_of::<u64>() as u64;
+    }
+    if !write_user_u64(pml4, cursor, 0) {
+        return None;
+    }
+
+    cursor = plan.envp_ptr;
+    for ptr in env_addrs.iter().take(env.len()) {
+        if !write_user_u64(pml4, cursor, *ptr) {
+            return None;
+        }
+        cursor += size_of::<u64>() as u64;
+    }
+    if !write_user_u64(pml4, cursor, 0) {
+        return None;
+    }
+
+    cursor = plan.auxv_ptr;
+    for (kind, value) in aux {
+        if !write_user_u64(pml4, cursor, *kind) {
+            return None;
+        }
+        cursor += size_of::<u64>() as u64;
+        if !write_user_u64(pml4, cursor, *value) {
+            return None;
+        }
+        cursor += size_of::<u64>() as u64;
+    }
+    if !write_user_u64(pml4, cursor, AT_NULL) {
+        return None;
+    }
+    cursor += size_of::<u64>() as u64;
+    if !write_user_u64(pml4, cursor, 0) {
+        return None;
+    }
+
+    Some(plan)
+}
+
+fn read_vfs_image(path: &str, max_size: usize) -> Result<OwnedExecImage, i64> {
+    let inode = fs::lookup(path).map_err(fs_to_errno)?;
+    let stat = fs::stat(inode).map_err(fs_to_errno)?;
+    if stat.file_type != fs::FileType::Regular {
+        return Err(EACCES);
+    }
+
+    let file_len = usize::try_from(stat.size).map_err(|_| EINVAL)?;
+    if file_len == 0 || file_len > max_size {
+        return Err(EINVAL);
+    }
+
+    let ptr = heap::kmalloc(file_len);
+    if ptr.is_null() {
+        return Err(ENOMEM);
+    }
+
+    let image = OwnedExecImage { ptr, len: file_len };
+    let dst = unsafe { core::slice::from_raw_parts_mut(image.ptr, image.len) };
+
+    let mut offset = 0usize;
+    while offset < dst.len() {
+        let read = fs::read(inode, offset as u64, &mut dst[offset..]).map_err(fs_to_errno)?;
+        if read == 0 {
+            return Err(EIO);
+        }
+        offset += read;
+    }
+
+    Ok(image)
+}
+
+fn resolve_exec_interp_image(path: &[u8]) -> Result<ExecImageSource, i64> {
+    if let Some(image) = resolve_interp_image(path) {
+        return Ok(ExecImageSource::Embedded(image));
+    }
+
+    let path = core::str::from_utf8(path).map_err(|_| EINVAL)?;
+    let image = read_vfs_image(path, EXEC_MAX_INTERP_IMAGE)?;
+    Ok(ExecImageSource::Owned(image))
 }
 
 fn user_range_ok(start: u64, len: usize) -> bool {
@@ -296,7 +615,7 @@ pub fn spawn_init() {
     };
     if !elf_result.success {
         serial_println!("[USER] ERROR: failed to load init ELF");
-        vmm::destroy_address_space(pml4);
+        free_address_space(pml4);
         return;
     }
 
@@ -307,7 +626,7 @@ pub fn spawn_init() {
             Some(image) => image,
             None => {
                 serial_println!("[USER] ERROR: unsupported PT_INTERP path");
-                vmm::destroy_address_space(pml4);
+                free_address_space(pml4);
                 return;
             }
         };
@@ -315,7 +634,7 @@ pub fn spawn_init() {
         let interp_result = elf::load_at(interp_image, pml4, INIT_INTERP_BASE);
         if !interp_result.success {
             serial_println!("[USER] ERROR: failed to load PT_INTERP image");
-            vmm::destroy_address_space(pml4);
+            free_address_space(pml4);
             return;
         }
 
@@ -324,36 +643,14 @@ pub fn spawn_init() {
     }
     elf_result.interp_base = interp_base;
 
-    let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
-    for i in 0..USER_STACK_PAGES {
-        let page_phys = pmm::alloc_page();
-        if page_phys.as_u64() == 0 {
-            serial_println!("[USER] ERROR: failed to allocate user stack");
-            vmm::destroy_address_space(pml4);
+    let (stack_bottom, stack_top) = match map_user_stack(pml4) {
+        Some(range) => range,
+        None => {
+            serial_println!("[USER] ERROR: failed to allocate/map user stack");
+            free_address_space(pml4);
             return;
         }
-
-        unsafe {
-            ptr::write_bytes(
-                page_phys.to_virt().as_u64() as *mut u8,
-                0,
-                PAGE_SIZE as usize,
-            );
-        }
-
-        let page_vaddr = stack_bottom + (i as u64 * PAGE_SIZE);
-        if vmm::map_page_in(
-            pml4,
-            VirtAddr::new(page_vaddr),
-            page_phys,
-            vmm::PTE_PRESENT | vmm::PTE_WRITE | vmm::PTE_USER | vmm::PTE_NO_EXECUTE,
-        ) != 0
-        {
-            serial_println!("[USER] ERROR: failed to map user stack");
-            vmm::destroy_address_space(pml4);
-            return;
-        }
-    }
+    };
 
     let auxv = [
         (AT_PHDR, elf_result.phdr_addr),
@@ -366,7 +663,7 @@ pub fn spawn_init() {
     let stack_plan = match populate_user_stack::<1, 2, 6>(
         pml4,
         stack_bottom,
-        USER_STACK_TOP,
+        stack_top,
         [INIT_ARGV0],
         [INIT_ENV_PATH, INIT_ENV_TERM],
         auxv,
@@ -374,7 +671,7 @@ pub fn spawn_init() {
         Some(plan) => plan,
         None => {
             serial_println!("[USER] ERROR: failed to build user stack");
-            vmm::destroy_address_space(pml4);
+            free_address_space(pml4);
             return;
         }
     };
@@ -382,7 +679,7 @@ pub fn spawn_init() {
     let task_ptr = task::task_alloc("init", TASK_FLAG_USER);
     if task_ptr.is_null() {
         serial_println!("[USER] ERROR: failed to allocate task");
-        vmm::destroy_address_space(pml4);
+        free_address_space(pml4);
         return;
     }
 
@@ -390,7 +687,7 @@ pub fn spawn_init() {
         (*task_ptr).pml4_phys = pml4.as_u64();
         (*task_ptr).user_entry = elf_result.entry_point;
         (*task_ptr).user_stack_bottom = stack_bottom;
-        (*task_ptr).user_stack_top = USER_STACK_TOP;
+        (*task_ptr).user_stack_top = stack_top;
         (*task_ptr).user_stack_ptr = stack_plan.initial_rsp;
         (*task_ptr).user_argc = stack_plan.argc;
         (*task_ptr).user_argv = stack_plan.argv_ptr;
@@ -435,6 +732,135 @@ pub fn spawn_init() {
         entry_rip,
         stack_plan.initial_rsp
     );
+}
+
+pub fn exec_current_image(
+    image: &[u8],
+    argv: &[&[u8]],
+    env: &[&[u8]],
+) -> Result<ExecImageStart, i64> {
+    if argv.len() > EXEC_MAX_ARGV || env.len() > EXEC_MAX_ENVP {
+        return Err(-E2BIG);
+    }
+
+    let current = task::current();
+    if current.is_null() {
+        return Err(-EINVAL);
+    }
+    if unsafe { ((*current).flags & TASK_FLAG_USER) == 0 } {
+        return Err(-EINVAL);
+    }
+
+    let new_pml4 = vmm::create_address_space();
+    if new_pml4.as_u64() == 0 {
+        return Err(-ENOMEM);
+    }
+
+    let mut elf_result = if elf::is_dynamic(image) {
+        elf::load_at(image, new_pml4, INIT_LOAD_BASE)
+    } else {
+        elf::load(image, new_pml4)
+    };
+    if !elf_result.success {
+        free_address_space(new_pml4);
+        return Err(-EINVAL);
+    }
+
+    let mut entry_rip = elf_result.entry_point;
+    let mut interp_base = 0u64;
+    if let Some(path) = interp_path_bytes(&elf_result.interp_path) {
+        let interp_image = match resolve_exec_interp_image(path) {
+            Ok(image) => image,
+            Err(err) => {
+                free_address_space(new_pml4);
+                return Err(-err);
+            }
+        };
+        let interp_result = elf::load_at(interp_image.as_slice(), new_pml4, INIT_INTERP_BASE);
+        if !interp_result.success {
+            free_address_space(new_pml4);
+            return Err(-EINVAL);
+        }
+        interp_base = interp_result.base_addr;
+        entry_rip = interp_result.entry_point;
+    }
+    elf_result.interp_base = interp_base;
+
+    let (stack_bottom, stack_top) = match map_user_stack(new_pml4) {
+        Some(range) => range,
+        None => {
+            free_address_space(new_pml4);
+            return Err(-ENOMEM);
+        }
+    };
+
+    let auxv = [
+        (AT_PHDR, elf_result.phdr_addr),
+        (AT_PHENT, elf_result.phdr_size as u64),
+        (AT_PHNUM, elf_result.phdr_count as u64),
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_BASE, interp_base),
+        (AT_ENTRY, elf_result.entry_point),
+    ];
+
+    let mut argv_addrs = [0u64; EXEC_MAX_ARGV];
+    let mut env_addrs = [0u64; EXEC_MAX_ENVP];
+    let stack_plan = match populate_user_stack_dynamic(
+        new_pml4,
+        stack_bottom,
+        stack_top,
+        argv,
+        env,
+        &auxv,
+        &mut argv_addrs,
+        &mut env_addrs,
+    ) {
+        Some(plan) => plan,
+        None => {
+            free_address_space(new_pml4);
+            return Err(-EINVAL);
+        }
+    };
+
+    let old_pml4 = unsafe { PhysAddr::new((*current).pml4_phys) };
+
+    shm::cleanup_task(current);
+
+    unsafe {
+        (*current).pml4_phys = new_pml4.as_u64();
+        (*current).user_entry = elf_result.entry_point;
+        (*current).user_stack_bottom = stack_bottom;
+        (*current).user_stack_top = stack_top;
+        (*current).user_stack_ptr = stack_plan.initial_rsp;
+        (*current).user_argc = stack_plan.argc;
+        (*current).user_argv = stack_plan.argv_ptr;
+        (*current).user_envp = stack_plan.envp_ptr;
+        (*current).user_auxv = stack_plan.auxv_ptr;
+        (*current).user_clear_tid = 0;
+        (*current).user_brk_start = elf_result.program_break;
+        (*current).user_brk = elf_result.program_break;
+        (*current).user_phdr_addr = elf_result.phdr_addr;
+        (*current).user_phdr_count = elf_result.phdr_count;
+        (*current).user_phdr_size = elf_result.phdr_size;
+        (*current).user_base_addr = elf_result.base_addr;
+        (*current).user_interp_base = interp_base;
+        (*current).user_is_dynamic = elf_result.is_dynamic;
+        (*current).sig_pending = 0;
+        (*current).signal_handlers = [0; task::SIG_MAX_TASK_SIGNALS];
+        (*current).signal_flags = [0; task::SIG_MAX_TASK_SIGNALS];
+        (*current).signal_mask_saved = [0; task::SIG_MAX_TASK_SIGNALS];
+        (*current).signal_restorer = 0;
+    }
+
+    vmm::switch(new_pml4);
+    if old_pml4.as_u64() != 0 && old_pml4 != new_pml4 {
+        free_address_space(old_pml4);
+    }
+
+    Ok(ExecImageStart {
+        entry_rip,
+        stack_ptr: stack_plan.initial_rsp,
+    })
 }
 
 #[cfg(test)]
@@ -497,5 +923,48 @@ mod tests {
     fn resolve_interp_image_matches_known_path() {
         assert!(resolve_interp_image(INIT_INTERP_PATH).is_some());
         assert!(resolve_interp_image(b"/bad/interp").is_none());
+    }
+
+    #[test]
+    fn dynamic_stack_plan_accepts_runtime_vectors() {
+        let argv: [&[u8]; 2] = [b"/bin/sh\0", b"-c\0"];
+        let env: [&[u8]; 1] = [b"PATH=/bin\0"];
+        let mut argv_addrs = [0u64; 4];
+        let mut env_addrs = [0u64; 4];
+
+        let plan = plan_user_stack_dynamic(
+            0x7fff_0000_0000,
+            0x7fff_0000_4000,
+            &argv,
+            &env,
+            2,
+            &mut argv_addrs,
+            &mut env_addrs,
+        )
+        .expect("dynamic stack plan should fit");
+
+        assert_eq!(plan.argc, 2);
+        assert_eq!(plan.initial_rsp & 0xF, 0);
+        assert!(argv_addrs[0] < 0x7fff_0000_4000);
+        assert!(env_addrs[0] < 0x7fff_0000_4000);
+    }
+
+    #[test]
+    fn dynamic_stack_plan_rejects_non_nul_strings() {
+        let argv: [&[u8]; 1] = [b"/bin/sh"];
+        let env: [&[u8]; 0] = [];
+        let mut argv_addrs = [0u64; 2];
+        let mut env_addrs = [0u64; 1];
+
+        assert!(plan_user_stack_dynamic(
+            0x7fff_0000_0000,
+            0x7fff_0000_2000,
+            &argv,
+            &env,
+            1,
+            &mut argv_addrs,
+            &mut env_addrs,
+        )
+        .is_none());
     }
 }

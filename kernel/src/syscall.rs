@@ -8,10 +8,11 @@ use arch_x86_64::pit;
 use arch_x86_64::syscall::SyscallFrame;
 
 use crate::ipc;
-use crate::memory::{pmm, vmm};
+use crate::memory::{heap, pmm, vmm};
 use crate::shm;
 use crate::signal;
 use crate::task::{self, TaskState, TASK_FLAG_USER};
+use crate::user;
 
 #[cfg(not(test))]
 macro_rules! sys_log {
@@ -31,6 +32,7 @@ const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
 const EIO: i64 = 5;
+const E2BIG: i64 = 7;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
@@ -69,6 +71,7 @@ const SYS_SHMGET: u64 = 29;
 const SYS_SHMAT: u64 = 30;
 const SYS_SHMCTL: u64 = 31;
 const SYS_GETPID: u64 = 39;
+const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_KILL: u64 = 62;
 const SYS_SHMDT: u64 = 67;
@@ -109,6 +112,10 @@ const WRITE_CHUNK_SIZE: usize = 128;
 const READ_CHUNK_SIZE: usize = 128;
 const UNKNOWN_SYSCALL_LOG_LIMIT: u32 = 8;
 const CLEAR_TID_SIZE: usize = 4;
+const EXEC_MAX_ARGV: usize = 64;
+const EXEC_MAX_ENVP: usize = 64;
+const EXEC_MAX_STR_LEN: usize = 256;
+const EXEC_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 const SIGNAL_FRAME_MAGIC_SYSCALL: u64 = 0x5352_4653_5953_0001;
 const SIGNAL_FRAME_MAGIC_INT80: u64 = 0x5352_4649_3830_0001;
 
@@ -246,6 +253,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_BRK, "brk", SyscallMode::UserTask, sys_brk),
     syscall_def(SYS_YIELD, "sched_yield", SyscallMode::AnyTask, sys_yield),
     syscall_def(SYS_GETPID, "getpid", SyscallMode::AnyTask, sys_getpid),
+    syscall_def(SYS_EXECVE, "execve", SyscallMode::UserTask, sys_execve),
     syscall_def(SYS_KILL, "kill", SyscallMode::UserTask, sys_kill),
     syscall_def(SYS_SHMDT, "shmdt", SyscallMode::UserTask, sys_shmdt),
     syscall_def(SYS_GETPPID, "getppid", SyscallMode::AnyTask, sys_getppid),
@@ -559,6 +567,23 @@ struct UserSignalFrameInt80 {
     ss: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ExecCString {
+    len: usize,
+    bytes: [u8; EXEC_MAX_STR_LEN],
+}
+
+impl ExecCString {
+    const EMPTY: Self = Self {
+        len: 0,
+        bytes: [0; EXEC_MAX_STR_LEN],
+    };
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 impl LinuxStat {
     fn from_fs(stat: fs::FileStat) -> Self {
         Self {
@@ -763,6 +788,134 @@ pub(crate) fn copy_cstr_from_user_current(user_src: u64, out: &mut [u8]) -> Resu
     }
 
     Err(EINVAL)
+}
+
+fn copy_cstr_from_user_task(
+    task_ptr: *mut task::Task,
+    user_src: u64,
+    out: &mut [u8],
+) -> Result<usize, i64> {
+    if out.is_empty() {
+        return Err(-EINVAL);
+    }
+
+    for (idx, dst_byte) in out.iter_mut().enumerate() {
+        let mut byte = [0u8; 1];
+        if let Err(err) = copy_from_user_task(task_ptr, user_src + idx as u64, &mut byte) {
+            return Err(-err);
+        }
+        *dst_byte = byte[0];
+        if byte[0] == 0 {
+            return Ok(idx);
+        }
+    }
+
+    Err(-E2BIG)
+}
+
+fn read_exec_cstr_vector(
+    task_ptr: *mut task::Task,
+    vector_ptr: u64,
+    out: &mut [ExecCString],
+) -> Result<usize, i64> {
+    if vector_ptr == 0 {
+        return Ok(0);
+    }
+
+    for idx in 0..out.len() {
+        let slot_ptr = vector_ptr + (idx * size_of::<u64>()) as u64;
+        let entry_ptr = match read_u64_from_user(task_ptr, slot_ptr) {
+            Ok(ptr) => ptr,
+            Err(err) => return Err(-err),
+        };
+        if entry_ptr == 0 {
+            return Ok(idx);
+        }
+
+        let len = copy_cstr_from_user_task(task_ptr, entry_ptr, &mut out[idx].bytes)?;
+        out[idx].len = len + 1;
+    }
+
+    Err(-E2BIG)
+}
+
+struct ExecImage {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl ExecImage {
+    fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+fn read_exec_image_from_inode(inode: u16) -> Result<ExecImage, i64> {
+    let stat = fs::stat(inode).map_err(|err| -fs_to_errno(err))?;
+    if stat.file_type != fs::FileType::Regular {
+        return Err(-EACCES);
+    }
+
+    let size = usize::try_from(stat.size).map_err(|_| -EINVAL)?;
+    if size == 0 || size > EXEC_MAX_IMAGE_SIZE {
+        return Err(-EINVAL);
+    }
+
+    let ptr = heap::kmalloc(size);
+    if ptr.is_null() {
+        return Err(-ENOMEM);
+    }
+
+    let image = ExecImage { ptr, len: size };
+    let dst = unsafe { core::slice::from_raw_parts_mut(ptr, size) };
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let read = fs::read(inode, copied as u64, &mut dst[copied..]).map_err(|err| {
+            heap::kfree(ptr);
+            -fs_to_errno(err)
+        })?;
+        if read == 0 {
+            heap::kfree(ptr);
+            return Err(-EIO);
+        }
+        copied += read;
+    }
+
+    Ok(image)
+}
+
+fn execve_common(
+    ctx: &SyscallContext,
+    filename_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+) -> Result<user::ExecImageStart, i64> {
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = read_user_path(filename_ptr, &mut path_buf)?;
+    if path.is_empty() {
+        return Err(-ENOENT);
+    }
+
+    let mut argv_buf = [ExecCString::EMPTY; EXEC_MAX_ARGV];
+    let argc = read_exec_cstr_vector(ctx.current, argv_ptr, &mut argv_buf)?;
+    let mut env_buf = [ExecCString::EMPTY; EXEC_MAX_ENVP];
+    let envc = read_exec_cstr_vector(ctx.current, envp_ptr, &mut env_buf)?;
+
+    let mut argv = [&[][..]; EXEC_MAX_ARGV];
+    for idx in 0..argc {
+        argv[idx] = argv_buf[idx].as_bytes();
+    }
+    let mut env = [&[][..]; EXEC_MAX_ENVP];
+    for idx in 0..envc {
+        env[idx] = env_buf[idx].as_bytes();
+    }
+
+    let dir_inode = resolve_dir_for_path(ctx, fs::AT_FDCWD, path)?;
+    let inode = fs::lookupat(dir_inode, path).map_err(|err| -fs_to_errno(err))?;
+    let image = read_exec_image_from_inode(inode)?;
+    let result = user::exec_current_image(image.as_slice(), &argv[..argc], &env[..envc]);
+    heap::kfree(image.ptr);
+    result
 }
 
 fn ensure_user_pages_unmapped(pml4: PhysAddr, start: u64, end: u64) -> Result<(), i64> {
@@ -2099,6 +2252,13 @@ fn sys_getpid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     }
 }
 
+fn sys_execve(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    match execve_common(ctx, call.arg(0), call.arg(1), call.arg(2)) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
 fn sys_getppid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     match ctx.ppid() {
         Ok(ppid) => ppid,
@@ -2443,6 +2603,26 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
         }
         return frame.rax;
     }
+    if frame.rax == SYS_EXECVE {
+        if !ctx.is_user_task() {
+            return to_sysret(-EPERM);
+        }
+        match execve_common(&ctx, frame.rdi, frame.rsi, frame.rdx) {
+            Ok(exec_start) => {
+                frame.rax = 0;
+                frame.rcx = exec_start.entry_rip;
+                frame.rsp = exec_start.stack_ptr;
+                return frame.rax;
+            }
+            Err(err) => {
+                frame.rax = to_sysret(err);
+                if let Some(ret) = apply_pending_signals_syscall(frame) {
+                    frame.rax = to_sysret(ret);
+                }
+                return frame.rax;
+            }
+        }
+    }
 
     let result = dispatch_syscall(call_from_syscall_frame(frame));
     frame.rax = to_sysret(result);
@@ -2463,6 +2643,24 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
                 to_sysret(restore)
             } else {
                 frame.rax
+            }
+        };
+        if let Some(ret) = apply_pending_signals_int80(frame) {
+            frame.rax = to_sysret(ret);
+        }
+        return;
+    }
+    if frame.rax == SYS_EXECVE {
+        frame.rax = if !ctx.is_user_task() {
+            to_sysret(-EPERM)
+        } else {
+            match execve_common(&ctx, frame.rdi, frame.rsi, frame.rdx) {
+                Ok(exec_start) => {
+                    frame.rip = exec_start.entry_rip;
+                    frame.rsp = exec_start.stack_ptr;
+                    0
+                }
+                Err(err) => to_sysret(err),
             }
         };
         if let Some(ret) = apply_pending_signals_int80(frame) {
@@ -2546,6 +2744,7 @@ mod tests {
             Some("renameat")
         );
         assert_eq!(lookup_syscall(SYS_PIPE2).map(|d| d.name), Some("pipe2"));
+        assert_eq!(lookup_syscall(SYS_EXECVE).map(|d| d.name), Some("execve"));
     }
 
     #[test]

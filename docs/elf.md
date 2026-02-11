@@ -23,19 +23,20 @@ The loader supports ELF64 for `x86_64` little-endian. `elf::load()` accepts `ET_
    - The virtual address range is aligned to 4KB pages.
    - Physical pages are allocated via `pmm::alloc_page()` and mapped with `vmm::map_page_in()`.
    - Pages are zeroed, then segment bytes are copied from the ELF image into the mapped pages.
-4. If the main image has `PT_INTERP`, the interpreter path is resolved against embedded images (`/lib/ld-peetos.so` currently) and loaded with `elf::load_at()` at a fixed user base.
+4. If the main image has `PT_INTERP`, the interpreter path is resolved and loaded with `elf::load_at()` at a fixed user base (`/lib/ld-peetos.so` is embedded for bootstrap; `execve` also supports VFS-backed interpreter lookup).
 5. Before committing load success, the loader verifies each final entry point is inside an executable user `PT_LOAD` range.
 6. The loader records program header metadata (PHDR address/count/size), detects dynamic metadata (`ET_DYN`, `PT_INTERP`, `PT_DYNAMIC`), and returns the entry point (`e_entry`) plus the top of the loaded image (`program_break`) for future heap work.
 7. `user::spawn_init()` sets up a 32KB user stack, writes a Linux-style initial stack image (`argc`, `argv`, `envp`, `auxv` with `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_BASE`/`AT_ENTRY`), and builds an `InterruptFrame` that starts at the interpreter entry (when present) or the main entry.
+8. `execve` now reuses the same loader/stack path to replace the current task image from a VFS file and apply caller-provided `argv`/`envp`.
 
 Limitations / Simplifications
 - `elf::load_at()` accepts PIE/`ET_DYN`, but relocations and `PT_DYNAMIC` entry parsing are not implemented.
-- `PT_INTERP` mapping is currently a minimal bootstrap: only embedded interpreter images are supported (no filesystem lookup or shebang-style resolution).
+- `PT_INTERP` mapping is still minimal bootstrap logic: embedded interpreter image support is first-class, VFS fallback exists for `execve`, and there is still no shebang-style script resolution.
 - Dynamic symbol resolution/relocations are still not implemented (`PT_DYNAMIC` is metadata-only at this stage).
 - Segment permissions set `PTE_NO_EXECUTE`, and `EFER.NXE` is enabled during syscall/MSR setup.
 - Segment-level W^X is enforced by rejecting `PF_W | PF_X` `PT_LOAD` segments, but there is no SMEP/SMAP integration.
 - User address checks are stricter than the initial baseline (checked arithmetic + entrypoint-in-exec-range checks), but there is still no ASLR.
 - `program_break` is consumed by per-task `brk` state, and baseline `mmap`/`mprotect`/`munmap` syscalls are now available for dynamic-loader bring-up; advanced VM policy (overcommit/accounting, VMA metadata, guard-page policy) is still pending.
-- Initial `argv`/`envp` values are currently fixed for the embedded init task; there is no `execve` path to supply caller-provided vectors yet.
+- Initial `argv`/`envp` for bootstrap remain fixed, but `execve` now accepts caller-provided vectors (with bounded argument/environment counts and string lengths).
 - Load failure rollback is still minimal; pages mapped before a late failure are not fully unwound.
 - The embedded ELF is rebuilt automatically via the Makefile; `scripts/build_user.sh` remains a manual helper.
