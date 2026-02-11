@@ -45,6 +45,9 @@ impl Tss {
 }
 
 static mut TSS: Tss = Tss::zero();
+#[cfg(target_os = "none")]
+#[no_mangle]
+static mut ARCH_X86_64_TSS_RSP0: u64 = 0;
 
 pub fn init() {
     let tss_addr = &raw const TSS as *const Tss as u64;
@@ -55,6 +58,10 @@ pub fn init() {
 pub fn set_rsp0(rsp0: u64) {
     unsafe {
         TSS.rsp0 = rsp0;
+        #[cfg(target_os = "none")]
+        {
+            ARCH_X86_64_TSS_RSP0 = rsp0;
+        }
     }
 }
 

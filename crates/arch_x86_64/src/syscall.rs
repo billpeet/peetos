@@ -34,6 +34,10 @@ pub fn init() {
         efer |= EFER_SCE | EFER_NXE;
         msr::write(msr::IA32_EFER, efer);
 
+        // Keep GS state well-defined for SWAPGS-based syscall entry.
+        msr::write(msr::IA32_GS_BASE, 0);
+        msr::write(msr::IA32_KERNEL_GS_BASE, 0);
+
         let star = ((GDT_KERNEL_DS as u64) << 48) | ((GDT_KERNEL_CS as u64) << 32);
         msr::write(msr::IA32_STAR, star);
         msr::write(msr::IA32_LSTAR, syscall_entry as *const () as u64);
@@ -74,14 +78,26 @@ extern "C" {
 }
 
 #[cfg(target_os = "none")]
+#[no_mangle]
+static mut ARCH_X86_64_SYSCALL_USER_RSP: u64 = 0;
+
+#[cfg(target_os = "none")]
 core::arch::global_asm!(
     r#"
 .section .text
 .extern syscall_handler
+.extern ARCH_X86_64_TSS_RSP0
+.extern ARCH_X86_64_SYSCALL_USER_RSP
 
 .global syscall_entry
 syscall_entry:
-    push rsp
+    swapgs
+    mov [rip + ARCH_X86_64_SYSCALL_USER_RSP], rsp
+    mov rsp, [rip + ARCH_X86_64_TSS_RSP0]
+    test rsp, rsp
+    jz .Lsyscall_no_kstack
+
+    push qword ptr [rip + ARCH_X86_64_SYSCALL_USER_RSP]
     push rcx
     push r11
 
@@ -107,7 +123,11 @@ syscall_entry:
     mov r11, [rsp + 56]
     mov rcx, [rsp + 64]
     mov rsp, [rsp + 72]
+    swapgs
     sysretq
+
+.Lsyscall_no_kstack:
+    ud2
 "#
 );
 

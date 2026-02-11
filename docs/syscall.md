@@ -25,16 +25,14 @@ Limitations / Simplifications
 
 **Syscall Entry Stub**
 `syscall_entry` is defined via `global_asm!` in `crates/arch_x86_64/src/syscall.rs`. It:
-1. Saves user RSP, RCX (return RIP), and R11 (return RFLAGS).
-2. Saves the syscall number (RAX) and the standard SysV argument registers.
-3. Calls `syscall_handler` with a pointer to the `SyscallFrame`.
-4. Restores registers and returns via `sysretq`.
-
-The current stub does not switch stacks. It assumes execution on the current stack and is suitable only for early bring-up. There is no SWAPGS or TSS.RSP0 integration yet.
+1. Uses `swapgs` and switches to the current task's kernel stack (tracked via `TSS.rsp0`).
+2. Saves user RSP, RCX (return RIP), and R11 (return RFLAGS) plus syscall arguments.
+3. Calls `syscall_handler` with a pointer to the `SyscallFrame` on the kernel stack.
+4. Restores registers and returns via `swapgs` + `sysretq`.
 
 Limitations / Simplifications
-- No stack switching, GS base swap, or per-task kernel stack support.
-- No SMEP/SMAP toggling or user pointer validation.
+- No SMEP/SMAP toggling yet.
+- User-pointer validation is baseline only (range + mapping checks); no hardened fault-recovery path yet.
 
 **INT 0x80 Path**
 For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed in the IDT. The handler uses the `InterruptFrame` to extract syscall arguments and write the return value to `RAX`.
@@ -42,6 +40,7 @@ For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed i
 Limitations / Simplifications
 - The `int 0x80` path currently shares the same Linux-numbered dispatcher as the SYSCALL path and supports a baseline subset:
   - `SYS_OPEN`, `SYS_OPENAT`, `SYS_MKDIRAT`, `SYS_CLOSE`, `SYS_READ`, `SYS_WRITE`, `SYS_LSEEK`
+  - `SYS_DUP`, `SYS_DUP2`, `SYS_DUP3`, `SYS_FCNTL` (baseline descriptor controls + `FD_CLOEXEC`)
   - `SYS_MMAP`, `SYS_MPROTECT`, `SYS_MUNMAP` (baseline userspace VM mapping path)
   - `SYS_RT_SIGACTION`, `SYS_RT_SIGPROCMASK`, `SYS_RT_SIGRETURN`, `SYS_KILL` (baseline signal path)
   - `SYS_SHMGET`, `SYS_SHMAT`, `SYS_SHMDT`, `SYS_SHMCTL` (baseline System V shared memory)
@@ -61,6 +60,7 @@ Limitations / Simplifications
 
 Current implemented handlers:
 - `open/openat/close/read/write/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
+- `dup/dup2/dup3/fcntl` baseline descriptor operations (`F_GETFD`, `F_SETFD`, `F_GETFL`, `F_DUPFD`, `F_DUPFD_CLOEXEC`) with `FD_CLOEXEC`
 - `mmap/mprotect/munmap` for baseline userspace mapping management (anonymous private mappings plus private file-backed mappings from VFS fds, fixed/fixed-noreplace handling, and page-level protection changes)
 - `kill`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` for baseline signal control and user-handler return
 - `pipe/pipe2` via in-kernel anonymous pipe state and per-task fd tables
@@ -85,7 +85,7 @@ Limitations / Simplifications
 - `brk` still uses simple contiguous growth/shrink and does not yet integrate with full userspace allocator policies (no overcommit accounting, no guard-page policy).
 - `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.
 - Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, no permission enforcement, and no inheritance semantics across `fork`/`exec` yet.
-- `execve` is intentionally narrow: no `CLOEXEC` handling yet, no shebang/script loading, bounded `argv`/`envp` vector sizes, and no full Linux signal-reset semantics.
+- `execve` is intentionally narrow: `FD_CLOEXEC` teardown is now wired, but there is still no shebang/script loading, bounded `argv`/`envp` vector sizes, and no full Linux signal-reset semantics.
 - `arch_prctl` is intentionally narrow: only `ARCH_SET_FS` and `ARCH_GET_FS` are implemented; GS-base operations return `-EINVAL`.
 - Signal support remains simplified: delivery is syscall-boundary based and user handlers currently require `SA_RESTORER`; `sigaltstack`, queued RT signal payloads/`siginfo_t`, and full Linux ucontext semantics are not implemented yet.
 
@@ -94,4 +94,4 @@ Limitations / Simplifications
 
 **Status Notes**
 - This is a minimal stub for future user-mode support.
-- No per-task kernel stack switching is implemented yet.
+- The syscall fast path now uses per-task kernel stacks (`TSS.rsp0`) and `swapgs`.

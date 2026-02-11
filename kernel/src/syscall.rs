@@ -64,12 +64,15 @@ const SYS_MUNMAP: u64 = 11;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_RT_SIGRETURN: u64 = 15;
+const SYS_DUP: u64 = 32;
+const SYS_DUP2: u64 = 33;
 const SYS_BRK: u64 = 12;
 const SYS_PIPE: u64 = 22;
 const SYS_YIELD: u64 = 24;
 const SYS_SHMGET: u64 = 29;
 const SYS_SHMAT: u64 = 30;
 const SYS_SHMCTL: u64 = 31;
+const SYS_FCNTL: u64 = 72;
 const SYS_GETPID: u64 = 39;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -87,6 +90,7 @@ const SYS_MKDIRAT: u64 = 258;
 const SYS_NEWFSTATAT: u64 = 262;
 const SYS_UNLINKAT: u64 = 263;
 const SYS_RENAMEAT: u64 = 264;
+const SYS_DUP3: u64 = 292;
 const SYS_PIPE2: u64 = 293;
 
 const AT_REMOVEDIR: u32 = 0x200;
@@ -109,6 +113,16 @@ const MAP_ANONYMOUS: u32 = 0x20;
 const MAP_DENYWRITE: u32 = 0x0800;
 const MAP_EXECUTABLE: u32 = 0x1000;
 const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+const O_CLOEXEC: u32 = 0x80000;
+
+const F_DUPFD: u32 = 0;
+const F_GETFD: u32 = 1;
+const F_SETFD: u32 = 2;
+const F_GETFL: u32 = 3;
+const F_DUPFD_CLOEXEC: u32 = 1030;
+const FD_CLOEXEC: u32 = 1;
+const FD_INTERNAL_CLOEXEC: u32 = 1 << 31;
+const USER_CANON_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
 
 const MMAP_BASE_ADDR: u64 = 0x0000_0001_0000_0000;
 const MMAP_BRK_GAP: u64 = 0x0020_0000;
@@ -252,6 +266,8 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_rt_sigreturn,
     ),
+    syscall_def(SYS_DUP, "dup", SyscallMode::UserTask, sys_dup),
+    syscall_def(SYS_DUP2, "dup2", SyscallMode::UserTask, sys_dup2),
     syscall_def(SYS_PIPE, "pipe", SyscallMode::UserTask, sys_pipe),
     syscall_def(SYS_SHMGET, "shmget", SyscallMode::UserTask, sys_shmget),
     syscall_def(SYS_SHMAT, "shmat", SyscallMode::UserTask, sys_shmat),
@@ -263,6 +279,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_KILL, "kill", SyscallMode::UserTask, sys_kill),
     syscall_def(SYS_SHMDT, "shmdt", SyscallMode::UserTask, sys_shmdt),
     syscall_def(SYS_GETPPID, "getppid", SyscallMode::AnyTask, sys_getppid),
+    syscall_def(SYS_FCNTL, "fcntl", SyscallMode::UserTask, sys_fcntl),
     syscall_def(
         SYS_ARCH_PRCTL,
         "arch_prctl",
@@ -310,6 +327,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_renameat,
     ),
+    syscall_def(SYS_DUP3, "dup3", SyscallMode::UserTask, sys_dup3),
     syscall_def(SYS_PIPE2, "pipe2", SyscallMode::UserTask, sys_pipe2),
 ];
 
@@ -405,29 +423,150 @@ fn fd_slot_is_open(task_ptr: *mut task::Task, idx: usize) -> bool {
     unsafe { (*task_ptr).user_fd_kind[idx] != task::USER_FD_KIND_EMPTY }
 }
 
+#[inline]
+fn fd_flags_from_open_flags(flags: u32) -> u32 {
+    let mut fd_flags = flags & !O_CLOEXEC;
+    if (flags & O_CLOEXEC) != 0 {
+        fd_flags |= FD_INTERNAL_CLOEXEC;
+    }
+    fd_flags
+}
+
+#[inline]
+fn fd_open_flags(flags: u32) -> u32 {
+    flags & !FD_INTERNAL_CLOEXEC
+}
+
+#[inline]
+fn fd_has_cloexec(flags: u32) -> bool {
+    (flags & FD_INTERNAL_CLOEXEC) != 0
+}
+
+#[inline]
+fn fd_set_cloexec(flags: u32, enabled: bool) -> u32 {
+    if enabled {
+        flags | FD_INTERNAL_CLOEXEC
+    } else {
+        flags & !FD_INTERNAL_CLOEXEC
+    }
+}
+
+fn fd_find_free_from(task_ptr: *mut task::Task, start: usize) -> Option<usize> {
+    if task_ptr.is_null() || start >= task::MAX_TASK_FDS {
+        return None;
+    }
+    for idx in start..task::MAX_TASK_FDS {
+        if unsafe { (*task_ptr).user_fd_kind[idx] == task::USER_FD_KIND_EMPTY } {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn fd_write_slot(
+    task_ptr: *mut task::Task,
+    idx: usize,
+    kind: u8,
+    inode: u16,
+    offset: u64,
+    flags: u32,
+) {
+    unsafe {
+        (*task_ptr).user_fd_kind[idx] = kind;
+        (*task_ptr).user_fd_inode[idx] =
+            if kind == task::USER_FD_KIND_VFS || kind == task::USER_FD_KIND_PIPE {
+                inode
+            } else {
+                task::USER_FD_NONE
+            };
+        (*task_ptr).user_fd_offset[idx] = offset;
+        (*task_ptr).user_fd_flags[idx] = flags;
+    }
+}
+
 fn fd_alloc(task_ptr: *mut task::Task, kind: u8, inode: u16, flags: u32) -> Result<i64, i64> {
     if task_ptr.is_null() {
         return Err(-ESRCH);
     }
 
-    for idx in 3..task::MAX_TASK_FDS {
-        if unsafe { (*task_ptr).user_fd_kind[idx] == task::USER_FD_KIND_EMPTY } {
-            unsafe {
-                (*task_ptr).user_fd_kind[idx] = kind;
-                (*task_ptr).user_fd_inode[idx] =
-                    if kind == task::USER_FD_KIND_VFS || kind == task::USER_FD_KIND_PIPE {
-                        inode
-                    } else {
-                        task::USER_FD_NONE
-                    };
-                (*task_ptr).user_fd_offset[idx] = 0;
-                (*task_ptr).user_fd_flags[idx] = flags;
-            }
-            return Ok(idx as i64);
-        }
+    let idx = match fd_find_free_from(task_ptr, 3) {
+        Some(idx) => idx,
+        None => return Err(-EMFILE),
+    };
+    fd_write_slot(task_ptr, idx, kind, inode, 0, flags);
+    Ok(idx as i64)
+}
+
+fn fd_dup_from(
+    task_ptr: *mut task::Task,
+    old_fd: i32,
+    min_fd: usize,
+    cloexec: bool,
+) -> Result<i64, i64> {
+    if task_ptr.is_null() {
+        return Err(-ESRCH);
+    }
+    let src_idx = fd_index(old_fd)?;
+    if !fd_slot_is_open(task_ptr, src_idx) {
+        return Err(-EBADF);
     }
 
-    Err(-EMFILE)
+    let dst_idx = match fd_find_free_from(task_ptr, min_fd) {
+        Some(idx) => idx,
+        None => return Err(-EMFILE),
+    };
+
+    let (kind, inode, offset, src_flags) = unsafe {
+        (
+            (*task_ptr).user_fd_kind[src_idx],
+            (*task_ptr).user_fd_inode[src_idx],
+            (*task_ptr).user_fd_offset[src_idx],
+            (*task_ptr).user_fd_flags[src_idx],
+        )
+    };
+    let new_flags = fd_set_cloexec(src_flags, cloexec);
+    fd_write_slot(task_ptr, dst_idx, kind, inode, offset, new_flags);
+    Ok(dst_idx as i64)
+}
+
+fn fd_dup_to(
+    task_ptr: *mut task::Task,
+    old_fd: i32,
+    new_fd: i32,
+    cloexec: bool,
+    reject_same: bool,
+) -> Result<i64, i64> {
+    if task_ptr.is_null() {
+        return Err(-ESRCH);
+    }
+    let src_idx = fd_index(old_fd)?;
+    let dst_idx = fd_index(new_fd)?;
+    if !fd_slot_is_open(task_ptr, src_idx) {
+        return Err(-EBADF);
+    }
+
+    if src_idx == dst_idx {
+        if reject_same {
+            return Err(-EINVAL);
+        }
+        return Ok(new_fd as i64);
+    }
+
+    if fd_slot_is_open(task_ptr, dst_idx) {
+        fd_close(task_ptr, new_fd)?;
+    }
+
+    let (kind, inode, offset, src_flags) = unsafe {
+        (
+            (*task_ptr).user_fd_kind[src_idx],
+            (*task_ptr).user_fd_inode[src_idx],
+            (*task_ptr).user_fd_offset[src_idx],
+            (*task_ptr).user_fd_flags[src_idx],
+        )
+    };
+    let new_flags = fd_set_cloexec(src_flags, cloexec);
+    fd_write_slot(task_ptr, dst_idx, kind, inode, offset, new_flags);
+    Ok(new_fd as i64)
 }
 
 fn fd_close(task_ptr: *mut task::Task, fd: i32) -> Result<(), i64> {
@@ -476,8 +615,25 @@ fn close_all_fds(task_ptr: *mut task::Task) {
     }
 }
 
+fn close_cloexec_fds(task_ptr: *mut task::Task) {
+    if task_ptr.is_null() {
+        return;
+    }
+
+    let mut fd = 0usize;
+    while fd < task::MAX_TASK_FDS {
+        let should_close = unsafe {
+            fd_slot_is_open(task_ptr, fd) && fd_has_cloexec((*task_ptr).user_fd_flags[fd])
+        };
+        if should_close {
+            let _ = fd_close(task_ptr, fd as i32);
+        }
+        fd += 1;
+    }
+}
+
 fn fd_access_mode(flags: u32) -> u32 {
-    flags & fs::O_ACCMODE
+    fd_open_flags(flags) & fs::O_ACCMODE
 }
 
 fn fd_can_read(flags: u32) -> bool {
@@ -673,7 +829,7 @@ fn user_range_ok(start: u64, len: usize) -> bool {
         return true;
     }
 
-    if start >= KERNEL_VIRT_BASE {
+    if start > USER_CANON_MAX || start >= KERNEL_VIRT_BASE {
         return false;
     }
 
@@ -682,11 +838,11 @@ fn user_range_ok(start: u64, len: usize) -> bool {
         None => return false,
     };
 
-    end < KERNEL_VIRT_BASE
+    end <= USER_CANON_MAX && end < KERNEL_VIRT_BASE
 }
 
 fn arch_prctl_set_fs_addr_ok(addr: u64) -> bool {
-    addr < KERNEL_VIRT_BASE
+    addr <= USER_CANON_MAX && addr < KERNEL_VIRT_BASE
 }
 
 fn copy_user_bytes(
@@ -937,6 +1093,9 @@ fn execve_common(
     let execfn = &path_buf[..execfn_len + 1];
     let result = user::exec_current_image(image.as_slice(), &argv[..argc], &env[..envc], execfn);
     heap::kfree(image.ptr);
+    if result.is_ok() {
+        close_cloexec_fds(ctx.current);
+    }
     result
 }
 
@@ -1402,6 +1561,8 @@ fn sys_open(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let flags = call.arg(2) as u32;
     let mode = call.arg(3) as u32;
+    let fs_flags = flags & !O_CLOEXEC;
+    let fd_flags = fd_flags_from_open_flags(flags);
     let mut path_buf = [0u8; fs::VFS_MAX_PATH];
     let path = match read_user_path(call.arg(1), &mut path_buf) {
         Ok(path) => path,
@@ -1414,7 +1575,7 @@ fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     refresh_procfs_runtime();
 
-    let opened = match fs::openat(dir_inode, path, flags, mode) {
+    let opened = match fs::openat(dir_inode, path, fs_flags, mode) {
         Ok(opened) => opened,
         Err(err) => return -fs_to_errno(err),
     };
@@ -1425,12 +1586,12 @@ fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         task::USER_FD_KIND_VFS
     };
 
-    let fd_result = match fd_alloc(ctx.current, fd_kind, opened.inode, flags) {
+    let fd_result = match fd_alloc(ctx.current, fd_kind, opened.inode, fd_flags) {
         Ok(fd) => fd,
         Err(err) => return err,
     };
 
-    if (flags & (fs::O_CREAT | fs::O_TRUNC)) != 0 {
+    if (fs_flags & (fs::O_CREAT | fs::O_TRUNC)) != 0 {
         sync_ext2_backing();
     }
 
@@ -1507,23 +1668,26 @@ fn write_u64_to_user(task_ptr: *mut task::Task, user_dst: u64, value: u64) -> Re
 fn sys_pipe2(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let user_pipefd = call.arg(0);
     let flags = call.arg(1) as u32;
-    if flags != 0 {
+    if (flags & !O_CLOEXEC) != 0 {
         return -EINVAL;
     }
+    let cloexec = (flags & O_CLOEXEC) != 0;
+    let read_flags = fd_set_cloexec(fs::O_RDONLY, cloexec);
+    let write_flags = fd_set_cloexec(fs::O_WRONLY, cloexec);
 
     let pipe_id = match ipc::pipe_open() {
         Ok(id) => id,
         Err(err) => return -ipc_to_errno(err),
     };
 
-    let read_fd = match fd_alloc(ctx.current, task::USER_FD_KIND_PIPE, pipe_id, fs::O_RDONLY) {
+    let read_fd = match fd_alloc(ctx.current, task::USER_FD_KIND_PIPE, pipe_id, read_flags) {
         Ok(fd) => fd as i32,
         Err(err) => {
             let _ = ipc::pipe_close(pipe_id, true, true);
             return err;
         }
     };
-    let write_fd = match fd_alloc(ctx.current, task::USER_FD_KIND_PIPE, pipe_id, fs::O_WRONLY) {
+    let write_fd = match fd_alloc(ctx.current, task::USER_FD_KIND_PIPE, pipe_id, write_flags) {
         Ok(fd) => fd as i32,
         Err(err) => {
             let _ = fd_close(ctx.current, read_fd);
@@ -2001,6 +2165,113 @@ fn sys_close(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
+fn parse_dup_min_fd(arg: u64) -> Result<usize, i64> {
+    let min = i64::try_from(arg).map_err(|_| -EINVAL)?;
+    if min < 0 {
+        return Err(-EINVAL);
+    }
+    let min = min as usize;
+    if min >= task::MAX_TASK_FDS {
+        return Err(-EINVAL);
+    }
+    Ok(min)
+}
+
+fn sys_dup(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    match fd_dup_from(ctx.current, call.arg(0) as i32, 0, false) {
+        Ok(fd) => fd,
+        Err(err) => err,
+    }
+}
+
+fn sys_dup2(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    match fd_dup_to(
+        ctx.current,
+        call.arg(0) as i32,
+        call.arg(1) as i32,
+        false,
+        false,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => err,
+    }
+}
+
+fn sys_dup3(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let flags = call.arg(2) as u32;
+    if (flags & !O_CLOEXEC) != 0 {
+        return -EINVAL;
+    }
+    let cloexec = (flags & O_CLOEXEC) != 0;
+    match fd_dup_to(
+        ctx.current,
+        call.arg(0) as i32,
+        call.arg(1) as i32,
+        cloexec,
+        true,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => err,
+    }
+}
+
+fn sys_fcntl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let cmd = call.arg(1) as u32;
+    let arg = call.arg(2);
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    match cmd {
+        F_GETFD => {
+            let flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+            if fd_has_cloexec(flags) {
+                FD_CLOEXEC as i64
+            } else {
+                0
+            }
+        }
+        F_SETFD => {
+            let cloexec = (arg as u32 & FD_CLOEXEC) != 0;
+            unsafe {
+                let flags = (*ctx.current).user_fd_flags[idx];
+                (*ctx.current).user_fd_flags[idx] = fd_set_cloexec(flags, cloexec);
+            }
+            0
+        }
+        F_GETFL => {
+            let flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+            fd_open_flags(flags) as i64
+        }
+        F_DUPFD => {
+            let min_fd = match parse_dup_min_fd(arg) {
+                Ok(v) => v,
+                Err(err) => return err,
+            };
+            match fd_dup_from(ctx.current, fd, min_fd, false) {
+                Ok(new_fd) => new_fd,
+                Err(err) => err,
+            }
+        }
+        F_DUPFD_CLOEXEC => {
+            let min_fd = match parse_dup_min_fd(arg) {
+                Ok(v) => v,
+                Err(err) => return err,
+            };
+            match fd_dup_from(ctx.current, fd, min_fd, true) {
+                Ok(new_fd) => new_fd,
+                Err(err) => err,
+            }
+        }
+        _ => -EINVAL,
+    }
+}
+
 fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let fd = call.arg(0) as i32;
     let idx = match fd_index(fd) {
@@ -2165,7 +2436,7 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
 
         if kind == task::USER_FD_KIND_VFS {
-            let append = (flags & fs::O_APPEND) != 0;
+            let append = (fd_open_flags(flags) & fs::O_APPEND) != 0;
             let write_res = match fs::write(inode, offset, &chunk[..take], append) {
                 Ok(result) => result,
                 Err(err) => {
@@ -2736,6 +3007,8 @@ mod tests {
     #[test]
     fn user_range_validation() {
         assert!(user_range_ok(0x1000, 4));
+        assert!(user_range_ok(USER_CANON_MAX, 1));
+        assert!(!user_range_ok(USER_CANON_MAX + 1, 1));
         assert!(!user_range_ok(KERNEL_VIRT_BASE, 1));
         assert!(!user_range_ok(KERNEL_VIRT_BASE - 1, 2));
     }
@@ -2775,6 +3048,9 @@ mod tests {
             lookup_syscall(SYS_RT_SIGRETURN).map(|d| d.name),
             Some("rt_sigreturn")
         );
+        assert_eq!(lookup_syscall(SYS_DUP).map(|d| d.name), Some("dup"));
+        assert_eq!(lookup_syscall(SYS_DUP2).map(|d| d.name), Some("dup2"));
+        assert_eq!(lookup_syscall(SYS_FCNTL).map(|d| d.name), Some("fcntl"));
         assert_eq!(lookup_syscall(SYS_SHMGET).map(|d| d.name), Some("shmget"));
         assert_eq!(lookup_syscall(SYS_SHMAT).map(|d| d.name), Some("shmat"));
         assert_eq!(lookup_syscall(SYS_SHMDT).map(|d| d.name), Some("shmdt"));
@@ -2797,6 +3073,7 @@ mod tests {
             lookup_syscall(SYS_RENAMEAT).map(|d| d.name),
             Some("renameat")
         );
+        assert_eq!(lookup_syscall(SYS_DUP3).map(|d| d.name), Some("dup3"));
         assert_eq!(lookup_syscall(SYS_PIPE2).map(|d| d.name), Some("pipe2"));
         assert_eq!(lookup_syscall(SYS_EXECVE).map(|d| d.name), Some("execve"));
         assert_eq!(
@@ -2830,8 +3107,71 @@ mod tests {
     #[test]
     fn arch_prctl_set_fs_rejects_kernel_addresses() {
         assert!(arch_prctl_set_fs_addr_ok(0));
-        assert!(arch_prctl_set_fs_addr_ok(KERNEL_VIRT_BASE - 1));
+        assert!(arch_prctl_set_fs_addr_ok(USER_CANON_MAX));
+        assert!(!arch_prctl_set_fs_addr_ok(USER_CANON_MAX + 1));
         assert!(!arch_prctl_set_fs_addr_ok(KERNEL_VIRT_BASE));
+    }
+
+    #[test]
+    fn fd_cloexec_roundtrip_helpers() {
+        let fd_flags = fd_flags_from_open_flags(fs::O_RDWR | fs::O_APPEND | O_CLOEXEC);
+        assert!(fd_has_cloexec(fd_flags));
+        assert_eq!(fd_open_flags(fd_flags), fs::O_RDWR | fs::O_APPEND);
+
+        let cleared = fd_set_cloexec(fd_flags, false);
+        assert!(!fd_has_cloexec(cleared));
+        assert_eq!(fd_open_flags(cleared), fs::O_RDWR | fs::O_APPEND);
+    }
+
+    #[test]
+    fn fd_dup_helpers_apply_requested_cloexec() {
+        let mut task = task::Task::for_test(7);
+        let task_ptr = &mut task as *mut task::Task;
+        fd_write_slot(
+            task_ptr,
+            5,
+            task::USER_FD_KIND_VFS,
+            42,
+            11,
+            fd_set_cloexec(fs::O_RDONLY, true),
+        );
+
+        let plain = fd_dup_from(task_ptr, 5, 0, false).expect("dup without cloexec");
+        let plain_idx = plain as usize;
+        assert_eq!(plain_idx, 0);
+        assert!(!fd_has_cloexec(unsafe {
+            (*task_ptr).user_fd_flags[plain_idx]
+        }));
+        assert_eq!(unsafe { (*task_ptr).user_fd_offset[plain_idx] }, 11);
+
+        let clo = fd_dup_from(task_ptr, 5, 1, true).expect("dup with cloexec");
+        let clo_idx = clo as usize;
+        assert_eq!(clo_idx, 1);
+        assert!(fd_has_cloexec(unsafe {
+            (*task_ptr).user_fd_flags[clo_idx]
+        }));
+        assert_eq!(unsafe { (*task_ptr).user_fd_inode[clo_idx] }, 42);
+    }
+
+    #[test]
+    fn close_cloexec_fds_keeps_non_cloexec_entries() {
+        let mut task = task::Task::for_test(8);
+        let task_ptr = &mut task as *mut task::Task;
+        fd_write_slot(
+            task_ptr,
+            3,
+            task::USER_FD_KIND_VFS,
+            10,
+            0,
+            fd_set_cloexec(fs::O_RDONLY, true),
+        );
+        fd_write_slot(task_ptr, 4, task::USER_FD_KIND_VFS, 11, 3, fs::O_RDWR);
+
+        close_cloexec_fds(task_ptr);
+
+        assert!(!fd_slot_is_open(task_ptr, 3));
+        assert!(fd_slot_is_open(task_ptr, 4));
+        assert_eq!(unsafe { (*task_ptr).user_fd_inode[4] }, 11);
     }
 
     #[test]

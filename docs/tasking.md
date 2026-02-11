@@ -63,7 +63,7 @@ Limitations / Simplifications
 - User mode is minimal: a single hardcoded user task with a fixed embedded ELF.
 - `execve` is now wired for single-task image replacement with caller-provided `argv`/`envp`, but `fork` and full multi-process lifecycle semantics are still missing.
 - Dynamic-linking support is bootstrap-only (embedded `PT_INTERP` image, no reloc/symbol resolution).
-- Per-task FD state exists and is used by baseline VFS syscalls, but advanced descriptor semantics (`dup*`, `fcntl`, CLOEXEC semantics on `exec`) are not implemented yet.
+- Per-task FD state now includes baseline descriptor semantics (`dup*`, `fcntl`, and `FD_CLOEXEC` close-on-exec), but open-file-description sharing semantics are still simplified.
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Address space switching and `TSS.rsp0` updates are minimal; no per-task TLS (FS/GS).
 - Per-task FS-base TLS state is now tracked/restored (`arch_prctl` `ARCH_SET_FS`/`ARCH_GET_FS`), but GS-base handling and full TLS model compatibility are still incomplete.
