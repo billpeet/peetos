@@ -322,7 +322,10 @@ mod tests {
         assert_eq!(consume_next(ptr), DeliveryAction::None);
 
         update_mask(ptr, SIG_UNBLOCK, signal_bit(SIGTERM)).expect("unblock");
-        assert_eq!(consume_next(ptr), DeliveryAction::Terminate(128 + SIGTERM as i32));
+        assert_eq!(
+            consume_next(ptr),
+            DeliveryAction::Terminate(128 + SIGTERM as i32)
+        );
     }
 
     #[test]

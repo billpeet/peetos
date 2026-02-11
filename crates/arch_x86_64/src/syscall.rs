@@ -50,7 +50,8 @@ extern "C" {
 }
 
 #[cfg(target_os = "none")]
-core::arch::global_asm!(r#"
+core::arch::global_asm!(
+    r#"
 .section .text
 .extern syscall_handler
 
@@ -83,7 +84,8 @@ syscall_entry:
     mov rcx, [rsp + 64]
     mov rsp, [rsp + 72]
     sysretq
-"#);
+"#
+);
 
 #[cfg(test)]
 mod tests {

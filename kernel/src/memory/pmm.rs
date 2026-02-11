@@ -1,9 +1,9 @@
 #[cfg(target_os = "none")]
 use core::ptr;
 
-use arch_x86_64::addr::{PhysAddr, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE};
 #[cfg(target_os = "none")]
 use arch_x86_64::addr::VirtAddr;
+use arch_x86_64::addr::{PhysAddr, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE};
 
 #[cfg(target_os = "none")]
 use crate::serial_println;
@@ -212,7 +212,10 @@ pub fn free_page(addr: PhysAddr) {
         }
 
         if !bitmap_test(pfn) {
-            serial_println!("[PMM] WARNING: Double-free detected at: 0x{:x}", addr.as_u64());
+            serial_println!(
+                "[PMM] WARNING: Double-free detected at: 0x{:x}",
+                addr.as_u64()
+            );
             return;
         }
 

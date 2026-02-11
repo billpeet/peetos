@@ -27,12 +27,18 @@ pub const GDT_ACCESS_CODE_DATA: u8 = 1 << 4;
 pub const GDT_ACCESS_EXECUTABLE: u8 = 1 << 3;
 pub const GDT_ACCESS_RW: u8 = 1 << 1;
 
-pub const GDT_ACCESS_KERNEL_CODE: u8 =
-    GDT_ACCESS_PRESENT | GDT_ACCESS_DPL_RING0 | GDT_ACCESS_CODE_DATA | GDT_ACCESS_EXECUTABLE | GDT_ACCESS_RW;
+pub const GDT_ACCESS_KERNEL_CODE: u8 = GDT_ACCESS_PRESENT
+    | GDT_ACCESS_DPL_RING0
+    | GDT_ACCESS_CODE_DATA
+    | GDT_ACCESS_EXECUTABLE
+    | GDT_ACCESS_RW;
 pub const GDT_ACCESS_KERNEL_DATA: u8 =
     GDT_ACCESS_PRESENT | GDT_ACCESS_DPL_RING0 | GDT_ACCESS_CODE_DATA | GDT_ACCESS_RW;
-pub const GDT_ACCESS_USER_CODE: u8 =
-    GDT_ACCESS_PRESENT | GDT_ACCESS_DPL_RING3 | GDT_ACCESS_CODE_DATA | GDT_ACCESS_EXECUTABLE | GDT_ACCESS_RW;
+pub const GDT_ACCESS_USER_CODE: u8 = GDT_ACCESS_PRESENT
+    | GDT_ACCESS_DPL_RING3
+    | GDT_ACCESS_CODE_DATA
+    | GDT_ACCESS_EXECUTABLE
+    | GDT_ACCESS_RW;
 pub const GDT_ACCESS_USER_DATA: u8 =
     GDT_ACCESS_PRESENT | GDT_ACCESS_DPL_RING3 | GDT_ACCESS_CODE_DATA | GDT_ACCESS_RW;
 
@@ -106,7 +112,14 @@ fn fill_entry(entry: &mut GdtEntry, base: u32, limit: u32, access: u8, flags: u8
 }
 
 #[cfg(target_os = "none")]
-unsafe fn write_entry(gdt_ptr: *mut GdtEntry, index: usize, base: u32, limit: u32, access: u8, flags: u8) {
+unsafe fn write_entry(
+    gdt_ptr: *mut GdtEntry,
+    index: usize,
+    base: u32,
+    limit: u32,
+    access: u8,
+    flags: u8,
+) {
     let mut entry = GdtEntry::zero();
     fill_entry(&mut entry, base, limit, access, flags);
     ptr::write(gdt_ptr.add(index), entry);

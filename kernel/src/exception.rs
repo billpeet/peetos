@@ -24,7 +24,12 @@ pub fn report(frame: &idt::InterruptFrame) {
     serial_println!("\n=== CPU EXCEPTION ===");
     serial_println!("Vector: {} ({})", int_no, idt::exception_name(int_no as u8));
     serial_println!("Error Code: 0x{:x}", error_code);
-    serial_println!("RIP=0x{:016x} CS=0x{:04x} RFLAGS=0x{:016x}", rip, cs, rflags);
+    serial_println!(
+        "RIP=0x{:016x} CS=0x{:04x} RFLAGS=0x{:016x}",
+        rip,
+        cs,
+        rflags
+    );
     serial_println!("RSP=0x{:016x} SS=0x{:04x}", rsp, ss);
     serial_println!("RAX=0x{:016x} RBX=0x{:016x}", rax, rbx);
     serial_println!("RCX=0x{:016x} RDX=0x{:016x}", rcx, rdx);
@@ -59,12 +64,24 @@ fn decode_page_fault(error_code: u64) -> PageFaultReason {
     let reserved = (error_code & 0x8) != 0;
     let instruction = (error_code & 0x10) != 0;
 
-    let summary = if present { "protection violation" } else { "non-present page" };
+    let summary = if present {
+        "protection violation"
+    } else {
+        "non-present page"
+    };
     let details = [
         if write { "write" } else { "read" },
         if user { "user-mode" } else { "kernel-mode" },
-        if reserved { "reserved-bit set" } else { "reserved-bit clear" },
-        if instruction { "instruction fetch" } else { "data access" },
+        if reserved {
+            "reserved-bit set"
+        } else {
+            "reserved-bit clear"
+        },
+        if instruction {
+            "instruction fetch"
+        } else {
+            "data access"
+        },
     ];
 
     PageFaultReason { summary, details }

@@ -1,14 +1,14 @@
 use core::ptr;
 
 use arch_x86_64::addr::PhysAddr;
-use arch_x86_64::interrupts;
 use arch_x86_64::idt::InterruptFrame;
-use arch_x86_64::tss;
+use arch_x86_64::interrupts;
 use arch_x86_64::pit;
+use arch_x86_64::tss;
 
+use crate::memory::vmm;
 use crate::serial_println;
 use crate::task::{self, Task, TaskState, TASK_FLAG_IDLE};
-use crate::memory::vmm;
 
 pub const DEFAULT_TIME_SLICE: u64 = 5;
 
@@ -91,7 +91,9 @@ fn pick_next_task() -> *mut Task {
 extern "C" fn idle_task_func(_arg: *mut u8) {
     loop {
         interrupts::enable();
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 
@@ -102,7 +104,9 @@ pub fn init() {
     if boot.is_null() {
         serial_println!("[SCHED] ERROR: boot task not found");
         loop {
-            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
+            }
         }
     }
 
@@ -116,7 +120,9 @@ pub fn init() {
     if idle_pid == task::INVALID_PID {
         serial_println!("[SCHED] ERROR: failed to create idle task");
         loop {
-            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
+            }
         }
     }
 
@@ -124,7 +130,9 @@ pub fn init() {
     if idle.is_null() {
         serial_println!("[SCHED] ERROR: idle task not found");
         loop {
-            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
+            }
         }
     }
 
@@ -190,7 +198,9 @@ pub fn tick() {
         }
 
         if (*CURRENT_TASK).time_slice == 0 {
-            if (*CURRENT_TASK).state == TaskState::Zombie || (*CURRENT_TASK).state == TaskState::Dead {
+            if (*CURRENT_TASK).state == TaskState::Zombie
+                || (*CURRENT_TASK).state == TaskState::Dead
+            {
                 PREEMPT_PENDING = true;
             } else if RUN_QUEUE_COUNT > 0 {
                 PREEMPT_PENDING = true;
@@ -228,11 +238,17 @@ pub fn block(reason: &str) {
             return;
         }
 
-        if (*CURRENT_TASK).state != TaskState::Blocked && (*CURRENT_TASK).state != TaskState::Sleeping {
+        if (*CURRENT_TASK).state != TaskState::Blocked
+            && (*CURRENT_TASK).state != TaskState::Sleeping
+        {
             (*CURRENT_TASK).state = TaskState::Blocked;
         }
 
-        serial_println!("[SCHED] Blocking task '{}' ({})", task_name(&*CURRENT_TASK), reason);
+        serial_println!(
+            "[SCHED] Blocking task '{}' ({})",
+            task_name(&*CURRENT_TASK),
+            reason
+        );
     }
 
     #[cfg(target_os = "none")]
@@ -278,7 +294,11 @@ pub fn sleep(ticks: u64) {
         let wake_time = pit::ticks().saturating_add(ticks);
         (*CURRENT_TASK).sleep_until = wake_time;
         (*CURRENT_TASK).state = TaskState::Sleeping;
-        serial_println!("[SCHED] Task '{}' sleeping for {} ticks", task_name(&*CURRENT_TASK), ticks);
+        serial_println!(
+            "[SCHED] Task '{}' sleeping for {} ticks",
+            task_name(&*CURRENT_TASK),
+            ticks
+        );
     }
 
     #[cfg(target_os = "none")]
@@ -379,7 +399,8 @@ extern "C" {
 }
 
 #[cfg(target_os = "none")]
-core::arch::global_asm!(r#"
+core::arch::global_asm!(
+    r#"
 .section .text
 .extern sched_yield_switch
 .extern sched_block_switch
@@ -497,7 +518,8 @@ sched_block_asm:
 
     add rsp, 16
     iretq
-"#);
+"#
+);
 
 #[cfg(test)]
 mod tests {
@@ -523,11 +545,15 @@ mod tests {
 
         let first = run_queue_pop();
         assert!(!first.is_null());
-        unsafe { assert_eq!((*first).pid, 1); }
+        unsafe {
+            assert_eq!((*first).pid, 1);
+        }
 
         let second = run_queue_pop();
         assert!(!second.is_null());
-        unsafe { assert_eq!((*second).pid, 2); }
+        unsafe {
+            assert_eq!((*second).pid, 2);
+        }
 
         let empty = run_queue_pop();
         assert!(empty.is_null());

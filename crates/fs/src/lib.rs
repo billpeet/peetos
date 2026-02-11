@@ -339,7 +339,13 @@ fn fs_time_tick(state: &mut VfsState) -> u64 {
     state.clock_ticks
 }
 
-fn touch_inode_metadata(state: &mut VfsState, inode: u16, access: bool, modify: bool, change: bool) {
+fn touch_inode_metadata(
+    state: &mut VfsState,
+    inode: u16,
+    access: bool,
+    modify: bool,
+    change: bool,
+) {
     if (inode as usize) >= VFS_MAX_INODES {
         return;
     }
@@ -607,7 +613,11 @@ fn alloc_inode(
             };
             inode.uid = 0;
             inode.gid = 0;
-            inode.links_count = if file_type == FileType::Directory { 2 } else { 1 };
+            inode.links_count = if file_type == FileType::Directory {
+                2
+            } else {
+                1
+            };
             inode.atime = now;
             inode.mtime = now;
             inode.ctime = now;
@@ -838,7 +848,13 @@ fn create_regular_at_inner(state: &mut VfsState, start: u16, path: &str) -> Resu
         return Ok(inode);
     }
 
-    let inode = alloc_inode(state, FileType::Regular, NodeBackend::Tmpfs, parent, &name[..name_len])?;
+    let inode = alloc_inode(
+        state,
+        FileType::Regular,
+        NodeBackend::Tmpfs,
+        parent,
+        &name[..name_len],
+    )?;
     add_child(state, parent, inode)?;
     touch_inode_metadata(state, parent, true, true, true);
     Ok(inode)
@@ -890,7 +906,13 @@ fn mkdir_at_inner(state: &mut VfsState, start: u16, path: &str) -> Result<(), i6
         return Ok(());
     }
 
-    let inode = alloc_inode(state, FileType::Directory, NodeBackend::Tmpfs, parent, &name[..name_len])?;
+    let inode = alloc_inode(
+        state,
+        FileType::Directory,
+        NodeBackend::Tmpfs,
+        parent,
+        &name[..name_len],
+    )?;
     add_child(state, parent, inode)?;
     touch_inode_metadata(state, parent, true, true, true);
     Ok(())
@@ -1144,9 +1166,7 @@ fn ext2_parse_meta(image: &[u8]) -> Result<Ext2Meta, i64> {
         return Err(EINVAL);
     }
 
-    let block_size = 1024usize
-        .checked_shl(log_block_size)
-        .ok_or(EINVAL)?;
+    let block_size = 1024usize.checked_shl(log_block_size).ok_or(EINVAL)?;
     if block_size < 1024 || block_size > 4096 {
         return Err(EINVAL);
     }
@@ -1756,12 +1776,7 @@ fn ext2_write_zero_range(
     Ok(())
 }
 
-fn ext2_read_file(
-    state: &VfsState,
-    ino: u32,
-    offset: u64,
-    dst: &mut [u8],
-) -> Result<usize, i64> {
+fn ext2_read_file(state: &VfsState, ino: u32, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
     if dst.is_empty() {
         return Ok(0);
     }
@@ -1784,7 +1799,10 @@ fn ext2_read_file(
 
         let block_off = pos % meta.block_size;
         let remain_file = size - pos;
-        let chunk = core::cmp::min(meta.block_size - block_off, core::cmp::min(remain_file, dst.len() - copied));
+        let chunk = core::cmp::min(
+            meta.block_size - block_off,
+            core::cmp::min(remain_file, dst.len() - copied),
+        );
         let block_no = inode.blocks[block_idx];
 
         if block_no == 0 {
@@ -1809,7 +1827,10 @@ fn ext2_write_file(
     append: bool,
 ) -> Result<WriteResult, i64> {
     let meta = state.ext2_meta;
-    let max_size = core::cmp::min(TMPFS_MAX_FILE_SIZE, EXT2_INODE_DIRECT_COUNT * meta.block_size);
+    let max_size = core::cmp::min(
+        TMPFS_MAX_FILE_SIZE,
+        EXT2_INODE_DIRECT_COUNT * meta.block_size,
+    );
 
     let mut inode = ext2_read_inode_from_state(state, ino)?;
     let start = if append {
@@ -2464,7 +2485,13 @@ fn backend_mutable(backend: NodeBackend) -> bool {
     matches!(backend, NodeBackend::Tmpfs | NodeBackend::Ext2)
 }
 
-fn open_at_inner(state: &mut VfsState, start: u16, path: &str, flags: u32, _mode: u32) -> Result<OpenResult, i64> {
+fn open_at_inner(
+    state: &mut VfsState,
+    start: u16,
+    path: &str,
+    flags: u32,
+    _mode: u32,
+) -> Result<OpenResult, i64> {
     let access = flags & O_ACCMODE;
     if access > O_RDWR {
         return Err(EINVAL);
@@ -2619,7 +2646,12 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
     Ok(stat)
 }
 
-fn unlink_at_inner(state: &mut VfsState, start: u16, path: &str, remove_dir: bool) -> Result<(), i64> {
+fn unlink_at_inner(
+    state: &mut VfsState,
+    start: u16,
+    path: &str,
+    remove_dir: bool,
+) -> Result<(), i64> {
     let mut name = [0u8; VFS_MAX_NAME];
     let (parent, name_len) = resolve_parent_from_inner(state, start, path, &mut name)?;
     let child = find_child(state, parent, &name[..name_len]).ok_or(ENOENT)?;
@@ -2712,11 +2744,14 @@ fn rename_at_inner(
 ) -> Result<(), i64> {
     let mut old_name = [0u8; VFS_MAX_NAME];
     let mut new_name = [0u8; VFS_MAX_NAME];
-    let (old_parent, old_len) = resolve_parent_from_inner(state, old_start, old_path, &mut old_name)?;
-    let (new_parent, new_len) = resolve_parent_from_inner(state, new_start, new_path, &mut new_name)?;
+    let (old_parent, old_len) =
+        resolve_parent_from_inner(state, old_start, old_path, &mut old_name)?;
+    let (new_parent, new_len) =
+        resolve_parent_from_inner(state, new_start, new_path, &mut new_name)?;
     let child = find_child(state, old_parent, &old_name[..old_len]).ok_or(ENOENT)?;
 
-    if old_parent == new_parent && old_len == new_len && old_name[..old_len] == new_name[..new_len] {
+    if old_parent == new_parent && old_len == new_len && old_name[..old_len] == new_name[..new_len]
+    {
         return Ok(());
     }
 
@@ -2877,7 +2912,11 @@ pub fn mount_ext2_image(mount_path: &str, image: &[u8]) -> Result<(), i64> {
             return Err(EINVAL);
         }
 
-        let root = ext2_read_inode(&state.ext2_image[..state.ext2_image_len], &meta, EXT2_ROOT_INODE)?;
+        let root = ext2_read_inode(
+            &state.ext2_image[..state.ext2_image_len],
+            &meta,
+            EXT2_ROOT_INODE,
+        )?;
         if ext2_mode_to_filetype(root.mode) != Some(FileType::Directory) {
             state.ext2_image_len = 0;
             return Err(EIO);
@@ -3192,8 +3231,10 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
                 }
             }
             NodeBackend::Ext2 => {
-                let max_size =
-                    core::cmp::min(TMPFS_MAX_FILE_SIZE, EXT2_INODE_DIRECT_COUNT * state.ext2_meta.block_size);
+                let max_size = core::cmp::min(
+                    TMPFS_MAX_FILE_SIZE,
+                    EXT2_INODE_DIRECT_COUNT * state.ext2_meta.block_size,
+                );
                 if target > max_size as i128 {
                     return Err(EINVAL);
                 }
@@ -3486,7 +3527,8 @@ mod tests {
         let persist_n = read(persist.inode, 0, &mut persist_buf).expect("read persisted file");
         assert_eq!(&persist_buf[..persist_n], b"persist");
 
-        let persisted_hello = open("/mnt/ext2/hello.txt", O_RDONLY, 0).expect("open rewritten hello");
+        let persisted_hello =
+            open("/mnt/ext2/hello.txt", O_RDONLY, 0).expect("open rewritten hello");
         let mut hello_buf = [0u8; 16];
         let hello_n = read(persisted_hello.inode, 0, &mut hello_buf).expect("read rewritten hello");
         assert_eq!(&hello_buf[..hello_n], b"rewritten");
@@ -3507,15 +3549,21 @@ mod tests {
         let _ = write(file.inode, 0, b"abc", false).expect("write child");
 
         let mut off = 0u64;
-        let first = readdir(dir, off).expect("readdir first").expect("dot entry");
+        let first = readdir(dir, off)
+            .expect("readdir first")
+            .expect("dot entry");
         assert_eq!(&first.name[..first.name_len], b".");
         off = first.next_offset;
 
-        let second = readdir(dir, off).expect("readdir second").expect("dotdot entry");
+        let second = readdir(dir, off)
+            .expect("readdir second")
+            .expect("dotdot entry");
         assert_eq!(&second.name[..second.name_len], b"..");
         off = second.next_offset;
 
-        let third = readdir(dir, off).expect("readdir child").expect("child entry");
+        let third = readdir(dir, off)
+            .expect("readdir child")
+            .expect("child entry");
         assert_eq!(&third.name[..third.name_len], b"child.txt");
         assert_eq!(third.d_type, DT_REG);
 
@@ -3556,18 +3604,27 @@ mod tests {
         mount_ext2_image("/mnt/ext2", SAMPLE_EXT2).expect("mount ext2");
 
         rename("/mnt/ext2/hello.txt", "/mnt/ext2/hello2.txt").expect("rename ext2 file");
-        assert_eq!(open("/mnt/ext2/hello.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+        assert_eq!(
+            open("/mnt/ext2/hello.txt", O_RDONLY, 0).unwrap_err(),
+            ENOENT
+        );
         let renamed = open("/mnt/ext2/hello2.txt", O_RDONLY, 0).expect("open renamed ext2");
         assert!(stat(renamed.inode).unwrap().size > 0);
 
         let todel = open("/mnt/ext2/todel.txt", O_CREAT | O_RDWR, 0).expect("create todel");
         let _ = write(todel.inode, 0, b"remove", false).expect("write todel");
         unlink("/mnt/ext2/todel.txt").expect("unlink ext2 file");
-        assert_eq!(open("/mnt/ext2/todel.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+        assert_eq!(
+            open("/mnt/ext2/todel.txt", O_RDONLY, 0).unwrap_err(),
+            ENOENT
+        );
 
         mkdir("/mnt/ext2/todir").expect("mkdir ext2 dir");
         rmdir("/mnt/ext2/todir").expect("rmdir ext2 dir");
-        assert_eq!(open("/mnt/ext2/todir", O_RDONLY | O_DIRECTORY, 0).unwrap_err(), ENOENT);
+        assert_eq!(
+            open("/mnt/ext2/todir", O_RDONLY | O_DIRECTORY, 0).unwrap_err(),
+            ENOENT
+        );
 
         let mut exported = [0u8; EXT2_MAX_IMAGE_SIZE];
         let image_len = export_ext2_image(&mut exported).expect("export");
@@ -3575,8 +3632,17 @@ mod tests {
         init();
         mount_ext2_image("/mnt/ext2", &exported[..image_len]).expect("remount exported");
         let _ = open("/mnt/ext2/hello2.txt", O_RDONLY, 0).expect("renamed survives remount");
-        assert_eq!(open("/mnt/ext2/hello.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
-        assert_eq!(open("/mnt/ext2/todel.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
-        assert_eq!(open("/mnt/ext2/todir", O_RDONLY | O_DIRECTORY, 0).unwrap_err(), ENOENT);
+        assert_eq!(
+            open("/mnt/ext2/hello.txt", O_RDONLY, 0).unwrap_err(),
+            ENOENT
+        );
+        assert_eq!(
+            open("/mnt/ext2/todel.txt", O_RDONLY, 0).unwrap_err(),
+            ENOENT
+        );
+        assert_eq!(
+            open("/mnt/ext2/todir", O_RDONLY | O_DIRECTORY, 0).unwrap_err(),
+            ENOENT
+        );
     }
 }

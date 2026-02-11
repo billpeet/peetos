@@ -9,8 +9,8 @@ use arch_x86_64::syscall::SyscallFrame;
 
 use crate::ipc;
 use crate::memory::{pmm, vmm};
-use crate::signal;
 use crate::shm;
+use crate::signal;
 use crate::task::{self, TaskState, TASK_FLAG_USER};
 
 #[cfg(not(test))]
@@ -700,7 +700,8 @@ fn write_struct_to_user<T: Copy>(
 
 fn read_struct_from_user<T: Copy>(task_ptr: *mut task::Task, user_src: u64) -> Result<T, i64> {
     let mut raw = MaybeUninit::<T>::uninit();
-    let bytes = unsafe { core::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, size_of::<T>()) };
+    let bytes =
+        unsafe { core::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, size_of::<T>()) };
     copy_from_user_task(task_ptr, user_src, bytes)?;
     Ok(unsafe { raw.assume_init() })
 }
@@ -914,7 +915,10 @@ fn write_pipe_fds(
     copy_to_user_task(task_ptr, user_dst, &raw)
 }
 
-fn read_sigaction_from_user(task_ptr: *mut task::Task, user_src: u64) -> Result<LinuxSigAction, i64> {
+fn read_sigaction_from_user(
+    task_ptr: *mut task::Task,
+    user_src: u64,
+) -> Result<LinuxSigAction, i64> {
     let mut raw = [0u8; core::mem::size_of::<LinuxSigAction>()];
     copy_from_user_task(task_ptr, user_src, &mut raw)?;
     let ptr = raw.as_ptr() as *const LinuxSigAction;
@@ -1768,7 +1772,9 @@ fn install_user_signal_frame_syscall(
     let frame_size = size_of::<UserSignalFrameSyscall>() as u64;
     let frame_rsp = frame.rsp.checked_sub(frame_size).ok_or(EFAULT)?;
     let frame_rsp = align_down(frame_rsp, 16);
-    let return_rsp = frame_rsp.checked_sub(size_of::<u64>() as u64).ok_or(EFAULT)?;
+    let return_rsp = frame_rsp
+        .checked_sub(size_of::<u64>() as u64)
+        .ok_or(EFAULT)?;
 
     let signal_frame = UserSignalFrameSyscall {
         magic: SIGNAL_FRAME_MAGIC_SYSCALL,
@@ -1803,7 +1809,9 @@ fn install_user_signal_frame_int80(
     let frame_size = size_of::<UserSignalFrameInt80>() as u64;
     let frame_rsp = frame.rsp.checked_sub(frame_size).ok_or(EFAULT)?;
     let frame_rsp = align_down(frame_rsp, 16);
-    let return_rsp = frame_rsp.checked_sub(size_of::<u64>() as u64).ok_or(EFAULT)?;
+    let return_rsp = frame_rsp
+        .checked_sub(size_of::<u64>() as u64)
+        .ok_or(EFAULT)?;
 
     let signal_frame = UserSignalFrameInt80 {
         magic: SIGNAL_FRAME_MAGIC_INT80,

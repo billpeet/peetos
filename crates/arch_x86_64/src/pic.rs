@@ -50,7 +50,6 @@ fn io_wait() {
     unsafe { outb(0x80, 0) };
 }
 
-
 #[cfg(target_os = "none")]
 pub fn init() {
     unsafe {
@@ -100,7 +99,11 @@ pub fn send_eoi(_irq: u8) {}
 
 #[cfg(target_os = "none")]
 pub fn mask_irq(irq: u8) {
-    let (port, line) = if irq < 8 { (PIC1_DATA, irq) } else { (PIC2_DATA, irq - 8) };
+    let (port, line) = if irq < 8 {
+        (PIC1_DATA, irq)
+    } else {
+        (PIC2_DATA, irq - 8)
+    };
     unsafe {
         let value = inb(port) | (1 << line);
         outb(port, value);
@@ -112,7 +115,11 @@ pub fn mask_irq(_irq: u8) {}
 
 #[cfg(target_os = "none")]
 pub fn unmask_irq(irq: u8) {
-    let (port, line) = if irq < 8 { (PIC1_DATA, irq) } else { (PIC2_DATA, irq - 8) };
+    let (port, line) = if irq < 8 {
+        (PIC1_DATA, irq)
+    } else {
+        (PIC2_DATA, irq - 8)
+    };
     unsafe {
         let value = inb(port) & !(1 << line);
         outb(port, value);

@@ -128,7 +128,12 @@ fn read_phdr(data: &[u8], offset: usize) -> Option<Elf64Phdr> {
 
 fn check_ident(ehdr: &Elf64Ehdr) -> bool {
     let ident = ehdr.e_ident;
-    let magic = u32::from_le_bytes([ident[EI_MAG0], ident[EI_MAG1], ident[EI_MAG2], ident[EI_MAG3]]);
+    let magic = u32::from_le_bytes([
+        ident[EI_MAG0],
+        ident[EI_MAG1],
+        ident[EI_MAG2],
+        ident[EI_MAG3],
+    ]);
     if magic != ELF_MAGIC {
         elf_log!("[ELF] Invalid: bad magic");
         return false;
@@ -287,7 +292,11 @@ fn entry_point_in_exec_segment(data: &[u8], ehdr: &Elf64Ehdr, load_bias: u64) ->
             Some(addr) => addr,
             None => return false,
         };
-        let seg_end = match phdr.p_vaddr.checked_add(phdr.p_memsz).and_then(|v| v.checked_add(load_bias)) {
+        let seg_end = match phdr
+            .p_vaddr
+            .checked_add(phdr.p_memsz)
+            .and_then(|v| v.checked_add(load_bias))
+        {
             Some(addr) => addr,
             None => return false,
         };
@@ -478,7 +487,12 @@ pub fn get_interp(data: &[u8], path_out: &mut [u8; ELF_INTERP_MAX]) -> bool {
     found
 }
 
-fn load_segments(data: &[u8], ehdr: &Elf64Ehdr, pml4: PhysAddr, load_bias: u64) -> Option<(u64, u64, u64, bool)> {
+fn load_segments(
+    data: &[u8],
+    ehdr: &Elf64Ehdr,
+    pml4: PhysAddr,
+    load_bias: u64,
+) -> Option<(u64, u64, u64, bool)> {
     let mut highest_addr = 0u64;
     let mut phdr_addr = 0u64;
     let mut found_pt_phdr = false;
@@ -584,7 +598,8 @@ fn load_segments(data: &[u8], ehdr: &Elf64Ehdr, pml4: PhysAddr, load_bias: u64) 
         while bytes_remaining > 0 {
             let page_vaddr = dest_vaddr & !0xFFF;
             let page_offset = (dest_vaddr & 0xFFF) as usize;
-            let bytes_in_page = cmp::min(bytes_remaining as usize, PAGE_SIZE as usize - page_offset);
+            let bytes_in_page =
+                cmp::min(bytes_remaining as usize, PAGE_SIZE as usize - page_offset);
 
             let phys = match vmm::get_physical_in(pml4, VirtAddr::new(page_vaddr)) {
                 Some(phys) => phys,
@@ -942,7 +957,8 @@ mod tests {
             p_align: 1,
         };
 
-        let mut bytes = vec![0u8; size_of::<Elf64Ehdr>() + size_of::<Elf64Phdr>() + interp_len as usize];
+        let mut bytes =
+            vec![0u8; size_of::<Elf64Ehdr>() + size_of::<Elf64Phdr>() + interp_len as usize];
         write_struct(&mut bytes[..size_of::<Elf64Ehdr>()], &header);
         write_struct(
             &mut bytes[size_of::<Elf64Ehdr>()..size_of::<Elf64Ehdr>() + size_of::<Elf64Phdr>()],

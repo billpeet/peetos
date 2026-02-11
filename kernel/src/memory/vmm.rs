@@ -126,7 +126,12 @@ fn get_or_create_table(table_phys: PhysAddr, index: usize, create: bool) -> Phys
     new_table
 }
 
-fn get_or_create_table_in(table_phys: PhysAddr, index: usize, create: bool, user_accessible: bool) -> PhysAddr {
+fn get_or_create_table_in(
+    table_phys: PhysAddr,
+    index: usize,
+    create: bool,
+    user_accessible: bool,
+) -> PhysAddr {
     let mut pte = read_pte(table_phys, index);
 
     if pte_present(pte) {
@@ -262,9 +267,8 @@ pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
     let pd_entry = read_pte(pd, pd_idx);
     if pte_present(pd_entry) && (pd_entry & PTE_LARGE) != 0 {
         let large_page_phys = pte_addr(pd_entry).as_u64();
-        let large_page_virt = ((pml4_idx as u64) << 39)
-            | ((pdpt_idx as u64) << 30)
-            | ((pd_idx as u64) << 21);
+        let large_page_virt =
+            ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30) | ((pd_idx as u64) << 21);
         let offset = virt.as_u64() - large_page_virt;
         if phys.as_u64() == large_page_phys + offset {
             return 0;
@@ -280,9 +284,17 @@ pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
 
     let existing = read_pte(pt, pt_idx);
     if pte_present(existing) {
-        write_pte(pt, pt_idx, phys.as_u64() | (flags & PTE_FLAGS_MASK) | PTE_PRESENT);
+        write_pte(
+            pt,
+            pt_idx,
+            phys.as_u64() | (flags & PTE_FLAGS_MASK) | PTE_PRESENT,
+        );
     } else {
-        write_pte(pt, pt_idx, phys.as_u64() | (flags & PTE_FLAGS_MASK) | PTE_PRESENT);
+        write_pte(
+            pt,
+            pt_idx,
+            phys.as_u64() | (flags & PTE_FLAGS_MASK) | PTE_PRESENT,
+        );
         unsafe {
             MAPPED_PAGES = MAPPED_PAGES.saturating_add(1);
         }
@@ -422,7 +434,9 @@ pub fn get_physical_in(target_pml4: PhysAddr, virt: VirtAddr) -> Option<PhysAddr
         return None;
     }
 
-    Some(PhysAddr::new(pte_addr(pt_entry).as_u64() | page_offset(virt.as_u64())))
+    Some(PhysAddr::new(
+        pte_addr(pt_entry).as_u64() | page_offset(virt.as_u64()),
+    ))
 }
 
 pub fn is_mapped(virt: VirtAddr) -> bool {
@@ -569,7 +583,10 @@ pub fn create_address_space() -> PhysAddr {
 
     unsafe {
         if pte_present(kernel_entry0) {
-            ptr::write(new_table, new_pdpt.as_u64() | (kernel_entry0 & PTE_FLAGS_MASK));
+            ptr::write(
+                new_table,
+                new_pdpt.as_u64() | (kernel_entry0 & PTE_FLAGS_MASK),
+            );
         }
 
         for i in 256..VMM_ENTRIES_PER_TABLE {
@@ -625,7 +642,11 @@ pub fn map_page_in(target_pml4: PhysAddr, virt: VirtAddr, phys: PhysAddr, flags:
         return -1;
     }
 
-    write_pte(pt, pt_idx, phys.as_u64() | (flags & PTE_FLAGS_MASK) | PTE_PRESENT);
+    write_pte(
+        pt,
+        pt_idx,
+        phys.as_u64() | (flags & PTE_FLAGS_MASK) | PTE_PRESENT,
+    );
 
     let current = read_cr3() & PTE_ADDR_MASK;
     if current == pml4.as_u64() {
@@ -860,9 +881,13 @@ pub fn clear_user_space(target_pml4: PhysAddr) {
 
 pub fn print_stats() {
     serial_println!("[VMM] Virtual Memory Statistics:");
-    serial_println!("[VMM]   PML4 address: 0x{:x}", unsafe { PML4_PHYS.as_u64() });
+    serial_println!("[VMM]   PML4 address: 0x{:x}", unsafe {
+        PML4_PHYS.as_u64()
+    });
     serial_println!("[VMM]   Mapped pages: {}", unsafe { MAPPED_PAGES });
-    serial_println!("[VMM]   Page tables allocated: {}", unsafe { TABLES_ALLOCATED });
+    serial_println!("[VMM]   Page tables allocated: {}", unsafe {
+        TABLES_ALLOCATED
+    });
 }
 
 pub struct MappingGuard {
