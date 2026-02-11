@@ -37,7 +37,7 @@ Key references in the C project:
 - Phase-6 IPC/sync baseline is now present in-kernel: `SpinLock`/`Mutex`/`Semaphore`, anonymous pipes backed by in-kernel ring buffers, baseline System V-style shared memory segments, futex wait/wake keying used by `SYS_FUTEX` and `clear_child_tid` wake-on-exit, plus user-handler signal delivery (`kill` + `rt_sigaction` + `rt_sigprocmask` + `rt_sigreturn`, `SA_RESTORER`-based handler entry/return, and `SIGPIPE` generation on broken pipes).
 - Initial user bootstrap now builds a conventional process stack (`argc`, `argv`, `envp`, `auxv`) so libc-facing usermode setup has a stable base for future `execve` work.
 - A phase-5 baseline VFS is now active with concrete tmpfs behavior, virtual `devfs`/`procfs` nodes, a mount table-backed `/proc/mounts`, and an ext2 importer mounted at `/mnt/ext2` where file and directory mutations (`create`/`mkdir`/`unlink`/`rmdir`/`rename`/`write`) update ext2 data/metadata in the mounted image buffer.
-- A phase-7 baseline PCI enumerator is now active in `crates/drivers` (config mechanism #1, bus/device/function scan, bounded boot-time serial inventory output).
+- A phase-7 baseline PCI enumerator is now active in `crates/drivers` (config mechanism #1, bus/device/function scan, bounded boot-time serial inventory output), and initial ATA/AHCI discovery is wired (IDE/AHCI class matching, AHCI ABAR capture, and early AHCI PCI command-bit setup for memory+bus-master mode).
 - Remaining placeholder crates are `net`, `syscall`, and `userabi`; advanced device drivers and full user space are still pending.
 
 ## Documentation

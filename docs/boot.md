@@ -34,11 +34,12 @@ Limitations / Simplifications
 3. Initialize the PIC and PIT.
 4. Initialize PMM, VMM, and the kernel heap.
 5. Run baseline PCI enumeration and print a bounded serial inventory.
-6. Initialize VFS, tasking/scheduler, IPC, and shared-memory subsystems.
-7. Configure syscall MSRs and dispatch state.
-8. Enable interrupts.
-9. Optionally exit QEMU when `test-exit` is enabled.
-10. Halt in an infinite loop.
+6. Run baseline storage-controller discovery (IDE/AHCI classification, AHCI ABAR capture, AHCI command-bit setup) and print a serial summary.
+7. Initialize VFS, tasking/scheduler, IPC, and shared-memory subsystems.
+8. Configure syscall MSRs and dispatch state.
+9. Enable interrupts.
+10. Optionally exit QEMU when `test-exit` is enabled.
+11. Halt in an infinite loop.
 
 Limitations / Simplifications
 - Single-core bring-up only; there is no per-CPU initialization yet.
