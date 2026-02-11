@@ -4,7 +4,7 @@ This document captures a high-level roadmap to reimplement the existing PeetOS C
 
 ## Parity Target (Source of Truth)
 
-The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the kernel sources in `../peetos/kernel/src`. The Rust port should aim for parity with Stages 1–9 before attempting Stage 10 optimizations.
+The current feature set is summarized in `../peetos_c/docs/ROADMAP.md` and the kernel sources in `../peetos_c/kernel/src`. The Rust port should aim for parity with Stages 1–9 before attempting Stage 10 optimizations.
 
 ## Current Status (Last reviewed: 2026-02-11)
 
@@ -93,6 +93,6 @@ The current feature set is summarized in `../peetos/docs/ROADMAP.md` and the ker
 
 ## Parity Verification
 
-- Re-run the shell test scripts from the C project (`../peetos/tests/*.sh`).
-- Validate the “What Works” list in `../peetos/docs/ROADMAP.md`.
+- Re-run the shell test scripts from the C project (`../peetos_c/tests/*.sh`).
+- Validate the “What Works” list in `../peetos_c/docs/ROADMAP.md`.
  - Use `make test` for Rust-port checks (host unit tests plus QEMU serial banner check; QEMU exits via `isa-debug-exit`).

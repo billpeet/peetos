@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This repo is the Rust reimplementation of the PeetOS C kernel (source of truth lives in `../peetos`). The goal is parity with the C kernel stages 1–9 before any stage 10 optimizations.
+This repo is the Rust reimplementation of the PeetOS C kernel (source of truth lives in `../peetos_c`). The goal is parity with the C kernel stages 1–9 before any stage 10 optimizations.
 
 **Basics**
 - Target: `x86_64` bare metal, higher-half kernel.
@@ -29,5 +29,5 @@ This repo is the Rust reimplementation of the PeetOS C kernel (source of truth l
 - Preserve the existing boot flow and linker setup unless there is a strong reason to change it.
 
 **Parity Targets**
-- Current feature scope is in `../peetos/docs/ROADMAP.md`.
-- Kernel source reference: `../peetos/kernel/src`.
+- Current feature scope is in `../peetos_c/docs/ROADMAP.md`.
+- Kernel source reference: `../peetos_c/kernel/src`.

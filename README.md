@@ -1,6 +1,6 @@
 # PeetOS (Rust Port)
 
-This repository is the Rust reimplementation of the PeetOS C kernel located in `../peetos`. The goal is to achieve feature parity with the existing C system, then iterate on modernization and safety.
+This repository is the Rust reimplementation of the PeetOS C kernel located in `../peetos_c`. The goal is to achieve feature parity with the existing C system, then iterate on modernization and safety.
 
 ## Architecture Snapshot
 
@@ -11,9 +11,9 @@ This repository is the Rust reimplementation of the PeetOS C kernel located in `
 
 Key references in the C project:
 
-- Feature scope: `../peetos/docs/ROADMAP.md`
-- Kernel subsystems: `../peetos/kernel/src`
-- Bootloader: `../peetos/boot`
+- Feature scope: `../peetos_c/docs/ROADMAP.md`
+- Kernel subsystems: `../peetos_c/kernel/src`
+- Bootloader: `../peetos_c/boot`
 
 ## Repository Layout
 
@@ -105,8 +105,8 @@ make test
 As features land, re-run the C project shell tests for parity:
 
 ```bash
-../peetos/tests/run_tests.sh
-../peetos/tests/run_shell_cmds.sh -clean "echo hello" "ls /bin"
+../peetos_c/tests/run_tests.sh
+../peetos_c/tests/run_shell_cmds.sh -clean "echo hello" "ls /bin"
 ```
 
 ## Notes
