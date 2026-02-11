@@ -33,3 +33,4 @@ fi
 grep -q "PeetOS Rust kernel: serial online" "${LOG_FILE}"
 grep -q "\\[PCI\\] Enumerated" "${LOG_FILE}"
 grep -q "\\[STORAGE\\] Detected" "${LOG_FILE}"
+grep -q "\\[BLK\\] Inventory" "${LOG_FILE}"

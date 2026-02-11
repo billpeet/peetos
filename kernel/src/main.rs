@@ -7,6 +7,7 @@ extern crate std;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
+mod block;
 mod elf;
 mod exception;
 mod ipc;

@@ -1,6 +1,6 @@
-# Device Drivers (Phase 7 Baseline)
+# Device Drivers (Phase 7 Progress)
 
-This document covers the current Phase-7 driver baseline: PCI enumeration plus initial ATA/AHCI discovery.
+This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI bring-up through AHCI command-engine `IDENTIFY` and baseline block-device inventory integration.
 
 **Where It Lives**
 - `crates/drivers/src/pci.rs`
@@ -8,36 +8,51 @@ This document covers the current Phase-7 driver baseline: PCI enumeration plus i
 - `crates/drivers/src/ahci.rs`
 - `crates/arch_x86_64/src/port.rs`
 - `kernel/src/storage.rs`
+- `kernel/src/block.rs`
 - `kernel/src/main.rs`
 
 **PCI Enumeration**
-The kernel now performs a boot-time PCI config-space scan using PCI configuration mechanism #1 (`0xCF8`/`0xCFC`). The scan walks all bus/device/function tuples (`256 x 32 x 8`) and records present functions (vendor ID != `0xFFFF`).
+The kernel performs a boot-time PCI config-space scan using PCI configuration mechanism #1 (`0xCF8`/`0xCFC`). The scan walks all bus/device/function tuples (`256 x 32 x 8`) and records present functions (`vendor_id != 0xFFFF`).
 
 Each discovered function captures:
 - BDF address (`bus:device.function`)
 - `vendor_id` / `device_id`
 - `class_code` / `subclass` / `prog_if`
 - `header_type`
+- PCI command/status, IRQ line/pin, and decoded BAR metadata
 
 During `kmain()` bring-up, the scanner runs after heap initialization and prints a bounded serial inventory (`PCI_LOG_LIMIT` entries) plus a summary.
 
-**ATA/AHCI Discovery**
-After PCI scan, the driver layer classifies mass-storage controllers:
-- IDE controllers (`class=0x01`, `subclass=0x01`) into legacy/native/mixed mode via `prog_if`.
-- AHCI controllers (`class=0x01`, `subclass=0x06`, `prog_if=0x01`) with ABAR extraction from BAR5.
+**ATA/AHCI Discovery and Identify Paths**
+After PCI scan, storage controllers are classified from class/subclass/prog-if:
+- IDE controllers (`class=0x01`, `subclass=0x01`) are decoded as legacy/native/mixed mode from `prog_if`.
+- AHCI controllers (`class=0x01`, `subclass=0x06`, `prog_if=0x01`) expose ABAR from BAR5.
 
-Boot logs now print a storage summary and per-controller lines, and AHCI functions are configured with PCI command bits for memory-space and bus-master operation.
+The kernel then performs:
+- PCI command-bit enable (`MEM_SPACE` + `BUS_MASTER`) for AHCI functions.
+- AHCI HBA MMIO mapping into dedicated high-half windows.
+- Capability/port probing (`CAP`, `GHC`, `PI`, `VS`, `SSTS`, `SIG`).
+- AHCI port command-engine setup for active SATA ports:
+  - stop engine
+  - program CLB/FB DMA regions
+  - start engine
+  - issue ATA `IDENTIFY` as a DMA AHCI command (CFIS + PRDT)
+  - poll completion and parse IDENTIFY words
+  - stop engine and release temporary DMA buffers
+- ATA PIO `IDENTIFY` probes over IDE primary/secondary master/slave channels.
 
-The AHCI module currently provides protocol constants plus decode helpers (`CAP` decode, port-signature mapping, implemented-port bitmap expansion) used by kernel-side HBA probing. The kernel now maps each AHCI controller ABAR into a dedicated MMIO window and reads:
-- HBA capability/version registers (`CAP`, `GHC`, `PI`, `VS`)
-- Per-port SATA status/signature (`SSTS`, `SIG`) for implemented ports
+**Block Device Integration**
+A minimal kernel block-device registry now records discovered disks from both paths:
+- transport (`ata-pio` or `ahci-dma`)
+- controller BDF + target (IDE drive slot or AHCI port)
+- logical block size + total sectors + LBA48 capability
 
-For IDE-class controllers, the kernel also performs baseline ATA PIO `IDENTIFY` probes across primary/secondary master/slave and reports discovered disks and LBA capacity.
+Boot logs include per-device registration lines and an aggregated `[BLK] Inventory` summary.
 
 Limitations / Simplifications
-- PCI BAR capture currently records address/type only; BAR sizing/probing and capability walking are still pending.
-- Uses legacy config-space mechanism #1, not ECAM/MMCONFIG.
-- Inventory is bounded for log safety; additional devices are counted but not printed once the limit is reached.
-- AHCI support currently stops at MMIO probing; command list/FIS setup, engine start/stop state machine, and DMA command execution are not implemented yet.
-- ATA probing currently uses IDENTIFY diagnostics only; no persistent ATA block-device path is wired yet.
-- No persistent in-kernel device registry yet; data is currently used for diagnostics and bring-up verification.
+- AHCI currently executes only `IDENTIFY`; generic DMA read/write command paths are still pending.
+- AHCI command execution is polling-based; interrupts and async completion are not wired.
+- The block-device registry is metadata-only and not yet consumed by VFS/ext2 mount paths.
+- No partition parsing (MBR/GPT) or block cache/page cache integration yet.
+- MMIO window mapping is currently bounded (`AHCI_MMIO_WINDOW_LIMIT`) and boot-time only.
+- Hotplug, power management, and controller reset/error-recovery flows are minimal.
