@@ -28,6 +28,8 @@ const ATA_SR_DRQ: u8 = 1 << 3;
 const ATA_SR_BSY: u8 = 1 << 7;
 
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
+const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
+const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
 
 const ATA_DRIVE_MASTER: u8 = 0xA0;
 const ATA_DRIVE_SLAVE: u8 = 0xB0;
@@ -43,6 +45,7 @@ const AHCI_CMD_TIMEOUT: usize = 1_000_000;
 const AHCI_COMMAND_LIST_BYTES: usize = 1024;
 const AHCI_RX_FIS_BYTES: usize = 256;
 const AHCI_H2D_FIS_DWORDS: u16 = 5;
+const AHCI_DMA_MAX_BYTES: usize = PAGE_SIZE as usize;
 
 static mut AHCI_MMIO_WINDOW_NEXT: usize = 0;
 
@@ -69,7 +72,7 @@ struct AhciPortBuffers {
     cmd_list: DmaRegion,
     recv_fis: DmaRegion,
     cmd_table: DmaRegion,
-    identify: DmaRegion,
+    data: DmaRegion,
 }
 
 pub fn init(pci_devices: &[pci::DeviceInfo]) {
@@ -120,6 +123,7 @@ pub fn init(pci_devices: &[pci::DeviceInfo]) {
     }
 
     log_block_inventory();
+    run_block_io_probe();
 }
 
 fn find_pci_device<'a>(
@@ -212,7 +216,21 @@ fn probe_ahci(ctrl: &storage::StorageController, dev: &pci::DeviceInfo) {
             info.lba48 as u8
         );
 
-        register_block_device(block::BlockTransport::AhciDma, ctrl, *port, info);
+        register_block_device(
+            block::BlockTransport::AhciDma,
+            ctrl,
+            *port,
+            info,
+            block::BlockOps {
+                read: Some(ahci_block_read),
+                write: Some(ahci_block_write),
+            },
+            block::BlockOpContext {
+                opaque0: base as u64,
+                opaque1: *port as u64,
+                opaque2: caps.command_slot_count as u64,
+            },
+        );
     }
 }
 
@@ -253,7 +271,14 @@ fn probe_ata_drive(
         info.lba48 as u8
     );
 
-    register_block_device(block::BlockTransport::AtaPio, ctrl, target, info);
+    register_block_device(
+        block::BlockTransport::AtaPio,
+        ctrl,
+        target,
+        info,
+        block::BlockOps::NONE,
+        block::BlockOpContext::EMPTY,
+    );
 }
 
 fn ata_identify(channel: AtaChannel, slave: bool) -> Option<AtaIdentify> {
@@ -305,52 +330,199 @@ fn ata_identify(channel: AtaChannel, slave: bool) -> Option<AtaIdentify> {
 }
 
 fn ahci_identify_dma(base: *mut u8, port: u8, max_slots: u8) -> Option<AtaIdentify> {
-    let Some(buffers) = alloc_ahci_port_buffers() else {
+    let mut identify_data = [0u8; ATA_IDENTIFY_BYTES];
+    if !ahci_exec_dma(
+        base,
+        port,
+        max_slots,
+        ATA_CMD_IDENTIFY,
+        0,
+        1,
+        false,
+        &mut identify_data,
+    ) {
         return None;
+    }
+
+    let mut identify_words = [0u16; ATA_WORD_COUNT];
+    unsafe {
+        ptr::copy_nonoverlapping(
+            identify_data.as_ptr() as *const u16,
+            identify_words.as_mut_ptr(),
+            ATA_WORD_COUNT,
+        );
+    }
+    Some(decode_identify_words(&identify_words))
+}
+
+fn ahci_block_read(
+    ctx: block::BlockOpContext,
+    device: &block::BlockDevice,
+    lba: u64,
+    out: &mut [u8],
+) -> Result<(), block::BlockIoError> {
+    ahci_block_read_transfer(ctx, device, lba, out)
+}
+
+fn ahci_block_write(
+    ctx: block::BlockOpContext,
+    device: &block::BlockDevice,
+    lba: u64,
+    data: &[u8],
+) -> Result<(), block::BlockIoError> {
+    let mut bounce = [0u8; AHCI_DMA_MAX_BYTES];
+    let size = validate_ahci_io(device, lba, data.len())?;
+    bounce[..size].copy_from_slice(data);
+
+    if !ahci_exec_dma(
+        ctx.opaque0 as *mut u8,
+        ctx.opaque1 as u8,
+        ctx.opaque2 as u8,
+        ATA_CMD_WRITE_DMA_EXT,
+        lba,
+        (size / ATA_IDENTIFY_BYTES) as u16,
+        true,
+        &mut bounce[..size],
+    ) {
+        return Err(block::BlockIoError::IoFault);
+    }
+
+    Ok(())
+}
+
+fn ahci_block_read_transfer(
+    ctx: block::BlockOpContext,
+    device: &block::BlockDevice,
+    lba: u64,
+    out: &mut [u8],
+) -> Result<(), block::BlockIoError> {
+    let mut bounce = [0u8; AHCI_DMA_MAX_BYTES];
+    let size = validate_ahci_io(device, lba, out.len())?;
+
+    if !ahci_exec_dma(
+        ctx.opaque0 as *mut u8,
+        ctx.opaque1 as u8,
+        ctx.opaque2 as u8,
+        ATA_CMD_READ_DMA_EXT,
+        lba,
+        (size / ATA_IDENTIFY_BYTES) as u16,
+        false,
+        &mut bounce[..size],
+    ) {
+        return Err(block::BlockIoError::IoFault);
+    }
+
+    out[..size].copy_from_slice(&bounce[..size]);
+    Ok(())
+}
+
+fn validate_ahci_io(
+    device: &block::BlockDevice,
+    lba: u64,
+    bytes: usize,
+) -> Result<usize, block::BlockIoError> {
+    if device.transport != block::BlockTransport::AhciDma {
+        return Err(block::BlockIoError::Unsupported);
+    }
+
+    if bytes == 0 {
+        return Err(block::BlockIoError::InvalidRequest);
+    }
+
+    if bytes > AHCI_DMA_MAX_BYTES {
+        return Err(block::BlockIoError::InvalidRequest);
+    }
+
+    if (bytes % ATA_IDENTIFY_BYTES) != 0 {
+        return Err(block::BlockIoError::UnalignedBuffer);
+    }
+
+    let sectors = (bytes / ATA_IDENTIFY_BYTES) as u64;
+    if sectors == 0 || sectors > u16::MAX as u64 {
+        return Err(block::BlockIoError::InvalidRequest);
+    }
+
+    let end = lba
+        .checked_add(sectors)
+        .ok_or(block::BlockIoError::OutOfRange)?;
+    if end > device.sectors {
+        return Err(block::BlockIoError::OutOfRange);
+    }
+
+    Ok(bytes)
+}
+
+fn ahci_exec_dma(
+    base: *mut u8,
+    port: u8,
+    max_slots: u8,
+    command: u8,
+    lba: u64,
+    sector_count: u16,
+    write: bool,
+    data: &mut [u8],
+) -> bool {
+    if base.is_null() || max_slots == 0 || sector_count == 0 {
+        return false;
+    }
+
+    let expected = (sector_count as usize) * ATA_IDENTIFY_BYTES;
+    if expected != data.len() || expected > AHCI_DMA_MAX_BYTES {
+        return false;
+    }
+
+    let Some(buffers) = alloc_ahci_port_buffers(data.len()) else {
+        return false;
     };
 
+    if write {
+        unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), buffers.data.virt, data.len());
+        }
+    } else {
+        unsafe {
+            ptr::write_bytes(buffers.data.virt, 0, data.len());
+        }
+    }
+
     let port_base = ahci::port_offset(port, 0);
-    let mut identify_words = [0u16; ATA_WORD_COUNT];
     let mut success = false;
 
     if !ahci_stop_command_engine(base, port_base) {
         free_ahci_port_buffers(buffers);
-        return None;
+        return false;
     }
 
     ahci_configure_port_dma(base, port_base, &buffers);
     ahci_start_command_engine(base, port_base);
 
-    if !ahci_wait_port_ready(base, port_base, AHCI_ENGINE_TIMEOUT) {
-        let _ = ahci_stop_command_engine(base, port_base);
-        free_ahci_port_buffers(buffers);
-        return None;
-    }
-
-    let ci = mmio_read32(base, port_base + ahci::AHCI_PORT_CI);
-    let sact = mmio_read32(base, port_base + ahci::AHCI_PORT_SACT);
-    if let Some(slot) = ahci::find_free_command_slot(ci, sact, max_slots) {
-        ahci_prepare_identify_command(&buffers, slot as usize);
-        if ahci_issue_identify(base, port_base, slot) {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    buffers.identify.virt as *const u16,
-                    identify_words.as_mut_ptr(),
-                    ATA_WORD_COUNT,
-                );
-            }
-            success = true;
+    if ahci_wait_port_ready(base, port_base, AHCI_ENGINE_TIMEOUT) {
+        let ci = mmio_read32(base, port_base + ahci::AHCI_PORT_CI);
+        let sact = mmio_read32(base, port_base + ahci::AHCI_PORT_SACT);
+        if let Some(slot) = ahci::find_free_command_slot(ci, sact, max_slots) {
+            ahci_prepare_dma_command(
+                &buffers,
+                slot as usize,
+                command,
+                lba,
+                sector_count,
+                write,
+                data.len(),
+            );
+            success = ahci_issue_slot(base, port_base, slot);
         }
     }
 
     let _ = ahci_stop_command_engine(base, port_base);
-    free_ahci_port_buffers(buffers);
 
-    if success {
-        Some(decode_identify_words(&identify_words))
-    } else {
-        None
+    if success && !write {
+        unsafe {
+            ptr::copy_nonoverlapping(buffers.data.virt, data.as_mut_ptr(), data.len());
+        }
     }
+
+    free_ahci_port_buffers(buffers);
+    success
 }
 
 fn ahci_stop_command_engine(base: *mut u8, port_base: usize) -> bool {
@@ -412,13 +584,42 @@ fn ahci_configure_port_dma(base: *mut u8, port_base: usize, buffers: &AhciPortBu
     mmio_write32(base, port_base + ahci::AHCI_PORT_IE, 0);
 }
 
-fn ahci_prepare_identify_command(buffers: &AhciPortBuffers, slot: usize) {
+fn fill_h2d_cfis(cfis: &mut [u8; 64], command: u8, lba: u64, sector_count: u16) {
+    *cfis = [0; 64];
+    cfis[0] = ahci::AHCI_FIS_TYPE_REG_H2D;
+    cfis[1] = ahci::AHCI_FIS_H2D_COMMAND;
+    cfis[2] = command;
+
+    if command == ATA_CMD_IDENTIFY {
+        return;
+    }
+
+    cfis[4] = (lba & 0xFF) as u8;
+    cfis[5] = ((lba >> 8) & 0xFF) as u8;
+    cfis[6] = ((lba >> 16) & 0xFF) as u8;
+    cfis[7] = 1 << 6;
+    cfis[8] = ((lba >> 24) & 0xFF) as u8;
+    cfis[9] = ((lba >> 32) & 0xFF) as u8;
+    cfis[10] = ((lba >> 40) & 0xFF) as u8;
+    cfis[12] = (sector_count & 0xFF) as u8;
+    cfis[13] = ((sector_count >> 8) & 0xFF) as u8;
+}
+
+fn ahci_prepare_dma_command(
+    buffers: &AhciPortBuffers,
+    slot: usize,
+    command: u8,
+    lba: u64,
+    sector_count: u16,
+    write: bool,
+    data_bytes: usize,
+) {
     let headers = buffers.cmd_list.virt as *mut ahci::AhciCommandHeader;
 
     unsafe {
         let header = &mut *headers.add(slot);
         *header = ahci::AhciCommandHeader::EMPTY;
-        header.flags = AHCI_H2D_FIS_DWORDS;
+        header.flags = AHCI_H2D_FIS_DWORDS | if write { ahci::AHCI_CMDH_WRITE } else { 0 };
         header.prdtl = 1;
         header.prdbc = 0;
         header.ctba = buffers.cmd_table.phys as u32;
@@ -426,18 +627,14 @@ fn ahci_prepare_identify_command(buffers: &AhciPortBuffers, slot: usize) {
 
         let table = buffers.cmd_table.virt as *mut ahci::AhciCommandTable1;
         *table = ahci::AhciCommandTable1::EMPTY;
-        (*table).cfis[0] = ahci::AHCI_FIS_TYPE_REG_H2D;
-        (*table).cfis[1] = ahci::AHCI_FIS_H2D_COMMAND;
-        (*table).cfis[2] = ATA_CMD_IDENTIFY;
-        (*table).prdt[0].dba = buffers.identify.phys as u32;
-        (*table).prdt[0].dbau = (buffers.identify.phys >> 32) as u32;
-        (*table).prdt[0].dbc_interrupt = (ATA_IDENTIFY_BYTES as u32 - 1) | (1u32 << 31);
-
-        ptr::write_bytes(buffers.identify.virt, 0, ATA_IDENTIFY_BYTES);
+        fill_h2d_cfis(&mut (*table).cfis, command, lba, sector_count);
+        (*table).prdt[0].dba = buffers.data.phys as u32;
+        (*table).prdt[0].dbau = (buffers.data.phys >> 32) as u32;
+        (*table).prdt[0].dbc_interrupt = (data_bytes as u32 - 1) | (1u32 << 31);
     }
 }
 
-fn ahci_issue_identify(base: *mut u8, port_base: usize, slot: u8) -> bool {
+fn ahci_issue_slot(base: *mut u8, port_base: usize, slot: u8) -> bool {
     if !ahci_wait_port_ready(base, port_base, AHCI_ENGINE_TIMEOUT) {
         return false;
     }
@@ -462,11 +659,15 @@ fn ahci_issue_identify(base: *mut u8, port_base: usize, slot: u8) -> bool {
     false
 }
 
-fn alloc_ahci_port_buffers() -> Option<AhciPortBuffers> {
+fn alloc_ahci_port_buffers(data_bytes: usize) -> Option<AhciPortBuffers> {
     let cmd_table_bytes = mem::size_of::<ahci::AhciCommandTable1>();
 
-    let cmd_list = alloc_dma_region(AHCI_COMMAND_LIST_BYTES, AHCI_COMMAND_LIST_BYTES)?;
-    let recv_fis = match alloc_dma_region(AHCI_RX_FIS_BYTES, AHCI_RX_FIS_BYTES) {
+    if data_bytes == 0 || data_bytes > AHCI_DMA_MAX_BYTES {
+        return None;
+    }
+
+    let cmd_list = alloc_dma_region(AHCI_COMMAND_LIST_BYTES, PAGE_SIZE as usize)?;
+    let recv_fis = match alloc_dma_region(AHCI_RX_FIS_BYTES, PAGE_SIZE as usize) {
         Some(region) => region,
         None => {
             free_dma_region(cmd_list);
@@ -474,7 +675,7 @@ fn alloc_ahci_port_buffers() -> Option<AhciPortBuffers> {
         }
     };
 
-    let cmd_table = match alloc_dma_region(cmd_table_bytes, 128) {
+    let cmd_table = match alloc_dma_region(cmd_table_bytes, PAGE_SIZE as usize) {
         Some(region) => region,
         None => {
             free_dma_region(recv_fis);
@@ -483,7 +684,7 @@ fn alloc_ahci_port_buffers() -> Option<AhciPortBuffers> {
         }
     };
 
-    let identify = match alloc_dma_region(ATA_IDENTIFY_BYTES, ATA_IDENTIFY_BYTES) {
+    let data = match alloc_dma_region(data_bytes, PAGE_SIZE as usize) {
         Some(region) => region,
         None => {
             free_dma_region(cmd_table);
@@ -497,12 +698,12 @@ fn alloc_ahci_port_buffers() -> Option<AhciPortBuffers> {
         cmd_list,
         recv_fis,
         cmd_table,
-        identify,
+        data,
     })
 }
 
 fn free_ahci_port_buffers(buffers: AhciPortBuffers) {
-    free_dma_region(buffers.identify);
+    free_dma_region(buffers.data);
     free_dma_region(buffers.cmd_table);
     free_dma_region(buffers.recv_fis);
     free_dma_region(buffers.cmd_list);
@@ -573,6 +774,8 @@ fn register_block_device(
     ctrl: &storage::StorageController,
     target: u8,
     identify: AtaIdentify,
+    ops: block::BlockOps,
+    ctx: block::BlockOpContext,
 ) {
     let device = block::BlockDevice {
         transport,
@@ -585,7 +788,13 @@ fn register_block_device(
         lba48: identify.lba48,
     };
 
-    if let Some(index) = block::register(device) {
+    let registered = if transport == block::BlockTransport::AtaPio {
+        block::register(device)
+    } else {
+        block::register_with_ops(device, ops, ctx)
+    };
+
+    if let Some(index) = registered {
         serial_println!(
             "[BLK] dev{} transport={} ctrl={:02X}:{:02X}.{} target={} sectors={} lba48={}",
             index,
@@ -641,6 +850,41 @@ fn log_block_inventory() {
             "[BLK] {} additional block device(s) not shown",
             inventory.total.saturating_sub(inventory.stored)
         );
+    }
+}
+
+fn run_block_io_probe() {
+    let mut snapshot = [block::BlockDevice::EMPTY; BLOCK_LOG_LIMIT];
+    let count = block::snapshot(&mut snapshot);
+
+    for (index, dev) in snapshot.iter().take(count).enumerate() {
+        if dev.transport != block::BlockTransport::AhciDma || dev.sectors == 0 {
+            continue;
+        }
+
+        let mut sector0 = [0u8; ATA_IDENTIFY_BYTES];
+        match block::read(index, 0, &mut sector0) {
+            Ok(()) => {
+                serial_println!(
+                    "[BLK] dev{} read lba0 ok sig={:02x}{:02x}{:02x}{:02x}",
+                    index,
+                    sector0[0],
+                    sector0[1],
+                    sector0[2],
+                    sector0[3]
+                );
+            }
+            Err(err) => {
+                serial_println!(
+                    "[BLK] dev{} read lba0 failed err={}",
+                    index,
+                    block::io_error_name(err)
+                );
+            }
+        }
+
+        let _ = block::write(index, 0, &[]);
+        break;
     }
 }
 
@@ -788,5 +1032,70 @@ mod tests {
         let decoded = decode_identify_words(&words);
         assert!(!decoded.lba48);
         assert_eq!(decoded.sectors, 0x1234_5678);
+    }
+
+    #[test]
+    fn validate_ahci_io_rejects_bad_sizes() {
+        let dev = block::BlockDevice {
+            transport: block::BlockTransport::AhciDma,
+            sectors: 4096,
+            ..block::BlockDevice::EMPTY
+        };
+
+        assert_eq!(
+            validate_ahci_io(&dev, 0, 513),
+            Err(block::BlockIoError::UnalignedBuffer)
+        );
+        assert_eq!(
+            validate_ahci_io(&dev, 0, AHCI_DMA_MAX_BYTES + ATA_IDENTIFY_BYTES),
+            Err(block::BlockIoError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn validate_ahci_io_checks_lba_bounds() {
+        let dev = block::BlockDevice {
+            transport: block::BlockTransport::AhciDma,
+            sectors: 8,
+            ..block::BlockDevice::EMPTY
+        };
+
+        assert_eq!(
+            validate_ahci_io(&dev, 7, ATA_IDENTIFY_BYTES),
+            Ok(ATA_IDENTIFY_BYTES)
+        );
+        assert_eq!(
+            validate_ahci_io(&dev, 7, ATA_IDENTIFY_BYTES * 2),
+            Err(block::BlockIoError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn h2d_cfis_encodes_lba48_fields() {
+        let mut cfis = [0u8; 64];
+        fill_h2d_cfis(&mut cfis, ATA_CMD_READ_DMA_EXT, 0x1122_3344_5566, 0x7788);
+
+        assert_eq!(cfis[0], ahci::AHCI_FIS_TYPE_REG_H2D);
+        assert_eq!(cfis[2], ATA_CMD_READ_DMA_EXT);
+        assert_eq!(cfis[4], 0x66);
+        assert_eq!(cfis[5], 0x55);
+        assert_eq!(cfis[6], 0x44);
+        assert_eq!(cfis[7], 0x40);
+        assert_eq!(cfis[8], 0x33);
+        assert_eq!(cfis[9], 0x22);
+        assert_eq!(cfis[10], 0x11);
+        assert_eq!(cfis[12], 0x88);
+        assert_eq!(cfis[13], 0x77);
+    }
+
+    #[test]
+    fn identify_cfis_keeps_lba_zeroed() {
+        let mut cfis = [0xFFu8; 64];
+        fill_h2d_cfis(&mut cfis, ATA_CMD_IDENTIFY, 0xFFFF_FFFF_FFFF, 0xFFFF);
+
+        assert_eq!(cfis[2], ATA_CMD_IDENTIFY);
+        assert_eq!(cfis[4], 0);
+        assert_eq!(cfis[7], 0);
+        assert_eq!(cfis[12], 0);
     }
 }
