@@ -1,3 +1,4 @@
+#[cfg(target_os = "none")]
 use arch_x86_64::port::{inl, outl};
 
 pub const CONFIG_ADDRESS_PORT: u16 = 0xCF8;

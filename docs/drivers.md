@@ -7,6 +7,7 @@ This document covers the current Phase-7 driver baseline: PCI enumeration plus i
 - `crates/drivers/src/storage.rs`
 - `crates/drivers/src/ahci.rs`
 - `crates/arch_x86_64/src/port.rs`
+- `kernel/src/storage.rs`
 - `kernel/src/main.rs`
 
 **PCI Enumeration**
@@ -27,11 +28,16 @@ After PCI scan, the driver layer classifies mass-storage controllers:
 
 Boot logs now print a storage summary and per-controller lines, and AHCI functions are configured with PCI command bits for memory-space and bus-master operation.
 
-The AHCI module currently provides protocol constants plus small decode helpers (`CAP` decode, port-signature mapping, implemented-port bitmap expansion) used as groundwork for full HBA bring-up.
+The AHCI module currently provides protocol constants plus decode helpers (`CAP` decode, port-signature mapping, implemented-port bitmap expansion) used by kernel-side HBA probing. The kernel now maps each AHCI controller ABAR into a dedicated MMIO window and reads:
+- HBA capability/version registers (`CAP`, `GHC`, `PI`, `VS`)
+- Per-port SATA status/signature (`SSTS`, `SIG`) for implemented ports
+
+For IDE-class controllers, the kernel also performs baseline ATA PIO `IDENTIFY` probes across primary/secondary master/slave and reports discovered disks and LBA capacity.
 
 Limitations / Simplifications
 - PCI BAR capture currently records address/type only; BAR sizing/probing and capability walking are still pending.
 - Uses legacy config-space mechanism #1, not ECAM/MMCONFIG.
 - Inventory is bounded for log safety; additional devices are counted but not printed once the limit is reached.
-- ATA/AHCI support is discovery/config only right now: no AHCI MMIO mapping, command-engine init, IDENTIFY, or read/write DMA path is implemented yet.
+- AHCI support currently stops at MMIO probing; command list/FIS setup, engine start/stop state machine, and DMA command execution are not implemented yet.
+- ATA probing currently uses IDENTIFY diagnostics only; no persistent ATA block-device path is wired yet.
 - No persistent in-kernel device registry yet; data is currently used for diagnostics and bring-up verification.

@@ -16,6 +16,7 @@ mod sched;
 mod serial;
 mod shm;
 mod signal;
+mod storage;
 mod sync;
 mod syscall;
 mod task;
@@ -23,12 +24,11 @@ mod user;
 mod vfs;
 
 use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall, tss};
-use drivers::{pci, storage};
+use drivers::pci;
 use memory::{heap, pmm, vmm};
 
 const PCI_SCAN_LIMIT: usize = 64;
 const PCI_LOG_LIMIT: usize = 16;
-const STORAGE_LOG_LIMIT: usize = 8;
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
@@ -93,52 +93,7 @@ pub extern "C" fn kmain() -> ! {
         );
     }
 
-    let mut storage_ctrls = [storage::StorageController::EMPTY; STORAGE_LOG_LIMIT];
-    let storage_summary = storage::enumerate(
-        &pci_devices[..pci_summary.stored_devices],
-        &mut storage_ctrls,
-    );
-    serial_println!(
-        "[STORAGE] Detected {} controller(s): ATA={} AHCI={} (showing {})",
-        storage_summary.total_controllers,
-        storage_summary.ata_controllers,
-        storage_summary.ahci_controllers,
-        storage_summary.stored_controllers
-    );
-    for ctrl in storage_ctrls
-        .iter()
-        .take(storage_summary.stored_controllers)
-    {
-        serial_println!(
-            "[STORAGE] {:02X}:{:02X}.{} {:04X}:{:04X} kind={} bus_master={} irq={:02X}",
-            ctrl.bus,
-            ctrl.device,
-            ctrl.function,
-            ctrl.vendor_id,
-            ctrl.device_id,
-            storage::kind_name(ctrl.kind),
-            ctrl.bus_master_enabled as u8,
-            ctrl.irq_line
-        );
-        if ctrl.kind == storage::StorageControllerKind::Ahci {
-            let cmd = pci::enable_mem_and_bus_master(ctrl.bus, ctrl.device, ctrl.function);
-            serial_println!(
-                "[AHCI] {:02X}:{:02X}.{} ABAR=0x{:x} ({}-bit) command=0x{:04X}",
-                ctrl.bus,
-                ctrl.device,
-                ctrl.function,
-                ctrl.ahci_abar,
-                if ctrl.ahci_abar_is_64bit { 64 } else { 32 },
-                cmd
-            );
-        }
-    }
-    if storage_summary.overflow {
-        serial_println!(
-            "[STORAGE] {} additional controller(s) not shown",
-            storage_summary.total_controllers - storage_summary.stored_controllers
-        );
-    }
+    storage::init(&pci_devices[..pci_summary.stored_devices]);
 
     vfs::init();
 

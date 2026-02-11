@@ -34,7 +34,7 @@ Limitations / Simplifications
 3. Initialize the PIC and PIT.
 4. Initialize PMM, VMM, and the kernel heap.
 5. Run baseline PCI enumeration and print a bounded serial inventory.
-6. Run baseline storage-controller discovery (IDE/AHCI classification, AHCI ABAR capture, AHCI command-bit setup) and print a serial summary.
+6. Run baseline storage-controller discovery (IDE/AHCI classification, AHCI ABAR capture, AHCI command-bit setup), plus AHCI MMIO capability/port probing and ATA IDENTIFY diagnostics, then print a serial summary.
 7. Initialize VFS, tasking/scheduler, IPC, and shared-memory subsystems.
 8. Configure syscall MSRs and dispatch state.
 9. Enable interrupts.
