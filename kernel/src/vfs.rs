@@ -16,6 +16,9 @@ const EXT2_MAX_IMAGE_SIZE: usize = 512 * 1024;
 const BLOCK_SECTOR_SIZE: usize = 512;
 const BLOCK_IO_CHUNK: usize = 4096;
 
+#[cfg(target_os = "none")]
+static SAMPLE_EXT2_IMG: &[u8] = &[];
+#[cfg(not(target_os = "none"))]
 static SAMPLE_EXT2_IMG: &[u8] = include_bytes!("../../user/sample_ext2.img");
 
 #[derive(Clone, Copy)]
@@ -40,6 +43,11 @@ pub fn init() {
     serial_println!("[VFS] Initialized (tmpfs + devfs + procfs)");
 
     if try_mount_ext2_from_block() {
+        return;
+    }
+
+    if SAMPLE_EXT2_IMG.is_empty() {
+        serial_println!("[VFS] Embedded ext2 sample disabled in kernel build");
         return;
     }
 

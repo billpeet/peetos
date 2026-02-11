@@ -38,6 +38,8 @@ endif
 SECTOR_SIZE := 512
 STAGE2_SECTORS := 16
 DISK_SECTORS := 20480
+STAGE2_KERNEL_LOAD_ADDR := 0x18000
+LOW_MEM_HOLE_ADDR := 0xA0000
 
 BOOT_STAGE1_SRC := boot/stage1/boot.asm
 BOOT_STAGE2_SRC := boot/stage2/stage2.asm
@@ -104,6 +106,13 @@ kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_I
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@cp $(KERNEL_TARGET) $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
+	@kernel_size=$$(stat -c%s $(KERNEL_BIN)); \
+	stage2_cap=$$(( $(LOW_MEM_HOLE_ADDR) - $(STAGE2_KERNEL_LOAD_ADDR) )); \
+	if [ $$kernel_size -gt $$stage2_cap ]; then \
+		echo "ERROR: kernel.bin ($$kernel_size bytes) exceeds stage2 staging window ($$stage2_cap bytes)."; \
+		echo "Reduce kernel image size or update bootloader staging strategy."; \
+		exit 1; \
+	fi
 
 # ---------------------------------------------------------------------------
 # Disk Image

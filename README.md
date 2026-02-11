@@ -37,7 +37,7 @@ Key references in the C project:
 - Dynamic-linker prep is now expanded: baseline VM mapping syscalls (`mmap`/`mprotect`/`munmap`) support private anonymous and private file-backed mappings from VFS fds for userspace loaders.
 - Phase-6 IPC/sync baseline is now present in-kernel: `SpinLock`/`Mutex`/`Semaphore`, anonymous pipes backed by in-kernel ring buffers, baseline System V-style shared memory segments, futex wait/wake keying used by `SYS_FUTEX` and `clear_child_tid` wake-on-exit, plus user-handler signal delivery (`kill` + `rt_sigaction` + `rt_sigprocmask` + `rt_sigreturn`, `SA_RESTORER`-based handler entry/return, and `SIGPIPE` generation on broken pipes).
 - Initial user bootstrap builds a conventional process stack (`argc`, `argv`, `envp`, `auxv`), now including baseline identity/random auxv entries (`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`/`AT_SECURE`/`AT_RANDOM`/`AT_EXECFN`); `execve` replaces the current image with caller-provided `argv`/`envp` vectors while preserving task identity and fd table state.
-- A phase-5 baseline VFS is now active with concrete tmpfs behavior, virtual `devfs`/`procfs` nodes, a mount table-backed `/proc/mounts`, and an ext2 importer mounted at `/mnt/ext2` where file and directory mutations (`create`/`mkdir`/`unlink`/`rmdir`/`rename`/`write`) update ext2 data/metadata in the mounted image buffer. VFS now attempts block-backed ext2 mount first and performs best-effort sync-back on mutating operations.
+- A phase-5 baseline VFS is now active with concrete tmpfs behavior, virtual `devfs`/`procfs` nodes, a mount table-backed `/proc/mounts`, and an ext2 importer mounted at `/mnt/ext2` where file and directory mutations (`create`/`mkdir`/`unlink`/`rmdir`/`rename`/`write`) update ext2 data/metadata in the mounted image buffer. VFS attempts block-backed ext2 mount first and performs best-effort sync-back on mutating operations when block-backed ext2 is active.
 - Phase-7 PCI enumeration is active in `crates/drivers` (config mechanism #1, bus/device/function scan, bounded boot-time serial inventory output), and ATA/AHCI bring-up now includes AHCI command-engine setup/teardown, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write commands behind the kernel block API, ATA PIO `IDENTIFY`, and a minimal in-kernel block-device inventory.
 - Baseline keyboard/TTY input is now wired in-kernel: PS/2 IRQ1 set-1 scancode decode feeds a canonical line-buffered console input path used by user `read` on stdio.
 - Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, and basic pixel/clear primitives.
@@ -90,7 +90,7 @@ Run in QEMU with serial output:
 make run
 ```
 
-Regenerate the sample ext2 filesystem image used by the kernel:
+Regenerate the sample ext2 filesystem image used by host-side fs tests:
 
 ```bash
 make ext2-image

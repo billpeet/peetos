@@ -466,9 +466,19 @@ const fn pfn_to_addr(pfn: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_tests() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     #[test]
     fn bitmap_set_clear_roundtrip() {
+        let _guard = lock_tests();
         unsafe {
             PMM_BITMAP = [0u8; PMM_BITMAP_SIZE];
         }
@@ -485,6 +495,7 @@ mod tests {
 
     #[test]
     fn range_markers_align_bounds() {
+        let _guard = lock_tests();
         unsafe {
             PMM_BITMAP = [0xFFu8; PMM_BITMAP_SIZE];
             FREE_PAGE_COUNT = 0;
@@ -502,6 +513,7 @@ mod tests {
 
     #[test]
     fn stats_compute_bytes() {
+        let _guard = lock_tests();
         unsafe {
             TOTAL_PAGE_COUNT = 10;
             USED_PAGE_COUNT = 4;
@@ -516,6 +528,7 @@ mod tests {
 
     #[test]
     fn phys_virt_constants_match() {
+        let _guard = lock_tests();
         let phys = PhysAddr::new(0x2000);
         let virt = phys.to_virt();
         assert_eq!(virt.as_u64(), 0xFFFF_FFFF_8000_2000);

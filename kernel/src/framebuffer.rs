@@ -6,6 +6,8 @@ const VESA_STATUS_ADDR: usize = 0xFFFF_FFFF_8000_0B00;
 const FRAMEBUFFER_WINDOW_BASE: u64 = 0xFFFF_FFFF_8100_0000;
 const FRAMEBUFFER_WINDOW_SIZE: u64 = 16 * 1024 * 1024;
 const FRAMEBUFFER_WINDOW_OFFSET_MASK: u64 = 0x1F_FFFF;
+const FRAMEBUFFER_MIN_PHYS_ADDR: u32 = 16 * 1024 * 1024;
+const FRAMEBUFFER_MAX_DIMENSION: u16 = 8192;
 
 const MODE_INFO_OFFSET_PITCH: usize = 16;
 const MODE_INFO_OFFSET_WIDTH: usize = 18;
@@ -71,6 +73,30 @@ fn framebuffer_virt_from_phys(phys_addr: u32) -> u64 {
     FRAMEBUFFER_WINDOW_BASE + (phys_addr as u64 & FRAMEBUFFER_WINDOW_OFFSET_MASK)
 }
 
+fn framebuffer_phys_addr_valid(phys_addr: u32) -> bool {
+    phys_addr >= FRAMEBUFFER_MIN_PHYS_ADDR && (phys_addr & 0xFFF) == 0
+}
+
+fn framebuffer_geometry_valid(pitch: u16, width: u16, height: u16, bpp: u8) -> bool {
+    if pitch == 0 || width == 0 || height == 0 {
+        return false;
+    }
+    if width > FRAMEBUFFER_MAX_DIMENSION || height > FRAMEBUFFER_MAX_DIMENSION {
+        return false;
+    }
+    if bpp != 32 {
+        return false;
+    }
+    if pitch % 4 != 0 {
+        return false;
+    }
+    let min_pitch = match (width as u32).checked_mul(4) {
+        Some(v) if v <= u16::MAX as u32 => v as u16,
+        _ => return false,
+    };
+    pitch >= min_pitch
+}
+
 fn framebuffer_bytes_required(pitch: u16, height: u16) -> Option<u64> {
     (pitch as u64).checked_mul(height as u64)
 }
@@ -105,18 +131,15 @@ fn probe_framebuffer() -> FramebufferInfo {
     }
 
     let status = parse_status(&status_raw);
-    if status.available == 0 || status.phys_addr == 0 {
+    if status.available != 1 || status.mode == 0 {
+        return FramebufferInfo::unavailable();
+    }
+    if !framebuffer_phys_addr_valid(status.phys_addr) {
         return FramebufferInfo::unavailable();
     }
 
     let (pitch, width, height, bpp) = parse_mode_info(&mode_raw);
-    if pitch == 0 || width == 0 || height == 0 {
-        return FramebufferInfo::unavailable();
-    }
-    if bpp != 32 {
-        return FramebufferInfo::unavailable();
-    }
-    if pitch % 4 != 0 {
+    if !framebuffer_geometry_valid(pitch, width, height, bpp) {
         return FramebufferInfo::unavailable();
     }
 
@@ -192,7 +215,13 @@ pub fn clear(color: u32) -> bool {
     }
 
     let pitch_pixels = fb.pitch as usize / 4;
-    let total_pixels = pitch_pixels.saturating_mul(fb.height as usize);
+    let total_pixels = match pitch_pixels.checked_mul(fb.height as usize) {
+        Some(v) => v,
+        None => return false,
+    };
+    if total_pixels == 0 {
+        return false;
+    }
     unsafe {
         let mut idx = 0usize;
         while idx < total_pixels {
@@ -252,5 +281,20 @@ mod tests {
     #[test]
     fn bytes_required_multiplies_pitch_and_height() {
         assert_eq!(framebuffer_bytes_required(5120, 1024), Some(5_242_880));
+    }
+
+    #[test]
+    fn phys_addr_validation_requires_high_aligned_addr() {
+        assert!(framebuffer_phys_addr_valid(0xFD00_0000));
+        assert!(!framebuffer_phys_addr_valid(0x000F_F000));
+        assert!(!framebuffer_phys_addr_valid(0xFD00_0001));
+    }
+
+    #[test]
+    fn geometry_validation_rejects_invalid_shapes() {
+        assert!(framebuffer_geometry_valid(5120, 1280, 1024, 32));
+        assert!(!framebuffer_geometry_valid(5116, 1280, 1024, 32));
+        assert!(!framebuffer_geometry_valid(5120, 1280, 1024, 24));
+        assert!(!framebuffer_geometry_valid(4096, 4096, 9000, 32));
     }
 }

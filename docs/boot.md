@@ -26,7 +26,8 @@ Limitations / Simplifications
 - Assumes a fixed page table layout and that PML4 is at physical `0x10000` (mapped at `0xFFFF_FFFF_8001_0000`).
 - No boot-info structure is passed to `kmain()` yet; the kernel relies on fixed memory locations for early data.
 - SSE enablement is unconditional and does not check CPUID feature bits.
-- The early stack is a fixed 16 KB region with no guard pages.
+- The early stack is a fixed 64 KB region with no guard pages.
+- Stage2 uses a fixed low-memory kernel staging window (`0x18000..0x9FFFF`) before relocating to `0x100000`; oversized kernels must be rejected at build time.
 
 **Kernel Initialization Sequence (`kmain`)**
 1. Initialize serial output and print the boot banner.
@@ -35,7 +36,7 @@ Limitations / Simplifications
 4. Initialize PMM, VMM, and the kernel heap.
 5. Run baseline PCI enumeration and print a bounded serial inventory.
 6. Run storage-controller bring-up (IDE/AHCI classification, AHCI ABAR capture, AHCI command-bit setup, AHCI MMIO capability/port probing, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write command path wiring, ATA PIO `IDENTIFY`), register discovered block devices, then print storage/block summaries.
-7. Initialize VFS (attempt block-backed ext2 mount, fallback to embedded sample, and enable block sync bridge for mutating VFS syscalls), then tasking/scheduler, IPC, and shared-memory subsystems.
+7. Initialize VFS (attempt block-backed ext2 mount and enable block sync bridge for mutating VFS syscalls), then tasking/scheduler, IPC, and shared-memory subsystems.
 8. Configure syscall MSRs and dispatch state.
 9. Enable interrupts.
 10. Optionally exit QEMU when `test-exit` is enabled.

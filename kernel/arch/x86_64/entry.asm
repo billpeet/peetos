@@ -152,7 +152,8 @@ _start:
     ; -----------------------------------------------------------------------
     ; We need a proper stack for C function calls.
     ; The stack grows downward, so RSP points to the top (highest address).
-    ; We reserve 16 KB for the stack, which should be plenty for now.
+    ; We reserve 64 KB for the stack to cover early Rust formatting/logging
+    ; and exception-report paths before task stacks are online.
     ;
     ; Note: The x86_64 ABI requires the stack to be 16-byte aligned
     ; before a CALL instruction. Our stack_top is aligned in the BSS.
@@ -225,14 +226,14 @@ align 16
 ; Remember: stack grows DOWN, so stack_top is at the HIGH address.
 
 stack_bottom:                   ; Lowest address of stack (never used directly)
-    resb 16384                  ; Reserve 16 KB
+    resb 65536                  ; Reserve 64 KB
 stack_top:                      ; Highest address of stack (initial RSP value)
 
 ; ===========================================================================
 ; END OF ENTRY.ASM
 ; ===========================================================================
 ; At this point, we've:
-;   1. Set up a 16 KB stack
+;   1. Set up a 64 KB stack
 ;   2. Cleared the BSS section
 ;   3. Called kmain()
 ;

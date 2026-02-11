@@ -26,10 +26,13 @@ The kernel computes the active framebuffer virtual base as:
 - `window_base + (phys_addr & 0x1F_FFFF)`
 
 Initialization validates that:
-- mode is marked available
+- mode is explicitly marked available (`status.available == 1`)
+- mode id is non-zero
+- framebuffer physical address is page-aligned and outside low memory bootstrap ranges
 - geometry fields are non-zero
 - bpp is `32`
 - pitch is 4-byte aligned
+- pitch is wide enough for `width * 4`
 - `(phys_offset + pitch * height)` stays within the 16 MiB window
 
 If validation fails, framebuffer is marked unavailable and kernel continues with serial-only output.
@@ -50,3 +53,4 @@ Limitations / Simplifications
 - No text renderer, font compositor, or terminal emulation is connected yet.
 - No double buffering, dirty-region tracking, or acceleration path exists.
 - Mapping is boot-time fixed-size (`16 MiB`) and not dynamically expanded/remapped.
+- Kernel bring-up does not clear the full framebuffer during early boot; only probe/logging is done at init.

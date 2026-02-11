@@ -19,7 +19,8 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
 - ext2 baseline importer:
   - `mount_ext2_image(path, image)` parses a raw ext2 image and imports files/dirs as ext2-backed VFS nodes.
   - The mounted ext2 image is kept as mutable fs state, and `export_ext2_image(out)` can snapshot the current mutated image bytes.
-  - Kernel init first attempts to load ext2 from discovered block devices (`kernel/src/block.rs`), and falls back to `user/sample_ext2.img` at `/mnt/ext2` if no block-backed ext2 image mounts successfully.
+  - Kernel init first attempts to load ext2 from discovered block devices (`kernel/src/block.rs`).
+  - Host-side fs tests use `user/sample_ext2.img`; current bare-metal kernel builds do not embed that sample fallback image.
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
   - `mkdir`/`mkdirat`
@@ -36,7 +37,7 @@ On initialization, the kernel creates:
 - tmpfs: `/`, `/tmp`, `/etc`
 - devfs nodes under `/dev`
 - procfs nodes under `/proc`
-- ext2 sample mount under `/mnt/ext2` (if sample image parses successfully)
+- ext2 mount under `/mnt/ext2` when a block-backed image is detected
 
 **Behavior Highlights**
 - tmpfs files are mutable and support offset-based reads/writes with sparse-zero fill on gaps.
@@ -85,3 +86,4 @@ Limitations / Simplifications
 - ext2 importer is intentionally minimal: regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
 - Block-backed ext2 sync is currently best-effort and coarse-grained (export whole mounted image and write it back), with no journal, crash-consistency protocol, or batched/page-cache flush policy.
 - ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.
+- Bare-metal kernel builds currently skip embedding the sample ext2 fallback image to stay within stage2 low-memory kernel staging limits.
