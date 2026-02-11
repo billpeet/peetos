@@ -31,7 +31,7 @@ Limitations / Simplifications
 **Kernel Initialization Sequence (`kmain`)**
 1. Initialize serial output and print the boot banner.
 2. Load the GDT/TSS/IDT, then register default exception + syscall handlers.
-3. Initialize the PIC, PIT, TTY state, and keyboard IRQ handling.
+3. Initialize framebuffer state from bootloader VESA handoff, then initialize the PIC, PIT, TTY state, and keyboard IRQ handling.
 4. Initialize PMM, VMM, and the kernel heap.
 5. Run baseline PCI enumeration and print a bounded serial inventory.
 6. Run storage-controller bring-up (IDE/AHCI classification, AHCI ABAR capture, AHCI command-bit setup, AHCI MMIO capability/port probing, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write command path wiring, ATA PIO `IDENTIFY`), register discovered block devices, then print storage/block summaries.

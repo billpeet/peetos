@@ -39,6 +39,7 @@ Key references in the C project:
 - A phase-5 baseline VFS is now active with concrete tmpfs behavior, virtual `devfs`/`procfs` nodes, a mount table-backed `/proc/mounts`, and an ext2 importer mounted at `/mnt/ext2` where file and directory mutations (`create`/`mkdir`/`unlink`/`rmdir`/`rename`/`write`) update ext2 data/metadata in the mounted image buffer. VFS now attempts block-backed ext2 mount first and performs best-effort sync-back on mutating operations.
 - Phase-7 PCI enumeration is active in `crates/drivers` (config mechanism #1, bus/device/function scan, bounded boot-time serial inventory output), and ATA/AHCI bring-up now includes AHCI command-engine setup/teardown, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write commands behind the kernel block API, ATA PIO `IDENTIFY`, and a minimal in-kernel block-device inventory.
 - Baseline keyboard/TTY input is now wired in-kernel: PS/2 IRQ1 set-1 scancode decode feeds a canonical line-buffered console input path used by user `read` on stdio.
+- Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, and basic pixel/clear primitives.
 - Remaining placeholder crates are `net`, `syscall`, and `userabi`; advanced device drivers and full user space are still pending.
 
 ## Documentation
@@ -52,6 +53,7 @@ Key references in the C project:
 - `docs/vfs.md` Baseline VFS/tmpfs/devfs/procfs/ext2 design and syscall integration.
 - `docs/ipc.md` Phase-6 synchronization primitives and IPC baseline (`pipe`/`futex`/`shm*`/`signal`).
 - `docs/drivers.md` Phase-7 baseline PCI enumeration design and integration.
+- `docs/framebuffer.md` Framebuffer boot handoff, mapping assumptions, and drawing primitives.
 - `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.
 - `docs/subsystems.md` Subsystem crate status and intended usage.
 

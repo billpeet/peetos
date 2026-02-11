@@ -1,6 +1,6 @@
 # Device Drivers (Phase 7 Progress)
 
-This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI bring-up through AHCI command-engine `IDENTIFY`, AHCI LBA48 DMA read/write commands, baseline block-device API integration, and initial keyboard input wiring.
+This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI bring-up through AHCI command-engine `IDENTIFY`, AHCI LBA48 DMA read/write commands, baseline block-device API integration, keyboard input wiring, and framebuffer setup.
 
 **Where It Lives**
 - `crates/drivers/src/pci.rs`
@@ -11,6 +11,7 @@ This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI 
 - `kernel/src/block.rs`
 - `kernel/src/keyboard.rs`
 - `kernel/src/tty.rs`
+- `kernel/src/framebuffer.rs`
 - `kernel/src/main.rs`
 
 **PCI Enumeration**
@@ -65,6 +66,17 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
   - serial echo for typed bytes/newline/backspace
 - Console `read` in syscall dispatch now pulls from this TTY queue and blocks while no full line is available.
 
+**Framebuffer Baseline**
+- Bootloader-provided VESA handoff structures are consumed from fixed higher-half addresses:
+  - status block: `0xFFFF_FFFF_8000_0B00`
+  - mode info block: `0xFFFF_FFFF_8000_0A00`
+- The kernel validates mode geometry and bpp (`32` for current baseline) and computes framebuffer virtual address inside the pre-mapped boot window at `0xFFFF_FFFF_8100_0000`.
+- The active window size is treated as `16 MiB`; initialization rejects modes whose offset+size exceeds that window.
+- Baseline drawing primitives are provided in-kernel:
+  - pixel write (`set_pixel`)
+  - full clear (`clear`)
+- Boot logs now include framebuffer activation/fallback status over serial.
+
 Limitations / Simplifications
 - AHCI command execution is polling-based; interrupts and async completion are not wired.
 - AHCI DMA transfer size is currently capped to one page (`4 KiB`) per command through a bounce buffer.
@@ -75,3 +87,6 @@ Limitations / Simplifications
 - Hotplug, power management, and controller reset/error-recovery flows are minimal.
 - Keyboard input is US-layout set-1 only; extended keys and key-repeat handling are minimal.
 - TTY is canonical-line buffered only; no `termios`, ptys, or virtual terminal switching yet.
+- Framebuffer currently assumes packed 32-bpp layout and does not yet decode VBE color masks.
+- No glyph/font renderer is wired to framebuffer yet; text output still uses serial.
+- No acceleration, double buffering, mode switching, or runtime remap support is implemented.

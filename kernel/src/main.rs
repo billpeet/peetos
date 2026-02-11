@@ -10,6 +10,7 @@ use core::panic::PanicInfo;
 mod block;
 mod elf;
 mod exception;
+mod framebuffer;
 mod ipc;
 mod keyboard;
 mod memory;
@@ -37,6 +38,23 @@ const PCI_LOG_LIMIT: usize = 16;
 pub extern "C" fn kmain() -> ! {
     serial::init();
     serial_println!("PeetOS Rust kernel: serial online");
+
+    framebuffer::init();
+    if framebuffer::is_available() {
+        let fb = framebuffer::info();
+        let _ = framebuffer::clear(0xFF00_0000);
+        serial_println!(
+            "[FB] Active {}x{}x{} pitch={} phys=0x{:08X} virt=0x{:016X}",
+            fb.width,
+            fb.height,
+            fb.bpp,
+            fb.pitch,
+            fb.phys_addr,
+            fb.buffer_virt
+        );
+    } else {
+        serial_println!("[FB] Unavailable (VGA fallback)");
+    }
 
     gdt::init();
     serial_println!("[GDT] Loaded");

@@ -16,5 +16,5 @@ This document summarizes subsystem crates. `fs` and `drivers` now contain active
 
 Limitations / Simplifications
 - `crates/fs` currently provides tmpfs + minimal virtual `devfs`/`procfs` and a baseline ext2 image-backed path (with kernel block bridge), but lacks a native block-device cache/flush stack, FAT support, journaling, and many ext2 edge cases (indirect blocks, full feature flags).
-- `crates/drivers` currently implements PCI discovery and AHCI/ATA bring-up helpers including baseline DMA command issuance; broad block-layer/VFS integration remains pending. Input baseline (PS/2 keyboard + canonical TTY) is currently implemented in the kernel crate rather than as a reusable drivers crate surface.
+- `crates/drivers` currently implements PCI discovery and AHCI/ATA bring-up helpers including baseline DMA command issuance; broad block-layer/VFS integration remains pending. Input baseline (PS/2 keyboard + canonical TTY) and framebuffer bootstrap are currently implemented in the kernel crate rather than as reusable drivers crate surfaces.
 - Public subsystem APIs are still evolving; only selected `fs`/`drivers` surfaces are wired into the kernel build today.
