@@ -72,7 +72,8 @@ Limitations / Simplifications
 - Most Linux syscall numbers are still unimplemented and return `-ENOSYS`.
 - VFS integration is baseline-only: `openat` supports absolute paths plus relative lookups from `AT_FDCWD` or a directory fd, but there is no mount namespace/chroot/path-root isolation.
 - `devfs`/`procfs` are minimal virtual backends (`/dev/null`, `/dev/zero`, `/dev/console`, `/proc/{uptime,meminfo,mounts,version}`) and are not yet full Linux-compatible implementations.
-- Console I/O is simplified: stdio descriptors are pre-seeded for user tasks, console writes go to serial, and console reads currently return EOF.
+- Console I/O is still simplified: stdio descriptors are pre-seeded for user tasks, console writes go to serial, and console reads use a canonical line-buffered TTY path backed by keyboard input (`read` blocks until a line is committed with Enter).
+- TTY behavior is minimal: canonical mode only, no `termios` ioctls/flags, no signal-generating control characters, and no pty support.
 - `brk` only manages simple per-task heap growth/shrink and does not yet integrate with full userspace allocator semantics (no `mmap` fallback, no overcommit policy, no guard pages).
 - `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.
 - Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, no permission enforcement, and no inheritance semantics across `fork`/`exec` yet.

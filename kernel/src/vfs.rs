@@ -45,7 +45,8 @@ pub fn init() {
 
     match fs::mount_ext2_image(EXT2_MOUNT_POINT, SAMPLE_EXT2_IMG) {
         Ok(()) => {
-            serial_println!("[VFS] Mounted ext2 sample at {}", EXT2_MOUNT_POINT);
+            // Keep this as a plain literal to avoid dynamic formatting in early boot.
+            serial_println!("[VFS] Mounted ext2 sample at /mnt/ext2");
         }
         Err(err) => {
             serial_println!("[VFS] WARN: failed to mount ext2 sample ({})", err);

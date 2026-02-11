@@ -72,8 +72,12 @@ section .text
 
 _start:
     ; -----------------------------------------------------------------------
-    ; STEP 1: Clear direction flag
+    ; STEP 1: Enter with interrupts disabled and clear direction flag
     ; -----------------------------------------------------------------------
+    ; Keep IRQs disabled during early init. We only enable them in Rust after
+    ; IDT/PIC/PIT/tasking are fully initialized.
+    cli                         ; Disable maskable interrupts
+
     ; The direction flag (DF) controls the direction of string operations.
     ; DF=0: String operations increment (forward)
     ; DF=1: String operations decrement (backward)
@@ -217,12 +221,11 @@ section .bss
 ; Align the stack to 16 bytes (required by x86_64 ABI)
 align 16
 
-; Reserve space for the stack
-; We allocate 16 KB which should be plenty for our simple kernel.
+; Reserve space for the stack.
 ; Remember: stack grows DOWN, so stack_top is at the HIGH address.
 
 stack_bottom:                   ; Lowest address of stack (never used directly)
-    resb 16384                  ; Reserve 16 KB (16384 bytes)
+    resb 16384                  ; Reserve 16 KB
 stack_top:                      ; Highest address of stack (initial RSP value)
 
 ; ===========================================================================

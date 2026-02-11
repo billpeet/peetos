@@ -1502,7 +1502,15 @@ fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
 
         let read_n = if kind == task::USER_FD_KIND_CONSOLE {
-            0usize
+            match crate::tty::read_console(ctx.current, &mut chunk[..take]) {
+                Ok(n) => n,
+                Err(err) => {
+                    if read_total > 0 {
+                        return read_total as i64;
+                    }
+                    return -err;
+                }
+            }
         } else if kind == task::USER_FD_KIND_VFS {
             refresh_procfs_runtime();
             match fs::read(inode, offset, &mut chunk[..take]) {

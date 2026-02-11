@@ -1,6 +1,6 @@
 # Device Drivers (Phase 7 Progress)
 
-This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI bring-up through AHCI command-engine `IDENTIFY`, AHCI LBA48 DMA read/write commands, and baseline block-device API integration.
+This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI bring-up through AHCI command-engine `IDENTIFY`, AHCI LBA48 DMA read/write commands, baseline block-device API integration, and initial keyboard input wiring.
 
 **Where It Lives**
 - `crates/drivers/src/pci.rs`
@@ -9,6 +9,8 @@ This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI 
 - `crates/arch_x86_64/src/port.rs`
 - `kernel/src/storage.rs`
 - `kernel/src/block.rs`
+- `kernel/src/keyboard.rs`
+- `kernel/src/tty.rs`
 - `kernel/src/main.rs`
 
 **PCI Enumeration**
@@ -54,6 +56,15 @@ The registry records discovered disks from both paths:
 
 Boot logs include per-device registration lines, an aggregated `[BLK] Inventory` summary, and a best-effort AHCI LBA0 read probe when AHCI devices are present.
 
+**Keyboard + TTY Input Baseline**
+- Keyboard IRQ1 is registered in the IDT and unmasked on the PIC during bring-up.
+- PS/2 set-1 scancodes are decoded with basic modifier handling (left/right shift, caps lock, printable keys, backspace, enter).
+- Decoded bytes are fed into a kernel TTY line buffer:
+  - canonical mode only (input is committed on newline)
+  - basic backspace editing in the pending line
+  - serial echo for typed bytes/newline/backspace
+- Console `read` in syscall dispatch now pulls from this TTY queue and blocks while no full line is available.
+
 Limitations / Simplifications
 - AHCI command execution is polling-based; interrupts and async completion are not wired.
 - AHCI DMA transfer size is currently capped to one page (`4 KiB`) per command through a bounce buffer.
@@ -62,3 +73,5 @@ Limitations / Simplifications
 - No partition parsing (MBR/GPT) or block cache/page cache integration yet.
 - MMIO window mapping is currently bounded (`AHCI_MMIO_WINDOW_LIMIT`) and boot-time only.
 - Hotplug, power management, and controller reset/error-recovery flows are minimal.
+- Keyboard input is US-layout set-1 only; extended keys and key-repeat handling are minimal.
+- TTY is canonical-line buffered only; no `termios`, ptys, or virtual terminal switching yet.

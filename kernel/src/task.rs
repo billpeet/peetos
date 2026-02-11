@@ -214,7 +214,6 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         serial_println!("[TASK] ERROR: failed to allocate task struct");
         return ptr::null_mut();
     }
-
     let task_ptr = task_phys.to_virt().as_u64() as *mut Task;
     unsafe {
         ptr::write_bytes(task_ptr as *mut u8, 0, size_of::<Task>());
@@ -226,7 +225,6 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         pmm::free_page(task_phys);
         return ptr::null_mut();
     }
-
     let stack_base = stack_phys.to_virt().as_u64();
     let stack_top = stack_base + KERNEL_STACK_SIZE;
 

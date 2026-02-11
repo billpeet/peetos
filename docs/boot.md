@@ -13,7 +13,7 @@ This document describes the early boot path into the Rust kernel and the high-le
 - Page tables are located at fixed physical addresses reused from the C kernel.
 
 **Entry Flow (`entry.asm`)**
-1. Clear DF to satisfy the SysV ABI expectations.
+1. Disable maskable interrupts (`cli`) and clear DF to satisfy SysV ABI expectations.
 2. Jump immediately to the higher-half address to avoid cache aliasing.
 3. Zero the `.bss` section using `__bss_start`/`__bss_end` from the linker.
 4. Unmap the identity-mapped lower half (PML4[0]) and flush the TLB.
@@ -31,7 +31,7 @@ Limitations / Simplifications
 **Kernel Initialization Sequence (`kmain`)**
 1. Initialize serial output and print the boot banner.
 2. Load the GDT/TSS/IDT, then register default exception + syscall handlers.
-3. Initialize the PIC and PIT.
+3. Initialize the PIC, PIT, TTY state, and keyboard IRQ handling.
 4. Initialize PMM, VMM, and the kernel heap.
 5. Run baseline PCI enumeration and print a bounded serial inventory.
 6. Run storage-controller bring-up (IDE/AHCI classification, AHCI ABAR capture, AHCI command-bit setup, AHCI MMIO capability/port probing, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write command path wiring, ATA PIO `IDENTIFY`), register discovered block devices, then print storage/block summaries.

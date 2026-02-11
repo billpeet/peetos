@@ -14,8 +14,10 @@ The serial console is configured for COM1 (`0x3F8`) at 38400 baud with 8N1 frami
 
 Limitations / Simplifications
 - Busy-wait transmit loop; no interrupts or buffering.
-- No input support, flow control, or log levels.
+- No serial RX input path, flow control, or log levels.
 - No locking for concurrent writers.
+
+Keyboard-backed console input is now provided separately via the phase-7 PS/2 + TTY path (`kernel/src/keyboard.rs` + `kernel/src/tty.rs`), with typed bytes echoed to serial output.
 
 **Exception Reporting**
 `kernel/src/exception.rs` prints a register dump and decodes page fault error codes. For page faults, it reads CR2 and prints the access type, privilege level, and present/reserved bits. Optional VGA printing exists behind the `vga` feature.

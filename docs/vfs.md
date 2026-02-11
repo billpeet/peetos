@@ -43,7 +43,7 @@ On initialization, the kernel creates:
 - `devfs` behavior:
   - `/dev/null`: reads EOF, writes are discarded
   - `/dev/zero`: reads return zero bytes, writes are discarded
-  - `/dev/console`: opened as a console descriptor; kernel routes writes to serial
+  - `/dev/console`: opened as a console descriptor; kernel routes writes to serial and reads through canonical line-buffered TTY input
 - `procfs` behavior:
   - `/proc/uptime` and `/proc/meminfo` are generated from runtime kernel stats
   - `/proc/mounts` is generated from the mount table and reflects mounted ext2 entries
@@ -81,7 +81,7 @@ Limitations / Simplifications
 - Metadata plumbing exists (`mode`/`uid`/`gid`/timestamps), but full POSIX permission policy and ownership-changing syscalls (`chmod`/`chown`) are not implemented yet.
 - `rename` currently behaves as no-replace (`EEXIST` if destination exists) rather than full Linux overwrite semantics.
 - Hard links and symbolic links are not implemented yet.
-- Console input is not implemented yet; console reads currently return EOF.
+- Console input path is baseline-only: canonical line mode with basic backspace editing and newline commit; no `termios`, raw mode, job control, or pty support.
 - ext2 importer is intentionally minimal: regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
 - Block-backed ext2 sync is currently best-effort and coarse-grained (export whole mounted image and write it back), with no journal, crash-consistency protocol, or batched/page-cache flush policy.
 - ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.

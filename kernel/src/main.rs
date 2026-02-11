@@ -11,6 +11,7 @@ mod block;
 mod elf;
 mod exception;
 mod ipc;
+mod keyboard;
 mod memory;
 mod qemu;
 mod sched;
@@ -21,6 +22,7 @@ mod storage;
 mod sync;
 mod syscall;
 mod task;
+mod tty;
 mod user;
 mod vfs;
 
@@ -55,6 +57,12 @@ pub extern "C" fn kmain() -> ! {
 
     pit::init();
     serial_println!("[PIT] Initialized");
+
+    tty::init();
+    serial_println!("[TTY] Initialized");
+
+    keyboard::init();
+    serial_println!("[KBD] Initialized");
 
     pmm::init();
     serial_println!("[PMM] Initialized");
