@@ -35,7 +35,7 @@ Limitations / Simplifications
 4. Initialize PMM, VMM, and the kernel heap.
 5. Run baseline PCI enumeration and print a bounded serial inventory.
 6. Run storage-controller bring-up (IDE/AHCI classification, AHCI ABAR capture, AHCI command-bit setup, AHCI MMIO capability/port probing, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write command path wiring, ATA PIO `IDENTIFY`), register discovered block devices, then print storage/block summaries.
-7. Initialize VFS, tasking/scheduler, IPC, and shared-memory subsystems.
+7. Initialize VFS (attempt block-backed ext2 mount, fallback to embedded sample, and enable block sync bridge for mutating VFS syscalls), then tasking/scheduler, IPC, and shared-memory subsystems.
 8. Configure syscall MSRs and dispatch state.
 9. Enable interrupts.
 10. Optionally exit QEMU when `test-exit` is enabled.

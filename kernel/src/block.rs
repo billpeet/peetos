@@ -252,8 +252,8 @@ pub fn write(index: usize, lba: u64, data: &[u8]) -> Result<(), BlockIoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     static LAST_READ_CTX: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_SUM: AtomicU64 = AtomicU64::new(0);

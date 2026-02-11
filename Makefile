@@ -41,6 +41,7 @@ DISK_SECTORS := 20480
 
 BOOT_STAGE1_SRC := boot/stage1/boot.asm
 BOOT_STAGE2_SRC := boot/stage2/stage2.asm
+BOOT_CONSTANTS := boot/include/constants.inc
 ENTRY_SRC := kernel/arch/x86_64/entry.asm
 
 KERNEL_TARGET_DIR := target/x86_64-unknown-none/$(PROFILE)
@@ -64,10 +65,10 @@ $(BUILD_DIR):
 # Bootloader
 # ---------------------------------------------------------------------------
 
-$(BOOT_BIN): $(BOOT_STAGE1_SRC) | $(BUILD_DIR)
+$(BOOT_BIN): $(BOOT_STAGE1_SRC) $(BOOT_CONSTANTS) | $(BUILD_DIR)
 	$(ASM) -f bin -g -o $@ $<
 
-$(STAGE2_BIN): $(BOOT_STAGE2_SRC) | $(BUILD_DIR)
+$(STAGE2_BIN): $(BOOT_STAGE2_SRC) $(BOOT_CONSTANTS) | $(BUILD_DIR)
 	$(ASM) -f bin -g -o $@ $<
 
 bootloader: $(BOOT_BIN) $(STAGE2_BIN)

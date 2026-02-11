@@ -308,6 +308,11 @@ fn fs_to_errno(err: i64) -> i64 {
     }
 }
 
+#[inline]
+fn sync_ext2_backing() {
+    let _ = crate::vfs::sync_ext2_to_block();
+}
+
 fn ipc_to_errno(err: i64) -> i64 {
     match err {
         ipc::EINVAL => EINVAL,
@@ -879,10 +884,16 @@ fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         task::USER_FD_KIND_VFS
     };
 
-    match fd_alloc(ctx.current, fd_kind, opened.inode, flags) {
+    let fd_result = match fd_alloc(ctx.current, fd_kind, opened.inode, flags) {
         Ok(fd) => fd,
-        Err(err) => err,
+        Err(err) => return err,
+    };
+
+    if (flags & (fs::O_CREAT | fs::O_TRUNC)) != 0 {
+        sync_ext2_backing();
     }
+
+    fd_result
 }
 
 fn sys_mkdirat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -898,7 +909,10 @@ fn sys_mkdirat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let _mode = call.arg(2) as u32;
 
     match fs::mkdirat(dir_inode, path) {
-        Ok(()) => 0,
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
         Err(err) => -fs_to_errno(err),
     }
 }
@@ -1396,7 +1410,10 @@ fn sys_unlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         fs::unlinkat(dir_inode, path)
     };
     match res {
-        Ok(()) => 0,
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
         Err(err) => -fs_to_errno(err),
     }
 }
@@ -1422,7 +1439,10 @@ fn sys_renameat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
 
     match fs::renameat(old_dir, old_path, new_dir, new_path) {
-        Ok(()) => 0,
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
         Err(err) => {
             if err == fs::EINVAL && old_dir != new_dir {
                 -EXDEV
@@ -1560,6 +1580,7 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let mut chunk = [0u8; WRITE_CHUNK_SIZE];
     let mut written = 0usize;
+    let mut wrote_vfs = false;
 
     while written < len {
         let take = cmp::min(chunk.len(), len - written);
@@ -1613,6 +1634,9 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             unsafe {
                 (*ctx.current).user_fd_offset[idx] = write_res.new_offset;
             }
+            if write_res.written > 0 {
+                wrote_vfs = true;
+            }
             written += write_res.written;
             continue;
         }
@@ -1641,6 +1665,10 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
 
         return -EBADF;
+    }
+
+    if wrote_vfs && written > 0 {
+        sync_ext2_backing();
     }
 
     written as i64

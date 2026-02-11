@@ -58,7 +58,7 @@ Limitations / Simplifications
 - AHCI command execution is polling-based; interrupts and async completion are not wired.
 - AHCI DMA transfer size is currently capped to one page (`4 KiB`) per command through a bounce buffer.
 - ATA (`ata-pio`) devices are inventory-only for now; read/write callbacks are currently wired for AHCI devices.
-- The block-device layer is not yet consumed by VFS/ext2 mount paths.
+- VFS currently consumes block I/O through an image-style ext2 bridge (read image from block at mount time + best-effort sync-back), not a native block-cache/page-cache-backed ext2 path.
 - No partition parsing (MBR/GPT) or block cache/page cache integration yet.
 - MMIO window mapping is currently bounded (`AHCI_MMIO_WINDOW_LIMIT`) and boot-time only.
 - Hotplug, power management, and controller reset/error-recovery flows are minimal.

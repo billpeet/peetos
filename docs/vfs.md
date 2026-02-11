@@ -19,7 +19,7 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
 - ext2 baseline importer:
   - `mount_ext2_image(path, image)` parses a raw ext2 image and imports files/dirs as ext2-backed VFS nodes.
   - The mounted ext2 image is kept as mutable fs state, and `export_ext2_image(out)` can snapshot the current mutated image bytes.
-  - Kernel init mounts `user/sample_ext2.img` at `/mnt/ext2`.
+  - Kernel init first attempts to load ext2 from discovered block devices (`kernel/src/block.rs`), and falls back to `user/sample_ext2.img` at `/mnt/ext2` if no block-backed ext2 image mounts successfully.
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
   - `mkdir`/`mkdirat`
@@ -55,6 +55,7 @@ On initialization, the kernel creates:
   - inode metadata (`mode`, `uid`, `gid`, link count, basic timestamps) is tracked and surfaced via `stat` paths.
   - `/proc/mounts` reports ext2 as `rw` when mounted.
   - Mount import is rollback-safe: on parse/import failure, partially imported nodes are removed.
+  - When ext2 is mounted from a block device, mutating VFS syscalls trigger best-effort image export + write-back through `block::write`.
 
 **Syscall Integration**
 - Linux-numbered file syscalls are dispatched through the VFS layer:
@@ -70,6 +71,7 @@ On initialization, the kernel creates:
   - `renameat` (`264`)
   - `read` (`0`)
   - `write` (`1`)
+- Mutating syscall paths (`open` with `O_CREAT`/`O_TRUNC`, `write`, `mkdirat`, `unlinkat`/`rmdirat`, `renameat`) invoke kernel-side ext2 sync when a block-backed ext2 mount is active.
 - Per-task FD tables track kind/inode/offset/flags.
 - User stdio (`fd 0/1/2`) is pre-seeded as console descriptors, and each user task tracks a cwd inode (currently rooted at `/`).
 
@@ -81,4 +83,5 @@ Limitations / Simplifications
 - Hard links and symbolic links are not implemented yet.
 - Console input is not implemented yet; console reads currently return EOF.
 - ext2 importer is intentionally minimal: regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
-- ext2 mutation durability is currently scoped to the mounted image buffer in RAM; there is no block-device flush path yet, so persistence across boots requires explicitly exporting the mutated image and reusing it.
+- Block-backed ext2 sync is currently best-effort and coarse-grained (export whole mounted image and write it back), with no journal, crash-consistency protocol, or batched/page-cache flush policy.
+- ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.

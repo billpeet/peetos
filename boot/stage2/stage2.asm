@@ -163,7 +163,7 @@ stage2_start:
     ; STEP 6: Load kernel from disk
     ; -----------------------------------------------------------------------
     ; The kernel is stored on disk after Stage 2.
-    ; We load it into memory at KERNEL_LOAD_ADDR (0x20000) as a staging buffer.
+    ; We load it into memory at KERNEL_LOAD_ADDR (0x18000) as a staging buffer.
     ; It will be relocated to KERNEL_START (0x100000) in 32-bit mode.
 
     mov si, msg_load_kernel
