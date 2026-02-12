@@ -1776,6 +1776,89 @@ fn ext2_write_zero_range(
     Ok(())
 }
 
+fn ext2_indirect_entries_per_block(meta: &Ext2Meta) -> Result<usize, i64> {
+    if (meta.block_size & 0x3) != 0 {
+        return Err(EIO);
+    }
+    let entries = meta.block_size / core::mem::size_of::<u32>();
+    if entries == 0 {
+        return Err(EIO);
+    }
+    Ok(entries)
+}
+
+fn ext2_read_indirect_entry(
+    image: &[u8],
+    meta: &Ext2Meta,
+    table_block: u32,
+    index: usize,
+) -> Result<u32, i64> {
+    let table = ext2_block_slice(image, meta, table_block)?;
+    let offset = index.checked_mul(core::mem::size_of::<u32>()).ok_or(EIO)?;
+    read_u32_le(table, offset)
+}
+
+fn ext2_data_block_for_logical_index(
+    image: &[u8],
+    meta: &Ext2Meta,
+    inode: &Ext2Inode,
+    block_idx: usize,
+) -> Result<u32, i64> {
+    if block_idx < EXT2_INODE_DIRECT_COUNT {
+        return Ok(inode.blocks[block_idx]);
+    }
+
+    let entries = ext2_indirect_entries_per_block(meta)?;
+    let mut remaining = block_idx - EXT2_INODE_DIRECT_COUNT;
+
+    if remaining < entries {
+        let table = inode.blocks[12];
+        if table == 0 {
+            return Ok(0);
+        }
+        return ext2_read_indirect_entry(image, meta, table, remaining);
+    }
+    remaining -= entries;
+
+    let double_span = entries.checked_mul(entries).ok_or(EIO)?;
+    if remaining < double_span {
+        let table = inode.blocks[13];
+        if table == 0 {
+            return Ok(0);
+        }
+        let first = remaining / entries;
+        let second = remaining % entries;
+        let l1 = ext2_read_indirect_entry(image, meta, table, first)?;
+        if l1 == 0 {
+            return Ok(0);
+        }
+        return ext2_read_indirect_entry(image, meta, l1, second);
+    }
+    remaining -= double_span;
+
+    let triple_span = double_span.checked_mul(entries).ok_or(EIO)?;
+    if remaining < triple_span {
+        let table = inode.blocks[14];
+        if table == 0 {
+            return Ok(0);
+        }
+        let first = remaining / double_span;
+        let second = (remaining % double_span) / entries;
+        let third = remaining % entries;
+        let l1 = ext2_read_indirect_entry(image, meta, table, first)?;
+        if l1 == 0 {
+            return Ok(0);
+        }
+        let l2 = ext2_read_indirect_entry(image, meta, l1, second)?;
+        if l2 == 0 {
+            return Ok(0);
+        }
+        return ext2_read_indirect_entry(image, meta, l2, third);
+    }
+
+    Err(EIO)
+}
+
 fn ext2_read_file(state: &VfsState, ino: u32, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
     if dst.is_empty() {
         return Ok(0);
@@ -1793,17 +1876,13 @@ fn ext2_read_file(state: &VfsState, ino: u32, offset: u64, dst: &mut [u8]) -> Re
     let mut pos = offset as usize;
     while copied < dst.len() && pos < size {
         let block_idx = pos / meta.block_size;
-        if block_idx >= EXT2_INODE_DIRECT_COUNT {
-            return Err(EIO);
-        }
-
         let block_off = pos % meta.block_size;
         let remain_file = size - pos;
         let chunk = core::cmp::min(
             meta.block_size - block_off,
             core::cmp::min(remain_file, dst.len() - copied),
         );
-        let block_no = inode.blocks[block_idx];
+        let block_no = ext2_data_block_for_logical_index(image, &meta, &inode, block_idx)?;
 
         if block_no == 0 {
             dst[copied..copied + chunk].fill(0);
@@ -2508,8 +2587,11 @@ fn open_at_inner(
         Err(err) => return Err(err),
     };
 
-    let inode_info = state.inodes[inode_idx as usize];
-    if inode_info.file_type == FileType::Directory {
+    let inode_ref = &state.inodes[inode_idx as usize];
+    let inode_file_type = inode_ref.file_type;
+    let inode_backend = inode_ref.backend;
+    let inode_ext2_ino = inode_ref.ext2_ino;
+    if inode_file_type == FileType::Directory {
         if access != O_RDONLY {
             return Err(EISDIR);
         }
@@ -2517,21 +2599,21 @@ fn open_at_inner(
         return Err(ENOTDIR);
     }
 
-    if (flags & O_TRUNC) != 0 && inode_info.file_type == FileType::Regular && access != O_RDONLY {
-        if !backend_mutable(inode_info.backend) {
+    if (flags & O_TRUNC) != 0 && inode_file_type == FileType::Regular && access != O_RDONLY {
+        if !backend_mutable(inode_backend) {
             return Err(EROFS);
         }
 
-        match inode_info.backend {
+        match inode_backend {
             NodeBackend::Tmpfs => {
                 state.inodes[inode_idx as usize].size = 0;
                 touch_inode_metadata(state, inode_idx, true, true, true);
             }
             NodeBackend::Ext2 => {
-                if inode_info.ext2_ino == 0 {
+                if inode_ext2_ino == 0 {
                     return Err(EIO);
                 }
-                ext2_truncate_to_zero(state, inode_info.ext2_ino)?;
+                ext2_truncate_to_zero(state, inode_ext2_ino)?;
                 state.inodes[inode_idx as usize].size = 0;
                 touch_inode_metadata(state, inode_idx, true, true, true);
             }
@@ -2539,12 +2621,10 @@ fn open_at_inner(
         }
     }
 
-    let opened = state.inodes[inode_idx as usize];
-
     Ok(OpenResult {
         inode: inode_idx,
-        file_type: opened.file_type,
-        is_console: opened.backend == NodeBackend::DevConsole,
+        file_type: inode_file_type,
+        is_console: inode_backend == NodeBackend::DevConsole,
     })
 }
 
@@ -2664,35 +2744,38 @@ fn unlink_at_inner(
         return Err(EROFS);
     }
 
-    let child_node = state.inodes[child as usize];
+    let child_ref = &state.inodes[child as usize];
+    let child_file_type = child_ref.file_type;
+    let child_child_count = child_ref.child_count;
+    let child_ext2_ino = child_ref.ext2_ino;
     if remove_dir {
-        if child_node.file_type != FileType::Directory {
+        if child_file_type != FileType::Directory {
             return Err(ENOTDIR);
         }
-        if child_node.child_count != 0 {
+        if child_child_count != 0 {
             return Err(ENOTEMPTY);
         }
-    } else if child_node.file_type == FileType::Directory {
+    } else if child_file_type == FileType::Directory {
         return Err(EISDIR);
     }
 
     if parent_backend == NodeBackend::Ext2 {
-        if state.inodes[parent as usize].ext2_ino == 0 || child_node.ext2_ino == 0 {
+        if state.inodes[parent as usize].ext2_ino == 0 || child_ext2_ino == 0 {
             return Err(EIO);
         }
         let parent_ino = state.inodes[parent as usize].ext2_ino;
         let removed = ext2_remove_dir_entry(state, parent_ino, &name[..name_len])?;
-        if removed != child_node.ext2_ino {
+        if removed != child_ext2_ino {
             return Err(EIO);
         }
 
-        let mut child_ext = ext2_read_inode_from_state(state, child_node.ext2_ino)?;
+        let mut child_ext = ext2_read_inode_from_state(state, child_ext2_ino)?;
         if remove_dir {
-            if !ext2_directory_is_empty(state, child_node.ext2_ino)? {
+            if !ext2_directory_is_empty(state, child_ext2_ino)? {
                 return Err(ENOTEMPTY);
             }
             ext2_free_inode_blocks(state, &mut child_ext)?;
-            ext2_free_inode(state, child_node.ext2_ino, true)?;
+            ext2_free_inode(state, child_ext2_ino, true)?;
             let mut parent_ext = ext2_read_inode_from_state(state, parent_ino)?;
             parent_ext.links_count = parent_ext.links_count.saturating_sub(1);
             parent_ext.mtime = fs_time_tick(state) as u32;
@@ -2704,10 +2787,10 @@ fn unlink_at_inner(
                 let now = fs_time_tick(state) as u32;
                 child_ext.ctime = now;
                 child_ext.mtime = now;
-                ext2_write_inode_to_state(state, child_node.ext2_ino, &child_ext)?;
+                ext2_write_inode_to_state(state, child_ext2_ino, &child_ext)?;
             } else {
                 ext2_free_inode_blocks(state, &mut child_ext)?;
-                ext2_free_inode(state, child_node.ext2_ino, false)?;
+                ext2_free_inode(state, child_ext2_ino, false)?;
             }
         }
     }
@@ -2771,41 +2854,43 @@ fn rename_at_inner(
         return Err(EROFS);
     }
 
-    let child_node = state.inodes[child as usize];
-    if child_node.file_type == FileType::Directory && is_descendant_of(state, child, new_parent) {
+    let child_ref = &state.inodes[child as usize];
+    let child_file_type = child_ref.file_type;
+    let child_ext2_ino = child_ref.ext2_ino;
+    if child_file_type == FileType::Directory && is_descendant_of(state, child, new_parent) {
         return Err(EINVAL);
     }
 
     if old_backend == NodeBackend::Ext2 {
         let old_parent_ino = state.inodes[old_parent as usize].ext2_ino;
         let new_parent_ino = state.inodes[new_parent as usize].ext2_ino;
-        if old_parent_ino == 0 || new_parent_ino == 0 || child_node.ext2_ino == 0 {
+        if old_parent_ino == 0 || new_parent_ino == 0 || child_ext2_ino == 0 {
             return Err(EIO);
         }
 
         let removed = ext2_remove_dir_entry(state, old_parent_ino, &old_name[..old_len])?;
-        if removed != child_node.ext2_ino {
+        if removed != child_ext2_ino {
             return Err(EIO);
         }
         if let Err(err) = ext2_add_dir_entry(
             state,
             new_parent_ino,
-            child_node.ext2_ino,
+            child_ext2_ino,
             &new_name[..new_len],
-            child_node.file_type,
+            child_file_type,
         ) {
             let _ = ext2_add_dir_entry(
                 state,
                 old_parent_ino,
-                child_node.ext2_ino,
+                child_ext2_ino,
                 &old_name[..old_len],
-                child_node.file_type,
+                child_file_type,
             );
             return Err(err);
         }
 
-        if child_node.file_type == FileType::Directory && old_parent_ino != new_parent_ino {
-            ext2_patch_dotdot(state, child_node.ext2_ino, new_parent_ino)?;
+        if child_file_type == FileType::Directory && old_parent_ino != new_parent_ino {
+            ext2_patch_dotdot(state, child_ext2_ino, new_parent_ino)?;
             let mut old_parent_inode = ext2_read_inode_from_state(state, old_parent_ino)?;
             old_parent_inode.links_count = old_parent_inode.links_count.saturating_sub(1);
             ext2_write_inode_to_state(state, old_parent_ino, &old_parent_inode)?;
@@ -2815,11 +2900,11 @@ fn rename_at_inner(
             ext2_write_inode_to_state(state, new_parent_ino, &new_parent_inode)?;
         }
 
-        let mut ext_child = ext2_read_inode_from_state(state, child_node.ext2_ino)?;
+        let mut ext_child = ext2_read_inode_from_state(state, child_ext2_ino)?;
         let now = fs_time_tick(state) as u32;
         ext_child.ctime = now;
         ext_child.mtime = now;
-        ext2_write_inode_to_state(state, child_node.ext2_ino, &ext_child)?;
+        ext2_write_inode_to_state(state, child_ext2_ino, &ext_child)?;
     }
 
     remove_child(state, old_parent, child)?;
@@ -3043,47 +3128,49 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
             return Err(ENOENT);
         }
 
-        let node = state.inodes[inode as usize];
-        if !node.used {
-            return Err(ENOENT);
-        }
-        if node.file_type == FileType::Directory {
-            return Err(EISDIR);
-        }
-
-        let out = match node.backend {
-            NodeBackend::Tmpfs => {
-                if dst.is_empty() {
-                    return Ok(0);
-                }
-
-                let file_size = node.size as usize;
-                if offset as usize >= file_size {
-                    return Ok(0);
-                }
-
-                let start = offset as usize;
-                let available = file_size - start;
-                let count = core::cmp::min(dst.len(), available);
-                dst[..count].copy_from_slice(&node.data[start..start + count]);
-                count
+        let out = {
+            let node = &state.inodes[inode as usize];
+            if !node.used {
+                return Err(ENOENT);
             }
-            NodeBackend::Ext2 => {
-                if node.ext2_ino == 0 {
-                    return Err(EIO);
+            if node.file_type == FileType::Directory {
+                return Err(EISDIR);
+            }
+
+            match node.backend {
+                NodeBackend::Tmpfs => {
+                    if dst.is_empty() {
+                        return Ok(0);
+                    }
+
+                    let file_size = node.size as usize;
+                    if offset as usize >= file_size {
+                        return Ok(0);
+                    }
+
+                    let start = offset as usize;
+                    let available = file_size - start;
+                    let count = core::cmp::min(dst.len(), available);
+                    dst[..count].copy_from_slice(&node.data[start..start + count]);
+                    count
                 }
-                ext2_read_file(state, node.ext2_ino, offset, dst)?
+                NodeBackend::Ext2 => {
+                    if node.ext2_ino == 0 {
+                        return Err(EIO);
+                    }
+                    ext2_read_file(state, node.ext2_ino, offset, dst)?
+                }
+                NodeBackend::DevNull => 0,
+                NodeBackend::DevZero => {
+                    dst.fill(0);
+                    dst.len()
+                }
+                NodeBackend::DevConsole => 0,
+                NodeBackend::ProcUptime
+                | NodeBackend::ProcMeminfo
+                | NodeBackend::ProcMounts
+                | NodeBackend::ProcVersion => read_proc(node, state, offset, dst)?,
             }
-            NodeBackend::DevNull => 0,
-            NodeBackend::DevZero => {
-                dst.fill(0);
-                dst.len()
-            }
-            NodeBackend::DevConsole => 0,
-            NodeBackend::ProcUptime
-            | NodeBackend::ProcMeminfo
-            | NodeBackend::ProcMounts
-            | NodeBackend::ProcVersion => read_proc(&node, state, offset, dst)?,
         };
         touch_inode_metadata(state, inode, true, false, false);
         Ok(out)
@@ -3098,15 +3185,18 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
             return Err(ENOENT);
         }
 
-        let node = state.inodes[inode as usize];
-        if !node.used {
+        let (used, file_type, backend, ext2_ino) = {
+            let node = &state.inodes[inode as usize];
+            (node.used, node.file_type, node.backend, node.ext2_ino)
+        };
+        if !used {
             return Err(ENOENT);
         }
-        if node.file_type == FileType::Directory {
+        if file_type == FileType::Directory {
             return Err(EISDIR);
         }
 
-        let result = match node.backend {
+        let result = match backend {
             NodeBackend::Tmpfs => {
                 let node_ref = &mut state.inodes[inode as usize];
                 let mut start = if append {
@@ -3153,10 +3243,10 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
                 }
             }
             NodeBackend::Ext2 => {
-                if node.ext2_ino == 0 {
+                if ext2_ino == 0 {
                     return Err(EIO);
                 }
-                let result = ext2_write_file(state, node.ext2_ino, offset, src, append)?;
+                let result = ext2_write_file(state, ext2_ino, offset, src, append)?;
                 state.inodes[inode as usize].size =
                     core::cmp::max(state.inodes[inode as usize].size, result.new_offset as u32);
                 result
@@ -3483,6 +3573,84 @@ mod tests {
         let nested = open("/mnt/ext2/newdir/note.txt", O_CREAT | O_RDWR, 0).expect("create nested");
         let nested_w = write(nested.inode, 0, b"vfs", false).expect("write nested");
         assert_eq!(nested_w.written, 3);
+    }
+
+    #[test]
+    fn ext2_logical_block_lookup_handles_indirect_levels() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+
+        let mut meta = Ext2Meta::empty();
+        meta.block_size = 1024;
+        let ptrs_per_block = meta.block_size / core::mem::size_of::<u32>();
+
+        let mut image = std::vec::Vec::from([0u8; 1024 * 32]);
+        let mut inode = Ext2Inode {
+            mode: 0,
+            uid: 0,
+            size: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            links_count: 0,
+            gid: 0,
+            block_count_512: 0,
+            blocks: [0; 15],
+        };
+
+        inode.blocks[0] = 2;
+        inode.blocks[12] = 3;
+        inode.blocks[13] = 4;
+        inode.blocks[14] = 5;
+
+        write_u32_le(&mut image, 3 * 1024, 6).expect("single indirect entry");
+        write_u32_le(&mut image, 4 * 1024, 7).expect("double l1 entry");
+        write_u32_le(&mut image, 7 * 1024 + 4, 8).expect("double l2 entry");
+        write_u32_le(&mut image, 5 * 1024, 9).expect("triple l1 entry");
+        write_u32_le(&mut image, 9 * 1024, 10).expect("triple l2 entry");
+        write_u32_le(&mut image, 10 * 1024 + 8, 11).expect("triple l3 entry");
+
+        assert_eq!(
+            ext2_data_block_for_logical_index(&image, &meta, &inode, 0).unwrap(),
+            2
+        );
+        assert_eq!(
+            ext2_data_block_for_logical_index(&image, &meta, &inode, EXT2_INODE_DIRECT_COUNT)
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            ext2_data_block_for_logical_index(
+                &image,
+                &meta,
+                &inode,
+                EXT2_INODE_DIRECT_COUNT + 1
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            ext2_data_block_for_logical_index(
+                &image,
+                &meta,
+                &inode,
+                EXT2_INODE_DIRECT_COUNT + ptrs_per_block + 1
+            )
+            .unwrap(),
+            8
+        );
+        assert_eq!(
+            ext2_data_block_for_logical_index(
+                &image,
+                &meta,
+                &inode,
+                EXT2_INODE_DIRECT_COUNT
+                    + ptrs_per_block
+                    + ptrs_per_block * ptrs_per_block
+                    + 2
+            )
+            .unwrap(),
+            11
+        );
     }
 
     #[test]

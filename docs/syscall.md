@@ -40,10 +40,12 @@ For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed i
 Limitations / Simplifications
 - The `int 0x80` path currently shares the same Linux-numbered dispatcher as the SYSCALL path and supports a baseline subset:
   - `SYS_OPEN`, `SYS_OPENAT`, `SYS_MKDIRAT`, `SYS_CLOSE`, `SYS_READ`, `SYS_WRITE`, `SYS_LSEEK`
+  - `SYS_WRITEV`
   - `SYS_DUP`, `SYS_DUP2`, `SYS_DUP3`, `SYS_FCNTL` (baseline descriptor controls + `FD_CLOEXEC`)
   - `SYS_MMAP`, `SYS_MPROTECT`, `SYS_MUNMAP` (baseline userspace VM mapping path)
   - `SYS_RT_SIGACTION`, `SYS_RT_SIGPROCMASK`, `SYS_RT_SIGRETURN`, `SYS_KILL` (baseline signal path)
   - `SYS_SHMGET`, `SYS_SHMAT`, `SYS_SHMDT`, `SYS_SHMCTL` (baseline System V shared memory)
+  - `SYS_UMASK`
   - `SYS_FSTAT`, `SYS_NEWFSTATAT`, `SYS_GETDENTS64`, `SYS_UNLINKAT`, `SYS_RENAMEAT`
   - `SYS_PIPE`, `SYS_PIPE2`, `SYS_FUTEX`
   - `SYS_EXECVE` (image replacement with caller-provided `argv`/`envp`)
@@ -59,13 +61,14 @@ Limitations / Simplifications
 `kernel/src/syscall.rs` now implements a table-driven dispatcher shared by both the SYSCALL and int 0x80 paths. Arguments are normalized into a small `SyscallArgs` struct, syscall entries carry mode metadata (any task vs user task), unknown syscall logs are rate-limited, and return values use Linux-style negative errno.
 
 Current implemented handlers:
-- `open/openat/close/read/write/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
+- `open/openat/close/read/write/writev/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
 - `dup/dup2/dup3/fcntl` baseline descriptor operations (`F_GETFD`, `F_SETFD`, `F_GETFL`, `F_DUPFD`, `F_DUPFD_CLOEXEC`) with `FD_CLOEXEC`
 - `mmap/mprotect/munmap` for baseline userspace mapping management (anonymous private mappings plus private file-backed mappings from VFS fds, fixed/fixed-noreplace handling, and page-level protection changes)
 - `kill`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` for baseline signal control and user-handler return
 - `pipe/pipe2` via in-kernel anonymous pipe state and per-task fd tables
 - `futex` (`WAIT`/`WAKE` baseline ops only)
 - `shmget/shmat/shmdt/shmctl(IPC_RMID)` via baseline in-kernel System V shared-memory segments
+- `umask(mask)` baseline process umask tracking (used by userspace runtime bring-up)
 - `execve(path, argv, envp)` with in-kernel argument/environment copy, VFS-backed ELF load, and direct frame handoff to the new image entry
 - `arch_prctl(ARCH_SET_FS/ARCH_GET_FS)` with per-task FS-base tracking and scheduler restore on context switch
 - `exit(status)` and `exit_group(status)`

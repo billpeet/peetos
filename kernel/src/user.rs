@@ -24,6 +24,11 @@ const EXEC_MAX_ARGV: usize = 64;
 const EXEC_MAX_ENVP: usize = 64;
 const EXEC_MAX_INTERP_IMAGE: usize = 2 * 1024 * 1024;
 
+#[cfg(feature = "musl-ext2-exec")]
+const INIT_ARGV0: &[u8] = b"/init-ext2\0";
+#[cfg(all(not(feature = "musl-ext2-exec"), feature = "musl-smoke"))]
+const INIT_ARGV0: &[u8] = b"/bin/echo\0";
+#[cfg(all(not(feature = "musl-ext2-exec"), not(feature = "musl-smoke")))]
 const INIT_ARGV0: &[u8] = b"/init\0";
 const INIT_ENV_PATH: &[u8] = b"PATH=/bin\0";
 const INIT_ENV_TERM: &[u8] = b"TERM=peetos\0";
@@ -51,7 +56,12 @@ const EINVAL: i64 = 22;
 const E2BIG: i64 = 7;
 const EACCES: i64 = 13;
 
-static HELLO_DYN_ELF: &[u8] = include_bytes!("../../user/hello_dyn.elf");
+#[cfg(feature = "musl-ext2-exec")]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2.elf");
+#[cfg(all(not(feature = "musl-ext2-exec"), feature = "musl-smoke"))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
+#[cfg(all(not(feature = "musl-ext2-exec"), not(feature = "musl-smoke")))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/hello_dyn.elf");
 static LD_PEETOS_SO: &[u8] = include_bytes!("../../user/ld-peetos.so");
 
 #[derive(Clone, Copy)]
@@ -678,6 +688,11 @@ fn populate_user_stack<const ARGC: usize, const ENVC: usize, const AUXC: usize>(
 
 pub fn spawn_init() {
     serial_println!("[USER] Setting up initial user task...");
+    if cfg!(feature = "musl-ext2-exec") {
+        serial_println!("[USER] musl-ext2-exec init image selected");
+    } else if cfg!(feature = "musl-smoke") {
+        serial_println!("[USER] musl-smoke init image selected");
+    }
 
     let pml4 = vmm::create_address_space();
     if pml4.as_u64() == 0 {
@@ -685,10 +700,10 @@ pub fn spawn_init() {
         return;
     }
 
-    let mut elf_result = if elf::is_dynamic(HELLO_DYN_ELF) {
-        elf::load_at(HELLO_DYN_ELF, pml4, INIT_LOAD_BASE)
+    let mut elf_result = if elf::is_dynamic(INIT_ELF) {
+        elf::load_at(INIT_ELF, pml4, INIT_LOAD_BASE)
     } else {
-        elf::load(HELLO_DYN_ELF, pml4)
+        elf::load(INIT_ELF, pml4)
     };
     if !elf_result.success {
         serial_println!("[USER] ERROR: failed to load init ELF");
@@ -746,6 +761,23 @@ pub fn spawn_init() {
         (AT_RANDOM, 0),
         (AT_EXECFN, 0),
     ];
+    #[cfg(all(feature = "musl-smoke", not(feature = "musl-ext2-exec")))]
+    let stack_plan = match populate_user_stack::<3, 2, 13>(
+        pml4,
+        stack_bottom,
+        stack_top,
+        [INIT_ARGV0, b"hello\0", b"from-musl\0"],
+        [INIT_ENV_PATH, INIT_ENV_TERM],
+        auxv,
+    ) {
+        Some(plan) => plan,
+        None => {
+            serial_println!("[USER] ERROR: failed to build user stack");
+            free_address_space(pml4);
+            return;
+        }
+    };
+    #[cfg(any(feature = "musl-ext2-exec", not(feature = "musl-smoke")))]
     let stack_plan = match populate_user_stack::<1, 2, 13>(
         pml4,
         stack_bottom,

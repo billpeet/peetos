@@ -1,4 +1,14 @@
 /build
 /target
+/musl/musl-src
+/musl/sysroot
+/musl/musl-*.tar.gz
+/toybox/toybox-src
+/toybox/out
+/toybox/toybox-*.tar.gz
+/user/musl_echo.elf
+/user/musl_execve_ext2.elf
+/user/toybox_echo.elf
+/user/sample_ext2_musl.img
 *.img
 !user/sample_ext2.img

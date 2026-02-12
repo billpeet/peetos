@@ -11,4 +11,6 @@ fs = { path = "../crates/fs" }
 [features]
 default = []
 test-exit = []
+musl-smoke = []
+musl-ext2-exec = []
 vga = []

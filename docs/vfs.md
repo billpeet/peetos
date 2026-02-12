@@ -20,7 +20,8 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
   - `mount_ext2_image(path, image)` parses a raw ext2 image and imports files/dirs as ext2-backed VFS nodes.
   - The mounted ext2 image is kept as mutable fs state, and `export_ext2_image(out)` can snapshot the current mutated image bytes.
   - Kernel init first attempts to load ext2 from discovered block devices (`kernel/src/block.rs`).
-  - Host-side fs tests use `user/sample_ext2.img`; current bare-metal kernel builds do not embed that sample fallback image.
+  - Host-side fs tests use `user/sample_ext2.img`; current bare-metal kernel builds do not embed that sample fallback image by default.
+  - A feature-gated runtime smoke path (`KERNEL_FEATURES=musl-ext2-exec`) embeds `user/sample_ext2_musl.img` so `/mnt/ext2/bin/echo` can be used for end-to-end `execve` validation.
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
   - `mkdir`/`mkdirat`
@@ -52,6 +53,7 @@ On initialization, the kernel creates:
 - ext2 behavior:
   - Imported files/directories support baseline mutable regular-file and directory operations (`read`, `write`, `truncate`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`) through the existing VFS file APIs.
   - Ext2 reads/writes operate on ext2 inode/data structures in the mounted image (not copied tmpfs file blobs), and size/offset tracking follows ext2 inode state.
+  - Logical-block reads now resolve direct and single/double/triple-indirect ext2 inode block pointers.
   - `create`/`mkdir` allocate ext2 inodes/blocks, update inode/block bitmaps and free counters, and insert directory entries in parent directories.
   - inode metadata (`mode`, `uid`, `gid`, link count, basic timestamps) is tracked and surfaced via `stat` paths.
   - `/proc/mounts` reports ext2 as `rw` when mounted.
@@ -83,7 +85,8 @@ Limitations / Simplifications
 - `rename` currently behaves as no-replace (`EEXIST` if destination exists) rather than full Linux overwrite semantics.
 - Hard links and symbolic links are not implemented yet.
 - Console input path is baseline-only: canonical line mode with basic backspace editing and newline commit; no `termios`, raw mode, job control, or pty support.
-- ext2 importer is intentionally minimal: regular files/directories only, direct data blocks only (no indirect blocks), no journal/recovery, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`.
+- ext2 importer is intentionally minimal: regular files/directories only, no journal/recovery, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`. Indirect-block pointer traversal is implemented for reads; indirect-block allocation/writes are not yet implemented.
 - Block-backed ext2 sync is currently best-effort and coarse-grained (export whole mounted image and write it back), with no journal, crash-consistency protocol, or batched/page-cache flush policy.
 - ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.
 - Bare-metal kernel builds currently skip embedding the sample ext2 fallback image to stay within stage2 low-memory kernel staging limits.
+- Feature-gated ext2 embedding for runtime smoke (`musl-ext2-exec`) is intended for debugging and may need image-size tuning if kernel staging-window limits are hit.

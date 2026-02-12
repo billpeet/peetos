@@ -16,6 +16,9 @@ ENTRY_OBJ  := $(BUILD_DIR)/entry.o
 USER_OBJ   := $(BUILD_DIR)/user_hello.o
 USER_DYN_OBJ := $(BUILD_DIR)/user_hello_dyn.o
 USER_INTERP_OBJ := $(BUILD_DIR)/user_ld_peetos.o
+USER_MUSL_SMOKE_ELF := user/musl_echo.elf
+USER_MUSL_EXT2_INIT_ELF := user/musl_execve_ext2.elf
+USER_EXT2_MUSL_IMG := user/sample_ext2_musl.img
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 KERNEL_BIN := $(BUILD_DIR)/kernel.bin
@@ -27,6 +30,9 @@ USER_ASM   := user/hello.asm
 USER_DYN_ASM := user/hello_dyn.asm
 USER_INTERP_ASM := user/ld_peetos.asm
 USER_EXT2_SCRIPT := scripts/build_ext2_sample.sh
+USER_MUSL_SMOKE_SCRIPT := scripts/build_musl_echo.sh
+USER_EXT2_MUSL_SCRIPT := scripts/build_ext2_musl_execve.sh
+USER_TOYBOX_ECHO_SCRIPT := scripts/build_toybox_echo.sh
 
 PROFILE ?= release
 ifeq ($(PROFILE),release)
@@ -56,7 +62,9 @@ else
 CARGO_FEATURES :=
 endif
 
-.PHONY: all image bootloader kernel user clean run test ext2-image
+.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec clean run test ext2-image \
+	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
+	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info
 
 all: image
 
@@ -100,9 +108,33 @@ $(USER_INTERP_SO): $(USER_INTERP_ASM) | $(BUILD_DIR)
 $(USER_EXT2_IMG):
 	$(USER_EXT2_SCRIPT)
 
+$(USER_MUSL_SMOKE_ELF): user/musl_echo.c $(USER_MUSL_SMOKE_SCRIPT)
+	$(USER_MUSL_SMOKE_SCRIPT)
+
+$(USER_MUSL_EXT2_INIT_ELF): user/musl_execve_ext2.c $(USER_MUSL_SMOKE_SCRIPT)
+	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
+
+$(USER_EXT2_MUSL_IMG): $(USER_EXT2_MUSL_SCRIPT) $(USER_TOYBOX_ECHO_SCRIPT) toybox/Makefile toybox/fetch-toybox.sh toybox/configs/echo-only.config user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt
+	$(USER_EXT2_MUSL_SCRIPT)
+
+ifneq ($(findstring musl-smoke,$(KERNEL_FEATURES)),)
+KERNEL_MUSL_SMOKE_DEP := $(USER_MUSL_SMOKE_ELF)
+else
+KERNEL_MUSL_SMOKE_DEP :=
+endif
+
+ifneq ($(findstring musl-ext2-exec,$(KERNEL_FEATURES)),)
+KERNEL_MUSL_EXT2_EXEC_DEP := $(USER_MUSL_EXT2_INIT_ELF) $(USER_EXT2_MUSL_IMG)
+else
+KERNEL_MUSL_EXT2_EXEC_DEP :=
+endif
+
 user: $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG)
 
-kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG)
+user-musl-smoke: $(USER_MUSL_SMOKE_ELF)
+user-musl-ext2-exec: $(USER_MUSL_EXT2_INIT_ELF) $(USER_EXT2_MUSL_IMG)
+
+kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@cp $(KERNEL_TARGET) $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
@@ -133,6 +165,50 @@ test:
 
 ext2-image: $(USER_EXT2_SCRIPT) user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt
 	$(USER_EXT2_SCRIPT)
+
+# ---------------------------------------------------------------------------
+# musl user-space runtime bootstrap (stage 9 prep)
+# ---------------------------------------------------------------------------
+
+musl-fetch:
+	$(MAKE) -C musl fetch
+
+musl-configure:
+	$(MAKE) -C musl configure
+
+musl:
+	$(MAKE) -C musl all
+
+musl-clean:
+	$(MAKE) -C musl clean
+
+musl-distclean:
+	$(MAKE) -C musl distclean
+
+musl-info:
+	$(MAKE) -C musl info
+
+# ---------------------------------------------------------------------------
+# toybox userspace staging (stage 9 prep)
+# ---------------------------------------------------------------------------
+
+toybox-fetch:
+	$(MAKE) -C toybox fetch
+
+toybox-configure:
+	$(MAKE) -C toybox configure
+
+toybox:
+	$(MAKE) -C toybox all
+
+toybox-clean:
+	$(MAKE) -C toybox clean
+
+toybox-distclean:
+	$(MAKE) -C toybox distclean
+
+toybox-info:
+	$(MAKE) -C toybox info
 
 clean:
 	@rm -rf $(BUILD_DIR)

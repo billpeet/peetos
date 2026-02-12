@@ -20,11 +20,13 @@ Key references in the C project:
 - `boot/` Reused stage1 and stage2 bootloader assembly.
 - `kernel/` Rust kernel binary crate.
 - `crates/` Subsystem crates (`arch_x86_64`, `fs`, and now `drivers` for baseline PCI enumeration are active; `net`, `syscall`, and `userabi` remain placeholders).
+- `musl/` Stage-9 musl source/bootstrap build glue for user-space runtime bring-up.
+- `toybox/` Stage-9 toybox source/bootstrap build glue for staged userspace utilities.
 - `linker/` Linker script for the kernel.
 - `docs/PORTING_PLAN.md` High-level implementation roadmap.
 - `docs/` Implementation docs grouped by subsystem, each with a limitations/simplifications section.
 
-## Current Status (Last reviewed: 2026-02-11)
+## Current Status (Last reviewed: 2026-02-12)
 
 - Boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a `hlt` loop.
 - Panic handler prints over serial, then halts with `cli; hlt`.
@@ -33,7 +35,7 @@ Key references in the C project:
 - Kernel tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption) with a minimal user-mode task loaded from an embedded ELF.
 - ELF loading is now hardened with stricter header/segment validation (alignment checks, malformed `PT_INTERP` rejection, RWX-segment rejection, entrypoint-in-exec checks), and NXE is enabled so non-executable mappings are effective.
 - Dynamic user bootstrap now works for a minimal `PT_INTERP` flow: a PIE main image is loaded, its interpreter (`/lib/ld-peetos.so`) is mapped, and first user RIP starts in the interpreter with `AT_ENTRY`/`AT_BASE` set.
-- Syscall dispatch now uses a table-driven Linux-numbered stage-4/6 baseline (`open`, `openat`, `mkdirat`, `close`, `read`, `write`, `lseek`, `fstat`, `newfstatat`, `getdents64`, `unlinkat`, `renameat`, `mmap`, `mprotect`, `munmap`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `kill`, `pipe`, `pipe2`, `futex`, `shmget`, `shmat`, `shmdt`, `shmctl`, `execve`, `exit`, `exit_group`, `yield`, `getpid`, `getppid`, `arch_prctl`, `gettid`, `set_tid_address`, `brk`) with shared SYSCALL/int80 argument handling and per-task user metadata (`brk`, stack bounds, argv/envp/auxv pointers, ELF PHDR info, FS-base TLS state, FD table state, cwd inode).
+- Syscall dispatch now uses a table-driven Linux-numbered stage-4/6 baseline (`open`, `openat`, `mkdirat`, `close`, `read`, `write`, `writev`, `lseek`, `fstat`, `newfstatat`, `getdents64`, `unlinkat`, `renameat`, `mmap`, `mprotect`, `munmap`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `kill`, `pipe`, `pipe2`, `futex`, `shmget`, `shmat`, `shmdt`, `shmctl`, `umask`, `execve`, `exit`, `exit_group`, `yield`, `getpid`, `getppid`, `arch_prctl`, `gettid`, `set_tid_address`, `brk`) with shared SYSCALL/int80 argument handling and per-task user metadata (`brk`, stack bounds, argv/envp/auxv pointers, ELF PHDR info, FS-base TLS state, FD table state, cwd inode).
 - Dynamic-linker prep is now expanded: baseline VM mapping syscalls (`mmap`/`mprotect`/`munmap`) support private anonymous and private file-backed mappings from VFS fds for userspace loaders.
 - Phase-6 IPC/sync baseline is now present in-kernel: `SpinLock`/`Mutex`/`Semaphore`, anonymous pipes backed by in-kernel ring buffers, baseline System V-style shared memory segments, futex wait/wake keying used by `SYS_FUTEX` and `clear_child_tid` wake-on-exit, plus user-handler signal delivery (`kill` + `rt_sigaction` + `rt_sigprocmask` + `rt_sigreturn`, `SA_RESTORER`-based handler entry/return, and `SIGPIPE` generation on broken pipes).
 - Initial user bootstrap builds a conventional process stack (`argc`, `argv`, `envp`, `auxv`), now including baseline identity/random auxv entries (`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`/`AT_SECURE`/`AT_RANDOM`/`AT_EXECFN`); `execve` replaces the current image with caller-provided `argv`/`envp` vectors while preserving task identity and fd table state.
@@ -41,6 +43,7 @@ Key references in the C project:
 - Phase-7 PCI enumeration is active in `crates/drivers` (config mechanism #1, bus/device/function scan, bounded boot-time serial inventory output), and ATA/AHCI bring-up now includes AHCI command-engine setup/teardown, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write commands behind the kernel block API, ATA PIO `IDENTIFY`, and a minimal in-kernel block-device inventory.
 - Baseline keyboard/TTY input is now wired in-kernel: PS/2 IRQ1 set-1 scancode decode feeds a canonical line-buffered console input path used by user `read` on stdio.
 - Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, and basic pixel/clear primitives.
+- Stage-9 userspace bootstrap plumbing is now present: musl source/sysroot build (`make musl-fetch`, `make musl-configure`, `make musl`) and toybox staging (`make toybox-fetch`, `make toybox`) with `echo` integrated into the ext2 `execve` smoke path.
 - Remaining placeholder crates are `net`, `syscall`, and `userabi`; advanced device drivers and full user space are still pending.
 
 ## Documentation
@@ -57,6 +60,8 @@ Key references in the C project:
 - `docs/framebuffer.md` Framebuffer boot handoff, mapping assumptions, and drawing primitives.
 - `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.
 - `docs/subsystems.md` Subsystem crate status and intended usage.
+- `docs/musl.md` Stage-9 musl bootstrap workflow and current limitations.
+- `docs/toybox.md` Stage-9 toybox bootstrap workflow and current limitations.
 
 ## Build Prerequisites
 
@@ -69,6 +74,7 @@ Optional but commonly required:
 
 - `rust-src` component if you need to rebuild `core` for a target.
 - `mke2fs` (`e2fsprogs`) if you want to regenerate `user/sample_ext2.img`.
+- `curl` or `wget` if you want to fetch musl/toybox source via `make musl-fetch` or `make toybox-fetch`.
 
 ## Build
 
@@ -95,6 +101,41 @@ Regenerate the sample ext2 filesystem image used by host-side fs tests:
 ```bash
 make ext2-image
 ```
+
+Bootstrap musl source/sysroot for PeetOS user-space work:
+
+```bash
+make musl-fetch
+make musl-configure
+make musl
+```
+
+Bootstrap toybox source and build the staged `echo` utility:
+
+```bash
+make toybox-fetch
+make toybox
+```
+
+Boot a musl-linked runtime smoke program (`echo`-style static binary) as the initial user task:
+
+```bash
+make musl
+make image PROFILE=debug KERNEL_FEATURES=musl-smoke
+timeout 8s qemu-system-x86_64 -drive format=raw,file=build/peetos.img -serial stdio -display none -no-reboot -no-shutdown
+```
+
+Boot a musl launcher that performs `execve("/mnt/ext2/bin/echo", ...)` to exercise the ext2 exec path:
+
+```bash
+make musl
+make toybox
+make image PROFILE=release KERNEL_FEATURES=musl-ext2-exec
+timeout 8s qemu-system-x86_64 -drive format=raw,file=build/peetos.img -serial stdio -display none -no-reboot -no-shutdown
+```
+
+Expected serial output includes `hello from-ext2` when the ext2 `execve` handoff succeeds.
+Note: `PROFILE=debug` may exceed the current stage2 low-memory kernel staging window for this feature set.
 
 ## Testing
 

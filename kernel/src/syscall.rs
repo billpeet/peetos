@@ -1,6 +1,7 @@
 use core::cmp;
 use core::mem::{size_of, MaybeUninit};
 use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
 use arch_x86_64::idt::InterruptFrame;
@@ -64,6 +65,7 @@ const SYS_MUNMAP: u64 = 11;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_RT_SIGRETURN: u64 = 15;
+const SYS_WRITEV: u64 = 20;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
 const SYS_BRK: u64 = 12;
@@ -73,6 +75,7 @@ const SYS_SHMGET: u64 = 29;
 const SYS_SHMAT: u64 = 30;
 const SYS_SHMCTL: u64 = 31;
 const SYS_FCNTL: u64 = 72;
+const SYS_UMASK: u64 = 95;
 const SYS_GETPID: u64 = 39;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -130,6 +133,7 @@ const MMAP_STACK_GUARD: u64 = 0x0020_0000;
 
 const WRITE_CHUNK_SIZE: usize = 128;
 const READ_CHUNK_SIZE: usize = 128;
+const WRITE_IOV_MAX: usize = 1024;
 const UNKNOWN_SYSCALL_LOG_LIMIT: u32 = 8;
 const CLEAR_TID_SIZE: usize = 4;
 const EXEC_MAX_ARGV: usize = 64;
@@ -140,6 +144,7 @@ const SIGNAL_FRAME_MAGIC_SYSCALL: u64 = 0x5352_4653_5953_0001;
 const SIGNAL_FRAME_MAGIC_INT80: u64 = 0x5352_4649_3830_0001;
 
 static mut UNKNOWN_SYSCALL_LOG_COUNT: u32 = 0;
+static PROCESS_UMASK: AtomicU32 = AtomicU32::new(0o022);
 
 #[derive(Clone, Copy)]
 struct SyscallArgs {
@@ -266,6 +271,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_rt_sigreturn,
     ),
+    syscall_def(SYS_WRITEV, "writev", SyscallMode::UserTask, sys_writev),
     syscall_def(SYS_DUP, "dup", SyscallMode::UserTask, sys_dup),
     syscall_def(SYS_DUP2, "dup2", SyscallMode::UserTask, sys_dup2),
     syscall_def(SYS_PIPE, "pipe", SyscallMode::UserTask, sys_pipe),
@@ -278,6 +284,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_EXECVE, "execve", SyscallMode::UserTask, sys_execve),
     syscall_def(SYS_KILL, "kill", SyscallMode::UserTask, sys_kill),
     syscall_def(SYS_SHMDT, "shmdt", SyscallMode::UserTask, sys_shmdt),
+    syscall_def(SYS_UMASK, "umask", SyscallMode::UserTask, sys_umask),
     syscall_def(SYS_GETPPID, "getppid", SyscallMode::AnyTask, sys_getppid),
     syscall_def(SYS_FCNTL, "fcntl", SyscallMode::UserTask, sys_fcntl),
     syscall_def(
@@ -682,6 +689,13 @@ struct LinuxStat {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct LinuxIovec {
+    iov_base: u64,
+    iov_len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LinuxSigAction {
     sa_handler: u64,
     sa_flags: u64,
@@ -1071,10 +1085,41 @@ fn execve_common(
         return Err(-EINVAL);
     }
 
-    let mut argv_buf = [ExecCString::EMPTY; EXEC_MAX_ARGV];
-    let argc = read_exec_cstr_vector(ctx.current, argv_ptr, &mut argv_buf)?;
-    let mut env_buf = [ExecCString::EMPTY; EXEC_MAX_ENVP];
-    let envc = read_exec_cstr_vector(ctx.current, envp_ptr, &mut env_buf)?;
+    let argv_buf_size = size_of::<ExecCString>() * EXEC_MAX_ARGV;
+    let argv_buf_ptr = heap::kmalloc(argv_buf_size) as *mut ExecCString;
+    if argv_buf_ptr.is_null() {
+        return Err(-ENOMEM);
+    }
+    unsafe {
+        ptr::write_bytes(argv_buf_ptr as *mut u8, 0, argv_buf_size);
+    }
+    let argv_buf = unsafe { core::slice::from_raw_parts_mut(argv_buf_ptr, EXEC_MAX_ARGV) };
+    let argc = match read_exec_cstr_vector(ctx.current, argv_ptr, argv_buf) {
+        Ok(argc) => argc,
+        Err(err) => {
+            heap::kfree(argv_buf_ptr as *mut u8);
+            return Err(err);
+        }
+    };
+
+    let env_buf_size = size_of::<ExecCString>() * EXEC_MAX_ENVP;
+    let env_buf_ptr = heap::kmalloc(env_buf_size) as *mut ExecCString;
+    if env_buf_ptr.is_null() {
+        heap::kfree(argv_buf_ptr as *mut u8);
+        return Err(-ENOMEM);
+    }
+    unsafe {
+        ptr::write_bytes(env_buf_ptr as *mut u8, 0, env_buf_size);
+    }
+    let env_buf = unsafe { core::slice::from_raw_parts_mut(env_buf_ptr, EXEC_MAX_ENVP) };
+    let envc = match read_exec_cstr_vector(ctx.current, envp_ptr, env_buf) {
+        Ok(envc) => envc,
+        Err(err) => {
+            heap::kfree(env_buf_ptr as *mut u8);
+            heap::kfree(argv_buf_ptr as *mut u8);
+            return Err(err);
+        }
+    };
 
     let mut argv = [&[][..]; EXEC_MAX_ARGV];
     for idx in 0..argc {
@@ -1087,11 +1132,20 @@ fn execve_common(
 
     let dir_inode = resolve_dir_for_path(ctx, fs::AT_FDCWD, path)?;
     let inode = fs::lookupat(dir_inode, path).map_err(|err| -fs_to_errno(err))?;
-    let image = read_exec_image_from_inode(inode)?;
+    let image = match read_exec_image_from_inode(inode) {
+        Ok(image) => image,
+        Err(err) => {
+            heap::kfree(env_buf_ptr as *mut u8);
+            heap::kfree(argv_buf_ptr as *mut u8);
+            return Err(err);
+        }
+    };
     let execfn_len = path.len();
     path_buf[execfn_len] = 0;
     let execfn = &path_buf[..execfn_len + 1];
     let result = user::exec_current_image(image.as_slice(), &argv[..argc], &env[..envc], execfn);
+    heap::kfree(env_buf_ptr as *mut u8);
+    heap::kfree(argv_buf_ptr as *mut u8);
     heap::kfree(image.ptr);
     if result.is_ok() {
         close_cloexec_fds(ctx.current);
@@ -2379,38 +2433,28 @@ fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     read_total as i64
 }
 
-fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
-    let fd = call.arg(0) as i32;
-    let idx = match fd_index(fd) {
-        Ok(idx) => idx,
-        Err(err) => return err,
-    };
-
-    if !fd_slot_is_open(ctx.current, idx) {
-        return -EBADF;
-    }
-
-    let len = match usize::try_from(call.arg(2)) {
-        Ok(v) => v,
-        Err(_) => return -EINVAL,
-    };
+fn write_from_user_fd(
+    ctx: &SyscallContext,
+    idx: usize,
+    user_src: u64,
+    len: usize,
+    wrote_vfs: &mut bool,
+) -> Result<usize, i64> {
     if len == 0 {
-        return 0;
+        return Ok(0);
     }
-
     let mut chunk = [0u8; WRITE_CHUNK_SIZE];
     let mut written = 0usize;
-    let mut wrote_vfs = false;
 
     while written < len {
         let take = cmp::min(chunk.len(), len - written);
-        let src = call.arg(1) + written as u64;
+        let src = user_src + written as u64;
         let copy_res = copy_from_user_task(ctx.current, src, &mut chunk[..take]);
         if let Err(err) = copy_res {
             if written > 0 {
-                return written as i64;
+                return Ok(written);
             }
-            return -err;
+            return Err(-err);
         }
 
         let (kind, inode, offset, flags) = unsafe {
@@ -2423,7 +2467,10 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         };
 
         if !fd_can_write(flags) {
-            return -EBADF;
+            if written > 0 {
+                return Ok(written);
+            }
+            return Err(-EBADF);
         }
 
         if kind == task::USER_FD_KIND_CONSOLE {
@@ -2441,9 +2488,9 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 Ok(result) => result,
                 Err(err) => {
                     if written > 0 {
-                        return written as i64;
+                        return Ok(written);
                     }
-                    return -fs_to_errno(err);
+                    return Err(-fs_to_errno(err));
                 }
             };
 
@@ -2455,7 +2502,7 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 (*ctx.current).user_fd_offset[idx] = write_res.new_offset;
             }
             if write_res.written > 0 {
-                wrote_vfs = true;
+                *wrote_vfs = true;
             }
             written += write_res.written;
             continue;
@@ -2469,9 +2516,9 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                         let _ = signal::send(ctx.current, signal::SIGPIPE);
                     }
                     if written > 0 {
-                        return written as i64;
+                        return Ok(written);
                     }
-                    return -ipc_to_errno(err);
+                    return Err(-ipc_to_errno(err));
                 }
             };
             if wrote == 0 {
@@ -2484,14 +2531,108 @@ fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             continue;
         }
 
+        if written > 0 {
+            return Ok(written);
+        }
+        return Err(-EBADF);
+    }
+
+    Ok(written)
+}
+
+fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+
+    if !fd_slot_is_open(ctx.current, idx) {
         return -EBADF;
     }
+
+    let len = match usize::try_from(call.arg(2)) {
+        Ok(v) => v,
+        Err(_) => return -EINVAL,
+    };
+
+    let mut wrote_vfs = false;
+    let written = match write_from_user_fd(ctx, idx, call.arg(1), len, &mut wrote_vfs) {
+        Ok(n) => n,
+        Err(err) => return err,
+    };
 
     if wrote_vfs && written > 0 {
         sync_ext2_backing();
     }
 
     written as i64
+}
+
+fn sys_writev(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let iovcnt = call.arg(2);
+    if iovcnt > WRITE_IOV_MAX as u64 {
+        return -EINVAL;
+    }
+
+    let mut total = 0usize;
+    let mut wrote_vfs = false;
+    let iov_ptr = call.arg(1);
+
+    for i in 0..(iovcnt as usize) {
+        let entry_ptr = iov_ptr + (i * size_of::<LinuxIovec>()) as u64;
+        let iov = match read_struct_from_user::<LinuxIovec>(ctx.current, entry_ptr) {
+            Ok(v) => v,
+            Err(err) => {
+                if total > 0 {
+                    break;
+                }
+                return -err;
+            }
+        };
+
+        let len = match usize::try_from(iov.iov_len) {
+            Ok(v) => v,
+            Err(_) => return -EINVAL,
+        };
+        if len == 0 {
+            continue;
+        }
+        if total > (i64::MAX as usize).saturating_sub(len) {
+            return -EINVAL;
+        }
+
+        let wrote = match write_from_user_fd(ctx, idx, iov.iov_base, len, &mut wrote_vfs) {
+            Ok(n) => n,
+            Err(err) => {
+                if total > 0 {
+                    break;
+                }
+                return err;
+            }
+        };
+
+        total += wrote;
+        if wrote < len {
+            break;
+        }
+    }
+
+    if wrote_vfs && total > 0 {
+        sync_ext2_backing();
+    }
+
+    total as i64
 }
 
 fn sys_lseek(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -2543,6 +2684,12 @@ fn sys_getpid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
         Ok(pid) => pid,
         Err(err) => err,
     }
+}
+
+fn sys_umask(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let new_mask = (call.arg(0) as u32) & 0o777;
+    let old = PROCESS_UMASK.swap(new_mask, Ordering::Relaxed);
+    old as i64
 }
 
 fn sys_execve(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -2888,6 +3035,25 @@ fn dispatch_syscall(call: SyscallArgs) -> i64 {
     (def.handler)(&ctx, &call)
 }
 
+#[inline]
+fn log_execve_result(result: &Result<user::ExecImageStart, i64>) {
+    if !cfg!(feature = "musl-ext2-exec") {
+        return;
+    }
+    match result {
+        Ok(start) => {
+            sys_log!(
+                "[SYSCALL] execve ok entry=0x{:x} rsp=0x{:x}",
+                start.entry_rip,
+                start.stack_ptr
+            );
+        }
+        Err(err) => {
+            sys_log!("[SYSCALL] execve err {}", err);
+        }
+    }
+}
+
 fn call_from_syscall_frame(frame: &SyscallFrame) -> SyscallArgs {
     SyscallArgs {
         num: frame.rax,
@@ -2932,7 +3098,9 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
         if !ctx.is_user_task() {
             return to_sysret(-EPERM);
         }
-        match execve_common(&ctx, frame.rdi, frame.rsi, frame.rdx) {
+        let exec_result = execve_common(&ctx, frame.rdi, frame.rsi, frame.rdx);
+        log_execve_result(&exec_result);
+        match exec_result {
             Ok(exec_start) => {
                 frame.rax = 0;
                 frame.rcx = exec_start.entry_rip;
@@ -2979,7 +3147,9 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
         frame.rax = if !ctx.is_user_task() {
             to_sysret(-EPERM)
         } else {
-            match execve_common(&ctx, frame.rdi, frame.rsi, frame.rdx) {
+            let exec_result = execve_common(&ctx, frame.rdi, frame.rsi, frame.rdx);
+            log_execve_result(&exec_result);
+            match exec_result {
                 Ok(exec_start) => {
                     frame.rip = exec_start.entry_rip;
                     frame.rsp = exec_start.stack_ptr;
@@ -3048,6 +3218,7 @@ mod tests {
             lookup_syscall(SYS_RT_SIGRETURN).map(|d| d.name),
             Some("rt_sigreturn")
         );
+        assert_eq!(lookup_syscall(SYS_WRITEV).map(|d| d.name), Some("writev"));
         assert_eq!(lookup_syscall(SYS_DUP).map(|d| d.name), Some("dup"));
         assert_eq!(lookup_syscall(SYS_DUP2).map(|d| d.name), Some("dup2"));
         assert_eq!(lookup_syscall(SYS_FCNTL).map(|d| d.name), Some("fcntl"));
@@ -3055,6 +3226,7 @@ mod tests {
         assert_eq!(lookup_syscall(SYS_SHMAT).map(|d| d.name), Some("shmat"));
         assert_eq!(lookup_syscall(SYS_SHMDT).map(|d| d.name), Some("shmdt"));
         assert_eq!(lookup_syscall(SYS_SHMCTL).map(|d| d.name), Some("shmctl"));
+        assert_eq!(lookup_syscall(SYS_UMASK).map(|d| d.name), Some("umask"));
         assert_eq!(lookup_syscall(SYS_MKDIRAT).map(|d| d.name), Some("mkdirat"));
         assert_eq!(lookup_syscall(SYS_FUTEX).map(|d| d.name), Some("futex"));
         assert_eq!(
