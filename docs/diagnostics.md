@@ -11,13 +11,14 @@ This document covers serial output, exception reporting, and test-only QEMU exit
 
 **Serial Console**
 The serial console is configured for COM1 (`0x3F8`) at 38400 baud with 8N1 framing. Output is synchronous and translates `\n` to CRLF. Macros `serial_print!` and `serial_println!` wrap the formatter.
+When framebuffer mode is active, serial bytes are also mirrored into a simple on-screen text grid (`kernel/src/fb_console.rs`) so output is visible in the QEMU display window.
 
 Limitations / Simplifications
 - Busy-wait transmit loop; no interrupts or buffering.
 - No serial RX input path, flow control, or log levels.
 - No locking for concurrent writers.
 
-Keyboard-backed console input is now provided separately via the phase-7 PS/2 + TTY path (`kernel/src/keyboard.rs` + `kernel/src/tty.rs`), with typed bytes echoed to serial output.
+Keyboard-backed console input is now provided separately via the phase-7 PS/2 + TTY path (`kernel/src/keyboard.rs` + `kernel/src/tty.rs`), with typed bytes echoed through the same serial path (and therefore mirrored to framebuffer when available).
 
 **Exception Reporting**
 `kernel/src/exception.rs` prints a register dump and decodes page fault error codes. For page faults, it reads CR2 and prints the access type, privilege level, and present/reserved bits. Optional VGA printing exists behind the `vga` feature.

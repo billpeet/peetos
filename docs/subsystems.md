@@ -10,7 +10,7 @@ This document summarizes subsystem crates. `fs` and `drivers` now contain active
 - `crates/fs`
 
 **Current State**
-- `crates/fs` now provides a no-std baseline VFS core (concrete tmpfs + virtual `devfs`/`procfs` + ext2 image import/mount/mutate support) used by kernel syscall dispatch (`open`/`openat`/`close`/`read`/`write`/`lseek`/`mkdirat`/`fstat`/`newfstatat`/`getdents64`/`unlinkat`/`renameat`), with kernel-side glue now mounting ext2 from the block layer when available and syncing ext2 image mutations back through block I/O.
+- `crates/fs` now provides a no-std baseline VFS core (concrete tmpfs + virtual `devfs`/`procfs` + ext2 image import/mount/mutate support) used by kernel syscall dispatch (`open`/`openat`/`close`/`read`/`write`/`lseek`/`mkdirat`/`fstat`/`newfstatat`/`getdents64`/`unlinkat`/`renameat`/`linkat`/`symlinkat`/`readlinkat`/`utimensat`), with kernel-side glue now mounting ext2 from the block layer when available and syncing ext2 image mutations back through block I/O.
 - `crates/drivers` now provides phase-7 PCI enumeration plus ATA/AHCI protocol support (storage-class matching, IDE/AHCI classification, AHCI ABAR extraction, AHCI capability/port decode helpers, and AHCI command/FIS table layouts), with kernel bring-up using these surfaces for AHCI MMIO probing, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write commands, ATA PIO `IDENTIFY`, and block-device inventory registration.
 - `crates/net`, `crates/syscall`, and `crates/userabi` remain placeholders for later phases.
 

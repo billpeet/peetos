@@ -88,5 +88,5 @@ Limitations / Simplifications
 - Keyboard input is US-layout set-1 only; extended keys and key-repeat handling are minimal.
 - TTY is canonical-line buffered only; no `termios`, ptys, or virtual terminal switching yet.
 - Framebuffer currently assumes packed 32-bpp layout and does not yet decode VBE color masks.
-- No glyph/font renderer is wired to framebuffer yet; text output still uses serial.
+- Framebuffer text rendering is minimal: serial output is mirrored into a fixed 8x8 bitmap text grid with no ANSI/VT emulation.
 - No acceleration, double buffering, mode switching, or runtime remap support is implemented.

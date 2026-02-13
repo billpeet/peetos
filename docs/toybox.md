@@ -2,11 +2,14 @@
 
 This document tracks Stage-9 toybox staging for PeetOS userspace bring-up.
 
+Shell-focused syscall requirements and priorities are tracked separately in
+`docs/toybox_shell_syscalls.md`.
+
 ## Scope
 
 - Fetch pinned toybox source into `toybox/toybox-src`.
-- Build a minimal static toybox binary with only `echo` enabled.
-- Stage that binary into the ext2 exec smoke image at `/mnt/ext2/bin/echo`.
+- Build minimal static toybox binaries for staged applets (`echo`, `sh`) plus a shell-core multicall image.
+- Stage shell-focused payload into the ext2 exec image with Toybox `sh` launched from `/mnt/ext2/bin/toybox` and basic file utilities.
 
 ## Commands
 
@@ -14,28 +17,44 @@ This document tracks Stage-9 toybox staging for PeetOS userspace bring-up.
 make toybox-fetch
 make toybox
 make toybox-info
+scripts/build_toybox_sh.sh
+scripts/build_toybox_core.sh
+scripts/run_toybox_next_smoke.sh
 ```
 
-Build the ext2 exec smoke path that launches toybox `echo` via `execve`:
+Build the ext2 exec path that launches Toybox `sh` via `execve`:
 
 ```bash
 make musl
 make toybox
 make image PROFILE=release KERNEL_FEATURES=musl-ext2-exec
-timeout 8s qemu-system-x86_64 -drive format=raw,file=build/peetos.img -serial stdio -display none -no-reboot -no-shutdown
+qemu-system-x86_64 \
+  -drive id=disk0,file=build/peetos.img,if=none,format=raw \
+  -device ich9-ahci,id=ahci \
+  -device ide-hd,drive=disk0,bus=ahci.0 \
+  -drive id=disk1,file=user/sample_ext2_musl.img,if=none,format=raw \
+  -device ide-hd,drive=disk1,bus=ahci.1 \
+  -serial stdio -no-reboot -no-shutdown
 ```
 
-Expected serial output includes `hello from-ext2`.
+Expected serial output includes `[musl-ext2-exec] launching interactive toybox sh`.
+Use the QEMU display window for keyboard input (TTY-backed shell stdin).
 
 ## Output
 
 - Source tree: `toybox/toybox-src`
 - Built utility: `toybox/out/echo`
 - Optional copied artifact: `user/toybox_echo.elf`
+- Optional copied artifact: `user/toybox_sh.elf`
+- Optional copied artifact: `user/toybox_core.elf`
 
 ## Limitations / Simplifications
 
-- Current staging is intentionally narrow and only enables the `echo` applet.
-- The smoke path copies the toybox binary as `/bin/echo` instead of relying on symlink/hardlink applet install layouts.
-- Broader utility coverage (`ls`, `cat`, shell, etc.) and syscall-gap hardening are still pending.
+- Current smoke staging enables a narrow shell-core applet set (`sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`).
+- The ext2 smoke path installs one `/bin/toybox` multicall binary; applets are invoked as `toybox <applet>`.
+- Runtime shell/smoke commands expect `user/sample_ext2_musl.img` to be attached as a second AHCI disk in QEMU.
+- `cp`/`mv`/`ln`/`touch` are currently staged primarily for syscall-gap smoke; VFS link/metadata/time syscalls are still baseline-stubbed, so full behavior is not yet parity-complete.
+- `scripts/run_toybox_next_smoke.sh` now continues through command failures and reports both completion and a failure marker so syscall gaps can be captured in one run.
+- Broader utility coverage (`find`, `tar`, etc.) and syscall-gap hardening are still pending.
+- `make toybox` still builds the standalone `echo` staging artifact (`toybox/out/echo`); shell-core staging uses `scripts/build_toybox_core.sh`.
 - The default repository tests avoid networked toybox builds and only validate script behavior/pathing.

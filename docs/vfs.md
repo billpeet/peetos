@@ -21,7 +21,7 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
   - The mounted ext2 image is kept as mutable fs state, and `export_ext2_image(out)` can snapshot the current mutated image bytes.
   - Kernel init first attempts to load ext2 from discovered block devices (`kernel/src/block.rs`).
   - Host-side fs tests use `user/sample_ext2.img`; current bare-metal kernel builds do not embed that sample fallback image by default.
-  - A feature-gated runtime smoke path (`KERNEL_FEATURES=musl-ext2-exec`) embeds `user/sample_ext2_musl.img` so `/mnt/ext2/bin/echo` can be used for end-to-end `execve` validation.
+  - Runtime shell/smoke flows (`musl-ext2-exec`, `musl-ext2-cmd-smoke`) use `user/sample_ext2_musl.img` as a second block-backed ext2 payload so Toybox `sh` can be launched via `/mnt/ext2/bin/toybox`.
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
   - `mkdir`/`mkdirat`
@@ -31,7 +31,8 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
   - `lseek`
   - `readdir` (`getdents64`)
   - `stat`/`fstat`/`newfstatat`
-  - `unlink`/`unlinkat`, `rmdir`/`unlinkat(AT_REMOVEDIR)`, `rename`/`renameat`
+  - `unlink`/`unlinkat`, `rmdir`/`unlinkat(AT_REMOVEDIR)`, `rename`/`renameat`, `linkat`, `symlinkat`
+  - `readlinkat` (baseline `/proc/self/exe` path), `utimensat` (baseline atime/mtime)
 
 **Default Filesystem Layout**
 On initialization, the kernel creates:
@@ -45,7 +46,7 @@ On initialization, the kernel creates:
 - `devfs` behavior:
   - `/dev/null`: reads EOF, writes are discarded
   - `/dev/zero`: reads return zero bytes, writes are discarded
-  - `/dev/console`: opened as a console descriptor; kernel routes writes to serial and reads through canonical line-buffered TTY input
+  - `/dev/console`: opened as a console descriptor; kernel routes writes to serial (mirrored to framebuffer text when available) and reads through canonical line-buffered TTY input
 - `procfs` behavior:
   - `/proc/uptime` and `/proc/meminfo` are generated from runtime kernel stats
   - `/proc/mounts` is generated from the mount table and reflects mounted ext2 entries
@@ -72,9 +73,13 @@ On initialization, the kernel creates:
   - `newfstatat` (`262`)
   - `unlinkat` (`263`)
   - `renameat` (`264`)
+  - `linkat` (`265`)
+  - `symlinkat` (`266`)
+  - `readlinkat` (`267`)
+  - `utimensat` (`280`)
   - `read` (`0`)
   - `write` (`1`)
-- Mutating syscall paths (`open` with `O_CREAT`/`O_TRUNC`, `write`, `mkdirat`, `unlinkat`/`rmdirat`, `renameat`) invoke kernel-side ext2 sync when a block-backed ext2 mount is active.
+- Mutating syscall paths (`open` with `O_CREAT`/`O_TRUNC`, `write`, `mkdirat`, `unlinkat`/`rmdirat`, `renameat`, `linkat`, `symlinkat`, `utimensat`) invoke kernel-side ext2 sync when a block-backed ext2 mount is active.
 - Per-task FD tables track kind/inode/offset/flags.
 - User stdio (`fd 0/1/2`) is pre-seeded as console descriptors, and each user task tracks a cwd inode (currently rooted at `/`).
 
@@ -83,10 +88,11 @@ Limitations / Simplifications
 - Synchronization is a single global fs lock; no finer-grained inode/dentry locking yet.
 - Metadata plumbing exists (`mode`/`uid`/`gid`/timestamps), but full POSIX permission policy and ownership-changing syscalls (`chmod`/`chown`) are not implemented yet.
 - `rename` currently behaves as no-replace (`EEXIST` if destination exists) rather than full Linux overwrite semantics.
-- Hard links and symbolic links are not implemented yet.
+- Hard links are baseline-implemented (`linkat`), with ext2-backed inode links and a pragmatic tmpfs fallback.
+- Symbolic links are baseline-implemented (`symlinkat` + `readlinkat` target reads), but general symlink-follow path resolution is not implemented yet.
 - Console input path is baseline-only: canonical line mode with basic backspace editing and newline commit; no `termios`, raw mode, job control, or pty support.
 - ext2 importer is intentionally minimal: regular files/directories only, no journal/recovery, and imported file size still capped by `TMPFS_MAX_FILE_SIZE`. Indirect-block pointer traversal is implemented for reads; indirect-block allocation/writes are not yet implemented.
 - Block-backed ext2 sync is currently best-effort and coarse-grained (export whole mounted image and write it back), with no journal, crash-consistency protocol, or batched/page-cache flush policy.
 - ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.
 - Bare-metal kernel builds currently skip embedding the sample ext2 fallback image to stay within stage2 low-memory kernel staging limits.
-- Feature-gated ext2 embedding for runtime smoke (`musl-ext2-exec`) is intended for debugging and may need image-size tuning if kernel staging-window limits are hit.
+- Runtime shell/smoke flows currently require attaching `user/sample_ext2_musl.img` as a second AHCI disk in QEMU.

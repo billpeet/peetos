@@ -18,6 +18,7 @@ USER_DYN_OBJ := $(BUILD_DIR)/user_hello_dyn.o
 USER_INTERP_OBJ := $(BUILD_DIR)/user_ld_peetos.o
 USER_MUSL_SMOKE_ELF := user/musl_echo.elf
 USER_MUSL_EXT2_INIT_ELF := user/musl_execve_ext2.elf
+USER_MUSL_EXT2_SMOKE_ELF := user/musl_execve_ext2_smoke.elf
 USER_EXT2_MUSL_IMG := user/sample_ext2_musl.img
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
@@ -32,7 +33,8 @@ USER_INTERP_ASM := user/ld_peetos.asm
 USER_EXT2_SCRIPT := scripts/build_ext2_sample.sh
 USER_MUSL_SMOKE_SCRIPT := scripts/build_musl_echo.sh
 USER_EXT2_MUSL_SCRIPT := scripts/build_ext2_musl_execve.sh
-USER_TOYBOX_ECHO_SCRIPT := scripts/build_toybox_echo.sh
+USER_TOYBOX_SH_SCRIPT := scripts/build_toybox_sh.sh
+USER_TOYBOX_CORE_SCRIPT := scripts/build_toybox_core.sh
 
 PROFILE ?= release
 ifeq ($(PROFILE),release)
@@ -53,7 +55,6 @@ BOOT_CONSTANTS := boot/include/constants.inc
 ENTRY_SRC := kernel/arch/x86_64/entry.asm
 
 KERNEL_TARGET_DIR := target/x86_64-unknown-none/$(PROFILE)
-KERNEL_TARGET := $(KERNEL_TARGET_DIR)/kernel
 
 KERNEL_FEATURES ?=
 ifneq ($(strip $(KERNEL_FEATURES)),)
@@ -62,9 +63,9 @@ else
 CARGO_FEATURES :=
 endif
 
-.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec clean run test ext2-image \
+.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke clean run run-current run-image run-shell test ext2-image \
 	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
-	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info
+	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info run-shell-smoke
 
 all: image
 
@@ -114,7 +115,10 @@ $(USER_MUSL_SMOKE_ELF): user/musl_echo.c $(USER_MUSL_SMOKE_SCRIPT)
 $(USER_MUSL_EXT2_INIT_ELF): user/musl_execve_ext2.c $(USER_MUSL_SMOKE_SCRIPT)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
 
-$(USER_EXT2_MUSL_IMG): $(USER_EXT2_MUSL_SCRIPT) $(USER_TOYBOX_ECHO_SCRIPT) toybox/Makefile toybox/fetch-toybox.sh toybox/configs/echo-only.config user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt
+$(USER_MUSL_EXT2_SMOKE_ELF): user/musl_execve_ext2_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
+	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
+
+$(USER_EXT2_MUSL_IMG): $(USER_EXT2_MUSL_SCRIPT) $(USER_TOYBOX_CORE_SCRIPT) toybox/Makefile toybox/fetch-toybox.sh toybox/configs/shell-core.config user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt
 	$(USER_EXT2_MUSL_SCRIPT)
 
 ifneq ($(findstring musl-smoke,$(KERNEL_FEATURES)),)
@@ -129,14 +133,43 @@ else
 KERNEL_MUSL_EXT2_EXEC_DEP :=
 endif
 
+ifneq ($(findstring musl-ext2-cmd-smoke,$(KERNEL_FEATURES)),)
+KERNEL_MUSL_EXT2_CMD_SMOKE_DEP := $(USER_MUSL_EXT2_SMOKE_ELF) $(USER_EXT2_MUSL_IMG)
+else
+KERNEL_MUSL_EXT2_CMD_SMOKE_DEP :=
+endif
+
 user: $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG)
 
 user-musl-smoke: $(USER_MUSL_SMOKE_ELF)
 user-musl-ext2-exec: $(USER_MUSL_EXT2_INIT_ELF) $(USER_EXT2_MUSL_IMG)
+user-musl-ext2-cmd-smoke: $(USER_MUSL_EXT2_SMOKE_ELF) $(USER_EXT2_MUSL_IMG)
 
-kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP)
+kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
-	@cp $(KERNEL_TARGET) $(KERNEL_ELF)
+	@case " $(KERNEL_FEATURES) " in \
+		*" musl-ext2-cmd-smoke "*) init_dep="musl_execve_ext2_smoke.elf" ;; \
+		*" musl-ext2-exec "*) init_dep="musl_execve_ext2.elf" ;; \
+		*" musl-smoke "*) init_dep="musl_echo.elf" ;; \
+		*) init_dep="hello_dyn.elf" ;; \
+	esac; \
+	kernel_artifact=""; \
+	for depfile in $(KERNEL_TARGET_DIR)/deps/kernel-*.d; do \
+		[ -f "$$depfile" ] || continue; \
+		if ! grep -q "$$init_dep" "$$depfile"; then \
+			continue; \
+		fi; \
+		candidate="$${depfile%.d}"; \
+		[ -f "$$candidate" ] || continue; \
+		if [ -z "$$kernel_artifact" ] || [ "$$candidate" -nt "$$kernel_artifact" ]; then \
+			kernel_artifact="$$candidate"; \
+		fi; \
+	done; \
+	if [ -z "$$kernel_artifact" ]; then \
+		echo "ERROR: failed to locate kernel artifact for init dependency '$$init_dep' in $(KERNEL_TARGET_DIR)/deps"; \
+		exit 1; \
+	fi; \
+	cp "$$kernel_artifact" $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
 	@kernel_size=$$(stat -c%s $(KERNEL_BIN)); \
 	stage2_cap=$$(( $(LOW_MEM_HOLE_ADDR) - $(STAGE2_KERNEL_LOAD_ADDR) )); \
@@ -157,8 +190,37 @@ image: bootloader kernel
 	@dd if=$(KERNEL_BIN) of=$(IMAGE) bs=$(SECTOR_SIZE) seek=$(shell expr 1 + $(STAGE2_SECTORS)) conv=notrunc status=none
 	@echo "Built $(IMAGE)"
 
-run: image
+run: run-image
+
+run-current:
+	@if [ ! -f $(IMAGE) ]; then \
+		echo "ERROR: $(IMAGE) not found. Build it first with 'make image'."; \
+		exit 1; \
+	fi
 	$(QEMU) -drive format=raw,file=$(IMAGE) -serial stdio
+
+run-image: image
+	$(QEMU) -drive format=raw,file=$(IMAGE) -serial stdio
+
+run-shell:
+	$(MAKE) image PROFILE=release KERNEL_FEATURES=musl-ext2-exec
+	$(QEMU) \
+		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
+		-device ich9-ahci,id=ahci \
+		-device ide-hd,drive=disk0,bus=ahci.0 \
+		-drive id=disk1,file=$(USER_EXT2_MUSL_IMG),if=none,format=raw \
+		-device ide-hd,drive=disk1,bus=ahci.1 \
+		-serial stdio -no-reboot -no-shutdown
+
+run-shell-smoke:
+	$(MAKE) image PROFILE=release KERNEL_FEATURES=musl-ext2-cmd-smoke
+	$(QEMU) \
+		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
+		-device ich9-ahci,id=ahci \
+		-device ide-hd,drive=disk0,bus=ahci.0 \
+		-drive id=disk1,file=$(USER_EXT2_MUSL_IMG),if=none,format=raw \
+		-device ide-hd,drive=disk1,bus=ahci.1 \
+		-serial stdio -display none -no-reboot -no-shutdown
 
 test:
 	@tests/run.sh

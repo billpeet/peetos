@@ -24,13 +24,30 @@ make image PROFILE=debug KERNEL_FEATURES=musl-smoke
 timeout 8s qemu-system-x86_64 -drive format=raw,file=build/peetos.img -serial stdio -display none -no-reboot -no-shutdown
 ```
 
-`execve` ext2 smoke path (boots musl launcher, then `execve("/mnt/ext2/bin/echo", ...)`):
+Expected serial output includes `hello from-musl`.
+
+`execve` ext2 shell path (boots musl launcher, then `execve("/mnt/ext2/bin/toybox", {"sh", ...})`):
 
 ```bash
 make musl
 make toybox
 make image PROFILE=release KERNEL_FEATURES=musl-ext2-exec
-timeout 8s qemu-system-x86_64 -drive format=raw,file=build/peetos.img -serial stdio -display none -no-reboot -no-shutdown
+qemu-system-x86_64 \
+  -drive id=disk0,file=build/peetos.img,if=none,format=raw \
+  -device ich9-ahci,id=ahci \
+  -device ide-hd,drive=disk0,bus=ahci.0 \
+  -drive id=disk1,file=user/sample_ext2_musl.img,if=none,format=raw \
+  -device ide-hd,drive=disk1,bus=ahci.1 \
+  -serial stdio -no-reboot -no-shutdown
+```
+
+Expected serial output includes `[musl-ext2-exec] launching interactive toybox sh`.
+Interactive input is via the QEMU display window (PS/2 keyboard -> kernel TTY -> user stdin).
+
+Scripted command smoke path (boots a shell-script launcher and captures syscall-gap logs):
+
+```bash
+scripts/run_toybox_next_smoke.sh
 ```
 
 Common overrides:
@@ -45,11 +62,13 @@ make musl CC=clang AR=llvm-ar RANLIB=llvm-ranlib
 
 - Headers: `musl/sysroot/include`
 - Libraries/CRT objects: `musl/sysroot/lib`
-- Ext2 exec smoke payload: `/mnt/ext2/bin/echo` built from `toybox/out/echo`
+- Ext2 exec smoke payload: `/mnt/ext2/bin/toybox` (multicall applets: `sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`) used for `execve` bring-up, built via `scripts/build_toybox_core.sh`
 
 ## Limitations / Simplifications
 
 - The bootstrap currently targets `x86_64-linux-musl` rather than a dedicated upstream `x86_64-peetos` musl target.
-- This stage sets up source/build plumbing and a narrow exec smoke path only; full dynamic-linker/runtime verification in-kernel is still pending.
+- This stage sets up source/build plumbing and a narrow shell bring-up path only; full dynamic-linker/runtime verification in-kernel is still pending.
+- The shell-core utility set intentionally includes a small syscall-gap probe tier (`cp`, `mv`, `ln`, `touch`) while VFS metadata/node-creation gaps (`fchmodat`, `fchownat`, `mknodat`) are still being closed.
 - The default repository tests intentionally avoid networked musl builds and instead validate script behavior/pathing.
 - `KERNEL_FEATURES=musl-ext2-exec` currently requires `PROFILE=release` in this tree because debug kernels can exceed stage2 low-memory kernel staging limits.
+- ext2 shell runtime/smoke flows currently expect attaching `user/sample_ext2_musl.img` as a second block device in QEMU.

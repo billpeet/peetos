@@ -32,7 +32,29 @@ if [[ ! -f "${WORK_DIR}/toybox-src/Makefile" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${ROOT_DIR}/toybox/configs/shell-core.config" ]]; then
+  echo "shell-core toybox config fragment missing" >&2
+  exit 1
+fi
+
+for symbol in CONFIG_SH CONFIG_ECHO CONFIG_CAT CONFIG_LS CONFIG_MKDIR CONFIG_RM CONFIG_PWD CONFIG_CP CONFIG_MV CONFIG_LN CONFIG_TOUCH; do
+  if ! rg -q "^${symbol}=y$" "${ROOT_DIR}/toybox/configs/shell-core.config"; then
+    echo "shell-core config missing ${symbol}=y" >&2
+    exit 1
+  fi
+done
+
 if MUSL_CC="${WORK_DIR}/missing-musl-gcc" "${ROOT_DIR}/scripts/build_toybox_echo.sh" --toybox-src "${WORK_DIR}/toybox-src" >/dev/null 2>&1; then
   echo "build_toybox_echo.sh should fail when musl compiler wrapper is missing" >&2
+  exit 1
+fi
+
+if MUSL_CC="${WORK_DIR}/missing-musl-gcc" "${ROOT_DIR}/scripts/build_toybox_sh.sh" --toybox-src "${WORK_DIR}/toybox-src" >/dev/null 2>&1; then
+  echo "build_toybox_sh.sh should fail when musl compiler wrapper is missing" >&2
+  exit 1
+fi
+
+if MUSL_CC="${WORK_DIR}/missing-musl-gcc" "${ROOT_DIR}/scripts/build_toybox_core.sh" --toybox-src "${WORK_DIR}/toybox-src" >/dev/null 2>&1; then
+  echo "build_toybox_core.sh should fail when musl compiler wrapper is missing" >&2
   exit 1
 fi

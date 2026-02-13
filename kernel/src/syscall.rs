@@ -4,6 +4,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
+use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
 use arch_x86_64::pit;
 use arch_x86_64::syscall::{self as arch_syscall, SyscallFrame};
@@ -42,11 +43,14 @@ const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
 const EEXIST: i64 = 17;
 const EXDEV: i64 = 18;
+const ECHILD: i64 = 10;
 const EINVAL: i64 = 22;
+const ENOTTY: i64 = 25;
 const EMFILE: i64 = 24;
 const ESPIPE: i64 = 29;
 const EROFS: i64 = 30;
 const EPIPE: i64 = 32;
+const ERANGE: i64 = 34;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const ENOTEMPTY: i64 = 39;
@@ -57,7 +61,9 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_STAT: u64 = 4;
 const SYS_FSTAT: u64 = 5;
+const SYS_LSTAT: u64 = 6;
 const SYS_LSEEK: u64 = 8;
 const SYS_MMAP: u64 = 9;
 const SYS_MPROTECT: u64 = 10;
@@ -65,39 +71,110 @@ const SYS_MUNMAP: u64 = 11;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_RT_SIGRETURN: u64 = 15;
+const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
+const SYS_ACCESS: u64 = 21;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
+const SYS_NANOSLEEP: u64 = 35;
+const SYS_CLONE: u64 = 56;
+const SYS_FORK: u64 = 57;
+const SYS_VFORK: u64 = 58;
 const SYS_BRK: u64 = 12;
+const SYS_WAIT4: u64 = 61;
+const SYS_UNAME: u64 = 63;
 const SYS_PIPE: u64 = 22;
 const SYS_YIELD: u64 = 24;
 const SYS_SHMGET: u64 = 29;
 const SYS_SHMAT: u64 = 30;
 const SYS_SHMCTL: u64 = 31;
 const SYS_FCNTL: u64 = 72;
+const SYS_GETCWD: u64 = 79;
+const SYS_CHDIR: u64 = 80;
+const SYS_FCHDIR: u64 = 81;
+const SYS_RENAME: u64 = 82;
+const SYS_LINK: u64 = 86;
 const SYS_UMASK: u64 = 95;
+const SYS_GETTIMEOFDAY: u64 = 96;
+const SYS_GETUID: u64 = 102;
+const SYS_GETGID: u64 = 104;
+const SYS_GETEUID: u64 = 107;
+const SYS_GETEGID: u64 = 108;
+const SYS_SETPGID: u64 = 109;
 const SYS_GETPID: u64 = 39;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_KILL: u64 = 62;
 const SYS_SHMDT: u64 = 67;
 const SYS_GETPPID: u64 = 110;
+const SYS_SETSID: u64 = 112;
+const SYS_GETSID: u64 = 124;
 const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_GETTID: u64 = 186;
 const SYS_FUTEX: u64 = 202;
 const SYS_SET_TID_ADDRESS: u64 = 218;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_EXIT_GROUP: u64 = 231;
+const SYS_UTIMES: u64 = 235;
+const SYS_CLOCK_GETTIME: u64 = 228;
 const SYS_OPENAT: u64 = 257;
 const SYS_MKDIRAT: u64 = 258;
+const SYS_FCHOWNAT: u64 = 260;
+const SYS_FUTIMESAT: u64 = 261;
 const SYS_NEWFSTATAT: u64 = 262;
 const SYS_UNLINKAT: u64 = 263;
 const SYS_RENAMEAT: u64 = 264;
+const SYS_LINKAT: u64 = 265;
+const SYS_SYMLINKAT: u64 = 266;
+const SYS_READLINKAT: u64 = 267;
+const SYS_FCHMODAT: u64 = 268;
+const SYS_FACCESSAT: u64 = 269;
+const SYS_MKNODAT: u64 = 259;
+const SYS_UTIMENSAT: u64 = 280;
 const SYS_DUP3: u64 = 292;
 const SYS_PIPE2: u64 = 293;
+const SYS_COPY_FILE_RANGE: u64 = 326;
+const SYS_FACCESSAT2: u64 = 439;
 
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_EMPTY_PATH: u32 = 0x1000;
+const AT_EACCESS: u32 = 0x200;
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+const AT_SYMLINK_FOLLOW: u32 = 0x400;
+
+const F_OK: u32 = 0;
+const X_OK: u32 = 1;
+const W_OK: u32 = 2;
+const R_OK: u32 = 4;
+
+const STAT_S_IRUSR: u32 = 0o400;
+const STAT_S_IWUSR: u32 = 0o200;
+const STAT_S_IXUSR: u32 = 0o100;
+const STAT_S_IRGRP: u32 = 0o040;
+const STAT_S_IWGRP: u32 = 0o020;
+const STAT_S_IXGRP: u32 = 0o010;
+const STAT_S_IROTH: u32 = 0o004;
+const STAT_S_IWOTH: u32 = 0o002;
+const STAT_S_IXOTH: u32 = 0o001;
+
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+const WNOHANG: u32 = 0x1;
+const SIGCHLD_EXIT_SIGNAL: u64 = 17;
+const UTIME_NOW: i64 = 0x3fff_ffff;
+const UTIME_OMIT: i64 = 0x3fff_fffe;
+
+const CLONE_CSIGNAL: u64 = 0x0000_00FF;
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_VFORK: u64 = 0x0000_4000;
+
+const TIOCGWINSZ: u64 = 0x5413;
+const TIOCGPGRP: u64 = 0x540F;
+const TIOCSPGRP: u64 = 0x5410;
+const TCGETS: u64 = 0x5401;
+const TCSETS: u64 = 0x5402;
+const TCSETSW: u64 = 0x5403;
+const TCSETSF: u64 = 0x5404;
 
 const ARCH_SET_GS: u64 = 0x1001;
 const ARCH_SET_FS: u64 = 0x1002;
@@ -140,8 +217,10 @@ const EXEC_MAX_ARGV: usize = 64;
 const EXEC_MAX_ENVP: usize = 64;
 const EXEC_MAX_STR_LEN: usize = 256;
 const EXEC_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+const GETCWD_MAX_DEPTH: usize = 32;
 const SIGNAL_FRAME_MAGIC_SYSCALL: u64 = 0x5352_4653_5953_0001;
 const SIGNAL_FRAME_MAGIC_INT80: u64 = 0x5352_4649_3830_0001;
+const UTS_FIELD_LEN: usize = 65;
 
 static mut UNKNOWN_SYSCALL_LOG_COUNT: u32 = 0;
 static PROCESS_UMASK: AtomicU32 = AtomicU32::new(0o022);
@@ -243,7 +322,9 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_WRITE, "write", SyscallMode::UserTask, sys_write),
     syscall_def(SYS_OPEN, "open", SyscallMode::UserTask, sys_open),
     syscall_def(SYS_CLOSE, "close", SyscallMode::UserTask, sys_close),
+    syscall_def(SYS_STAT, "stat", SyscallMode::UserTask, sys_stat),
     syscall_def(SYS_FSTAT, "fstat", SyscallMode::UserTask, sys_fstat),
+    syscall_def(SYS_LSTAT, "lstat", SyscallMode::UserTask, sys_lstat),
     syscall_def(SYS_LSEEK, "lseek", SyscallMode::UserTask, sys_lseek),
     syscall_def(SYS_MMAP, "mmap", SyscallMode::UserTask, sys_mmap),
     syscall_def(
@@ -271,21 +352,52 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_rt_sigreturn,
     ),
+    syscall_def(SYS_IOCTL, "ioctl", SyscallMode::UserTask, sys_ioctl),
     syscall_def(SYS_WRITEV, "writev", SyscallMode::UserTask, sys_writev),
+    syscall_def(SYS_ACCESS, "access", SyscallMode::UserTask, sys_access),
     syscall_def(SYS_DUP, "dup", SyscallMode::UserTask, sys_dup),
     syscall_def(SYS_DUP2, "dup2", SyscallMode::UserTask, sys_dup2),
+    syscall_def(
+        SYS_NANOSLEEP,
+        "nanosleep",
+        SyscallMode::UserTask,
+        sys_nanosleep,
+    ),
     syscall_def(SYS_PIPE, "pipe", SyscallMode::UserTask, sys_pipe),
+    syscall_def(SYS_CLONE, "clone", SyscallMode::UserTask, sys_clone),
+    syscall_def(SYS_WAIT4, "wait4", SyscallMode::UserTask, sys_wait4),
+    syscall_def(SYS_UNAME, "uname", SyscallMode::UserTask, sys_uname),
     syscall_def(SYS_SHMGET, "shmget", SyscallMode::UserTask, sys_shmget),
     syscall_def(SYS_SHMAT, "shmat", SyscallMode::UserTask, sys_shmat),
     syscall_def(SYS_SHMCTL, "shmctl", SyscallMode::UserTask, sys_shmctl),
     syscall_def(SYS_BRK, "brk", SyscallMode::UserTask, sys_brk),
     syscall_def(SYS_YIELD, "sched_yield", SyscallMode::AnyTask, sys_yield),
+    syscall_def(SYS_FORK, "fork", SyscallMode::UserTask, sys_fork),
+    syscall_def(SYS_VFORK, "vfork", SyscallMode::UserTask, sys_vfork),
+    syscall_def(SYS_GETCWD, "getcwd", SyscallMode::UserTask, sys_getcwd),
+    syscall_def(SYS_CHDIR, "chdir", SyscallMode::UserTask, sys_chdir),
+    syscall_def(SYS_FCHDIR, "fchdir", SyscallMode::UserTask, sys_fchdir),
+    syscall_def(SYS_RENAME, "rename", SyscallMode::UserTask, sys_rename),
+    syscall_def(SYS_LINK, "link", SyscallMode::UserTask, sys_link),
+    syscall_def(
+        SYS_GETTIMEOFDAY,
+        "gettimeofday",
+        SyscallMode::UserTask,
+        sys_gettimeofday,
+    ),
+    syscall_def(SYS_GETUID, "getuid", SyscallMode::AnyTask, sys_getuid),
+    syscall_def(SYS_GETGID, "getgid", SyscallMode::AnyTask, sys_getgid),
+    syscall_def(SYS_GETEUID, "geteuid", SyscallMode::AnyTask, sys_geteuid),
+    syscall_def(SYS_GETEGID, "getegid", SyscallMode::AnyTask, sys_getegid),
     syscall_def(SYS_GETPID, "getpid", SyscallMode::AnyTask, sys_getpid),
+    syscall_def(SYS_SETPGID, "setpgid", SyscallMode::UserTask, sys_setpgid),
     syscall_def(SYS_EXECVE, "execve", SyscallMode::UserTask, sys_execve),
     syscall_def(SYS_KILL, "kill", SyscallMode::UserTask, sys_kill),
     syscall_def(SYS_SHMDT, "shmdt", SyscallMode::UserTask, sys_shmdt),
     syscall_def(SYS_UMASK, "umask", SyscallMode::UserTask, sys_umask),
     syscall_def(SYS_GETPPID, "getppid", SyscallMode::AnyTask, sys_getppid),
+    syscall_def(SYS_SETSID, "setsid", SyscallMode::UserTask, sys_setsid),
+    syscall_def(SYS_GETSID, "getsid", SyscallMode::UserTask, sys_getsid),
     syscall_def(SYS_FCNTL, "fcntl", SyscallMode::UserTask, sys_fcntl),
     syscall_def(
         SYS_ARCH_PRCTL,
@@ -307,20 +419,40 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_exit_group,
     ),
+    syscall_def(SYS_UTIMES, "utimes", SyscallMode::UserTask, sys_utimes),
     syscall_def(
         SYS_GETDENTS64,
         "getdents64",
         SyscallMode::UserTask,
         sys_getdents64,
     ),
+    syscall_def(
+        SYS_CLOCK_GETTIME,
+        "clock_gettime",
+        SyscallMode::UserTask,
+        sys_clock_gettime,
+    ),
     syscall_def(SYS_FUTEX, "futex", SyscallMode::UserTask, sys_futex),
     syscall_def(SYS_OPENAT, "openat", SyscallMode::UserTask, sys_openat),
     syscall_def(SYS_MKDIRAT, "mkdirat", SyscallMode::UserTask, sys_mkdirat),
+    syscall_def(SYS_MKNODAT, "mknodat", SyscallMode::UserTask, sys_mknodat),
+    syscall_def(
+        SYS_FCHOWNAT,
+        "fchownat",
+        SyscallMode::UserTask,
+        sys_fchownat,
+    ),
     syscall_def(
         SYS_NEWFSTATAT,
         "newfstatat",
         SyscallMode::UserTask,
         sys_newfstatat,
+    ),
+    syscall_def(
+        SYS_FUTIMESAT,
+        "futimesat",
+        SyscallMode::UserTask,
+        sys_futimesat,
     ),
     syscall_def(
         SYS_UNLINKAT,
@@ -334,8 +466,51 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_renameat,
     ),
+    syscall_def(SYS_LINKAT, "linkat", SyscallMode::UserTask, sys_linkat),
+    syscall_def(
+        SYS_SYMLINKAT,
+        "symlinkat",
+        SyscallMode::UserTask,
+        sys_symlinkat,
+    ),
+    syscall_def(
+        SYS_READLINKAT,
+        "readlinkat",
+        SyscallMode::UserTask,
+        sys_readlinkat,
+    ),
+    syscall_def(
+        SYS_FCHMODAT,
+        "fchmodat",
+        SyscallMode::UserTask,
+        sys_fchmodat,
+    ),
+    syscall_def(
+        SYS_FACCESSAT,
+        "faccessat",
+        SyscallMode::UserTask,
+        sys_faccessat,
+    ),
+    syscall_def(
+        SYS_UTIMENSAT,
+        "utimensat",
+        SyscallMode::UserTask,
+        sys_utimensat,
+    ),
     syscall_def(SYS_DUP3, "dup3", SyscallMode::UserTask, sys_dup3),
     syscall_def(SYS_PIPE2, "pipe2", SyscallMode::UserTask, sys_pipe2),
+    syscall_def(
+        SYS_COPY_FILE_RANGE,
+        "copy_file_range",
+        SyscallMode::UserTask,
+        sys_copy_file_range,
+    ),
+    syscall_def(
+        SYS_FACCESSAT2,
+        "faccessat2",
+        SyscallMode::UserTask,
+        sys_faccessat2,
+    ),
 ];
 
 #[inline]
@@ -689,9 +864,54 @@ struct LinuxStat {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct LinuxUtsName {
+    sysname: [u8; UTS_FIELD_LEN],
+    nodename: [u8; UTS_FIELD_LEN],
+    release: [u8; UTS_FIELD_LEN],
+    version: [u8; UTS_FIELD_LEN],
+    machine: [u8; UTS_FIELD_LEN],
+    domainname: [u8; UTS_FIELD_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LinuxIovec {
     iov_base: u64,
     iov_len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxTimeVal {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxTimeSpec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxWinSize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxTermios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [u8; 19],
 }
 
 #[repr(C)]
@@ -791,6 +1011,12 @@ impl LinuxStat {
     }
 }
 
+fn write_uts_field(dst: &mut [u8; UTS_FIELD_LEN], value: &[u8]) {
+    let len = cmp::min(value.len(), UTS_FIELD_LEN - 1);
+    dst[..len].copy_from_slice(&value[..len]);
+    dst[len] = 0;
+}
+
 fn resolve_dir_inode(ctx: &SyscallContext, dirfd: i32) -> Result<u16, i64> {
     if dirfd == fs::AT_FDCWD {
         if ctx.current.is_null() {
@@ -826,6 +1052,217 @@ fn resolve_dir_for_path(ctx: &SyscallContext, dirfd: i32, path: &str) -> Result<
     } else {
         resolve_dir_inode(ctx, dirfd)
     }
+}
+
+fn resolve_vfs_fd_inode(ctx: &SyscallContext, fd: i32) -> Result<u16, i64> {
+    let idx = fd_index(fd)?;
+    if !fd_slot_is_open(ctx.current, idx) {
+        return Err(-EBADF);
+    }
+    let (kind, inode) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+        )
+    };
+    if kind != task::USER_FD_KIND_VFS {
+        return Err(-EBADF);
+    }
+    Ok(inode)
+}
+
+fn timespec_to_unix_seconds(spec: LinuxTimeSpec, now: u64, current: u64) -> Result<u64, i64> {
+    match spec.tv_nsec {
+        UTIME_NOW => Ok(now),
+        UTIME_OMIT => Ok(current),
+        nsec => {
+            if spec.tv_sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+                return Err(-EINVAL);
+            }
+            Ok(spec.tv_sec as u64)
+        }
+    }
+}
+
+#[inline]
+fn access_mode_is_valid(mode: u32) -> bool {
+    (mode & !(R_OK | W_OK | X_OK)) == 0
+}
+
+#[inline]
+fn access_permission_bits_for(stat: &fs::FileStat, uid: u32, gid: u32) -> u32 {
+    if uid == stat.uid {
+        return (stat.mode & (STAT_S_IRUSR | STAT_S_IWUSR | STAT_S_IXUSR)) >> 6;
+    }
+    if gid == stat.gid {
+        return (stat.mode & (STAT_S_IRGRP | STAT_S_IWGRP | STAT_S_IXGRP)) >> 3;
+    }
+    stat.mode & (STAT_S_IROTH | STAT_S_IWOTH | STAT_S_IXOTH)
+}
+
+fn access_allowed(stat: &fs::FileStat, mode: u32, uid: u32, gid: u32) -> bool {
+    if mode == F_OK {
+        return true;
+    }
+
+    let perms = access_permission_bits_for(stat, uid, gid);
+    if (mode & R_OK) != 0 && (perms & 0b100) == 0 {
+        return false;
+    }
+    if (mode & W_OK) != 0 && (perms & 0b010) == 0 {
+        return false;
+    }
+    if (mode & X_OK) != 0 && (perms & 0b001) == 0 {
+        return false;
+    }
+    true
+}
+
+fn lookup_inode_for_at_path(ctx: &SyscallContext, dirfd: i32, path: &str) -> Result<u16, i64> {
+    let dir_inode = resolve_dir_for_path(ctx, dirfd, path)?;
+    match fs::lookupat(dir_inode, path) {
+        Ok(inode) => Ok(inode),
+        Err(err) => Err(-fs_to_errno(err)),
+    }
+}
+
+#[inline]
+fn path_component_is_dot(name: &[u8]) -> bool {
+    name.len() == 1 && name[0] == b'.'
+}
+
+#[inline]
+fn path_component_is_dotdot(name: &[u8]) -> bool {
+    name.len() == 2 && name[0] == b'.' && name[1] == b'.'
+}
+
+fn find_inode_path_from(
+    dir_inode: u16,
+    target_inode: u16,
+    current_len: usize,
+    depth: usize,
+    path_buf: &mut [u8; fs::VFS_MAX_PATH],
+) -> Result<Option<usize>, i64> {
+    if dir_inode == target_inode {
+        return Ok(Some(current_len));
+    }
+    if depth >= GETCWD_MAX_DEPTH {
+        return Ok(None);
+    }
+
+    let mut offset = 0u64;
+    loop {
+        let entry = match fs::readdir(dir_inode, offset) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(err) => return Err(-fs_to_errno(err)),
+        };
+        offset = entry.next_offset;
+        if entry.name_len == 0 {
+            continue;
+        }
+        let name = &entry.name[..entry.name_len];
+        if path_component_is_dot(name) || path_component_is_dotdot(name) {
+            continue;
+        }
+        let name_str = match core::str::from_utf8(name) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let child_inode = match fs::lookupat(dir_inode, name_str) {
+            Ok(inode) => inode,
+            Err(_) => continue,
+        };
+
+        let next_len;
+        if current_len == 0 {
+            if 1 + name.len() >= path_buf.len() {
+                continue;
+            }
+            path_buf[0] = b'/';
+            path_buf[1..1 + name.len()].copy_from_slice(name);
+            next_len = 1 + name.len();
+        } else {
+            if current_len + 1 + name.len() >= path_buf.len() {
+                continue;
+            }
+            path_buf[current_len] = b'/';
+            path_buf[current_len + 1..current_len + 1 + name.len()].copy_from_slice(name);
+            next_len = current_len + 1 + name.len();
+        }
+
+        if child_inode == target_inode {
+            return Ok(Some(next_len));
+        }
+
+        match fs::inode_is_dir(child_inode) {
+            Ok(true) => {
+                if let Some(found_len) =
+                    find_inode_path_from(child_inode, target_inode, next_len, depth + 1, path_buf)?
+                {
+                    return Ok(Some(found_len));
+                }
+            }
+            Ok(false) => {}
+            Err(_) => {}
+        }
+    }
+
+    Ok(None)
+}
+
+fn build_cwd_path(
+    task_ptr: *mut task::Task,
+    path_buf: &mut [u8; fs::VFS_MAX_PATH],
+) -> Result<usize, i64> {
+    if task_ptr.is_null() {
+        return Err(-ESRCH);
+    }
+    let cwd = unsafe { (*task_ptr).user_cwd_inode };
+    if cwd == fs::root_inode() {
+        path_buf[0] = b'/';
+        return Ok(1);
+    }
+    match find_inode_path_from(fs::root_inode(), cwd, 0, 0, path_buf)? {
+        Some(len) => Ok(len),
+        None => Err(-ENOENT),
+    }
+}
+
+#[inline]
+fn ticks_to_seconds_nanos(ticks: u64) -> (i64, i64) {
+    let hz = pit::TIMER_FREQUENCY as u64;
+    let sec = ticks / hz;
+    let rem_ticks = ticks % hz;
+    let nsec = (rem_ticks as u128 * 1_000_000_000u128 / hz as u128) as u64;
+    (sec as i64, nsec as i64)
+}
+
+fn timespec_to_sleep_ticks(spec: &LinuxTimeSpec) -> Result<u64, i64> {
+    if spec.tv_sec < 0 || spec.tv_nsec < 0 || spec.tv_nsec >= 1_000_000_000 {
+        return Err(-EINVAL);
+    }
+
+    let secs = spec.tv_sec as u128;
+    let nanos = spec.tv_nsec as u128;
+    let total_nanos = secs
+        .checked_mul(1_000_000_000u128)
+        .and_then(|v| v.checked_add(nanos))
+        .ok_or(-EINVAL)?;
+    if total_nanos == 0 {
+        return Ok(0);
+    }
+
+    let hz = pit::TIMER_FREQUENCY as u128;
+    let ticks = total_nanos
+        .checked_mul(hz)
+        .and_then(|v| v.checked_add(1_000_000_000u128 - 1))
+        .map(|v| v / 1_000_000_000u128)
+        .ok_or(-EINVAL)?;
+    if ticks > u64::MAX as u128 {
+        return Err(-EINVAL);
+    }
+    Ok(ticks as u64)
 }
 
 fn refresh_procfs_runtime() {
@@ -1673,6 +2110,566 @@ fn sys_mkdirat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
+fn sys_access_common(ctx: &SyscallContext, dirfd: i32, pathname: u64, mode: u32) -> i64 {
+    if !access_mode_is_valid(mode) {
+        return -EINVAL;
+    }
+
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(pathname, &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+
+    let inode = match lookup_inode_for_at_path(ctx, dirfd, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+    let stat = match fs::stat(inode) {
+        Ok(stat) => stat,
+        Err(err) => return -fs_to_errno(err),
+    };
+
+    let (uid, gid) = unsafe { ((*ctx.current).user_uid, (*ctx.current).user_gid) };
+    if access_allowed(&stat, mode, uid, gid) {
+        0
+    } else {
+        -EACCES
+    }
+}
+
+fn sys_access(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    sys_access_common(ctx, fs::AT_FDCWD, call.arg(0), call.arg(1) as u32)
+}
+
+fn sys_faccessat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    sys_access_common(ctx, call.arg(0) as i32, call.arg(1), call.arg(2) as u32)
+}
+
+fn sys_faccessat2(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let flags = call.arg(3) as u32;
+    if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW) != 0 {
+        return -EINVAL;
+    }
+    sys_access_common(ctx, call.arg(0) as i32, call.arg(1), call.arg(2) as u32)
+}
+
+fn sys_chdir(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(call.arg(0), &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+
+    let inode = match lookup_inode_for_at_path(ctx, fs::AT_FDCWD, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+    match fs::inode_is_dir(inode) {
+        Ok(true) => {
+            unsafe {
+                (*ctx.current).user_cwd_inode = inode;
+            }
+            0
+        }
+        Ok(false) => -ENOTDIR,
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+fn sys_fchdir(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let inode = match resolve_dir_inode(ctx, call.arg(0) as i32) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+    unsafe {
+        (*ctx.current).user_cwd_inode = inode;
+    }
+    0
+}
+
+fn sys_getcwd(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let user_buf = call.arg(0);
+    let user_len = match usize::try_from(call.arg(1)) {
+        Ok(len) => len,
+        Err(_) => return -EINVAL,
+    };
+    if user_len == 0 {
+        return -EINVAL;
+    }
+
+    let mut path = [0u8; fs::VFS_MAX_PATH];
+    let path_len = match build_cwd_path(ctx.current, &mut path) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+    let required = path_len + 1;
+    if required > user_len {
+        return -ERANGE;
+    }
+
+    let mut out = [0u8; fs::VFS_MAX_PATH];
+    out[..path_len].copy_from_slice(&path[..path_len]);
+    out[path_len] = 0;
+    match copy_to_user_task(ctx.current, user_buf, &out[..required]) {
+        Ok(()) => user_buf as i64,
+        Err(err) => -err,
+    }
+}
+
+fn sys_rename(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let wrapped = SyscallArgs {
+        num: SYS_RENAMEAT,
+        args: [
+            fs::AT_FDCWD as u64,
+            call.arg(0),
+            fs::AT_FDCWD as u64,
+            call.arg(1),
+            0,
+            0,
+        ],
+    };
+    sys_renameat(ctx, &wrapped)
+}
+
+fn sys_link(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let wrapped = SyscallArgs {
+        num: SYS_LINKAT,
+        args: [
+            fs::AT_FDCWD as u64,
+            call.arg(0),
+            fs::AT_FDCWD as u64,
+            call.arg(1),
+            0,
+            0,
+        ],
+    };
+    sys_linkat(ctx, &wrapped)
+}
+
+fn sys_gettimeofday(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let tv_ptr = call.arg(0);
+    let _tz_ptr = call.arg(1);
+
+    if tv_ptr != 0 {
+        let ticks = pit::ticks();
+        let (sec, nsec) = ticks_to_seconds_nanos(ticks);
+        let tv = LinuxTimeVal {
+            tv_sec: sec,
+            tv_usec: nsec / 1_000,
+        };
+        if let Err(err) = write_struct_to_user(ctx.current, tv_ptr, &tv) {
+            return -err;
+        }
+    }
+    0
+}
+
+fn sys_clock_gettime(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let clock_id = call.arg(0) as i32;
+    if clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC {
+        return -EINVAL;
+    }
+
+    let ticks = pit::ticks();
+    let (sec, nsec) = ticks_to_seconds_nanos(ticks);
+    let ts = LinuxTimeSpec {
+        tv_sec: sec,
+        tv_nsec: nsec,
+    };
+    match write_struct_to_user(ctx.current, call.arg(1), &ts) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
+}
+
+fn sys_nanosleep(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let req = match read_struct_from_user::<LinuxTimeSpec>(ctx.current, call.arg(0)) {
+        Ok(req) => req,
+        Err(err) => return -err,
+    };
+    let ticks = match timespec_to_sleep_ticks(&req) {
+        Ok(ticks) => ticks,
+        Err(err) => return err,
+    };
+    if ticks > 0 {
+        crate::sched::sleep(ticks);
+    }
+
+    if call.arg(1) != 0 {
+        let rem = LinuxTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if let Err(err) = write_struct_to_user(ctx.current, call.arg(1), &rem) {
+            return -err;
+        }
+    }
+    0
+}
+
+#[inline]
+fn log_stub_enosys(name: &str) {
+    if cfg!(feature = "musl-ext2-cmd-smoke") {
+        sys_log!("[SYSCALL] {} -> -ENOSYS", name);
+    }
+}
+
+fn sys_linkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let flags = call.arg(4) as u32;
+    if (flags & !AT_SYMLINK_FOLLOW) != 0 {
+        return -EINVAL;
+    }
+
+    let mut old_buf = [0u8; fs::VFS_MAX_PATH];
+    let mut new_buf = [0u8; fs::VFS_MAX_PATH];
+    let old_path = match read_user_path(call.arg(1), &mut old_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_path = match read_user_path(call.arg(3), &mut new_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if old_path.is_empty() || new_path.is_empty() {
+        return -ENOENT;
+    }
+
+    let old_dir = match resolve_dir_for_path(ctx, call.arg(0) as i32, old_path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+    let new_dir = match resolve_dir_for_path(ctx, call.arg(2) as i32, new_path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    match fs::linkat(old_dir, old_path, new_dir, new_path) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+fn sys_symlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let mut target_buf = [0u8; fs::VFS_MAX_PATH];
+    let mut link_buf = [0u8; fs::VFS_MAX_PATH];
+    let target = match read_user_path(call.arg(0), &mut target_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let link_path = match read_user_path(call.arg(2), &mut link_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if link_path.is_empty() {
+        return -ENOENT;
+    }
+
+    let dir = match resolve_dir_for_path(ctx, call.arg(1) as i32, link_path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    match fs::symlinkat(dir, target, link_path) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+fn sys_readlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let dirfd = call.arg(0) as i32;
+    let user_buf = call.arg(2);
+    let buf_len = match usize::try_from(call.arg(3)) {
+        Ok(len) => len,
+        Err(_) => return -EINVAL,
+    };
+    if buf_len == 0 {
+        return -EINVAL;
+    }
+
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(call.arg(1), &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+
+    // Baseline procfs convenience: many userland paths probe /proc/self/exe.
+    if path == "/proc/self/exe" || path == "proc/self/exe" {
+        let target = b"/proc/self/exe";
+        let count = cmp::min(target.len(), buf_len);
+        return match copy_to_user_task(ctx.current, user_buf, &target[..count]) {
+            Ok(()) => count as i64,
+            Err(err) => -err,
+        };
+    }
+
+    let dir = match resolve_dir_for_path(ctx, dirfd, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    let mut link_buf = [0u8; fs::VFS_MAX_PATH];
+    match fs::readlinkat(dir, path, &mut link_buf) {
+        Ok(link_len) => {
+            let count = cmp::min(link_len, buf_len);
+            match copy_to_user_task(ctx.current, user_buf, &link_buf[..count]) {
+                Ok(()) => count as i64,
+                Err(err) => -err,
+            }
+        }
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+fn sys_fchmodat(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    log_stub_enosys("fchmodat");
+    -ENOSYS
+}
+
+fn sys_fchownat(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    log_stub_enosys("fchownat");
+    -ENOSYS
+}
+
+fn sys_mknodat(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    log_stub_enosys("mknodat");
+    -ENOSYS
+}
+
+fn sys_utimensat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let dirfd = call.arg(0) as i32;
+    let path_ptr = call.arg(1);
+    let times_ptr = call.arg(2);
+    let flags = call.arg(3) as u32;
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 {
+        return -EINVAL;
+    }
+
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = if path_ptr == 0 {
+        ""
+    } else {
+        match read_user_path(path_ptr, &mut path_buf) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    };
+
+    let inode = if path.is_empty() {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return -ENOENT;
+        }
+        match resolve_vfs_fd_inode(ctx, dirfd) {
+            Ok(inode) => inode,
+            Err(err) => return err,
+        }
+    } else {
+        match lookup_inode_for_at_path(ctx, dirfd, path) {
+            Ok(inode) => inode,
+            Err(err) => return err,
+        }
+    };
+
+    let current = match fs::stat(inode) {
+        Ok(stat) => stat,
+        Err(err) => return -fs_to_errno(err),
+    };
+    let now = pit::ticks();
+
+    let (atime, mtime) = if times_ptr == 0 {
+        (now, now)
+    } else {
+        let specs = match read_struct_from_user::<[LinuxTimeSpec; 2]>(ctx.current, times_ptr) {
+            Ok(specs) => specs,
+            Err(err) => return -err,
+        };
+        let atime = match timespec_to_unix_seconds(specs[0], now, current.atime) {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+        let mtime = match timespec_to_unix_seconds(specs[1], now, current.mtime) {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+        (atime, mtime)
+    };
+
+    match fs::set_times(inode, atime, mtime) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+fn sys_utimes(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    log_stub_enosys("utimensat");
+    -ENOSYS
+}
+
+fn sys_futimesat(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    log_stub_enosys("utimensat");
+    -ENOSYS
+}
+
+fn sys_copy_file_range(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let in_fd = call.arg(0) as i32;
+    let in_off_ptr = call.arg(1);
+    let out_fd = call.arg(2) as i32;
+    let out_off_ptr = call.arg(3);
+    let len = match usize::try_from(call.arg(4)) {
+        Ok(v) => v,
+        Err(_) => return -EINVAL,
+    };
+    let flags = call.arg(5);
+    if flags != 0 {
+        return -EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let in_idx = match fd_index(in_fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    let out_idx = match fd_index(out_fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, in_idx) || !fd_slot_is_open(ctx.current, out_idx) {
+        return -EBADF;
+    }
+
+    let (in_kind, in_ino, in_fd_off, in_flags) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[in_idx],
+            (*ctx.current).user_fd_inode[in_idx],
+            (*ctx.current).user_fd_offset[in_idx],
+            (*ctx.current).user_fd_flags[in_idx],
+        )
+    };
+    let (out_kind, out_ino, out_fd_off, out_flags) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[out_idx],
+            (*ctx.current).user_fd_inode[out_idx],
+            (*ctx.current).user_fd_offset[out_idx],
+            (*ctx.current).user_fd_flags[out_idx],
+        )
+    };
+    if in_kind != task::USER_FD_KIND_VFS || out_kind != task::USER_FD_KIND_VFS {
+        return -EINVAL;
+    }
+    if !fd_can_read(in_flags) || !fd_can_write(out_flags) {
+        return -EBADF;
+    }
+
+    let mut in_off = if in_off_ptr != 0 {
+        let off = match read_struct_from_user::<i64>(ctx.current, in_off_ptr) {
+            Ok(v) => v,
+            Err(err) => return -err,
+        };
+        if off < 0 {
+            return -EINVAL;
+        }
+        off as u64
+    } else {
+        in_fd_off
+    };
+    let mut out_off = if out_off_ptr != 0 {
+        let off = match read_struct_from_user::<i64>(ctx.current, out_off_ptr) {
+            Ok(v) => v,
+            Err(err) => return -err,
+        };
+        if off < 0 {
+            return -EINVAL;
+        }
+        off as u64
+    } else {
+        out_fd_off
+    };
+
+    let mut copied = 0usize;
+    let mut buf = [0u8; READ_CHUNK_SIZE];
+    while copied < len {
+        let take = cmp::min(buf.len(), len - copied);
+        let read_n = match fs::read(in_ino, in_off, &mut buf[..take]) {
+            Ok(n) => n,
+            Err(err) => {
+                if copied > 0 {
+                    break;
+                }
+                return -fs_to_errno(err);
+            }
+        };
+        if read_n == 0 {
+            break;
+        }
+
+        let write_res = match fs::write(out_ino, out_off, &buf[..read_n], false) {
+            Ok(w) => w,
+            Err(err) => {
+                if copied > 0 {
+                    break;
+                }
+                return -fs_to_errno(err);
+            }
+        };
+        if write_res.written == 0 {
+            break;
+        }
+
+        let wrote = write_res.written;
+        in_off = in_off.saturating_add(wrote as u64);
+        out_off = write_res.new_offset;
+        copied += wrote;
+
+        if wrote < read_n {
+            break;
+        }
+    }
+
+    if in_off_ptr == 0 {
+        unsafe {
+            (*ctx.current).user_fd_offset[in_idx] = in_off;
+        }
+    } else if in_off <= i64::MAX as u64 {
+        if let Err(err) = write_struct_to_user(ctx.current, in_off_ptr, &(in_off as i64)) {
+            return -err;
+        }
+    }
+    if out_off_ptr == 0 {
+        unsafe {
+            (*ctx.current).user_fd_offset[out_idx] = out_off;
+        }
+    } else if out_off <= i64::MAX as u64 {
+        if let Err(err) = write_struct_to_user(ctx.current, out_off_ptr, &(out_off as i64)) {
+            return -err;
+        }
+    }
+
+    if copied > 0 {
+        sync_ext2_backing();
+    }
+    copied as i64
+}
+
 fn write_pipe_fds(
     task_ptr: *mut task::Task,
     user_dst: u64,
@@ -1717,6 +2714,389 @@ fn read_u64_from_user(task_ptr: *mut task::Task, user_src: u64) -> Result<u64, i
 
 fn write_u64_to_user(task_ptr: *mut task::Task, user_dst: u64, value: u64) -> Result<(), i64> {
     copy_to_user_task(task_ptr, user_dst, &value.to_ne_bytes())
+}
+
+fn read_i32_from_user(task_ptr: *mut task::Task, user_src: u64) -> Result<i32, i64> {
+    let mut raw = [0u8; 4];
+    copy_from_user_task(task_ptr, user_src, &mut raw)?;
+    Ok(i32::from_ne_bytes(raw))
+}
+
+fn write_i32_to_user(task_ptr: *mut task::Task, user_dst: u64, value: i32) -> Result<(), i64> {
+    copy_to_user_task(task_ptr, user_dst, &value.to_ne_bytes())
+}
+
+#[inline]
+fn wait_status_from_exit_code(code: i32) -> i32 {
+    (code & 0xFF) << 8
+}
+
+fn default_termios() -> LinuxTermios {
+    let mut tio = LinuxTermios {
+        c_iflag: 0,
+        c_oflag: 0,
+        c_cflag: 0,
+        c_lflag: 0,
+        c_line: 0,
+        c_cc: [0; 19],
+    };
+
+    // Baseline canonical tty behavior compatible with common libc defaults.
+    tio.c_iflag = 0o0000400 | 0o0002000; // ICRNL | IXON
+    tio.c_oflag = 0o0000001 | 0o0000004; // OPOST | ONLCR
+    tio.c_cflag = 0o0000060 | 0o0000400 | 0o00000600 | 0o0000040000; // CS8 | CREAD | B38400 | CLOCAL
+    tio.c_lflag = 0o0000002 | 0o0000010 | 0o0000100 | 0o0001000 | 0o0010000; // ICANON | ECHO | ECHOE | ECHOK | ISIG
+    tio.c_cc[0] = 3; // VINTR
+    tio.c_cc[1] = 28; // VQUIT
+    tio.c_cc[2] = 127; // VERASE
+    tio.c_cc[3] = 21; // VKILL
+    tio.c_cc[4] = 4; // VEOF
+    tio.c_cc[5] = 0; // VTIME
+    tio.c_cc[6] = 1; // VMIN
+    tio.c_cc[8] = 17; // VSTART
+    tio.c_cc[9] = 19; // VSTOP
+    tio.c_cc[10] = 26; // VSUSP
+    tio
+}
+
+fn process_group_exists_in_session(sid: i32, pgid: i32) -> bool {
+    for idx in 0..task::MAX_TASKS {
+        let task_ptr = task::get_by_index(idx);
+        if task_ptr.is_null() {
+            continue;
+        }
+        let (task_sid, task_pgid, state) =
+            unsafe { ((*task_ptr).sid, (*task_ptr).pgid, (*task_ptr).state) };
+        if state == TaskState::Dead {
+            continue;
+        }
+        if task_sid == sid && task_pgid == pgid {
+            return true;
+        }
+    }
+    false
+}
+
+fn process_group_exists(pgid: i32) -> bool {
+    for idx in 0..task::MAX_TASKS {
+        let task_ptr = task::get_by_index(idx);
+        if task_ptr.is_null() {
+            continue;
+        }
+        let (task_pgid, state) = unsafe { ((*task_ptr).pgid, (*task_ptr).state) };
+        if state == TaskState::Dead {
+            continue;
+        }
+        if task_pgid == pgid {
+            return true;
+        }
+    }
+    false
+}
+
+fn ioctl_console(ctx: &SyscallContext, request: u64, argp: u64) -> i64 {
+    match request {
+        TIOCGWINSZ => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let ws = LinuxWinSize {
+                ws_row: 25,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            match write_struct_to_user(ctx.current, argp, &ws) {
+                Ok(()) => 0,
+                Err(err) => -err,
+            }
+        }
+        TCGETS => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let tio = default_termios();
+            match write_struct_to_user(ctx.current, argp, &tio) {
+                Ok(()) => 0,
+                Err(err) => -err,
+            }
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            match read_struct_from_user::<LinuxTermios>(ctx.current, argp) {
+                Ok(_) => 0,
+                Err(err) => -err,
+            }
+        }
+        TIOCGPGRP => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let pgrp = unsafe { (*ctx.current).pgid };
+            match write_i32_to_user(ctx.current, argp, pgrp) {
+                Ok(()) => 0,
+                Err(err) => -err,
+            }
+        }
+        TIOCSPGRP => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let requested = match read_i32_from_user(ctx.current, argp) {
+                Ok(value) => value,
+                Err(err) => return -err,
+            };
+            if requested <= 0 {
+                return -EINVAL;
+            }
+            let sid = unsafe { (*ctx.current).sid };
+            if !process_group_exists_in_session(sid, requested) {
+                return -EPERM;
+            }
+            0
+        }
+        _ => -ENOTTY,
+    }
+}
+
+fn fork_cleanup_child(task_ptr: *mut task::Task) {
+    if task_ptr.is_null() {
+        return;
+    }
+    close_all_fds(task_ptr);
+    let child_pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
+    if child_pml4.as_u64() != 0 {
+        vmm::clear_user_space(child_pml4);
+        vmm::destroy_address_space(child_pml4);
+        unsafe {
+            (*task_ptr).pml4_phys = 0;
+        }
+    }
+    task::task_destroy(task_ptr);
+}
+
+fn clone_parent_fds_for_child(parent: *mut task::Task, child: *mut task::Task) -> Result<(), i64> {
+    unsafe {
+        (*child).user_fd_kind = (*parent).user_fd_kind;
+        (*child).user_fd_inode = (*parent).user_fd_inode;
+        (*child).user_fd_offset = (*parent).user_fd_offset;
+        (*child).user_fd_flags = (*parent).user_fd_flags;
+    }
+
+    for idx in 0..task::MAX_TASK_FDS {
+        let (kind, inode, flags) = unsafe {
+            (
+                (*child).user_fd_kind[idx],
+                (*child).user_fd_inode[idx],
+                (*child).user_fd_flags[idx],
+            )
+        };
+        if kind == task::USER_FD_KIND_PIPE && inode != task::USER_FD_NONE {
+            let retain_read = fd_can_read(flags);
+            let retain_write = fd_can_write(flags);
+            ipc::pipe_retain(inode, retain_read, retain_write).map_err(|err| -ipc_to_errno(err))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn create_fork_child(ctx: &SyscallContext, child_frame: &InterruptFrame) -> Result<i64, i64> {
+    let parent = ctx.current;
+    if parent.is_null() {
+        return Err(-ESRCH);
+    }
+    let parent_pml4 = unsafe { PhysAddr::new((*parent).pml4_phys) };
+    if parent_pml4.as_u64() == 0 {
+        return Err(-EINVAL);
+    }
+
+    let child = task::task_alloc("fork", TASK_FLAG_USER);
+    if child.is_null() {
+        return Err(-ENOMEM);
+    }
+
+    let child_pml4 = vmm::create_address_space();
+    if child_pml4.as_u64() == 0 {
+        task::task_destroy(child);
+        return Err(-ENOMEM);
+    }
+    if vmm::clone_user_space(parent_pml4, child_pml4) != 0 {
+        vmm::clear_user_space(child_pml4);
+        vmm::destroy_address_space(child_pml4);
+        task::task_destroy(child);
+        return Err(-ENOMEM);
+    }
+
+    unsafe {
+        (*child).pml4_phys = child_pml4.as_u64();
+
+        (*child).user_entry = (*parent).user_entry;
+        (*child).user_stack_bottom = (*parent).user_stack_bottom;
+        (*child).user_stack_top = (*parent).user_stack_top;
+        (*child).user_stack_ptr = (*parent).user_stack_ptr;
+        (*child).user_argc = (*parent).user_argc;
+        (*child).user_argv = (*parent).user_argv;
+        (*child).user_envp = (*parent).user_envp;
+        (*child).user_auxv = (*parent).user_auxv;
+        (*child).user_fs_base = (*parent).user_fs_base;
+        (*child).user_clear_tid = 0;
+        (*child).user_brk_start = (*parent).user_brk_start;
+        (*child).user_brk = (*parent).user_brk;
+        (*child).user_phdr_addr = (*parent).user_phdr_addr;
+        (*child).user_phdr_count = (*parent).user_phdr_count;
+        (*child).user_phdr_size = (*parent).user_phdr_size;
+        (*child).user_base_addr = (*parent).user_base_addr;
+        (*child).user_interp_base = (*parent).user_interp_base;
+        (*child).user_is_dynamic = (*parent).user_is_dynamic;
+        (*child).user_uid = (*parent).user_uid;
+        (*child).user_gid = (*parent).user_gid;
+        (*child).user_cwd_inode = (*parent).user_cwd_inode;
+        (*child).pgid = (*parent).pgid;
+        (*child).sid = (*parent).sid;
+        (*child).signal_handlers = (*parent).signal_handlers;
+        (*child).signal_flags = (*parent).signal_flags;
+        (*child).signal_mask_saved = (*parent).signal_mask_saved;
+        (*child).signal_restorer = (*parent).signal_restorer;
+        (*child).signal_blocked = (*parent).signal_blocked;
+        (*child).sig_pending = 0;
+        (*child).user_shm_id = [0; task::MAX_TASK_SHM_ATTACH];
+        (*child).user_shm_addr = [0; task::MAX_TASK_SHM_ATTACH];
+        (*child).user_shm_size = [0; task::MAX_TASK_SHM_ATTACH];
+        (*child).user_shm_flags = [0; task::MAX_TASK_SHM_ATTACH];
+    }
+
+    if let Err(err) = clone_parent_fds_for_child(parent, child) {
+        fork_cleanup_child(child);
+        return Err(err);
+    }
+
+    unsafe {
+        let mut frame_addr = (*child).kernel_stack_top - size_of::<InterruptFrame>() as u64;
+        frame_addr &= !0xF;
+        let frame_ptr = frame_addr as *mut InterruptFrame;
+        ptr::write(frame_ptr, *child_frame);
+        (*child).saved_rsp = frame_addr;
+        (*child).state = TaskState::Ready;
+    }
+
+    crate::sched::add_task(child);
+    Ok(unsafe { (*child).pid as i64 })
+}
+
+#[cfg(target_os = "none")]
+fn capture_syscall_preserved_regs() -> (u64, u64, u64, u64, u64, u64) {
+    let (rbx, rbp, r12, r13, r14, r15): (u64, u64, u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "mov {rbx_out}, rbx",
+            "mov {rbp_out}, rbp",
+            "mov {r12_out}, r12",
+            "mov {r13_out}, r13",
+            "mov {r14_out}, r14",
+            "mov {r15_out}, r15",
+            rbx_out = lateout(reg) rbx,
+            rbp_out = lateout(reg) rbp,
+            r12_out = lateout(reg) r12,
+            r13_out = lateout(reg) r13,
+            r14_out = lateout(reg) r14,
+            r15_out = lateout(reg) r15,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    (rbx, rbp, r12, r13, r14, r15)
+}
+
+#[cfg(not(target_os = "none"))]
+fn capture_syscall_preserved_regs() -> (u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0)
+}
+
+fn build_child_frame_from_syscall_frame(frame: &SyscallFrame) -> InterruptFrame {
+    let (rbx, rbp, r12, r13, r14, r15) = capture_syscall_preserved_regs();
+    InterruptFrame {
+        r15,
+        r14,
+        r13,
+        r12,
+        r11: frame.r11,
+        r10: frame.r10,
+        r9: frame.r9,
+        r8: frame.r8,
+        rbp,
+        rdi: frame.rdi,
+        rsi: frame.rsi,
+        rdx: frame.rdx,
+        rcx: frame.rcx,
+        rbx,
+        rax: 0,
+        int_no: 0,
+        error_code: 0,
+        rip: frame.rcx,
+        cs: gdt::USER_CS as u64,
+        rflags: frame.r11,
+        rsp: frame.rsp,
+        ss: gdt::USER_DS as u64,
+    }
+}
+
+fn build_child_frame_from_int80_frame(frame: &InterruptFrame) -> InterruptFrame {
+    let mut child = *frame;
+    child.rax = 0;
+    child.int_no = 0;
+    child.error_code = 0;
+    child
+}
+
+fn validate_clone_args(call: &SyscallArgs) -> Result<u64, i64> {
+    let flags = call.arg(0);
+    let child_stack = call.arg(1);
+    let parent_tid = call.arg(2);
+    let child_tid = call.arg(3);
+    let tls = call.arg(4);
+
+    if (flags & !(CLONE_CSIGNAL | CLONE_VM | CLONE_VFORK)) != 0 {
+        return Err(-EINVAL);
+    }
+    if (flags & CLONE_CSIGNAL) != SIGCHLD_EXIT_SIGNAL {
+        return Err(-EINVAL);
+    }
+    let clone_vm = (flags & CLONE_VM) != 0;
+    let clone_vfork = (flags & CLONE_VFORK) != 0;
+    if clone_vm != clone_vfork {
+        return Err(-EINVAL);
+    }
+    if parent_tid != 0 || child_tid != 0 || tls != 0 {
+        return Err(-EINVAL);
+    }
+    if child_stack != 0 && !user_range_ok(child_stack, 1) {
+        return Err(-EFAULT);
+    }
+    Ok(child_stack)
+}
+
+fn build_clone_child_frame_from_syscall(
+    frame: &SyscallFrame,
+    child_stack: u64,
+) -> Result<InterruptFrame, i64> {
+    let mut child = build_child_frame_from_syscall_frame(frame);
+    if child_stack != 0 {
+        child.rsp = child_stack;
+    }
+    Ok(child)
+}
+
+fn build_clone_child_frame_from_int80(
+    frame: &InterruptFrame,
+    child_stack: u64,
+) -> Result<InterruptFrame, i64> {
+    let mut child = build_child_frame_from_int80_frame(frame);
+    if child_stack != 0 {
+        child.rsp = child_stack;
+    }
+    Ok(child)
 }
 
 fn sys_pipe2(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -1909,6 +3289,24 @@ fn sys_shmctl(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
+fn stat_path(ctx: &SyscallContext, path_ptr: u64, follow_symlinks: bool) -> Result<fs::FileStat, i64> {
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = read_user_path(path_ptr, &mut path_buf)?;
+    if path.is_empty() {
+        return Err(-ENOENT);
+    }
+
+    let dir_inode = resolve_dir_for_path(ctx, fs::AT_FDCWD, path)?;
+    let inode = if follow_symlinks {
+        fs::lookupat(dir_inode, path).map_err(|err| -fs_to_errno(err))?
+    } else {
+        // VFS symlink support is still pending, so lstat currently resolves
+        // through lookupat with the same behavior as stat.
+        fs::lookupat(dir_inode, path).map_err(|err| -fs_to_errno(err))?
+    };
+    fs::stat(inode).map_err(|err| -fs_to_errno(err))
+}
+
 fn write_stat_to_user(task_ptr: *mut task::Task, dst: u64, stat: fs::FileStat) -> i64 {
     let raw = LinuxStat::from_fs(stat);
     let bytes = unsafe {
@@ -1918,6 +3316,50 @@ fn write_stat_to_user(task_ptr: *mut task::Task, dst: u64, stat: fs::FileStat) -
         )
     };
     match copy_to_user_task(task_ptr, dst, bytes) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
+}
+
+fn sys_stat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let stat = match stat_path(ctx, call.arg(0), true) {
+        Ok(stat) => stat,
+        Err(err) => return err,
+    };
+    write_stat_to_user(ctx.current, call.arg(1), stat)
+}
+
+fn sys_lstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let stat = match stat_path(ctx, call.arg(0), false) {
+        Ok(stat) => stat,
+        Err(err) => return err,
+    };
+    write_stat_to_user(ctx.current, call.arg(1), stat)
+}
+
+fn sys_uname(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let mut uts = LinuxUtsName {
+        sysname: [0; UTS_FIELD_LEN],
+        nodename: [0; UTS_FIELD_LEN],
+        release: [0; UTS_FIELD_LEN],
+        version: [0; UTS_FIELD_LEN],
+        machine: [0; UTS_FIELD_LEN],
+        domainname: [0; UTS_FIELD_LEN],
+    };
+    write_uts_field(&mut uts.sysname, b"PeetOS");
+    write_uts_field(&mut uts.nodename, b"peetos");
+    write_uts_field(&mut uts.release, b"0.1.0");
+    write_uts_field(&mut uts.version, b"#1");
+    write_uts_field(&mut uts.machine, b"x86_64");
+    write_uts_field(&mut uts.domainname, b"localdomain");
+
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&uts as *const LinuxUtsName) as *const u8,
+            core::mem::size_of::<LinuxUtsName>(),
+        )
+    };
+    match copy_to_user_task(ctx.current, call.arg(0), bytes) {
         Ok(()) => 0,
         Err(err) => -err,
     }
@@ -2679,11 +4121,289 @@ fn sys_yield(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     0
 }
 
+fn sys_ioctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let idx = match fd_index(call.arg(0) as i32) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let kind = unsafe { (*ctx.current).user_fd_kind[idx] };
+    if kind == task::USER_FD_KIND_CONSOLE {
+        ioctl_console(ctx, call.arg(1), call.arg(2))
+    } else {
+        -ENOTTY
+    }
+}
+
+fn child_pid_matches(wait_pid: i64, child_pid: i32) -> bool {
+    if wait_pid == -1 {
+        return true;
+    }
+    if wait_pid > 0 {
+        return child_pid == wait_pid as i32;
+    }
+    false
+}
+
+fn find_waitable_child(
+    parent_pid: i32,
+    wait_pid: i64,
+    found_match: &mut bool,
+) -> Option<*mut task::Task> {
+    for idx in 0..task::MAX_TASKS {
+        let child = task::get_by_index(idx);
+        if child.is_null() {
+            continue;
+        }
+        let (child_ppid, child_pid, child_state) =
+            unsafe { ((*child).ppid, (*child).pid, (*child).state) };
+        if child_ppid != parent_pid {
+            continue;
+        }
+        if !child_pid_matches(wait_pid, child_pid) {
+            continue;
+        }
+        *found_match = true;
+        if child_state == TaskState::Zombie {
+            return Some(child);
+        }
+    }
+    None
+}
+
+fn sys_wait4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let wait_pid = call.arg(0) as i64;
+    let user_status = call.arg(1);
+    let options = call.arg(2) as u32;
+    let user_rusage = call.arg(3);
+
+    if wait_pid < -1 || wait_pid == 0 {
+        return -EINVAL;
+    }
+    if (options & !WNOHANG) != 0 {
+        return -EINVAL;
+    }
+    if user_rusage != 0 {
+        return -ENOSYS;
+    }
+    if ctx.current.is_null() {
+        return -ESRCH;
+    }
+
+    let parent_pid = unsafe { (*ctx.current).pid };
+    loop {
+        let mut found_match = false;
+        let child = find_waitable_child(parent_pid, wait_pid, &mut found_match);
+        if let Some(child_task) = child {
+            let (pid, exit_code, child_pml4) = unsafe {
+                (
+                    (*child_task).pid,
+                    (*child_task).exit_code,
+                    PhysAddr::new((*child_task).pml4_phys),
+                )
+            };
+            let status = wait_status_from_exit_code(exit_code);
+
+            if user_status != 0 {
+                if let Err(err) = write_i32_to_user(ctx.current, user_status, status) {
+                    return -err;
+                }
+            }
+
+            if child_pml4.as_u64() != 0 {
+                vmm::clear_user_space(child_pml4);
+                vmm::destroy_address_space(child_pml4);
+                unsafe {
+                    (*child_task).pml4_phys = 0;
+                }
+            }
+            task::task_destroy(child_task);
+            return pid as i64;
+        }
+
+        if !found_match {
+            return -ECHILD;
+        }
+        if (options & WNOHANG) != 0 {
+            return 0;
+        }
+        if !crate::sched::is_running() {
+            return -EAGAIN;
+        }
+        crate::sched::yield_now();
+    }
+}
+
+fn sys_fork(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    // fork needs direct trap-frame access and is handled in entry stubs.
+    -ENOSYS
+}
+
+fn sys_clone(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    // clone needs direct trap-frame access and is handled in entry stubs.
+    -ENOSYS
+}
+
+fn sys_vfork(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    // vfork is handled in entry stubs as a clone/fork compatibility path.
+    -ENOSYS
+}
+
 fn sys_getpid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     match ctx.pid() {
         Ok(pid) => pid,
         Err(err) => err,
     }
+}
+
+fn pid_from_syscall_arg_or_current(raw: u64, current_pid: i32) -> Result<i32, i64> {
+    let pid = raw as i64;
+    if pid < 0 || pid > i32::MAX as i64 {
+        return Err(-EINVAL);
+    }
+    if pid == 0 {
+        return Ok(current_pid);
+    }
+    Ok(pid as i32)
+}
+
+fn pgid_from_syscall_arg_or_target(raw: u64, target_pid: i32) -> Result<i32, i64> {
+    let pgid = raw as i64;
+    if pgid < 0 || pgid > i32::MAX as i64 {
+        return Err(-EINVAL);
+    }
+    if pgid == 0 {
+        return Ok(target_pid);
+    }
+    Ok(pgid as i32)
+}
+
+fn lookup_user_task(pid: i32) -> *mut task::Task {
+    let task_ptr = task::get_by_pid(pid);
+    if task_ptr.is_null() {
+        return ptr::null_mut();
+    }
+    let is_user = unsafe { ((*task_ptr).flags & TASK_FLAG_USER) != 0 };
+    if !is_user {
+        return ptr::null_mut();
+    }
+    task_ptr
+}
+
+fn sys_setpgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+
+    let caller_pid = unsafe { (*ctx.current).pid };
+    let caller_sid = unsafe { (*ctx.current).sid };
+
+    let target_pid = match pid_from_syscall_arg_or_current(call.arg(0), caller_pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+    let new_pgid = match pgid_from_syscall_arg_or_target(call.arg(1), target_pid) {
+        Ok(pgid) => pgid,
+        Err(err) => return err,
+    };
+    if new_pgid <= 0 {
+        return -EINVAL;
+    }
+
+    let target = lookup_user_task(target_pid);
+    if target.is_null() {
+        return -ESRCH;
+    }
+
+    let (target_pid_value, target_ppid, target_sid, target_state) = unsafe {
+        (
+            (*target).pid,
+            (*target).ppid,
+            (*target).sid,
+            (*target).state,
+        )
+    };
+
+    if target_state == TaskState::Zombie || target_state == TaskState::Dead {
+        return -ESRCH;
+    }
+    if target_pid_value != caller_pid && target_ppid != caller_pid {
+        return -ESRCH;
+    }
+    if target_sid != caller_sid {
+        return -EPERM;
+    }
+    if target_pid_value == target_sid {
+        return -EPERM;
+    }
+    if new_pgid != target_pid_value && !process_group_exists_in_session(target_sid, new_pgid) {
+        return -EPERM;
+    }
+
+    unsafe {
+        (*target).pgid = new_pgid;
+    }
+    0
+}
+
+fn sys_setsid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+
+    let pid = unsafe { (*ctx.current).pid };
+    let pgid = unsafe { (*ctx.current).pgid };
+    if pgid == pid || process_group_exists(pid) {
+        return -EPERM;
+    }
+
+    unsafe {
+        (*ctx.current).sid = pid;
+        (*ctx.current).pgid = pid;
+    }
+    pid as i64
+}
+
+fn sys_getsid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+
+    let caller_pid = unsafe { (*ctx.current).pid };
+    let target_pid = match pid_from_syscall_arg_or_current(call.arg(0), caller_pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+    let target = lookup_user_task(target_pid);
+    if target.is_null() {
+        return -ESRCH;
+    }
+    unsafe { (*target).sid as i64 }
+}
+
+fn sys_getuid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+    unsafe { (*ctx.current).user_uid as i64 }
+}
+
+fn sys_geteuid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    sys_getuid(ctx, _call)
+}
+
+fn sys_getgid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+    unsafe { (*ctx.current).user_gid as i64 }
+}
+
+fn sys_getegid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    sys_getgid(ctx, _call)
 }
 
 fn sys_umask(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -3037,7 +4757,7 @@ fn dispatch_syscall(call: SyscallArgs) -> i64 {
 
 #[inline]
 fn log_execve_result(result: &Result<user::ExecImageStart, i64>) {
-    if !cfg!(feature = "musl-ext2-exec") {
+    if !cfg!(any(feature = "musl-ext2-exec", feature = "musl-ext2-cmd-smoke")) {
         return;
     }
     match result {
@@ -3116,6 +4836,46 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
             }
         }
     }
+    if frame.rax == SYS_FORK || frame.rax == SYS_VFORK || frame.rax == SYS_CLONE {
+        if !ctx.is_user_task() {
+            return to_sysret(-EPERM);
+        }
+        let result = if frame.rax == SYS_CLONE {
+            let call = call_from_syscall_frame(frame);
+            let child_stack = match validate_clone_args(&call) {
+                Ok(stack) => stack,
+                Err(err) => {
+                    frame.rax = to_sysret(err);
+                    if let Some(ret) = apply_pending_signals_syscall(frame) {
+                        frame.rax = to_sysret(ret);
+                    }
+                    return frame.rax;
+                }
+            };
+            let child_frame = match build_clone_child_frame_from_syscall(frame, child_stack) {
+                Ok(child_frame) => child_frame,
+                Err(err) => {
+                    frame.rax = to_sysret(err);
+                    if let Some(ret) = apply_pending_signals_syscall(frame) {
+                        frame.rax = to_sysret(ret);
+                    }
+                    return frame.rax;
+                }
+            };
+            create_fork_child(&ctx, &child_frame)
+        } else {
+            let child_frame = build_child_frame_from_syscall_frame(frame);
+            create_fork_child(&ctx, &child_frame)
+        };
+        frame.rax = to_sysret(match result {
+            Ok(pid) => pid,
+            Err(err) => err,
+        });
+        if let Some(ret) = apply_pending_signals_syscall(frame) {
+            frame.rax = to_sysret(ret);
+        }
+        return frame.rax;
+    }
 
     let result = dispatch_syscall(call_from_syscall_frame(frame));
     frame.rax = to_sysret(result);
@@ -3163,6 +4923,49 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
         }
         return;
     }
+    if frame.rax == SYS_FORK || frame.rax == SYS_VFORK || frame.rax == SYS_CLONE {
+        frame.rax = if !ctx.is_user_task() {
+            to_sysret(-EPERM)
+        } else if frame.rax == SYS_CLONE {
+            let call = call_from_int80_frame(frame);
+            let child_stack = match validate_clone_args(&call) {
+                Ok(stack) => stack,
+                Err(err) => {
+                    frame.rax = to_sysret(err);
+                    if let Some(ret) = apply_pending_signals_int80(frame) {
+                        frame.rax = to_sysret(ret);
+                    }
+                    return;
+                }
+            };
+            let child_frame = match build_clone_child_frame_from_int80(frame, child_stack) {
+                Ok(child_frame) => child_frame,
+                Err(err) => {
+                    frame.rax = to_sysret(err);
+                    if let Some(ret) = apply_pending_signals_int80(frame) {
+                        frame.rax = to_sysret(ret);
+                    }
+                    return;
+                }
+            };
+            let result = create_fork_child(&ctx, &child_frame);
+            to_sysret(match result {
+                Ok(pid) => pid,
+                Err(err) => err,
+            })
+        } else {
+            let child_frame = build_child_frame_from_int80_frame(frame);
+            let result = create_fork_child(&ctx, &child_frame);
+            to_sysret(match result {
+                Ok(pid) => pid,
+                Err(err) => err,
+            })
+        };
+        if let Some(ret) = apply_pending_signals_int80(frame) {
+            frame.rax = to_sysret(ret);
+        }
+        return;
+    }
 
     frame.rax = to_sysret(dispatch_syscall(call_from_int80_frame(frame)));
     if let Some(ret) = apply_pending_signals_int80(frame) {
@@ -3199,7 +5002,10 @@ mod tests {
     #[test]
     fn syscall_lookup_includes_vfs_extensions() {
         assert_eq!(lookup_syscall(SYS_PIPE).map(|d| d.name), Some("pipe"));
+        assert_eq!(lookup_syscall(SYS_STAT).map(|d| d.name), Some("stat"));
+        assert_eq!(lookup_syscall(SYS_LSTAT).map(|d| d.name), Some("lstat"));
         assert_eq!(lookup_syscall(SYS_KILL).map(|d| d.name), Some("kill"));
+        assert_eq!(lookup_syscall(SYS_UNAME).map(|d| d.name), Some("uname"));
         assert_eq!(lookup_syscall(SYS_MMAP).map(|d| d.name), Some("mmap"));
         assert_eq!(
             lookup_syscall(SYS_MPROTECT).map(|d| d.name),
@@ -3251,6 +5057,66 @@ mod tests {
         assert_eq!(
             lookup_syscall(SYS_ARCH_PRCTL).map(|d| d.name),
             Some("arch_prctl")
+        );
+        assert_eq!(lookup_syscall(SYS_CLONE).map(|d| d.name), Some("clone"));
+        assert_eq!(lookup_syscall(SYS_FORK).map(|d| d.name), Some("fork"));
+        assert_eq!(lookup_syscall(SYS_VFORK).map(|d| d.name), Some("vfork"));
+        assert_eq!(lookup_syscall(SYS_WAIT4).map(|d| d.name), Some("wait4"));
+        assert_eq!(lookup_syscall(SYS_IOCTL).map(|d| d.name), Some("ioctl"));
+        assert_eq!(lookup_syscall(SYS_ACCESS).map(|d| d.name), Some("access"));
+        assert_eq!(
+            lookup_syscall(SYS_FACCESSAT).map(|d| d.name),
+            Some("faccessat")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_FACCESSAT2).map(|d| d.name),
+            Some("faccessat2")
+        );
+        assert_eq!(lookup_syscall(SYS_GETCWD).map(|d| d.name), Some("getcwd"));
+        assert_eq!(lookup_syscall(SYS_CHDIR).map(|d| d.name), Some("chdir"));
+        assert_eq!(lookup_syscall(SYS_FCHDIR).map(|d| d.name), Some("fchdir"));
+        assert_eq!(lookup_syscall(SYS_RENAME).map(|d| d.name), Some("rename"));
+        assert_eq!(lookup_syscall(SYS_LINK).map(|d| d.name), Some("link"));
+        assert_eq!(lookup_syscall(SYS_LINKAT).map(|d| d.name), Some("linkat"));
+        assert_eq!(
+            lookup_syscall(SYS_SYMLINKAT).map(|d| d.name),
+            Some("symlinkat")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_READLINKAT).map(|d| d.name),
+            Some("readlinkat")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_UTIMENSAT).map(|d| d.name),
+            Some("utimensat")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_GETTIMEOFDAY).map(|d| d.name),
+            Some("gettimeofday")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_CLOCK_GETTIME).map(|d| d.name),
+            Some("clock_gettime")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_NANOSLEEP).map(|d| d.name),
+            Some("nanosleep")
+        );
+        assert_eq!(lookup_syscall(SYS_GETUID).map(|d| d.name), Some("getuid"));
+        assert_eq!(lookup_syscall(SYS_GETEUID).map(|d| d.name), Some("geteuid"));
+        assert_eq!(lookup_syscall(SYS_GETGID).map(|d| d.name), Some("getgid"));
+        assert_eq!(lookup_syscall(SYS_GETEGID).map(|d| d.name), Some("getegid"));
+        assert_eq!(lookup_syscall(SYS_SETPGID).map(|d| d.name), Some("setpgid"));
+        assert_eq!(lookup_syscall(SYS_SETSID).map(|d| d.name), Some("setsid"));
+        assert_eq!(lookup_syscall(SYS_GETSID).map(|d| d.name), Some("getsid"));
+        assert_eq!(lookup_syscall(SYS_UTIMES).map(|d| d.name), Some("utimes"));
+        assert_eq!(
+            lookup_syscall(SYS_FUTIMESAT).map(|d| d.name),
+            Some("futimesat")
+        );
+        assert_eq!(
+            lookup_syscall(SYS_COPY_FILE_RANGE).map(|d| d.name),
+            Some("copy_file_range")
         );
     }
 
@@ -3380,5 +5246,212 @@ mod tests {
             args: [0; 6],
         });
         assert_eq!(ret, -ESRCH);
+    }
+
+    #[test]
+    fn access_mode_validation_rejects_unknown_bits() {
+        assert!(access_mode_is_valid(F_OK));
+        assert!(access_mode_is_valid(R_OK | W_OK | X_OK));
+        assert!(!access_mode_is_valid(0x80));
+    }
+
+    #[test]
+    fn access_allowed_uses_owner_bits_for_current_uid() {
+        let stat = fs::FileStat {
+            ino: 1,
+            mode: STAT_S_IRUSR | STAT_S_IWUSR,
+            uid: 1000,
+            gid: 1000,
+            nlink: 1,
+            size: 0,
+            blksize: 0,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            file_type: fs::FileType::Regular,
+        };
+        assert!(access_allowed(&stat, R_OK, 1000, 1000));
+        assert!(!access_allowed(&stat, X_OK, 1000, 1000));
+    }
+
+    #[test]
+    fn ticks_to_seconds_nanos_matches_pit_frequency() {
+        assert_eq!(ticks_to_seconds_nanos(100), (1, 0));
+        assert_eq!(ticks_to_seconds_nanos(123), (1, 230_000_000));
+    }
+
+    #[test]
+    fn timespec_to_sleep_ticks_rounds_up_partial_tick() {
+        let one_ns = LinuxTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 1,
+        };
+        assert_eq!(timespec_to_sleep_ticks(&one_ns), Ok(1));
+
+        let ten_ms = LinuxTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        assert_eq!(timespec_to_sleep_ticks(&ten_ms), Ok(1));
+
+        let invalid = LinuxTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000_000,
+        };
+        assert_eq!(timespec_to_sleep_ticks(&invalid), Err(-EINVAL));
+    }
+
+    #[test]
+    fn utimens_timespec_special_values_are_handled() {
+        assert_eq!(
+            timespec_to_unix_seconds(
+                LinuxTimeSpec {
+                    tv_sec: -1,
+                    tv_nsec: UTIME_NOW,
+                },
+                77,
+                11
+            ),
+            Ok(77)
+        );
+        assert_eq!(
+            timespec_to_unix_seconds(
+                LinuxTimeSpec {
+                    tv_sec: -1,
+                    tv_nsec: UTIME_OMIT,
+                },
+                77,
+                11
+            ),
+            Ok(11)
+        );
+    }
+
+    #[test]
+    fn utimens_timespec_rejects_invalid_nsec_or_negative_sec() {
+        assert_eq!(
+            timespec_to_unix_seconds(
+                LinuxTimeSpec {
+                    tv_sec: -1,
+                    tv_nsec: 0,
+                },
+                1,
+                1
+            ),
+            Err(-EINVAL)
+        );
+        assert_eq!(
+            timespec_to_unix_seconds(
+                LinuxTimeSpec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000_000,
+                },
+                1,
+                1
+            ),
+            Err(-EINVAL)
+        );
+    }
+
+    #[test]
+    fn wait_status_encodes_exit_code_for_waitpid_macros() {
+        assert_eq!(wait_status_from_exit_code(0), 0);
+        assert_eq!(wait_status_from_exit_code(1), 0x0100);
+        assert_eq!(wait_status_from_exit_code(255), 0xFF00_u32 as i32);
+    }
+
+    #[test]
+    fn pid_arg_zero_maps_to_current_pid() {
+        assert_eq!(pid_from_syscall_arg_or_current(0, 42), Ok(42));
+        assert_eq!(pid_from_syscall_arg_or_current(7, 42), Ok(7));
+        assert_eq!(
+            pid_from_syscall_arg_or_current((-1_i64) as u64, 42),
+            Err(-EINVAL)
+        );
+    }
+
+    #[test]
+    fn pgid_arg_zero_maps_to_target_pid() {
+        assert_eq!(pgid_from_syscall_arg_or_target(0, 55), Ok(55));
+        assert_eq!(pgid_from_syscall_arg_or_target(9, 55), Ok(9));
+        assert_eq!(
+            pgid_from_syscall_arg_or_target((-1_i64) as u64, 55),
+            Err(-EINVAL)
+        );
+    }
+
+    #[test]
+    fn setsid_rejects_process_group_leader() {
+        let mut task = task::Task::for_test(99);
+        let ctx = SyscallContext::new(&mut task as *mut task::Task);
+        let call = SyscallArgs {
+            num: 0,
+            args: [0; 6],
+        };
+        assert_eq!(sys_setsid(&ctx, &call), -EPERM);
+    }
+
+    #[test]
+    fn setsid_promotes_non_leader_to_session_leader() {
+        let mut task = task::Task::for_test(100);
+        task.pgid = 77;
+        task.sid = 77;
+        let ctx = SyscallContext::new(&mut task as *mut task::Task);
+        let call = SyscallArgs {
+            num: 0,
+            args: [0; 6],
+        };
+
+        assert_eq!(sys_setsid(&ctx, &call), 100);
+        assert_eq!(task.pgid, 100);
+        assert_eq!(task.sid, 100);
+    }
+
+    #[test]
+    fn getsid_rejects_negative_pid_argument() {
+        let mut task = task::Task::for_test(10);
+        let ctx = SyscallContext::new(&mut task as *mut task::Task);
+        let call = SyscallArgs {
+            num: 0,
+            args: [(-1_i64) as u64, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(sys_getsid(&ctx, &call), -EINVAL);
+    }
+
+    #[test]
+    fn clone_args_accept_fork_compatible_flags() {
+        let call = SyscallArgs {
+            num: SYS_CLONE,
+            args: [SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(validate_clone_args(&call), Ok(0));
+    }
+
+    #[test]
+    fn clone_args_accept_vfork_compat_flags() {
+        let call = SyscallArgs {
+            num: SYS_CLONE,
+            args: [CLONE_VM | CLONE_VFORK | SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(validate_clone_args(&call), Ok(0));
+    }
+
+    #[test]
+    fn clone_args_reject_partial_vm_vfork_combo() {
+        let call = SyscallArgs {
+            num: SYS_CLONE,
+            args: [CLONE_VM | SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(validate_clone_args(&call), Err(-EINVAL));
+    }
+
+    #[test]
+    fn clone_args_reject_nonzero_tid_tls_pointers() {
+        let call = SyscallArgs {
+            num: SYS_CLONE,
+            args: [SIGCHLD_EXIT_SIGNAL, 0, 1, 0, 0, 0],
+        };
+        assert_eq!(validate_clone_args(&call), Err(-EINVAL));
     }
 }

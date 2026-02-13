@@ -50,6 +50,8 @@ pub enum TaskState {
 pub struct Task {
     pub(crate) pid: Pid,
     pub(crate) ppid: Pid,
+    pub(crate) pgid: Pid,
+    pub(crate) sid: Pid,
     pub(crate) name: [u8; TASK_NAME_MAX],
     pub(crate) state: TaskState,
     pub(crate) flags: u32,
@@ -142,6 +144,8 @@ pub fn init() {
         let mut boot = Task {
             pid: 0,
             ppid: 0,
+            pgid: 0,
+            sid: 0,
             name: [0; TASK_NAME_MAX],
             state: TaskState::Running,
             flags: TASK_FLAG_KERNEL,
@@ -236,6 +240,8 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.pid = NEXT_PID;
         NEXT_PID = NEXT_PID.saturating_add(1);
         task.ppid = current().as_ref().map(|t| t.pid).unwrap_or(0);
+        task.pgid = task.pid;
+        task.sid = task.pid;
         task.state = TaskState::Created;
         task.flags = flags;
         task.exit_code = 0;
@@ -474,6 +480,8 @@ impl Task {
         Task {
             pid,
             ppid: 0,
+            pgid: pid,
+            sid: pid,
             name: [0; TASK_NAME_MAX],
             state: TaskState::Ready,
             flags: TASK_FLAG_KERNEL,

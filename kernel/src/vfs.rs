@@ -16,9 +16,7 @@ const EXT2_MAX_IMAGE_SIZE: usize = 512 * 1024;
 const BLOCK_SECTOR_SIZE: usize = 512;
 const BLOCK_IO_CHUNK: usize = 4096;
 
-#[cfg(all(target_os = "none", feature = "musl-ext2-exec"))]
-static SAMPLE_EXT2_IMG: &[u8] = include_bytes!("../../user/sample_ext2_musl.img");
-#[cfg(all(target_os = "none", not(feature = "musl-ext2-exec")))]
+#[cfg(target_os = "none")]
 static SAMPLE_EXT2_IMG: &[u8] = &[];
 #[cfg(not(target_os = "none"))]
 static SAMPLE_EXT2_IMG: &[u8] = include_bytes!("../../user/sample_ext2.img");

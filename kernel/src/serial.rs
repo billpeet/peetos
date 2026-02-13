@@ -95,6 +95,7 @@ pub fn write_bytes(bytes: &[u8]) {
             SERIAL1.write_byte(byte);
         }
     }
+    crate::fb_console::write_bytes(bytes);
 }
 
 #[macro_export]

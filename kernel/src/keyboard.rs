@@ -69,8 +69,12 @@ fn decode_scancode(state: &mut KeyboardState, scancode: u8) -> Option<u8> {
     let code = scancode & !SCANCODE_RELEASE_MASK;
 
     if state.extended {
-        // Extended keys (arrows, keypad Enter, etc.) are not yet mapped.
+        // Extended keys are mostly ignored for now, but keypad Enter should
+        // behave like regular Enter for shell/TTY usability.
         state.extended = false;
+        if !release && code == 0x1C {
+            return Some(b'\n');
+        }
         return None;
     }
 
@@ -208,10 +212,12 @@ mod tests {
     }
 
     #[test]
-    fn extended_prefix_is_ignored_for_now() {
+    fn extended_prefix_is_ignored_except_keypad_enter() {
         let mut state = KeyboardState::new();
         assert_eq!(decode_scancode(&mut state, 0xE0), None);
         assert_eq!(decode_scancode(&mut state, 0x48), None);
+        assert_eq!(decode_scancode(&mut state, 0xE0), None);
+        assert_eq!(decode_scancode(&mut state, 0x1C), Some(b'\n'));
         assert_eq!(decode_scancode(&mut state, 0x1E), Some(b'a'));
     }
 }

@@ -241,6 +241,23 @@ pub fn pipe_open() -> Result<u16, i64> {
     Ok(pipe_id)
 }
 
+pub fn pipe_retain(pipe_id: u16, retain_read: bool, retain_write: bool) -> Result<(), i64> {
+    let mut state = IPC_STATE.lock();
+    let idx = pipe_id as usize;
+    if idx >= IPC_MAX_PIPES || !state.pipes[idx].used {
+        return Err(ENOENT);
+    }
+
+    let pipe = &mut state.pipes[idx];
+    if retain_read {
+        pipe.read_ends = pipe.read_ends.saturating_add(1);
+    }
+    if retain_write {
+        pipe.write_ends = pipe.write_ends.saturating_add(1);
+    }
+    Ok(())
+}
+
 pub fn pipe_close(pipe_id: u16, close_read: bool, close_write: bool) -> Result<(), i64> {
     let mut state = IPC_STATE.lock();
     let idx = pipe_id as usize;
@@ -441,6 +458,20 @@ mod tests {
         init();
         let pipe = pipe_open().expect("pipe alloc");
         pipe_close(pipe, true, false).expect("close readers");
+        let err = pipe_write(ptr::null_mut(), pipe, b"x").unwrap_err();
+        assert_eq!(err, EPIPE);
+    }
+
+    #[test]
+    fn pipe_retain_balances_additional_descriptors() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let pipe = pipe_open().expect("pipe alloc");
+
+        pipe_retain(pipe, true, false).expect("retain read end");
+        pipe_close(pipe, true, false).expect("close one read end");
+        pipe_close(pipe, true, false).expect("close second read end");
+
         let err = pipe_write(ptr::null_mut(), pipe, b"x").unwrap_err();
         assert_eq!(err, EPIPE);
     }

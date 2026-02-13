@@ -26,13 +26,36 @@ mkdir -p "${STAGE_ROOT}"
 cp -a "${BASE_ROOT}/." "${STAGE_ROOT}/"
 
 mkdir -p "${STAGE_ROOT}/bin"
-"${ROOT_DIR}/scripts/build_toybox_echo.sh" \
-  --out "${STAGE_ROOT}/bin/echo"
-chmod 0755 "${STAGE_ROOT}/bin/echo"
+"${ROOT_DIR}/scripts/build_toybox_core.sh" \
+  --out "${STAGE_ROOT}/bin/toybox"
+chmod 0755 "${STAGE_ROOT}/bin/toybox"
+
+# Applets are invoked as `toybox <applet>` to keep the smoke image compact.
+cat > "${STAGE_ROOT}/bin/next_smoke.sh" <<'EOS'
+fail=0
+pwd || fail=1
+toybox ls bin || fail=1
+toybox mkdir -p /tmp/smoke || fail=1
+echo alpha >/tmp/smoke/a || fail=1
+toybox cat /tmp/smoke/a || fail=1
+toybox cp /tmp/smoke/a /tmp/smoke/b || fail=1
+toybox mv /tmp/smoke/b /tmp/smoke/c || fail=1
+toybox ln /tmp/smoke/c /tmp/smoke/hard || fail=1
+toybox touch /tmp/smoke/t || fail=1
+toybox ls /tmp/smoke || fail=1
+toybox rm -f /tmp/smoke/a /tmp/smoke/c /tmp/smoke/hard /tmp/smoke/t || fail=1
+toybox rm -rf /tmp/smoke || fail=1
+echo [musl-ext2-cmd-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-cmd-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/next_smoke.sh"
 
 TMP_IMG="${TMP_DIR}/ext2.img"
-# Keep image small enough for stage2 kernel staging when embedded.
-mke2fs -q -t ext2 -F -b 1024 -I 256 -N 96 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 128
+# Keep image compact for QEMU smoke runs while leaving room for the
+# static Toybox multicall payload.
+mke2fs -q -t ext2 -F -b 1024 -I 256 -N 96 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 384
 
 mv "${TMP_IMG}" "${OUT_IMG}"
 chmod 0644 "${OUT_IMG}"

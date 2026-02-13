@@ -27,6 +27,17 @@ mod tty;
 mod user;
 mod vfs;
 
+#[cfg(not(feature = "test-exit"))]
+mod fb_console;
+#[cfg(feature = "test-exit")]
+mod fb_console {
+    pub fn init() {}
+    pub fn write_bytes(_bytes: &[u8]) {}
+}
+
+#[cfg(not(feature = "test-exit"))]
+mod font8x8_basic;
+
 use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall, tss};
 use drivers::pci;
 use memory::{heap, pmm, vmm};
@@ -40,6 +51,7 @@ pub extern "C" fn kmain() -> ! {
     serial_println!("PeetOS Rust kernel: serial online");
 
     framebuffer::init();
+    fb_console::init();
     if framebuffer::is_available() {
         serial_println!("[FB] Active");
     } else {

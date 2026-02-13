@@ -47,17 +47,21 @@ const MOUNT_MAX: usize = 8;
 const STAT_S_IFMT: u32 = 0xF000;
 const STAT_S_IFDIR: u32 = 0x4000;
 const STAT_S_IFREG: u32 = 0x8000;
+const STAT_S_IFLNK: u32 = 0xA000;
 const STAT_S_IRUSR: u32 = 0o400;
 const STAT_S_IWUSR: u32 = 0o200;
 const STAT_S_IXUSR: u32 = 0o100;
 const STAT_S_IRGRP: u32 = 0o040;
+const STAT_S_IWGRP: u32 = 0o020;
 const STAT_S_IXGRP: u32 = 0o010;
 const STAT_S_IROTH: u32 = 0o004;
+const STAT_S_IWOTH: u32 = 0o002;
 const STAT_S_IXOTH: u32 = 0o001;
 
 pub const DT_UNKNOWN: u8 = 0;
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 10;
 
 const EXT2_SUPERBLOCK_OFFSET: usize = 1024;
 const EXT2_SUPER_MAGIC: u16 = 0xEF53;
@@ -69,12 +73,15 @@ const EXT2_MAX_IMAGE_SIZE: usize = 512 * 1024;
 
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
+const EXT2_FT_SYMLINK: u8 = 7;
 
 const EXT2_S_IFMT: u16 = 0xF000;
 const EXT2_S_IFDIR: u16 = 0x4000;
 const EXT2_S_IFREG: u16 = 0x8000;
+const EXT2_S_IFLNK: u16 = 0xA000;
 const EXT2_DEF_FILE_MODE: u16 = EXT2_S_IFREG | 0o644;
 const EXT2_DEF_DIR_MODE: u16 = EXT2_S_IFDIR | 0o755;
+const EXT2_DEF_SYMLINK_MODE: u16 = EXT2_S_IFLNK | 0o777;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -82,6 +89,7 @@ pub enum FileType {
     None = 0,
     Regular = 1,
     Directory = 2,
+    Symlink = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -609,6 +617,7 @@ fn alloc_inode(
             inode.mode = match file_type {
                 FileType::Directory => (STAT_S_IFDIR | 0o755) as u16,
                 FileType::Regular => (STAT_S_IFREG | 0o644) as u16,
+                FileType::Symlink => (STAT_S_IFLNK | 0o777) as u16,
                 FileType::None => 0,
             };
             inode.uid = 0;
@@ -1635,6 +1644,7 @@ fn ext2_dirent_file_type(file_type: FileType) -> u8 {
     match file_type {
         FileType::Directory => EXT2_FT_DIR,
         FileType::Regular => EXT2_FT_REG_FILE,
+        FileType::Symlink => EXT2_FT_SYMLINK,
         _ => 0,
     }
 }
@@ -1726,6 +1736,24 @@ fn ext2_write_inode_to_state(state: &mut VfsState, ino: u32, inode: &Ext2Inode) 
     let meta = state.ext2_meta;
     let image = &mut state.ext2_image[..state.ext2_image_len];
     ext2_write_inode(image, &meta, ino, inode)
+}
+
+fn ext2_refresh_alias_nodes(state: &mut VfsState, ext2_ino: u32, inode: &Ext2Inode) {
+    let mut idx = 0usize;
+    while idx < VFS_MAX_INODES {
+        let node = &mut state.inodes[idx];
+        if node.used && node.backend == NodeBackend::Ext2 && node.ext2_ino == ext2_ino {
+            node.size = inode.size;
+            node.mode = inode.mode;
+            node.uid = inode.uid;
+            node.gid = inode.gid;
+            node.links_count = inode.links_count;
+            node.atime = inode.atime as u64;
+            node.mtime = inode.mtime as u64;
+            node.ctime = inode.ctime as u64;
+        }
+        idx += 1;
+    }
 }
 
 fn ext2_ensure_data_block(
@@ -1966,6 +1994,7 @@ fn ext2_write_file(
     inode.atime = now;
     inode.block_count_512 = ext2_recalc_inode_block_count_512(&meta, &inode);
     ext2_write_inode_to_state(state, ino, &inode)?;
+    ext2_refresh_alias_nodes(state, ino, &inode);
 
     Ok(WriteResult {
         written: count,
@@ -1995,6 +2024,7 @@ fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
     inode.atime = now;
     let _ = meta; // keep read/write behavior explicit for future extensions
     ext2_write_inode_to_state(state, ino, &inode)?;
+    ext2_refresh_alias_nodes(state, ino, &inode);
     Ok(())
 }
 
@@ -2274,6 +2304,7 @@ fn ext2_create_child_on_disk(
         mode: match file_type {
             FileType::Regular => EXT2_DEF_FILE_MODE,
             FileType::Directory => EXT2_DEF_DIR_MODE,
+            FileType::Symlink => EXT2_DEF_SYMLINK_MODE,
             FileType::None => return Err(EINVAL),
         },
         uid: 0,
@@ -2344,6 +2375,7 @@ fn ext2_mode_to_filetype(mode: u16) -> Option<FileType> {
     match mode & EXT2_S_IFMT {
         EXT2_S_IFDIR => Some(FileType::Directory),
         EXT2_S_IFREG => Some(FileType::Regular),
+        EXT2_S_IFLNK => Some(FileType::Symlink),
         _ => None,
     }
 }
@@ -2352,6 +2384,7 @@ fn filetype_to_dtype(file_type: FileType) -> u8 {
     match file_type {
         FileType::Directory => DT_DIR,
         FileType::Regular => DT_REG,
+        FileType::Symlink => DT_LNK,
         FileType::None => DT_UNKNOWN,
     }
 }
@@ -2362,6 +2395,7 @@ fn inode_mode_for_stat(node: &Inode) -> u32 {
         mode |= match node.file_type {
             FileType::Directory => STAT_S_IFDIR,
             FileType::Regular => STAT_S_IFREG,
+            FileType::Symlink => STAT_S_IFLNK,
             FileType::None => 0,
         };
     }
@@ -2377,6 +2411,17 @@ fn inode_mode_for_stat(node: &Inode) -> u32 {
                     | STAT_S_IXOTH
             }
             FileType::Regular => STAT_S_IRUSR | STAT_S_IWUSR | STAT_S_IRGRP | STAT_S_IROTH,
+            FileType::Symlink => {
+                STAT_S_IRUSR
+                    | STAT_S_IWUSR
+                    | STAT_S_IXUSR
+                    | STAT_S_IRGRP
+                    | STAT_S_IWGRP
+                    | STAT_S_IXGRP
+                    | STAT_S_IROTH
+                    | STAT_S_IWOTH
+                    | STAT_S_IXOTH
+            }
             FileType::None => 0,
         };
     }
@@ -2489,6 +2534,7 @@ fn ext2_import_node(
                 )
             })?;
         }
+        FileType::Symlink => {}
         FileType::None => {}
     }
 
@@ -2788,6 +2834,7 @@ fn unlink_at_inner(
                 child_ext.ctime = now;
                 child_ext.mtime = now;
                 ext2_write_inode_to_state(state, child_ext2_ino, &child_ext)?;
+                ext2_refresh_alias_nodes(state, child_ext2_ino, &child_ext);
             } else {
                 ext2_free_inode_blocks(state, &mut child_ext)?;
                 ext2_free_inode(state, child_ext2_ino, false)?;
@@ -2918,6 +2965,337 @@ fn rename_at_inner(
     touch_inode_metadata(state, new_parent, true, true, true);
     touch_inode_metadata(state, child, false, false, true);
     Ok(())
+}
+
+fn link_at_inner(
+    state: &mut VfsState,
+    old_start: u16,
+    old_path: &str,
+    new_start: u16,
+    new_path: &str,
+) -> Result<(), i64> {
+    let old_inode = lookup_path_from_inner(state, old_start, old_path)?;
+    if inode_is_mount_root(state, old_inode) {
+        return Err(EBUSY);
+    }
+
+    let mut new_name = [0u8; VFS_MAX_NAME];
+    let (new_parent, new_len) =
+        resolve_parent_from_inner(state, new_start, new_path, &mut new_name)?;
+    if find_child(state, new_parent, &new_name[..new_len]).is_some() {
+        return Err(EEXIST);
+    }
+
+    let old_node = state.inodes[old_inode as usize];
+    if !old_node.used {
+        return Err(ENOENT);
+    }
+    if old_node.file_type == FileType::Directory {
+        return Err(EPERM);
+    }
+
+    let new_backend = state.inodes[new_parent as usize].backend;
+    if old_node.backend != new_backend {
+        return Err(EINVAL);
+    }
+    if !backend_mutable(old_node.backend) {
+        return Err(EROFS);
+    }
+    if state.inodes[new_parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
+        return Err(ENOSPC);
+    }
+    if !has_free_vfs_inode(state) {
+        return Err(ENOSPC);
+    }
+
+    match old_node.backend {
+        NodeBackend::Tmpfs => {
+            let new_inode = alloc_inode(
+                state,
+                old_node.file_type,
+                NodeBackend::Tmpfs,
+                new_parent,
+                &new_name[..new_len],
+            )?;
+            {
+                let now = fs_time_tick(state);
+                let old_links = state.inodes[old_inode as usize].links_count.saturating_add(1);
+                let old = &mut state.inodes[old_inode as usize];
+                old.links_count = old_links;
+                old.ctime = now;
+
+                let link = &mut state.inodes[new_inode as usize];
+                link.size = old_node.size;
+                link.data[..old_node.size as usize]
+                    .copy_from_slice(&old_node.data[..old_node.size as usize]);
+                link.mode = old_node.mode;
+                link.uid = old_node.uid;
+                link.gid = old_node.gid;
+                link.links_count = old_links;
+                link.atime = old_node.atime;
+                link.mtime = old_node.mtime;
+                link.ctime = now;
+            }
+            add_child(state, new_parent, new_inode)?;
+            touch_inode_metadata(state, new_parent, true, true, true);
+            Ok(())
+        }
+        NodeBackend::Ext2 => {
+            let old_ext2_ino = old_node.ext2_ino;
+            let new_parent_ext2_ino = state.inodes[new_parent as usize].ext2_ino;
+            if old_ext2_ino == 0 || new_parent_ext2_ino == 0 {
+                return Err(EIO);
+            }
+
+            ext2_add_dir_entry(
+                state,
+                new_parent_ext2_ino,
+                old_ext2_ino,
+                &new_name[..new_len],
+                old_node.file_type,
+            )?;
+
+            let mut ext_inode = ext2_read_inode_from_state(state, old_ext2_ino)?;
+            ext_inode.links_count = ext_inode.links_count.saturating_add(1);
+            ext_inode.ctime = fs_time_tick(state) as u32;
+            ext2_write_inode_to_state(state, old_ext2_ino, &ext_inode)?;
+
+            let new_inode = match alloc_inode(
+                state,
+                old_node.file_type,
+                NodeBackend::Ext2,
+                new_parent,
+                &new_name[..new_len],
+            ) {
+                Ok(inode) => inode,
+                Err(err) => {
+                    let _ =
+                        ext2_remove_dir_entry(state, new_parent_ext2_ino, &new_name[..new_len]);
+                    if ext_inode.links_count > 0 {
+                        ext_inode.links_count -= 1;
+                    }
+                    let _ = ext2_write_inode_to_state(state, old_ext2_ino, &ext_inode);
+                    return Err(err);
+                }
+            };
+
+            {
+                let link = &mut state.inodes[new_inode as usize];
+                link.ext2_ino = old_ext2_ino;
+            }
+            if let Err(err) = add_child(state, new_parent, new_inode) {
+                clear_inode(&mut state.inodes[new_inode as usize]);
+                let _ = ext2_remove_dir_entry(state, new_parent_ext2_ino, &new_name[..new_len]);
+                if ext_inode.links_count > 0 {
+                    ext_inode.links_count -= 1;
+                }
+                let _ = ext2_write_inode_to_state(state, old_ext2_ino, &ext_inode);
+                return Err(err);
+            }
+
+            ext2_refresh_alias_nodes(state, old_ext2_ino, &ext_inode);
+            touch_inode_metadata(state, new_parent, true, true, true);
+            Ok(())
+        }
+        _ => Err(EROFS),
+    }
+}
+
+fn symlink_at_inner(
+    state: &mut VfsState,
+    start: u16,
+    target: &str,
+    link_path: &str,
+) -> Result<(), i64> {
+    if link_path.is_empty() {
+        return Err(ENOENT);
+    }
+
+    let target_bytes = target.as_bytes();
+    let mut name = [0u8; VFS_MAX_NAME];
+    let (parent, name_len) = resolve_parent_from_inner(state, start, link_path, &mut name)?;
+    if find_child(state, parent, &name[..name_len]).is_some() {
+        return Err(EEXIST);
+    }
+
+    let parent_backend = state.inodes[parent as usize].backend;
+    if !backend_mutable(parent_backend) {
+        return Err(EROFS);
+    }
+    if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
+        return Err(ENOSPC);
+    }
+    if !has_free_vfs_inode(state) {
+        return Err(ENOSPC);
+    }
+
+    match parent_backend {
+        NodeBackend::Tmpfs => {
+            if target_bytes.len() > TMPFS_MAX_FILE_SIZE {
+                return Err(ENOSPC);
+            }
+            let inode = alloc_inode(
+                state,
+                FileType::Symlink,
+                NodeBackend::Tmpfs,
+                parent,
+                &name[..name_len],
+            )?;
+            {
+                let node = &mut state.inodes[inode as usize];
+                node.size = target_bytes.len() as u32;
+                node.data[..target_bytes.len()].copy_from_slice(target_bytes);
+            }
+            add_child(state, parent, inode)?;
+            touch_inode_metadata(state, parent, true, true, true);
+            Ok(())
+        }
+        NodeBackend::Ext2 => {
+            let parent_ino = state.inodes[parent as usize].ext2_ino;
+            if parent_ino == 0 {
+                return Err(EIO);
+            }
+
+            let (ext2_ino, _) =
+                ext2_create_child_on_disk(state, parent_ino, &name[..name_len], FileType::Symlink)?;
+
+            if !target_bytes.is_empty() {
+                let wrote = match ext2_write_file(state, ext2_ino, 0, target_bytes, false) {
+                    Ok(w) => w,
+                    Err(err) => {
+                        let _ = ext2_remove_dir_entry(state, parent_ino, &name[..name_len]);
+                        let mut child = ext2_read_inode_from_state(state, ext2_ino)?;
+                        let _ = ext2_free_inode_blocks(state, &mut child);
+                        let _ = ext2_free_inode(state, ext2_ino, false);
+                        return Err(err);
+                    }
+                };
+                if wrote.written != target_bytes.len() {
+                    let _ = ext2_remove_dir_entry(state, parent_ino, &name[..name_len]);
+                    let mut child = ext2_read_inode_from_state(state, ext2_ino)?;
+                    let _ = ext2_free_inode_blocks(state, &mut child);
+                    let _ = ext2_free_inode(state, ext2_ino, false);
+                    return Err(ENOSPC);
+                }
+            }
+
+            let inode = match alloc_inode(
+                state,
+                FileType::Symlink,
+                NodeBackend::Ext2,
+                parent,
+                &name[..name_len],
+            ) {
+                Ok(inode) => inode,
+                Err(err) => {
+                    let _ = ext2_remove_dir_entry(state, parent_ino, &name[..name_len]);
+                    if let Ok(mut child) = ext2_read_inode_from_state(state, ext2_ino) {
+                        let _ = ext2_free_inode_blocks(state, &mut child);
+                    }
+                    let _ = ext2_free_inode(state, ext2_ino, false);
+                    return Err(err);
+                }
+            };
+
+            let child = ext2_read_inode_from_state(state, ext2_ino)?;
+            {
+                let node = &mut state.inodes[inode as usize];
+                node.ext2_ino = ext2_ino;
+                node.size = child.size;
+                node.mode = child.mode;
+                node.uid = child.uid;
+                node.gid = child.gid;
+                node.links_count = child.links_count;
+                node.atime = child.atime as u64;
+                node.mtime = child.mtime as u64;
+                node.ctime = child.ctime as u64;
+            }
+            if let Err(err) = add_child(state, parent, inode) {
+                clear_inode(&mut state.inodes[inode as usize]);
+                let _ = ext2_remove_dir_entry(state, parent_ino, &name[..name_len]);
+                if let Ok(mut child) = ext2_read_inode_from_state(state, ext2_ino) {
+                    let _ = ext2_free_inode_blocks(state, &mut child);
+                }
+                let _ = ext2_free_inode(state, ext2_ino, false);
+                return Err(err);
+            }
+
+            touch_inode_metadata(state, parent, true, true, true);
+            Ok(())
+        }
+        _ => Err(EROFS),
+    }
+}
+
+fn readlink_at_inner(state: &VfsState, start: u16, path: &str, dst: &mut [u8]) -> Result<usize, i64> {
+    if path.is_empty() {
+        return Err(ENOENT);
+    }
+    let inode = lookup_path_from_inner(state, start, path)?;
+    let node = &state.inodes[inode as usize];
+    if !node.used {
+        return Err(ENOENT);
+    }
+    if node.file_type != FileType::Symlink {
+        return Err(EINVAL);
+    }
+    if dst.is_empty() {
+        return Ok(0);
+    }
+
+    match node.backend {
+        NodeBackend::Tmpfs => {
+            let count = core::cmp::min(dst.len(), node.size as usize);
+            dst[..count].copy_from_slice(&node.data[..count]);
+            Ok(count)
+        }
+        NodeBackend::Ext2 => {
+            if node.ext2_ino == 0 {
+                return Err(EIO);
+            }
+            ext2_read_file(state, node.ext2_ino, 0, dst)
+        }
+        _ => Err(EINVAL),
+    }
+}
+
+fn set_times_inner(state: &mut VfsState, inode: u16, atime: u64, mtime: u64) -> Result<(), i64> {
+    if inode as usize >= VFS_MAX_INODES {
+        return Err(ENOENT);
+    }
+    if !state.inodes[inode as usize].used {
+        return Err(ENOENT);
+    }
+
+    let backend = state.inodes[inode as usize].backend;
+    if !backend_mutable(backend) {
+        return Err(EROFS);
+    }
+
+    let ctime = fs_time_tick(state);
+    match backend {
+        NodeBackend::Tmpfs => {
+            let node = &mut state.inodes[inode as usize];
+            node.atime = atime;
+            node.mtime = mtime;
+            node.ctime = ctime;
+            Ok(())
+        }
+        NodeBackend::Ext2 => {
+            let ext2_ino = state.inodes[inode as usize].ext2_ino;
+            if ext2_ino == 0 || atime > u32::MAX as u64 || mtime > u32::MAX as u64 {
+                return Err(EINVAL);
+            }
+            let mut ext_inode = ext2_read_inode_from_state(state, ext2_ino)?;
+            ext_inode.atime = atime as u32;
+            ext_inode.mtime = mtime as u32;
+            ext_inode.ctime = ctime as u32;
+            ext2_write_inode_to_state(state, ext2_ino, &ext_inode)?;
+            ext2_refresh_alias_nodes(state, ext2_ino, &ext_inode);
+            Ok(())
+        }
+        _ => Err(EROFS),
+    }
 }
 
 pub fn root_inode() -> u16 {
@@ -3117,6 +3495,34 @@ pub fn renameat(old_start: u16, old_path: &str, new_start: u16, new_path: &str) 
     with_state(|state| {
         ensure_init(state);
         rename_at_inner(state, old_start, old_path, new_start, new_path)
+    })
+}
+
+pub fn linkat(old_start: u16, old_path: &str, new_start: u16, new_path: &str) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        link_at_inner(state, old_start, old_path, new_start, new_path)
+    })
+}
+
+pub fn symlinkat(start: u16, target: &str, link_path: &str) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        symlink_at_inner(state, start, target, link_path)
+    })
+}
+
+pub fn readlinkat(start: u16, path: &str, dst: &mut [u8]) -> Result<usize, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        readlink_at_inner(state, start, path, dst)
+    })
+}
+
+pub fn set_times(inode: u16, atime: u64, mtime: u64) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        set_times_inner(state, inode, atime, mtime)
     })
 }
 
@@ -3450,6 +3856,45 @@ mod tests {
     }
 
     #[test]
+    fn linkat_creates_second_visible_name() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let opened = open("/tmp/link-src.txt", O_CREAT | O_RDWR, 0).expect("create src");
+        let _ = write(opened.inode, 0, b"linkdata", false).expect("write src");
+        linkat(ROOT_INODE, "/tmp/link-src.txt", ROOT_INODE, "/tmp/link-dst.txt")
+            .expect("create link");
+
+        let linked = open("/tmp/link-dst.txt", O_RDONLY, 0).expect("open linked name");
+        let mut out = [0u8; 16];
+        let n = read(linked.inode, 0, &mut out).expect("read linked");
+        assert_eq!(&out[..n], b"linkdata");
+    }
+
+    #[test]
+    fn set_times_updates_atime_and_mtime() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let opened = open("/tmp/times.txt", O_CREAT | O_RDWR, 0).expect("create");
+        set_times(opened.inode, 123, 456).expect("set times");
+        let stat = stat(opened.inode).expect("stat");
+        assert_eq!(stat.atime, 123);
+        assert_eq!(stat.mtime, 456);
+    }
+
+    #[test]
+    fn symlinkat_and_readlinkat_roundtrip() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        symlinkat(ROOT_INODE, "/tmp/target.txt", "/tmp/link.txt").expect("create symlink");
+        let mut out = [0u8; 64];
+        let n = readlinkat(ROOT_INODE, "/tmp/link.txt", &mut out).expect("read symlink");
+        assert_eq!(&out[..n], b"/tmp/target.txt");
+    }
+
+    #[test]
     fn mkdir_and_nested_create_work() {
         let _guard = TEST_LOCK.lock().expect("lock should work");
         init();
@@ -3573,6 +4018,33 @@ mod tests {
         let nested = open("/mnt/ext2/newdir/note.txt", O_CREAT | O_RDWR, 0).expect("create nested");
         let nested_w = write(nested.inode, 0, b"vfs", false).expect("write nested");
         assert_eq!(nested_w.written, 3);
+
+        linkat(
+            ROOT_INODE,
+            "/mnt/ext2/hello.txt",
+            ROOT_INODE,
+            "/mnt/ext2/hello-link.txt",
+        )
+        .expect("ext2 link");
+        let linked = open("/mnt/ext2/hello-link.txt", O_RDONLY, 0).expect("open ext2 link");
+        let mut linked_buf = [0u8; 32];
+        let linked_n = read(linked.inode, 0, &mut linked_buf).expect("read ext2 link");
+        assert!(linked_n > 0);
+
+        let original = open("/mnt/ext2/hello.txt", O_RDONLY, 0).expect("open original ext2");
+        let st = stat(original.inode).expect("stat original");
+        assert!(st.nlink >= 2);
+
+        unlink("/mnt/ext2/hello-link.txt").expect("unlink ext2 link");
+        let st_after_unlink = stat(original.inode).expect("stat original after unlink");
+        assert_eq!(st_after_unlink.nlink, 1);
+
+        symlinkat(ROOT_INODE, "/mnt/ext2/hello.txt", "/mnt/ext2/hello-sym.txt")
+            .expect("ext2 symlink");
+        let mut link_target = [0u8; 128];
+        let target_n =
+            readlinkat(ROOT_INODE, "/mnt/ext2/hello-sym.txt", &mut link_target).expect("readlink");
+        assert_eq!(&link_target[..target_n], b"/mnt/ext2/hello.txt");
     }
 
     #[test]
@@ -3619,13 +4091,8 @@ mod tests {
             6
         );
         assert_eq!(
-            ext2_data_block_for_logical_index(
-                &image,
-                &meta,
-                &inode,
-                EXT2_INODE_DIRECT_COUNT + 1
-            )
-            .unwrap(),
+            ext2_data_block_for_logical_index(&image, &meta, &inode, EXT2_INODE_DIRECT_COUNT + 1)
+                .unwrap(),
             0
         );
         assert_eq!(
@@ -3643,10 +4110,7 @@ mod tests {
                 &image,
                 &meta,
                 &inode,
-                EXT2_INODE_DIRECT_COUNT
-                    + ptrs_per_block
-                    + ptrs_per_block * ptrs_per_block
-                    + 2
+                EXT2_INODE_DIRECT_COUNT + ptrs_per_block + ptrs_per_block * ptrs_per_block + 2
             )
             .unwrap(),
             11
