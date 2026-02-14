@@ -7,13 +7,20 @@ extern crate std;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
+mod arp;
 mod block;
+mod e1000;
 mod elf;
+mod ethernet;
 mod exception;
 mod framebuffer;
+mod icmp;
 mod ipc;
+mod ipv4;
 mod keyboard;
 mod memory;
+mod mmio;
+mod net;
 mod qemu;
 mod sched;
 mod serial;
@@ -24,6 +31,7 @@ mod sync;
 mod syscall;
 mod task;
 mod tty;
+mod udp;
 mod user;
 mod vfs;
 
@@ -124,6 +132,8 @@ pub extern "C" fn kmain() -> ! {
 
     storage::init(&pci_devices[..pci_summary.stored_devices]);
 
+    net::init(&pci_devices[..pci_summary.stored_devices]);
+
     vfs::init();
 
     task::init();
@@ -154,6 +164,7 @@ pub extern "C" fn kmain() -> ! {
     qemu::exit_success();
 
     loop {
+        net::poll();
         unsafe {
             core::arch::asm!("hlt");
         }

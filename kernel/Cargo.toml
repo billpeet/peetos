@@ -7,6 +7,7 @@ edition = "2021"
 arch_x86_64 = { path = "../crates/arch_x86_64" }
 drivers = { path = "../crates/drivers" }
 fs = { path = "../crates/fs" }
+net = { path = "../crates/net" }
 
 [features]
 default = []
@@ -15,3 +16,5 @@ musl-smoke = []
 musl-ext2-exec = []
 musl-ext2-cmd-smoke = []
 vga = []
+net-ping-smoke = []
+net-udp-smoke = []
