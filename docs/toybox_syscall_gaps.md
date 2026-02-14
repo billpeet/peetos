@@ -160,7 +160,8 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 
 1. Networking tools (`wget`, `ping`, `ifconfig`, `netcat`, etc.):
 - `socket` (41), `connect` (42), `accept` (43), `sendto` (44), `recvfrom` (45)
-- `bind` (49), `listen` (50), `setsockopt` (54), `getsockopt` (55), `poll` (7)
+- `bind` (49), `listen` (50), `setsockopt` (54), `getsockopt` (55) — now implemented
+- `poll` (7), `ppoll` (271), `recvmsg` (47) — now implemented
 
 2. Mount/admin tools (`mount`, `umount`, `switch_root`, namespace tooling):
 - `mount` (165), `umount2` (166), `pivot_root` (155), `setns` (308), `unshare` (272)

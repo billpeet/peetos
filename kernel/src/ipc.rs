@@ -391,6 +391,22 @@ pub fn pipe_write(task: *mut Task, pipe_id: u16, src: &[u8]) -> Result<usize, i6
     Ok(written)
 }
 
+/// Non-destructive poll of pipe state. Returns
+/// `(has_data, has_space, read_eof, write_broken)`.
+pub fn pipe_poll_status(pipe_id: u16) -> Result<(bool, bool, bool, bool), i64> {
+    let state = IPC_STATE.lock();
+    let idx = pipe_id as usize;
+    if idx >= IPC_MAX_PIPES || !state.pipes[idx].used {
+        return Err(ENOENT);
+    }
+    let pipe = &state.pipes[idx];
+    let has_data = pipe.len > 0;
+    let has_space = (pipe.len as usize) < PIPE_CAPACITY;
+    let read_eof = pipe.write_ends == 0;
+    let write_broken = pipe.read_ends == 0;
+    Ok((has_data, has_space, read_eof, write_broken))
+}
+
 pub fn futex_wait(task: *mut Task, addr: u64) -> Result<(), i64> {
     let key = futex_key(addr);
     {

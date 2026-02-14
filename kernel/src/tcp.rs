@@ -700,6 +700,45 @@ pub fn is_connected(handle: usize) -> bool {
     }
 }
 
+/// Returns true if there is buffered receive data on the connection.
+pub fn has_rx_data(handle: usize) -> bool {
+    unsafe {
+        if handle >= MAX_CONNECTIONS || !CONNECTIONS[handle].active {
+            return false;
+        }
+        CONNECTIONS[handle].rx_len > 0
+    }
+}
+
+/// Returns true if there is an established child connection waiting to be
+/// accepted on `listen_port`.
+pub fn has_pending_accept(listen_port: u16) -> bool {
+    unsafe {
+        for c in CONNECTIONS.iter() {
+            if c.active
+                && !c.listener
+                && c.local_port == listen_port
+                && c.state == TcpState::Established
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns true if the connection is Established and has room in the send
+/// window / retransmit buffer.
+pub fn can_send(handle: usize) -> bool {
+    unsafe {
+        if handle >= MAX_CONNECTIONS || !CONNECTIONS[handle].active {
+            return false;
+        }
+        CONNECTIONS[handle].state == TcpState::Established
+            && CONNECTIONS[handle].tx_len < TX_BUF_SIZE
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Incoming packet handler (called from IPv4 dispatch)
 // ---------------------------------------------------------------------------

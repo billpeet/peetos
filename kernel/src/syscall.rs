@@ -15,6 +15,7 @@ use crate::shm;
 use crate::signal;
 use crate::socket;
 use crate::task::{self, TaskState, TASK_FLAG_USER};
+use crate::tty;
 use crate::user;
 
 #[cfg(not(test))]
@@ -161,6 +162,18 @@ const SYS_SYNC: u64 = 162;
 const SYS_SCHED_GETAFFINITY: u64 = 204;
 const SYS_COPY_FILE_RANGE: u64 = 326;
 const SYS_FACCESSAT2: u64 = 439;
+
+// Poll syscall numbers
+const SYS_POLL: u64 = 7;
+const SYS_PPOLL: u64 = 271;
+
+// Poll event bits (Linux ABI)
+const POLLIN: i16 = 0x0001;
+const POLLPRI: i16 = 0x0002;
+const POLLOUT: i16 = 0x0004;
+const POLLERR: i16 = 0x0008;
+const POLLHUP: i16 = 0x0010;
+const POLLNVAL: i16 = 0x0020;
 
 // Socket syscall numbers
 const SYS_SOCKET: u64 = 41;
@@ -633,6 +646,9 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_sched_getaffinity,
     ),
     syscall_def(SYS_GETPGID, "getpgid", SyscallMode::UserTask, sys_getpgid),
+    // Poll syscalls
+    syscall_def(SYS_POLL, "poll", SyscallMode::UserTask, sys_poll),
+    syscall_def(SYS_PPOLL, "ppoll", SyscallMode::UserTask, sys_ppoll),
     // Socket syscalls
     syscall_def(SYS_SOCKET, "socket", SyscallMode::UserTask, sys_socket),
     syscall_def(SYS_CONNECT, "connect", SyscallMode::UserTask, sys_connect),
@@ -1049,6 +1065,28 @@ struct LinuxUtsName {
 struct LinuxIovec {
     iov_base: u64,
     iov_len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxMsgHdr {
+    msg_name: u64,
+    msg_namelen: u32,
+    _pad0: u32,
+    msg_iov: u64,
+    msg_iovlen: u64,
+    msg_control: u64,
+    msg_controllen: u64,
+    msg_flags: u32,
+    _pad1: u32,
 }
 
 #[repr(C)]
@@ -5875,12 +5913,319 @@ fn sys_recvfrom(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     n as i64
 }
 
+// ---------------------------------------------------------------------------
+// poll / ppoll implementation
+// ---------------------------------------------------------------------------
+
+const POLL_MAX_FDS: usize = 32;
+
+/// Compute revents for a single FD.
+fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16) -> i16 {
+    let idx = match fd_index(fd) {
+        Ok(i) => i,
+        Err(_) => return POLLNVAL,
+    };
+    if !fd_slot_is_open(task_ptr, idx) {
+        return POLLNVAL;
+    }
+
+    let (kind, inode, flags) = unsafe {
+        (
+            (*task_ptr).user_fd_kind[idx],
+            (*task_ptr).user_fd_inode[idx],
+            (*task_ptr).user_fd_flags[idx],
+        )
+    };
+
+    let mut revents: i16 = 0;
+
+    if kind == task::USER_FD_KIND_CONSOLE {
+        if (requested & POLLIN) != 0 && tty::has_ready_data() {
+            revents |= POLLIN;
+        }
+        if (requested & POLLOUT) != 0 {
+            revents |= POLLOUT; // console always writable
+        }
+    } else if kind == task::USER_FD_KIND_VFS {
+        // Regular files are always ready
+        if (requested & POLLIN) != 0 {
+            revents |= POLLIN;
+        }
+        if (requested & POLLOUT) != 0 {
+            revents |= POLLOUT;
+        }
+    } else if kind == task::USER_FD_KIND_PIPE {
+        if let Ok((has_data, has_space, read_eof, write_broken)) =
+            ipc::pipe_poll_status(inode)
+        {
+            let can_read = fd_can_read(flags);
+            let can_write = fd_can_write(flags);
+            if can_read {
+                if has_data {
+                    revents |= POLLIN;
+                }
+                if read_eof {
+                    revents |= POLLHUP;
+                }
+            }
+            if can_write {
+                if has_space {
+                    revents |= POLLOUT;
+                }
+                if write_broken {
+                    revents |= POLLERR;
+                }
+            }
+        } else {
+            revents |= POLLNVAL;
+        }
+    } else if kind == task::USER_FD_KIND_SOCKET {
+        let sock_events = socket::socket_poll_events(inode) as i16;
+        // Always report POLLERR/POLLHUP/POLLNVAL regardless of requested
+        revents = sock_events & (requested | POLLERR | POLLHUP | POLLNVAL);
+    }
+
+    revents
+}
+
+fn do_poll(
+    ctx: &SyscallContext,
+    fds_ptr: u64,
+    nfds: usize,
+    deadline: Option<u64>,
+) -> i64 {
+    if nfds > POLL_MAX_FDS {
+        return -EINVAL;
+    }
+    if fds_ptr == 0 && nfds > 0 {
+        return -EFAULT;
+    }
+
+    // Read PollFd array from user
+    let mut fds = [PollFd { fd: -1, events: 0, revents: 0 }; POLL_MAX_FDS];
+    if nfds > 0 {
+        let byte_len = nfds * size_of::<PollFd>();
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                fds.as_mut_ptr() as *mut u8,
+                byte_len,
+            )
+        };
+        if let Err(e) = copy_from_user_task(ctx.current, fds_ptr, bytes) {
+            return -(e);
+        }
+    }
+
+    loop {
+        let mut ready_count: i64 = 0;
+        for i in 0..nfds {
+            fds[i].revents = 0;
+            if fds[i].fd < 0 {
+                continue;
+            }
+            fds[i].revents = poll_fd_revents(ctx.current, fds[i].fd, fds[i].events);
+            if fds[i].revents != 0 {
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 || deadline == Some(0) {
+            // Write back
+            if nfds > 0 {
+                let byte_len = nfds * size_of::<PollFd>();
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        fds.as_ptr() as *const u8,
+                        byte_len,
+                    )
+                };
+                if let Err(e) = copy_to_user_task(ctx.current, fds_ptr, bytes) {
+                    return -(e);
+                }
+            }
+            return ready_count;
+        }
+
+        // Check deadline
+        if let Some(dl) = deadline {
+            if pit::uptime_ms() >= dl {
+                // Timeout — write back zero revents
+                if nfds > 0 {
+                    let byte_len = nfds * size_of::<PollFd>();
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            fds.as_ptr() as *const u8,
+                            byte_len,
+                        )
+                    };
+                    let _ = copy_to_user_task(ctx.current, fds_ptr, bytes);
+                }
+                return 0;
+            }
+        }
+
+        // Drive NIC + TCP tick, then yield
+        #[cfg(not(test))]
+        {
+            crate::net::poll();
+            crate::sched::yield_now();
+        }
+    }
+}
+
+fn sys_ppoll(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fds_ptr = call.arg(0);
+    let nfds = call.arg(1) as usize;
+    let tspec_ptr = call.arg(2);
+    // arg3 = sigmask (ignored)
+
+    let deadline = if tspec_ptr == 0 {
+        None // block indefinitely
+    } else {
+        match read_struct_from_user::<LinuxTimeSpec>(ctx.current, tspec_ptr) {
+            Ok(ts) => {
+                if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+                    return -EINVAL;
+                }
+                let timeout_ms =
+                    (ts.tv_sec as u64).saturating_mul(1000)
+                    .saturating_add((ts.tv_nsec as u64) / 1_000_000);
+                Some(pit::uptime_ms().saturating_add(timeout_ms))
+            }
+            Err(e) => return -(e),
+        }
+    };
+
+    do_poll(ctx, fds_ptr, nfds, deadline)
+}
+
+fn sys_poll(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fds_ptr = call.arg(0);
+    let nfds = call.arg(1) as usize;
+    let timeout_ms = call.arg(2) as i32;
+
+    let deadline = if timeout_ms < 0 {
+        None // block indefinitely
+    } else if timeout_ms == 0 {
+        Some(0u64) // non-blocking
+    } else {
+        Some(pit::uptime_ms().saturating_add(timeout_ms as u64))
+    };
+
+    do_poll(ctx, fds_ptr, nfds, deadline)
+}
+
+// ---------------------------------------------------------------------------
+// sendmsg / recvmsg
+// ---------------------------------------------------------------------------
+
 fn sys_sendmsg(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     -ENOSYS
 }
 
-fn sys_recvmsg(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
-    -ENOSYS
+fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let msghdr_ptr = call.arg(1);
+    let msg_flags_arg = call.arg(2) as u32;
+
+    if msghdr_ptr == 0 {
+        return -EFAULT;
+    }
+
+    let (idx, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let fd_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let nb = (fd_open_flags(fd_flags) & O_NONBLOCK) != 0
+        || (msg_flags_arg & 0x40) != 0; // MSG_DONTWAIT
+
+    // Read msghdr from user
+    let hdr = match read_struct_from_user::<LinuxMsgHdr>(ctx.current, msghdr_ptr) {
+        Ok(h) => h,
+        Err(e) => return -(e),
+    };
+
+    // Sum iovec lengths to determine total buffer size
+    let iov_count = hdr.msg_iovlen as usize;
+    if iov_count > 64 {
+        return -EINVAL;
+    }
+
+    let mut total_len: usize = 0;
+    let mut iovecs = [LinuxIovec { iov_base: 0, iov_len: 0 }; 64];
+    for i in 0..iov_count {
+        let entry_ptr = hdr.msg_iov + (i * size_of::<LinuxIovec>()) as u64;
+        match read_struct_from_user::<LinuxIovec>(ctx.current, entry_ptr) {
+            Ok(iov) => {
+                iovecs[i] = iov;
+                total_len = total_len.saturating_add(iov.iov_len as usize);
+            }
+            Err(e) => return -(e),
+        }
+    }
+
+    // Cap at 4096-byte kernel buffer
+    const RECVMSG_BUF_SIZE: usize = 4096;
+    let recv_len = total_len.min(RECVMSG_BUF_SIZE);
+    let mut kbuf = [0u8; RECVMSG_BUF_SIZE];
+
+    let (n, src_ip, src_port) = match socket::socket_recvfrom(sock_id, &mut kbuf[..recv_len], nb) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Scatter received data across iovecs
+    let mut remaining = n;
+    let mut src_off: usize = 0;
+    for i in 0..iov_count {
+        if remaining == 0 {
+            break;
+        }
+        let chunk = remaining.min(iovecs[i].iov_len as usize);
+        if chunk > 0 && iovecs[i].iov_base != 0 {
+            if let Err(e) = copy_to_user_task(ctx.current, iovecs[i].iov_base, &kbuf[src_off..src_off + chunk]) {
+                return -(e);
+            }
+        }
+        src_off += chunk;
+        remaining -= chunk;
+    }
+
+    // Write source address to msg_name if non-null
+    if hdr.msg_name != 0 && hdr.msg_namelen >= SOCKADDR_IN_SIZE as u32 {
+        let _ = write_sockaddr_in(ctx.current, hdr.msg_name, 0, &src_ip, src_port);
+        // Write back msg_namelen
+        let namelen_bytes = (SOCKADDR_IN_SIZE as u32).to_le_bytes();
+        let _ = copy_to_user_task(
+            ctx.current,
+            msghdr_ptr + 8, // offset of msg_namelen in LinuxMsgHdr
+            &namelen_bytes,
+        );
+    } else if hdr.msg_name == 0 {
+        // Write back msg_namelen = 0
+        let zero_bytes = 0u32.to_le_bytes();
+        let _ = copy_to_user_task(ctx.current, msghdr_ptr + 8, &zero_bytes);
+    }
+
+    // Write back msg_controllen = 0
+    let zero_controllen = 0u64.to_le_bytes();
+    let _ = copy_to_user_task(
+        ctx.current,
+        msghdr_ptr + 40, // offset of msg_controllen
+        &zero_controllen,
+    );
+
+    // Write back msg_flags = 0
+    let zero_flags = 0u32.to_le_bytes();
+    let _ = copy_to_user_task(
+        ctx.current,
+        msghdr_ptr + 48, // offset of msg_flags
+        &zero_flags,
+    );
+
+    n as i64
 }
 
 fn sys_shutdown(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {

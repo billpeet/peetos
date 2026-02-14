@@ -269,6 +269,12 @@ pub fn ingest_byte(byte: u8) {
     }
 }
 
+/// Returns true if the TTY ready-buffer contains at least one byte.
+pub fn has_ready_data() -> bool {
+    let state = TTY_STATE.lock();
+    state.ready_len > 0
+}
+
 pub fn read_nonblocking(out: &mut [u8]) -> usize {
     let mut state = TTY_STATE.lock();
     ready_pop_locked(&mut state, out)

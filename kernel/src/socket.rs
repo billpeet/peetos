@@ -449,6 +449,61 @@ pub fn socket_recvfrom(
     }
 }
 
+// Poll event bits (match Linux ABI)
+const POLLIN: u16 = 0x0001;
+const POLLOUT: u16 = 0x0004;
+const POLLHUP: u16 = 0x0010;
+
+/// Return a bitmask of POLLIN/POLLOUT/POLLHUP for socket `id`.
+pub fn socket_poll_events(id: u16) -> u16 {
+    let s = match get_socket(id) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let mut events: u16 = 0;
+
+    if s.protocol == PROTO_TCP {
+        let handle = s.handle as usize;
+        match s.state {
+            STATE_CONNECTED => {
+                if tcp::has_rx_data(handle) || !tcp::is_connected(handle) {
+                    events |= POLLIN;
+                }
+                if tcp::can_send(handle) {
+                    events |= POLLOUT;
+                }
+                if !tcp::is_connected(handle) {
+                    events |= POLLHUP;
+                }
+            }
+            STATE_LISTENING => {
+                if tcp::has_pending_accept(s.local_port) {
+                    events |= POLLIN;
+                }
+            }
+            STATE_SHUTDOWN => {
+                events |= POLLHUP;
+                if tcp::has_rx_data(handle) {
+                    events |= POLLIN;
+                }
+            }
+            _ => {}
+        }
+    } else {
+        // UDP
+        let handle = s.handle as usize;
+        if s.state == STATE_BOUND || s.state == STATE_CONNECTED {
+            if udp::rx_pending(handle) > 0 {
+                events |= POLLIN;
+            }
+            events |= POLLOUT; // UDP can always send
+        }
+    }
+
+    events
+}
+
 /// Shutdown a socket (partial close).
 pub fn socket_shutdown(id: u16, _how: i32) -> Result<(), i64> {
     let s = get_socket(id)?;
