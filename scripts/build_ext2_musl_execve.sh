@@ -190,6 +190,13 @@ toybox unicode 41 >/dev/null || fail=1
 toybox mountpoint / 2>/dev/null; true
 toybox whoami 2>/dev/null; true
 
+# -- seventh-wave: networking applets (basic argv/help validation) --
+toybox netcat --help 2>&1 | toybox head -n 1 || fail=1
+toybox wget --help 2>&1 | toybox head -n 1 || fail=1
+toybox ftpget --help 2>&1 | toybox head -n 1 || fail=1
+toybox sntp --help 2>&1 | toybox head -n 1 || fail=1
+toybox microcom --help 2>&1 | toybox head -n 1 || fail=1
+
 echo [musl-ext2-cmd-smoke] done
 if [ "$fail" -ne 0 ]; then
   echo [musl-ext2-cmd-smoke] failures
@@ -199,8 +206,8 @@ chmod 0755 "${STAGE_ROOT}/bin/next_smoke.sh"
 
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact for QEMU smoke runs while leaving room for the
-# static Toybox multicall payload (expanded for fifth-wave applets).
-mke2fs -q -t ext2 -F -b 1024 -I 256 -N 256 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 2048
+# static Toybox multicall payload (expanded for networking applets).
+mke2fs -q -t ext2 -F -b 1024 -I 256 -N 384 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 3072
 
 mv "${TMP_IMG}" "${OUT_IMG}"
 chmod 0644 "${OUT_IMG}"

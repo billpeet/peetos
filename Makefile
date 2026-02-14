@@ -63,7 +63,7 @@ else
 CARGO_FEATURES :=
 endif
 
-.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke clean run run-current run-image run-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke test ext2-image \
+.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke clean run run-current run-image run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke test ext2-image \
 	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
 	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info run-shell-smoke
 
@@ -118,7 +118,7 @@ $(USER_MUSL_EXT2_INIT_ELF): user/musl_execve_ext2.c $(USER_MUSL_SMOKE_SCRIPT)
 $(USER_MUSL_EXT2_SMOKE_ELF): user/musl_execve_ext2_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
 
-$(USER_EXT2_MUSL_IMG): $(USER_EXT2_MUSL_SCRIPT) $(USER_TOYBOX_CORE_SCRIPT) toybox/Makefile toybox/fetch-toybox.sh toybox/configs/shell-core.config user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt
+$(USER_EXT2_MUSL_IMG): $(USER_EXT2_MUSL_SCRIPT) $(USER_TOYBOX_CORE_SCRIPT) toybox/Makefile toybox/fetch-toybox.sh toybox/configs/shell-core.config user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt user/ext2_root/etc/resolv.conf
 	$(USER_EXT2_MUSL_SCRIPT)
 
 ifneq ($(findstring musl-smoke,$(KERNEL_FEATURES)),)
@@ -210,6 +210,18 @@ run-shell:
 		-device ide-hd,drive=disk0,bus=ahci.0 \
 		-drive id=disk1,file=$(USER_EXT2_MUSL_IMG),if=none,format=raw \
 		-device ide-hd,drive=disk1,bus=ahci.1 \
+		-serial stdio -no-reboot -no-shutdown
+
+run-net-shell:
+	$(MAKE) image PROFILE=release KERNEL_FEATURES=musl-ext2-exec
+	$(QEMU) \
+		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
+		-device ich9-ahci,id=ahci \
+		-device ide-hd,drive=disk0,bus=ahci.0 \
+		-drive id=disk1,file=$(USER_EXT2_MUSL_IMG),if=none,format=raw \
+		-device ide-hd,drive=disk1,bus=ahci.1 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0 \
 		-serial stdio -no-reboot -no-shutdown
 
 run-net:

@@ -69,6 +69,13 @@ Sixth-wave applets (15 additions, no new syscalls required):
 - lsb: `zcat` (gzip.c), `sha1sum`/`sha224sum`/`sha256sum`/`sha384sum`/`sha512sum` (md5sum.c aliases)
 - other: `base32` (base64.c), `unicode` (ascii.c), `sha3sum` (sha3sum.c), `mountpoint` (mountpoint.c)
 
+Seventh-wave networking applets (6 additions, staged for BSD sockets + poll/recvmsg):
+- TCP/UDP tools: `netcat` (SOCK_STREAM/DGRAM), `wget` (TCP), `httpd` (TCP server), `ftpget` (TCP dual-channel), `sntp` (UDP)
+- Serial/TTY: `microcom` (uses poll() on TTY, not network)
+- All use `xgetaddrinfo()` → musl `getaddrinfo()` which handles numeric IPs via `inet_pton()` without DNS; hostname resolution requires `/etc/resolv.conf` (staged with QEMU DNS forwarder at 10.0.2.3)
+- Blocked applets (not staged): `ping` (needs IPPROTO_ICMP socket support), `host` (needs libresolv)
+- Interactive networking available via `make run-net-shell` (ext2 shell + E1000)
+
 P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`)
 are now implemented; `chmod`/`chown` applets use the new handlers.
 
