@@ -40,6 +40,7 @@ pub fn init(pci_devices: &[pci::DeviceInfo]) {
     crate::ipv4::init();
     crate::icmp::init();
     crate::udp::init();
+    crate::tcp::init();
 
     // Send gratuitous ARP
     crate::arp::send_gratuitous();
@@ -63,11 +64,15 @@ pub fn init(pci_devices: &[pci::DeviceInfo]) {
 
     #[cfg(feature = "net-udp-smoke")]
     crate::udp::smoke_test();
+
+    #[cfg(feature = "net-tcp-smoke")]
+    crate::tcp::smoke_test();
 }
 
 /// Poll for incoming network packets. Call from idle loop.
 pub fn poll() {
     if crate::e1000::is_initialized() {
         crate::e1000::poll();
+        crate::tcp::tick();
     }
 }

@@ -30,6 +30,7 @@ mod storage;
 mod sync;
 mod syscall;
 mod task;
+mod tcp;
 mod tty;
 mod udp;
 mod user;

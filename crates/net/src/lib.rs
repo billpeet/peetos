@@ -222,6 +222,7 @@ pub enum NetError {
     Timeout,
     PortInUse,
     NoResources,
+    ConnectionRefused,
 }
 
 #[cfg(test)]
