@@ -672,6 +672,35 @@ pub fn close(handle: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Metadata accessors (used by socket layer)
+// ---------------------------------------------------------------------------
+
+/// Returns (local_port, remote_ip, remote_port) for a connection.
+pub fn connection_info(handle: usize) -> Option<(u16, Ipv4Addr, u16)> {
+    unsafe {
+        if handle >= MAX_CONNECTIONS || !CONNECTIONS[handle].active {
+            return None;
+        }
+        Some((
+            CONNECTIONS[handle].local_port,
+            CONNECTIONS[handle].remote_ip,
+            CONNECTIONS[handle].remote_port,
+        ))
+    }
+}
+
+/// Returns true if the connection is in Established or CloseWait state.
+pub fn is_connected(handle: usize) -> bool {
+    unsafe {
+        if handle >= MAX_CONNECTIONS || !CONNECTIONS[handle].active {
+            return false;
+        }
+        CONNECTIONS[handle].state == TcpState::Established
+            || CONNECTIONS[handle].state == TcpState::CloseWait
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Incoming packet handler (called from IPv4 dispatch)
 // ---------------------------------------------------------------------------
 

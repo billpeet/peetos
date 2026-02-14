@@ -63,7 +63,7 @@ else
 CARGO_FEATURES :=
 endif
 
-.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke clean run run-current run-image run-shell run-net run-net-udp-smoke run-net-tcp-smoke test ext2-image \
+.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke clean run run-current run-image run-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke test ext2-image \
 	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
 	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info run-shell-smoke
 
@@ -238,6 +238,14 @@ run-net-udp-smoke:
 
 run-net-tcp-smoke:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=net-tcp-smoke
+	$(QEMU) \
+		-drive format=raw,file=$(IMAGE) \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0 \
+		-serial stdio -display none -no-reboot -no-shutdown
+
+run-net-socket-smoke:
+	$(MAKE) image PROFILE=release KERNEL_FEATURES=net-socket-smoke
 	$(QEMU) \
 		-drive format=raw,file=$(IMAGE) \
 		-netdev user,id=net0 \

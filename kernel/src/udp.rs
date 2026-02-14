@@ -203,6 +203,20 @@ pub fn unbind(handle: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Metadata accessors (used by socket layer)
+// ---------------------------------------------------------------------------
+
+/// Returns the local port for a binding, or None if invalid/inactive.
+pub fn binding_port(handle: usize) -> Option<u16> {
+    unsafe {
+        if handle >= MAX_BINDINGS || !BINDINGS[handle].active {
+            return None;
+        }
+        Some(BINDINGS[handle].local_port)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Send
 // ---------------------------------------------------------------------------
 

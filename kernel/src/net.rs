@@ -67,6 +67,9 @@ pub fn init(pci_devices: &[pci::DeviceInfo]) {
 
     #[cfg(feature = "net-tcp-smoke")]
     crate::tcp::smoke_test();
+
+    #[cfg(feature = "net-socket-smoke")]
+    crate::socket::smoke_test();
 }
 
 /// Poll for incoming network packets. Call from idle loop.

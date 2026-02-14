@@ -26,6 +26,7 @@ mod sched;
 mod serial;
 mod shm;
 mod signal;
+mod socket;
 mod storage;
 mod sync;
 mod syscall;

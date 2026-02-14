@@ -13,6 +13,7 @@ use crate::ipc;
 use crate::memory::{heap, pmm, vmm};
 use crate::shm;
 use crate::signal;
+use crate::socket;
 use crate::task::{self, TaskState, TASK_FLAG_USER};
 use crate::user;
 
@@ -56,6 +57,15 @@ const EISDIR: i64 = 21;
 const ENOTEMPTY: i64 = 39;
 const ENOSYS: i64 = 38;
 const ENOSPC: i64 = 28;
+const ENOTSOCK: i64 = 88;
+const EPROTONOSUPPORT: i64 = 93;
+const EOPNOTSUPP: i64 = 95;
+const EAFNOSUPPORT: i64 = 97;
+const EADDRINUSE: i64 = 98;
+const ENOTCONN: i64 = 107;
+const ETIMEDOUT: i64 = 110;
+const ECONNREFUSED: i64 = 111;
+const EINPROGRESS: i64 = 115;
 
 const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
@@ -152,6 +162,24 @@ const SYS_SCHED_GETAFFINITY: u64 = 204;
 const SYS_COPY_FILE_RANGE: u64 = 326;
 const SYS_FACCESSAT2: u64 = 439;
 
+// Socket syscall numbers
+const SYS_SOCKET: u64 = 41;
+const SYS_CONNECT: u64 = 42;
+const SYS_ACCEPT: u64 = 43;
+const SYS_SENDTO: u64 = 44;
+const SYS_RECVFROM: u64 = 45;
+const SYS_SENDMSG: u64 = 46;
+const SYS_RECVMSG: u64 = 47;
+const SYS_SHUTDOWN: u64 = 48;
+const SYS_BIND: u64 = 49;
+const SYS_LISTEN: u64 = 50;
+const SYS_GETSOCKNAME: u64 = 51;
+const SYS_GETPEERNAME: u64 = 52;
+const SYS_SOCKETPAIR: u64 = 53;
+const SYS_SETSOCKOPT: u64 = 54;
+const SYS_GETSOCKOPT: u64 = 55;
+const SYS_ACCEPT4: u64 = 288;
+
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_EMPTY_PATH: u32 = 0x1000;
 const AT_EACCESS: u32 = 0x200;
@@ -210,6 +238,23 @@ const MAP_DENYWRITE: u32 = 0x0800;
 const MAP_EXECUTABLE: u32 = 0x1000;
 const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 const O_CLOEXEC: u32 = 0x80000;
+const O_NONBLOCK: u32 = 0x800;
+
+// Socket constants
+const AF_INET: u32 = 2;
+const SOCK_STREAM: u32 = 1;
+const SOCK_DGRAM: u32 = 2;
+const SOCK_CLOEXEC: u32 = 0x80000;
+const SOCK_NONBLOCK: u32 = 0x800;
+const SOCKADDR_IN_SIZE: usize = 16;
+
+// Socket option levels/names
+const SOL_SOCKET: u32 = 1;
+const SO_ERROR: u32 = 4;
+const SO_REUSEADDR: u32 = 2;
+const SO_KEEPALIVE: u32 = 9;
+const IPPROTO_TCP: u32 = 6;
+const TCP_NODELAY: u32 = 1;
 
 const F_DUPFD: u32 = 0;
 const F_GETFD: u32 = 1;
@@ -588,6 +633,48 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_sched_getaffinity,
     ),
     syscall_def(SYS_GETPGID, "getpgid", SyscallMode::UserTask, sys_getpgid),
+    // Socket syscalls
+    syscall_def(SYS_SOCKET, "socket", SyscallMode::UserTask, sys_socket),
+    syscall_def(SYS_CONNECT, "connect", SyscallMode::UserTask, sys_connect),
+    syscall_def(SYS_ACCEPT, "accept", SyscallMode::UserTask, sys_accept),
+    syscall_def(SYS_SENDTO, "sendto", SyscallMode::UserTask, sys_sendto),
+    syscall_def(SYS_RECVFROM, "recvfrom", SyscallMode::UserTask, sys_recvfrom),
+    syscall_def(SYS_SENDMSG, "sendmsg", SyscallMode::UserTask, sys_sendmsg),
+    syscall_def(SYS_RECVMSG, "recvmsg", SyscallMode::UserTask, sys_recvmsg),
+    syscall_def(SYS_SHUTDOWN, "shutdown", SyscallMode::UserTask, sys_shutdown),
+    syscall_def(SYS_BIND, "bind", SyscallMode::UserTask, sys_bind),
+    syscall_def(SYS_LISTEN, "listen", SyscallMode::UserTask, sys_listen),
+    syscall_def(
+        SYS_GETSOCKNAME,
+        "getsockname",
+        SyscallMode::UserTask,
+        sys_getsockname,
+    ),
+    syscall_def(
+        SYS_GETPEERNAME,
+        "getpeername",
+        SyscallMode::UserTask,
+        sys_getpeername,
+    ),
+    syscall_def(
+        SYS_SOCKETPAIR,
+        "socketpair",
+        SyscallMode::UserTask,
+        sys_socketpair,
+    ),
+    syscall_def(
+        SYS_SETSOCKOPT,
+        "setsockopt",
+        SyscallMode::UserTask,
+        sys_setsockopt,
+    ),
+    syscall_def(
+        SYS_GETSOCKOPT,
+        "getsockopt",
+        SyscallMode::UserTask,
+        sys_getsockopt,
+    ),
+    syscall_def(SYS_ACCEPT4, "accept4", SyscallMode::UserTask, sys_accept4),
 ];
 
 #[inline]
@@ -733,7 +820,10 @@ fn fd_write_slot(
     unsafe {
         (*task_ptr).user_fd_kind[idx] = kind;
         (*task_ptr).user_fd_inode[idx] =
-            if kind == task::USER_FD_KIND_VFS || kind == task::USER_FD_KIND_PIPE {
+            if kind == task::USER_FD_KIND_VFS
+                || kind == task::USER_FD_KIND_PIPE
+                || kind == task::USER_FD_KIND_SOCKET
+            {
                 inode
             } else {
                 task::USER_FD_NONE
@@ -850,6 +940,10 @@ fn fd_close(task_ptr: *mut task::Task, fd: i32) -> Result<(), i64> {
         let close_write = fd_can_write(flags);
         if inode != task::USER_FD_NONE {
             let _ = ipc::pipe_close(inode, close_read, close_write);
+        }
+    } else if kind == task::USER_FD_KIND_SOCKET {
+        if inode != task::USER_FD_NONE {
+            let _ = socket::socket_close(inode);
         }
     }
 
@@ -4074,6 +4168,17 @@ fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                     return -ipc_to_errno(err);
                 }
             }
+        } else if kind == task::USER_FD_KIND_SOCKET {
+            let nb = (flags & O_NONBLOCK) != 0;
+            match socket::socket_recv(inode, &mut chunk[..take], nb) {
+                Ok(n) => n,
+                Err(err) => {
+                    if read_total > 0 {
+                        return read_total as i64;
+                    }
+                    return err;
+                }
+            }
         } else {
             return -EBADF;
         };
@@ -4202,6 +4307,24 @@ fn write_from_user_fd(
             }
             unsafe {
                 (*ctx.current).user_fd_offset[idx] = offset.saturating_add(wrote as u64);
+            }
+            written += wrote;
+            continue;
+        }
+
+        if kind == task::USER_FD_KIND_SOCKET {
+            let nb = (flags & O_NONBLOCK) != 0;
+            let wrote = match socket::socket_send(inode, &chunk[..take], nb) {
+                Ok(n) => n,
+                Err(err) => {
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    return Err(err);
+                }
+            };
+            if wrote == 0 {
+                break;
             }
             written += wrote;
             continue;
@@ -5441,6 +5564,437 @@ fn sys_getpgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
     let pgid = unsafe { (*target).pgid };
     pgid as i64
+}
+
+// ---------------------------------------------------------------------------
+// Socket syscall helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a sockaddr_in from user memory. Layout: {family: u16, port: u16 (net order), addr: [u8;4], zero: [u8;8]}
+fn parse_sockaddr_in(
+    task_ptr: *mut task::Task,
+    addr_ptr: u64,
+    addr_len: usize,
+) -> Result<(net::Ipv4Addr, u16), i64> {
+    if addr_len < SOCKADDR_IN_SIZE {
+        return Err(-EINVAL);
+    }
+    let mut buf = [0u8; SOCKADDR_IN_SIZE];
+    copy_from_user_task(task_ptr, addr_ptr, &mut buf)?;
+    let family = (buf[0] as u16) | ((buf[1] as u16) << 8);
+    if family != AF_INET as u16 {
+        return Err(-EAFNOSUPPORT);
+    }
+    // Port is in network byte order (big endian)
+    let port = ((buf[2] as u16) << 8) | (buf[3] as u16);
+    let ip = net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+    Ok((ip, port))
+}
+
+/// Write a sockaddr_in to user memory.
+fn write_sockaddr_in(
+    task_ptr: *mut task::Task,
+    addr_ptr: u64,
+    addrlen_ptr: u64,
+    ip: &net::Ipv4Addr,
+    port: u16,
+) -> Result<(), i64> {
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+    let mut buf = [0u8; SOCKADDR_IN_SIZE];
+    buf[0] = AF_INET as u8;
+    buf[1] = 0; // AF_INET fits in one byte on little-endian
+    // Port in network byte order (big endian)
+    buf[2] = (port >> 8) as u8;
+    buf[3] = (port & 0xFF) as u8;
+    buf[4] = ip.0[0];
+    buf[5] = ip.0[1];
+    buf[6] = ip.0[2];
+    buf[7] = ip.0[3];
+
+    copy_to_user_task(task_ptr, addr_ptr, &buf)?;
+
+    if addrlen_ptr != 0 {
+        let len_val = SOCKADDR_IN_SIZE as u32;
+        let len_bytes = len_val.to_le_bytes();
+        copy_to_user_task(task_ptr, addrlen_ptr, &len_bytes)?;
+    }
+    Ok(())
+}
+
+/// Get socket_id from an FD that is a socket. Returns socket inode (= socket table id).
+fn fd_to_socket_id(task_ptr: *mut task::Task, fd: i32) -> Result<(usize, u16), i64> {
+    let idx = fd_index(fd)?;
+    if !fd_slot_is_open(task_ptr, idx) {
+        return Err(-EBADF);
+    }
+    let (kind, inode) = unsafe {
+        ((*task_ptr).user_fd_kind[idx], (*task_ptr).user_fd_inode[idx])
+    };
+    if kind != task::USER_FD_KIND_SOCKET {
+        return Err(-ENOTSOCK);
+    }
+    Ok((idx, inode))
+}
+
+// ---------------------------------------------------------------------------
+// Socket syscall handlers
+// ---------------------------------------------------------------------------
+
+fn sys_socket(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let domain = call.arg(0) as u32;
+    let raw_type = call.arg(1) as u32;
+    let _protocol = call.arg(2) as u32;
+
+    if domain != AF_INET {
+        return -EAFNOSUPPORT;
+    }
+
+    let base_type = raw_type & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
+        return -EPROTONOSUPPORT;
+    }
+
+    let socket_id = match socket::socket_create(base_type) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let mut fd_flags = fs::O_RDWR;
+    if (raw_type & SOCK_NONBLOCK) != 0 {
+        fd_flags |= O_NONBLOCK;
+    }
+    let fd_flags = fd_flags_from_open_flags(if (raw_type & SOCK_CLOEXEC) != 0 {
+        fd_flags | O_CLOEXEC
+    } else {
+        fd_flags
+    });
+
+    match fd_alloc(ctx.current, task::USER_FD_KIND_SOCKET, socket_id, fd_flags) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = socket::socket_close(socket_id);
+            e
+        }
+    }
+}
+
+fn sys_bind(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let addr_ptr = call.arg(1);
+    let addr_len = call.arg(2) as usize;
+
+    let (_, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let (ip, port) = match parse_sockaddr_in(ctx.current, addr_ptr, addr_len) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match socket::socket_bind(sock_id, &ip, port) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_listen(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let backlog = call.arg(1) as u32;
+
+    let (_, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match socket::socket_listen(sock_id, backlog) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_connect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let addr_ptr = call.arg(1);
+    let addr_len = call.arg(2) as usize;
+
+    let (idx, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let (ip, port) = match parse_sockaddr_in(ctx.current, addr_ptr, addr_len) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let nb = (fd_open_flags(flags) & O_NONBLOCK) != 0;
+
+    match socket::socket_connect(sock_id, &ip, port, nb) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_accept(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    // accept() is accept4() with flags=0
+    let mut call4 = *call;
+    // accept(fd, addr, addrlen) → accept4(fd, addr, addrlen, 0)
+    call4.args[3] = 0;
+    sys_accept4(ctx, &call4)
+}
+
+fn sys_accept4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let addr_ptr = call.arg(1);
+    let addrlen_ptr = call.arg(2);
+    let flags = call.arg(3) as u32;
+
+    let (idx, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let listen_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let nb = (fd_open_flags(listen_flags) & O_NONBLOCK) != 0;
+
+    let (new_sock_id, remote_ip, remote_port) = match socket::socket_accept(sock_id, nb) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Write remote address to user if requested
+    if addr_ptr != 0 {
+        if let Err(e) = write_sockaddr_in(ctx.current, addr_ptr, addrlen_ptr, &remote_ip, remote_port) {
+            let _ = socket::socket_close(new_sock_id);
+            return e;
+        }
+    }
+
+    // Allocate an FD for the new socket
+    let mut new_fd_flags = fs::O_RDWR;
+    if (flags & SOCK_NONBLOCK) != 0 {
+        new_fd_flags |= O_NONBLOCK;
+    }
+    let new_fd_flags = fd_flags_from_open_flags(if (flags & SOCK_CLOEXEC) != 0 {
+        new_fd_flags | O_CLOEXEC
+    } else {
+        new_fd_flags
+    });
+
+    match fd_alloc(ctx.current, task::USER_FD_KIND_SOCKET, new_sock_id, new_fd_flags) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = socket::socket_close(new_sock_id);
+            e
+        }
+    }
+}
+
+fn sys_sendto(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let buf_ptr = call.arg(1);
+    let len = call.arg(2) as usize;
+    let _flags = call.arg(3) as u32;
+    let addr_ptr = call.arg(4);
+    let addr_len = call.arg(5) as usize;
+
+    let (_, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Copy data from user
+    const SEND_MAX: usize = 4096;
+    let copy_len = len.min(SEND_MAX);
+    let mut kbuf = [0u8; SEND_MAX];
+    if let Err(e) = copy_from_user_task(ctx.current, buf_ptr, &mut kbuf[..copy_len]) {
+        return -e;
+    }
+
+    if addr_ptr != 0 && addr_len >= SOCKADDR_IN_SIZE {
+        // sendto with explicit destination
+        let (ip, port) = match parse_sockaddr_in(ctx.current, addr_ptr, addr_len) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        match socket::socket_sendto(sock_id, &kbuf[..copy_len], &ip, port) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        }
+    } else {
+        // No destination — use connected address (like send())
+        let nb = false; // sendto doesn't pass socket flags easily; use blocking
+        match socket::socket_send(sock_id, &kbuf[..copy_len], nb) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        }
+    }
+}
+
+fn sys_recvfrom(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let buf_ptr = call.arg(1);
+    let len = call.arg(2) as usize;
+    let _flags = call.arg(3) as u32;
+    let addr_ptr = call.arg(4);
+    let addrlen_ptr = call.arg(5);
+
+    let (idx, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let fd_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let nb = (fd_open_flags(fd_flags) & O_NONBLOCK) != 0;
+
+    const RECV_MAX: usize = 4096;
+    let recv_len = len.min(RECV_MAX);
+    let mut kbuf = [0u8; RECV_MAX];
+
+    let (n, src_ip, src_port) = match socket::socket_recvfrom(sock_id, &mut kbuf[..recv_len], nb) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if n > 0 {
+        if let Err(e) = copy_to_user_task(ctx.current, buf_ptr, &kbuf[..n]) {
+            return -e;
+        }
+    }
+
+    // Write source address to user if requested
+    if addr_ptr != 0 {
+        let _ = write_sockaddr_in(ctx.current, addr_ptr, addrlen_ptr, &src_ip, src_port);
+    }
+
+    n as i64
+}
+
+fn sys_sendmsg(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    -ENOSYS
+}
+
+fn sys_recvmsg(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    -ENOSYS
+}
+
+fn sys_shutdown(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let how = call.arg(1) as i32;
+
+    if how < 0 || how > 2 {
+        return -EINVAL;
+    }
+
+    let (_, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match socket::socket_shutdown(sock_id, how) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_getsockname(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let addr_ptr = call.arg(1);
+    let addrlen_ptr = call.arg(2);
+
+    let (_, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let (ip, port) = match socket::socket_getsockname(sock_id) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match write_sockaddr_in(ctx.current, addr_ptr, addrlen_ptr, &ip, port) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_getpeername(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let addr_ptr = call.arg(1);
+    let addrlen_ptr = call.arg(2);
+
+    let (_, sock_id) = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let (ip, port) = match socket::socket_getpeername(sock_id) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match write_sockaddr_in(ctx.current, addr_ptr, addrlen_ptr, &ip, port) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_socketpair(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    -ENOSYS
+}
+
+fn sys_setsockopt(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    // Stub: silently accept common options
+    0
+}
+
+fn sys_getsockopt(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let level = call.arg(1) as u32;
+    let optname = call.arg(2) as u32;
+    let optval_ptr = call.arg(3);
+    let optlen_ptr = call.arg(4);
+
+    // Validate this is a socket
+    let _ = match fd_to_socket_id(ctx.current, fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Return 0 for SO_ERROR and other common queries
+    if level == SOL_SOCKET && optname == SO_ERROR {
+        let zero: u32 = 0;
+        let bytes = zero.to_le_bytes();
+        if let Err(e) = copy_to_user_task(ctx.current, optval_ptr, &bytes) {
+            return -e;
+        }
+        if optlen_ptr != 0 {
+            let len: u32 = 4;
+            let len_bytes = len.to_le_bytes();
+            if let Err(e) = copy_to_user_task(ctx.current, optlen_ptr, &len_bytes) {
+                return -e;
+            }
+        }
+        return 0;
+    }
+
+    // For other options, return 0 (success) with a zero value
+    if optval_ptr != 0 {
+        let zero: u32 = 0;
+        let bytes = zero.to_le_bytes();
+        let _ = copy_to_user_task(ctx.current, optval_ptr, &bytes);
+    }
+    if optlen_ptr != 0 {
+        let len: u32 = 4;
+        let len_bytes = len.to_le_bytes();
+        let _ = copy_to_user_task(ctx.current, optlen_ptr, &len_bytes);
+    }
+    0
 }
 
 fn install_user_signal_frame_syscall(
