@@ -1,11 +1,12 @@
 use core::{mem, ptr};
 
-use arch_x86_64::addr::{PhysAddr, VirtAddr, PAGE_SIZE};
+use arch_x86_64::addr::{VirtAddr, PAGE_SIZE};
 use arch_x86_64::port::{inb, inw, outb};
 use drivers::{ahci, pci, storage};
 
 use crate::block;
 use crate::memory::{heap, vmm};
+use crate::mmio::{map_mmio_window, mmio_read32, mmio_write32};
 use crate::serial_println;
 
 const STORAGE_LOG_LIMIT: usize = 8;
@@ -34,9 +35,6 @@ const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_DRIVE_MASTER: u8 = 0xA0;
 const ATA_DRIVE_SLAVE: u8 = 0xB0;
 
-const AHCI_MMIO_WINDOW_BASE: u64 = 0xFFFF_FFFF_D000_0000;
-const AHCI_MMIO_WINDOW_STRIDE: u64 = 0x20_000;
-const AHCI_MMIO_WINDOW_LIMIT: usize = 8;
 const AHCI_MMIO_READ_SIZE: usize = 0x1200;
 
 const AHCI_ENGINE_TIMEOUT: usize = 1_000_000;
@@ -46,8 +44,6 @@ const AHCI_COMMAND_LIST_BYTES: usize = 1024;
 const AHCI_RX_FIS_BYTES: usize = 256;
 const AHCI_H2D_FIS_DWORDS: u16 = 5;
 const AHCI_DMA_MAX_BYTES: usize = PAGE_SIZE as usize;
-
-static mut AHCI_MMIO_WINDOW_NEXT: usize = 0;
 
 #[derive(Clone, Copy)]
 struct AtaChannel {
@@ -936,42 +932,6 @@ fn control_bar_base(bar: pci::PciBar, default: u16) -> u16 {
     }
 }
 
-fn map_mmio_window(phys_addr: u64, size: usize) -> Option<*mut u8> {
-    let window_index = unsafe {
-        if AHCI_MMIO_WINDOW_NEXT >= AHCI_MMIO_WINDOW_LIMIT {
-            return None;
-        }
-        let current = AHCI_MMIO_WINDOW_NEXT;
-        AHCI_MMIO_WINDOW_NEXT += 1;
-        current
-    };
-
-    let virt_base = AHCI_MMIO_WINDOW_BASE + (window_index as u64) * AHCI_MMIO_WINDOW_STRIDE;
-    let phys_base = phys_addr & !(PAGE_SIZE - 1);
-    let page_offset = (phys_addr - phys_base) as usize;
-    let map_size = page_offset.saturating_add(size);
-    let page_count = (map_size as u64 + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    for page in 0..page_count {
-        let virt = VirtAddr::new(virt_base + page * PAGE_SIZE);
-        let phys = PhysAddr::new(phys_base + page * PAGE_SIZE);
-        if vmm::map_page(virt, phys, vmm::VMM_FLAG_KERNEL_DATA) != 0 {
-            return None;
-        }
-    }
-
-    Some((virt_base as usize + page_offset) as *mut u8)
-}
-
-fn mmio_read32(base: *mut u8, offset: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(base.add(offset) as *const u32) }
-}
-
-fn mmio_write32(base: *mut u8, offset: usize, value: u32) {
-    unsafe {
-        core::ptr::write_volatile(base.add(offset) as *mut u32, value);
-    }
-}
 
 #[cfg(test)]
 mod tests {

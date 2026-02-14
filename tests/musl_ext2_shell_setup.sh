@@ -35,7 +35,8 @@ if ! grep -q '/bin/toybox' "${EXT2_BUILDER}"; then
   exit 1
 fi
 
-if grep -q '/bin/sh' "${EXT2_BUILDER}"; then
-  echo "ext2 builder unexpectedly stages /bin/sh (image should stay multicall-only)" >&2
+# /bin/sh hardlink is now expected (musl popen/system require /bin/sh -c)
+if ! grep -q 'ln.*bin/sh' "${EXT2_BUILDER}"; then
+  echo "ext2 builder is missing /bin/sh hardlink for musl popen/system support" >&2
   exit 1
 fi

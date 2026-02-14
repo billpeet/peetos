@@ -53,11 +53,14 @@ Use the QEMU display window for keyboard input (TTY-backed shell stdin).
 - Current smoke staging enables a shell-core applet set (31 applets): `sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`, `true`, `false`, `test`, `sleep`, `seq`, `env`, `basename`, `dirname`, `wc`, `head`, `tail`, `tee`, `sort`, `uniq`, `tr`, `cut`, `chmod`, `chown`, `uname`.
 - Next-wave applets (26 additions): `find`, `grep`, `sed`, `xargs`, `date`, `id`, `printf`, `readlink`, `stat`, `du`, `kill`, `which`, `dd`, `mktemp`, `yes`, `nohup`, `rmdir`, `cmp`, `strings`, `paste`, `nl`, `rev`, `comm`, `fold`, `free`, `uptime`.
 - Third-wave applets (26 additions): `tar`, `diff`, `patch`, `md5sum`, `od`, `tac`, `realpath`, `hostname`, `expr`, `truncate`, `expand`, `df`, `printenv`, `unlink`, `split`, `tty`, `sync`, `cal`, `groups`, `logname`, `nproc`, `file`, `gzip`, `gunzip`.
-- The ext2 smoke path installs one `/bin/toybox` multicall binary; applets are invoked as `toybox <applet>`.
+- Fourth-wave applets (2 additions): `awk`, `install`.
+- Fifth-wave applets (35 additions): `chgrp`, `cksum`, `cpio`, `getconf`, `iconv`, `link`, `time`, `tsort`, `uudecode`, `uuencode`, `ulimit`, `ascii`, `base64`, `bunzip2`, `bzcat`, `clear`, `dos2unix`, `unix2dos`, `factor`, `fmt`, `getopt`, `hd`, `help`, `mcookie`, `nologin`, `pwgen`, `readelf`, `reset`, `setsid`, `shred`, `shuf`, `ts`, `usleep`, `uuidgen`, `xxd`, `hexdump`, `csplit`. All use syscalls already implemented in the kernel -- no new syscall stubs required.
+- Sixth-wave applets (15 additions): `whoami`, `arch`, `egrep`, `fgrep`, `crc32`, `[` (test glue), `zcat`, `sha1sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum`, `base32`, `unicode`, `sha3sum`, `mountpoint`. Mostly aliases of already-compiled source files or pure-computation utilities -- no new syscalls required.
+- The ext2 smoke path installs one `/bin/toybox` multicall binary plus a `/bin/sh` hardlink (so musl `popen()`/`system()` can invoke `/bin/sh -c`); applets are invoked as `toybox <applet>`.
 - Runtime shell/smoke commands expect `user/sample_ext2_musl.img` to be attached as a second AHCI disk in QEMU.
 - P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`) are now implemented; `chmod`/`chown` applets exercise the new handlers.
 - Third-wave syscalls (`fchmod`, `fchown`, `truncate`, `sync`, `pread64`, `pwrite64`, `readv`, `sched_getaffinity`, `getpgid`) are now implemented for third-wave applet coverage.
 - `scripts/run_toybox_next_smoke.sh` now continues through command failures and reports both completion and a failure marker so syscall gaps can be captured in one run.
-- Broader utility coverage (`awk`, etc.) and syscall-gap hardening are still pending; third-wave archive/text/system tools are now staged.
+- Sixth-wave applets bring the total staged commands to ~136; all zero-cost aliases and pure-computation utilities are now enabled.
 - `make toybox` still builds the standalone `echo` staging artifact (`toybox/out/echo`); shell-core staging uses `scripts/build_toybox_core.sh`.
 - The default repository tests avoid networked toybox builds and only validate script behavior/pathing.

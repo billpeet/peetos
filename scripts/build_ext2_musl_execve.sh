@@ -29,6 +29,7 @@ mkdir -p "${STAGE_ROOT}/bin"
 "${ROOT_DIR}/scripts/build_toybox_core.sh" \
   --out "${STAGE_ROOT}/bin/toybox"
 chmod 0755 "${STAGE_ROOT}/bin/toybox"
+ln "${STAGE_ROOT}/bin/toybox" "${STAGE_ROOT}/bin/sh"
 
 # Applets are invoked as `toybox <applet>` to keep the smoke image compact.
 cat > "${STAGE_ROOT}/bin/next_smoke.sh" <<'EOS'
@@ -134,6 +135,61 @@ toybox nproc || fail=1
 toybox file /bin/toybox 2>/dev/null; true
 echo hello | toybox gzip | toybox gunzip || fail=1
 
+# -- fourth-wave: awk + install --
+echo 'hello world' | toybox awk '{print $2}' || fail=1
+echo -e "1 alpha\n2 beta\n3 gamma" | toybox awk '/beta/' || fail=1
+echo -e "10\n20\n30" | toybox awk '{s+=$1} END {print s}' || fail=1
+echo install_src >/tmp/inst_src && toybox install -m 755 /tmp/inst_src /tmp/inst_dst && toybox test -f /tmp/inst_dst && toybox rm -f /tmp/inst_src /tmp/inst_dst || fail=1
+toybox install -d /tmp/inst_dir && toybox test -d /tmp/inst_dir && toybox rmdir /tmp/inst_dir || fail=1
+
+# -- fifth-wave: remaining no-new-syscall applets --
+toybox cksum /bin/toybox >/dev/null || fail=1
+echo -e "a b\nb c" | toybox tsort || fail=1
+echo hello | toybox uuencode test | toybox uudecode -o /tmp/uu_out && toybox test -f /tmp/uu_out && toybox rm -f /tmp/uu_out || fail=1
+echo x >/tmp/cg && toybox chgrp 0 /tmp/cg && toybox rm -f /tmp/cg || fail=1
+toybox link /bin/toybox /tmp/lk_test && toybox rm -f /tmp/lk_test || fail=1
+echo hello | toybox iconv || fail=1
+toybox getconf PAGE_SIZE >/dev/null || fail=1
+toybox time toybox true 2>/dev/null || fail=1
+toybox ulimit -a >/dev/null || fail=1
+echo hello | toybox base64 | toybox base64 -d || fail=1
+echo -e "hello\r\n" | toybox dos2unix | toybox cat || fail=1
+echo hello | toybox xxd | toybox xxd -r || fail=1
+toybox factor 12 || fail=1
+toybox ascii >/dev/null || fail=1
+toybox usleep 1 || fail=1
+echo -e "a\nb\nc" | toybox shuf >/dev/null || fail=1
+toybox mcookie >/dev/null || fail=1
+toybox uuidgen >/dev/null || fail=1
+toybox getopt -o ab -- -a -b >/dev/null || fail=1
+echo hello | toybox hd >/dev/null || fail=1
+echo hello | toybox hexdump >/dev/null || fail=1
+echo hello | toybox fmt || fail=1
+toybox help echo >/dev/null 2>&1; true
+toybox nologin 2>/dev/null; true
+echo hello | toybox ts >/dev/null 2>&1; true
+toybox pwgen 8 1 >/dev/null || fail=1
+toybox readelf -h /bin/toybox >/dev/null || fail=1
+echo x >/tmp/shred_test && toybox shred -u /tmp/shred_test || fail=1
+toybox clear >/dev/null 2>&1; true
+toybox reset >/dev/null 2>&1; true
+
+# -- sixth-wave: aliases and pure-computation applets --
+toybox arch >/dev/null || fail=1
+echo findme | toybox egrep findme >/dev/null || fail=1
+echo findme | toybox fgrep findme >/dev/null || fail=1
+toybox crc32 /bin/toybox >/dev/null || fail=1
+toybox [ -f /bin/toybox ] || fail=1
+echo hello | toybox gzip | toybox zcat || fail=1
+toybox sha1sum /bin/toybox >/dev/null || fail=1
+toybox sha256sum /bin/toybox >/dev/null || fail=1
+toybox sha512sum /bin/toybox >/dev/null || fail=1
+echo hello | toybox base32 | toybox base32 -d || fail=1
+toybox sha3sum /bin/toybox >/dev/null || fail=1
+toybox unicode 41 >/dev/null || fail=1
+toybox mountpoint / 2>/dev/null; true
+toybox whoami 2>/dev/null; true
+
 echo [musl-ext2-cmd-smoke] done
 if [ "$fail" -ne 0 ]; then
   echo [musl-ext2-cmd-smoke] failures
@@ -143,8 +199,8 @@ chmod 0755 "${STAGE_ROOT}/bin/next_smoke.sh"
 
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact for QEMU smoke runs while leaving room for the
-# static Toybox multicall payload (expanded for third-wave applets).
-mke2fs -q -t ext2 -F -b 1024 -I 256 -N 256 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 1536
+# static Toybox multicall payload (expanded for fifth-wave applets).
+mke2fs -q -t ext2 -F -b 1024 -I 256 -N 256 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 2048
 
 mv "${TMP_IMG}" "${OUT_IMG}"
 chmod 0644 "${OUT_IMG}"

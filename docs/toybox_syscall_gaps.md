@@ -55,6 +55,20 @@ Third-wave applets (26 additions):
 - Data inspection: `od`, `tac`, `file`, `strings` (already in next-wave)
 - Path/system: `realpath`, `hostname`, `expr`, `truncate`, `expand`, `df`, `printenv`, `unlink`, `split`, `tty`, `sync`, `cal`, `groups`, `logname`, `nproc`
 
+Fourth-wave applets (2 additions):
+- Text processing: `awk`
+- File installation: `install`
+
+Fifth-wave applets (35 additions, no new syscalls required):
+- posix: `chgrp`, `cksum`, `cpio`, `getconf`, `iconv`, `link`, `time`, `tsort`, `uudecode`, `uuencode`, `ulimit`
+- other: `ascii`, `base64`, `bunzip2`, `bzcat`, `clear`, `dos2unix`, `unix2dos`, `factor`, `fmt`, `getopt`, `hd`, `help`, `mcookie`, `nologin`, `pwgen`, `readelf`, `reset`, `setsid`, `shred`, `shuf`, `ts`, `usleep`, `uuidgen`, `xxd`
+- pending: `hexdump`, `csplit`
+
+Sixth-wave applets (15 additions, no new syscalls required):
+- posix aliases: `whoami` (id.c alias), `arch` (uname.c), `egrep`/`fgrep` (grep.c aliases), `crc32` (cksum.c), `[` test glue (test.c alias)
+- lsb: `zcat` (gzip.c), `sha1sum`/`sha224sum`/`sha256sum`/`sha384sum`/`sha512sum` (md5sum.c aliases)
+- other: `base32` (base64.c), `unicode` (ascii.c), `sha3sum` (sha3sum.c), `mountpoint` (mountpoint.c)
+
 P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`)
 are now implemented; `chmod`/`chown` applets use the new handlers.
 
@@ -164,12 +178,20 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 - `touch`: `utimensat`, `access`
 - `tar`: `linkat`, `symlinkat`, `mknodat`, `fchownat`, `fchmodat`, `ftruncate`, `fchmod`, `fchown`
 - `gzip`/`gunzip`: `fchmod`, `fchown`, `truncate`
+- `awk`: `read`, `write`, `openat`, `close`, `pipe`, `fork`, `wait4`, `execve` (uses musl `popen()` internally; `/bin/sh` hardlink required)
+- `install`: `faccessat`, `utimensat`, `fchmodat`, `fchownat`, `mkdirat` (shares `cp` code path, `CONFIG_CP` required)
 - `diff`/`patch`: `read`, `write`, `stat`, `openat`
 - `truncate`: `truncate` (76)
 - `nproc`: `sched_getaffinity`
 - `df`: `statfs`
 - `sync`: `sync` (162)
 - `ps`/`time` and process wrappers: `wait4`, session/process-group syscalls
+- `cpio`: `open`, `read`, `write`, `stat`, `fchown`, `fchmod`, `mkdir`, `symlink`, `utimensat`, `fork`
+- `iconv`: `read`, `write` (musl self-contained iconv)
+- `readelf`: `open`, `fstat`, `mmap`, `munmap`
+- `time`: `clock_gettime`, `vfork`, `wait4`
+- `setsid`: `setsid`, `setpgid`, `vfork`, `wait4`, `execve`
+- `shred`: `open`, `write`, `lseek`, `getrandom`, `chmod`, `unlink`
 
 ## Execution Plan
 
