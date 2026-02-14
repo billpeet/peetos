@@ -110,6 +110,30 @@ toybox free || fail=1
 toybox uptime || fail=1
 toybox strings /bin/toybox | toybox head -n 1 || fail=1
 
+# -- third-wave utilities --
+echo tarme >/tmp/tar_in && toybox tar cf /tmp/test.tar /tmp/tar_in 2>/dev/null && toybox rm -f /tmp/tar_in && toybox tar tf /tmp/test.tar 2>/dev/null && toybox rm -f /tmp/test.tar || fail=1
+echo aaa >/tmp/diff1 && echo bbb >/tmp/diff2 && toybox diff /tmp/diff1 /tmp/diff2 >/dev/null 2>&1; toybox rm -f /tmp/diff1 /tmp/diff2; true
+echo -e "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new" >/tmp/test.patch; true
+toybox md5sum /bin/toybox >/dev/null || fail=1
+echo hello | toybox od -A x -t x1 >/dev/null || fail=1
+echo -e "a\nb\nc" | toybox tac || fail=1
+toybox realpath /bin/toybox || fail=1
+toybox hostname 2>/dev/null; true
+toybox expr 1 + 1 || fail=1
+echo full >/tmp/trunc_test && toybox truncate -s 0 /tmp/trunc_test && toybox rm -f /tmp/trunc_test || fail=1
+echo -e "a\tb" | toybox expand || fail=1
+toybox df / 2>/dev/null; true
+toybox printenv PATH 2>/dev/null; true
+echo unlink_me >/tmp/unlink_test && toybox unlink /tmp/unlink_test || fail=1
+toybox tty 2>/dev/null; true
+toybox sync 2>/dev/null; true
+toybox cal 2>/dev/null; true
+toybox groups 2>/dev/null; true
+toybox logname 2>/dev/null; true
+toybox nproc || fail=1
+toybox file /bin/toybox 2>/dev/null; true
+echo hello | toybox gzip | toybox gunzip || fail=1
+
 echo [musl-ext2-cmd-smoke] done
 if [ "$fail" -ne 0 ]; then
   echo [musl-ext2-cmd-smoke] failures
@@ -119,8 +143,8 @@ chmod 0755 "${STAGE_ROOT}/bin/next_smoke.sh"
 
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact for QEMU smoke runs while leaving room for the
-# static Toybox multicall payload.
-mke2fs -q -t ext2 -F -b 1024 -I 256 -N 192 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 768
+# static Toybox multicall payload (expanded for third-wave applets).
+mke2fs -q -t ext2 -F -b 1024 -I 256 -N 256 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 1536
 
 mv "${TMP_IMG}" "${OUT_IMG}"
 chmod 0644 "${OUT_IMG}"

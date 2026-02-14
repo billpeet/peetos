@@ -16,7 +16,7 @@ For shell-specific bring-up priorities, see `docs/toybox_shell_syscalls.md`.
 
 Currently implemented in `kernel/src/syscall.rs`:
 
-- `read`, `write`, `writev`, `open`, `openat`, `close`, `lseek`
+- `read`, `write`, `writev`, `readv`, `pread64`, `pwrite64`, `open`, `openat`, `close`, `lseek`
 - `stat`, `lstat`, `fstat`, `newfstatat`, `getdents64`
 - `mkdirat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`, `readlinkat`, `utimensat`
 - legacy compatibility aliases: `rename` (82), `link` (86)
@@ -26,10 +26,11 @@ Currently implemented in `kernel/src/syscall.rs`:
 - `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `kill`
 - `futex`, `shmget`, `shmat`, `shmdt`, `shmctl`
 - `clone` (fork-compatible subset), `fork`, `vfork` (fork-compatible path), `wait4`, `copy_file_range`, `execve`, `exit`, `exit_group`, `sched_yield`
-- `getpid`, `getppid`, `gettid`, `set_tid_address`
+- `getpid`, `getppid`, `gettid`, `set_tid_address`, `getpgid`
 - `uname`
 - `arch_prctl`, `umask`
-- `ftruncate`, `getrandom`, `sysinfo`, `prlimit64`, `getrusage`, `statfs`, `fstatfs`
+- `ftruncate`, `truncate`, `getrandom`, `sysinfo`, `prlimit64`, `getrusage`, `statfs`, `fstatfs`
+- `fchmod`, `fchown`, `sync`, `sched_getaffinity`
 
 ## Current Staged Applets
 
@@ -47,6 +48,13 @@ Next-wave applets (26 additions):
 - Text processing: `paste`, `nl`, `rev`, `comm`, `fold`
 - System info: `free`, `uptime`
 
+Third-wave applets (26 additions):
+- Archive/compression: `tar`, `gzip`, `gunzip`
+- File comparison: `diff`, `patch`, `cmp` (already in next-wave)
+- Checksums: `md5sum`
+- Data inspection: `od`, `tac`, `file`, `strings` (already in next-wave)
+- Path/system: `realpath`, `hostname`, `expr`, `truncate`, `expand`, `df`, `printenv`, `unlink`, `split`, `tty`, `sync`, `cal`, `groups`, `logname`, `nproc`
+
 P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`)
 are now implemented; `chmod`/`chown` applets use the new handlers.
 
@@ -57,6 +65,17 @@ Next-wave syscalls now implemented:
 - `prlimit64` (302) - done (stub returning RLIM_INFINITY)
 - `getrusage` (98) - done (stub returning zeroed rusage)
 - `statfs` (137) / `fstatfs` (138) - done (tmpfs/ext2 backend-aware values)
+
+Third-wave syscalls now implemented:
+- `fchmod` (91) - done (fd-based permission-bit update for VFS/ext2)
+- `fchown` (93) - done (fd-based uid/gid update for VFS/ext2)
+- `truncate` (76) - done (path-based truncate via VFS lookup)
+- `sync` (162) - done (ext2 sync-back)
+- `pread64` (17) - done (positioned read without fd offset change)
+- `pwrite64` (18) - done (positioned write without fd offset change)
+- `readv` (19) - done (scatter/gather read via iovec entries)
+- `sched_getaffinity` (204) - done (single-CPU affinity stub)
+- `getpgid` (121) - done (return process group ID for pid)
 
 Virtual device additions:
 - `/dev/urandom` - done (XORshift PRNG read, DevNull-like write)
@@ -133,7 +152,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 - `mount` (165), `umount2` (166), `pivot_root` (155), `setns` (308), `unshare` (272)
 
 3. Scheduler/ioprio/module/sysadmin paths:
-- `sched_setattr` (314), `sched_getattr` (315), `sched_setaffinity` (203), `sched_getaffinity` (204)
+- `sched_setattr` (314), `sched_getattr` (315), `sched_setaffinity` (203)
 - `ioprio_set` (251), `ioprio_get` (252)
 - module syscalls (`init_module`, `finit_module`, `delete_module`)
 
@@ -143,7 +162,13 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 - `ln`: `linkat`, `symlinkat`
 - `rm`/`find`: `faccessat`, `fchdir`
 - `touch`: `utimensat`, `access`
-- `tar`: `linkat`, `symlinkat`, `mknodat`, `fchownat`, `fchmodat`, `ftruncate`
+- `tar`: `linkat`, `symlinkat`, `mknodat`, `fchownat`, `fchmodat`, `ftruncate`, `fchmod`, `fchown`
+- `gzip`/`gunzip`: `fchmod`, `fchown`, `truncate`
+- `diff`/`patch`: `read`, `write`, `stat`, `openat`
+- `truncate`: `truncate` (76)
+- `nproc`: `sched_getaffinity`
+- `df`: `statfs`
+- `sync`: `sync` (162)
 - `ps`/`time` and process wrappers: `wait4`, session/process-group syscalls
 
 ## Execution Plan
@@ -176,3 +201,10 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
   - `fchownat` truncates uid/gid to u16 to match current VFS inode field width; no privilege checks.
   - `mknodat` only supports `S_IFREG` regular file creation; character/block/fifo device nodes are unsupported.
   - `utimes`/`futimesat` convert `struct timeval` tv_sec directly; microsecond precision is discarded.
+  - `fchmod`/`fchown` operate on VFS fd inodes without ownership/capability checks.
+  - `truncate` resolves path to VFS inode and delegates to same backend as `ftruncate`.
+  - `sync` performs a best-effort ext2 sync-back; no per-filesystem sync granularity.
+  - `pread64`/`pwrite64` operate on VFS fds only (pipes/console return `-ESPIPE`).
+  - `readv` delegates to `sys_read` per iovec entry (not zero-copy).
+  - `sched_getaffinity` returns a single-CPU affinity mask (no SMP awareness).
+  - `getpgid` queries live task table; no zombie/exited-task lookup.

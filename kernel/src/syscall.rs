@@ -140,6 +140,15 @@ const SYS_STATFS: u64 = 137;
 const SYS_FSTATFS: u64 = 138;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
+const SYS_PREAD64: u64 = 17;
+const SYS_PWRITE64: u64 = 18;
+const SYS_READV: u64 = 19;
+const SYS_TRUNCATE: u64 = 76;
+const SYS_FCHMOD: u64 = 91;
+const SYS_FCHOWN: u64 = 93;
+const SYS_GETPGID: u64 = 121;
+const SYS_SYNC: u64 = 162;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
 const SYS_COPY_FILE_RANGE: u64 = 326;
 const SYS_FACCESSAT2: u64 = 439;
 
@@ -550,6 +559,35 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_fstatfs,
     ),
+    syscall_def(SYS_FCHMOD, "fchmod", SyscallMode::UserTask, sys_fchmod),
+    syscall_def(SYS_FCHOWN, "fchown", SyscallMode::UserTask, sys_fchown),
+    syscall_def(
+        SYS_TRUNCATE,
+        "truncate",
+        SyscallMode::UserTask,
+        sys_truncate,
+    ),
+    syscall_def(SYS_SYNC, "sync", SyscallMode::AnyTask, sys_sync),
+    syscall_def(
+        SYS_PREAD64,
+        "pread64",
+        SyscallMode::UserTask,
+        sys_pread64,
+    ),
+    syscall_def(
+        SYS_PWRITE64,
+        "pwrite64",
+        SyscallMode::UserTask,
+        sys_pwrite64,
+    ),
+    syscall_def(SYS_READV, "readv", SyscallMode::UserTask, sys_readv),
+    syscall_def(
+        SYS_SCHED_GETAFFINITY,
+        "sched_getaffinity",
+        SyscallMode::UserTask,
+        sys_sched_getaffinity,
+    ),
+    syscall_def(SYS_GETPGID, "getpgid", SyscallMode::UserTask, sys_getpgid),
 ];
 
 #[inline]
@@ -5003,6 +5041,406 @@ fn sys_fstatfs(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(()) => 0,
         Err(err) => -err,
     }
+}
+
+// ---------------------------------------------------------------------------
+// fchmod (91)
+// ---------------------------------------------------------------------------
+fn sys_fchmod(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let mode = call.arg(1) as u32;
+
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let (kind, inode) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+        )
+    };
+    if kind != task::USER_FD_KIND_VFS {
+        return -EBADF;
+    }
+
+    match fs::chmod(inode, (mode & 0o7777) as u16) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fchown (93)
+// ---------------------------------------------------------------------------
+fn sys_fchown(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let owner = call.arg(1) as u32;
+    let group = call.arg(2) as u32;
+
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let (kind, inode) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+        )
+    };
+    if kind != task::USER_FD_KIND_VFS {
+        return -EBADF;
+    }
+
+    match fs::chown(inode, owner, group) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// truncate (76)
+// ---------------------------------------------------------------------------
+fn sys_truncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let path_ptr = call.arg(0);
+    let length = call.arg(1);
+
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(path_ptr, &mut path_buf) {
+        Ok(p) => p,
+        Err(err) => return err,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+
+    let dir_inode = match resolve_dir_for_path(ctx, fs::AT_FDCWD, path) {
+        Ok(ino) => ino,
+        Err(err) => return err,
+    };
+    let inode = match fs::lookupat(dir_inode, path) {
+        Ok(ino) => ino,
+        Err(err) => return -fs_to_errno(err),
+    };
+
+    let result = if length == 0 {
+        fs::truncate(inode)
+    } else {
+        fs::truncate_to(inode, length)
+    };
+
+    match result {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sync (162)
+// ---------------------------------------------------------------------------
+fn sys_sync(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    sync_ext2_backing();
+    0
+}
+
+// ---------------------------------------------------------------------------
+// pread64 (17)
+// ---------------------------------------------------------------------------
+fn sys_pread64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let buf_ptr = call.arg(1);
+    let count = call.arg(2);
+    let offset = call.arg(3);
+
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let len = match usize::try_from(count) {
+        Ok(v) => v,
+        Err(_) => return -EINVAL,
+    };
+    if len == 0 {
+        return 0;
+    }
+
+    let (kind, inode, flags) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+            (*ctx.current).user_fd_flags[idx],
+        )
+    };
+
+    if !fd_can_read(flags) {
+        return -EBADF;
+    }
+    if kind == task::USER_FD_KIND_PIPE || kind == task::USER_FD_KIND_CONSOLE {
+        return -ESPIPE;
+    }
+    if kind != task::USER_FD_KIND_VFS {
+        return -EBADF;
+    }
+
+    let mut read_total = 0usize;
+    let mut chunk = [0u8; READ_CHUNK_SIZE];
+    let mut pos = offset;
+
+    loop {
+        if read_total >= len {
+            break;
+        }
+        let take = cmp::min(chunk.len(), len - read_total);
+
+        refresh_procfs_runtime();
+        let read_n = match fs::read(inode, pos, &mut chunk[..take]) {
+            Ok(n) => n,
+            Err(err) => {
+                if read_total > 0 {
+                    return read_total as i64;
+                }
+                return -fs_to_errno(err);
+            }
+        };
+        if read_n == 0 {
+            break;
+        }
+
+        match copy_to_user_task(ctx.current, buf_ptr + read_total as u64, &chunk[..read_n]) {
+            Ok(()) => {}
+            Err(err) => {
+                if read_total > 0 {
+                    return read_total as i64;
+                }
+                return -err;
+            }
+        }
+
+        pos = pos.saturating_add(read_n as u64);
+        read_total += read_n;
+
+        if read_n < take {
+            break;
+        }
+    }
+
+    read_total as i64
+}
+
+// ---------------------------------------------------------------------------
+// pwrite64 (18)
+// ---------------------------------------------------------------------------
+fn sys_pwrite64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let buf_ptr = call.arg(1);
+    let count = call.arg(2);
+    let offset = call.arg(3);
+
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let len = match usize::try_from(count) {
+        Ok(v) => v,
+        Err(_) => return -EINVAL,
+    };
+    if len == 0 {
+        return 0;
+    }
+
+    let (kind, inode, flags) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+            (*ctx.current).user_fd_flags[idx],
+        )
+    };
+
+    if !fd_can_write(flags) {
+        return -EBADF;
+    }
+    if kind == task::USER_FD_KIND_PIPE || kind == task::USER_FD_KIND_CONSOLE {
+        return -ESPIPE;
+    }
+    if kind != task::USER_FD_KIND_VFS {
+        return -EBADF;
+    }
+
+    let mut chunk = [0u8; WRITE_CHUNK_SIZE];
+    let mut written = 0usize;
+    let mut pos = offset;
+
+    while written < len {
+        let take = cmp::min(chunk.len(), len - written);
+        if let Err(err) = copy_from_user_task(ctx.current, buf_ptr + written as u64, &mut chunk[..take]) {
+            if written > 0 {
+                return written as i64;
+            }
+            return -err;
+        }
+
+        let write_res = match fs::write(inode, pos, &chunk[..take], false) {
+            Ok(result) => result,
+            Err(err) => {
+                if written > 0 {
+                    return written as i64;
+                }
+                return -fs_to_errno(err);
+            }
+        };
+
+        if write_res.written == 0 {
+            break;
+        }
+
+        pos = write_res.new_offset;
+        written += write_res.written;
+    }
+
+    if written > 0 {
+        sync_ext2_backing();
+    }
+
+    written as i64
+}
+
+// ---------------------------------------------------------------------------
+// readv (19)
+// ---------------------------------------------------------------------------
+fn sys_readv(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let iov_ptr = call.arg(1);
+    let iovcnt = call.arg(2);
+
+    if iovcnt > WRITE_IOV_MAX as u64 {
+        return -EINVAL;
+    }
+
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let mut total = 0usize;
+
+    for i in 0..(iovcnt as usize) {
+        let entry_ptr = iov_ptr + (i * size_of::<LinuxIovec>()) as u64;
+        let iov = match read_struct_from_user::<LinuxIovec>(ctx.current, entry_ptr) {
+            Ok(v) => v,
+            Err(err) => {
+                if total > 0 {
+                    break;
+                }
+                return -err;
+            }
+        };
+
+        let len = match usize::try_from(iov.iov_len) {
+            Ok(v) => v,
+            Err(_) => return -EINVAL,
+        };
+        if len == 0 {
+            continue;
+        }
+        if total > (i64::MAX as usize).saturating_sub(len) {
+            return -EINVAL;
+        }
+
+        // Build a synthetic SyscallArgs for the read sub-operation.
+        let sub_call = SyscallArgs {
+            num: SYS_READ,
+            args: [fd as u64, iov.iov_base, len as u64, 0, 0, 0],
+        };
+        let n = sys_read(ctx, &sub_call);
+        if n < 0 {
+            if total > 0 {
+                break;
+            }
+            return n;
+        }
+        total += n as usize;
+        if (n as usize) < len {
+            break;
+        }
+    }
+
+    total as i64
+}
+
+// ---------------------------------------------------------------------------
+// sched_getaffinity (204)
+// ---------------------------------------------------------------------------
+fn sys_sched_getaffinity(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let _pid = call.arg(0) as i32;
+    let cpusetsize = call.arg(1) as usize;
+    let mask_ptr = call.arg(2);
+
+    if mask_ptr == 0 || cpusetsize == 0 {
+        return -EINVAL;
+    }
+
+    // Single-CPU stub: set bit 0 in the affinity mask.
+    let write_len = cmp::min(cpusetsize, 128);
+    let mut mask = [0u8; 128];
+    mask[0] = 1; // CPU 0 present
+
+    match copy_to_user_task(ctx.current, mask_ptr, &mask[..write_len]) {
+        Ok(()) => write_len as i64,
+        Err(err) => -err,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// getpgid (121)
+// ---------------------------------------------------------------------------
+fn sys_getpgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let pid = call.arg(0) as i32;
+
+    if pid < 0 {
+        return -EINVAL;
+    }
+
+    if pid == 0 {
+        // Return current task's pgid.
+        let pgid = unsafe { (*ctx.current).pgid };
+        return pgid as i64;
+    }
+
+    // For pid > 0, look up that task's pgid.
+    let target = task::get_by_pid(pid);
+    if target.is_null() {
+        return -ESRCH;
+    }
+    let pgid = unsafe { (*target).pgid };
+    pgid as i64
 }
 
 fn install_user_signal_frame_syscall(

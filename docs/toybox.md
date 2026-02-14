@@ -52,10 +52,12 @@ Use the QEMU display window for keyboard input (TTY-backed shell stdin).
 
 - Current smoke staging enables a shell-core applet set (31 applets): `sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`, `true`, `false`, `test`, `sleep`, `seq`, `env`, `basename`, `dirname`, `wc`, `head`, `tail`, `tee`, `sort`, `uniq`, `tr`, `cut`, `chmod`, `chown`, `uname`.
 - Next-wave applets (26 additions): `find`, `grep`, `sed`, `xargs`, `date`, `id`, `printf`, `readlink`, `stat`, `du`, `kill`, `which`, `dd`, `mktemp`, `yes`, `nohup`, `rmdir`, `cmp`, `strings`, `paste`, `nl`, `rev`, `comm`, `fold`, `free`, `uptime`.
+- Third-wave applets (26 additions): `tar`, `diff`, `patch`, `md5sum`, `od`, `tac`, `realpath`, `hostname`, `expr`, `truncate`, `expand`, `df`, `printenv`, `unlink`, `split`, `tty`, `sync`, `cal`, `groups`, `logname`, `nproc`, `file`, `gzip`, `gunzip`.
 - The ext2 smoke path installs one `/bin/toybox` multicall binary; applets are invoked as `toybox <applet>`.
 - Runtime shell/smoke commands expect `user/sample_ext2_musl.img` to be attached as a second AHCI disk in QEMU.
 - P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`) are now implemented; `chmod`/`chown` applets exercise the new handlers.
+- Third-wave syscalls (`fchmod`, `fchown`, `truncate`, `sync`, `pread64`, `pwrite64`, `readv`, `sched_getaffinity`, `getpgid`) are now implemented for third-wave applet coverage.
 - `scripts/run_toybox_next_smoke.sh` now continues through command failures and reports both completion and a failure marker so syscall gaps can be captured in one run.
-- Broader utility coverage (`tar`, etc.) and syscall-gap hardening are still pending; next-wave scripting/text/system tools are now staged.
+- Broader utility coverage (`awk`, etc.) and syscall-gap hardening are still pending; third-wave archive/text/system tools are now staged.
 - `make toybox` still builds the standalone `echo` staging artifact (`toybox/out/echo`); shell-core staging uses `scripts/build_toybox_core.sh`.
 - The default repository tests avoid networked toybox builds and only validate script behavior/pathing.
