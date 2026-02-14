@@ -69,7 +69,7 @@ const EXT2_ROOT_INODE: u32 = 2;
 const EXT2_GROUP_DESC_SIZE: usize = 32;
 const EXT2_INODE_DIRECT_COUNT: usize = 12;
 const EXT2_MAX_RECURSION: u8 = 16;
-const EXT2_MAX_IMAGE_SIZE: usize = 512 * 1024;
+const EXT2_MAX_IMAGE_SIZE: usize = 768 * 1024;
 
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
@@ -104,6 +104,7 @@ enum NodeBackend {
     ProcMeminfo = 6,
     ProcMounts = 7,
     ProcVersion = 8,
+    DevUrandom = 9,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +243,7 @@ struct VfsState {
     ext2_meta: Ext2Meta,
     ext2_image_len: usize,
     ext2_image: [u8; EXT2_MAX_IMAGE_SIZE],
+    prng_state: u64,
 }
 
 impl VfsState {
@@ -260,6 +262,7 @@ impl VfsState {
             ext2_meta: Ext2Meta::empty(),
             ext2_image_len: 0,
             ext2_image: [0; EXT2_MAX_IMAGE_SIZE],
+            prng_state: 0,
         }
     }
 }
@@ -371,6 +374,24 @@ fn touch_inode_metadata(
     if change {
         node.ctime = now;
     }
+}
+
+fn fill_xorshift_bytes(state: &mut VfsState, buf: &mut [u8]) {
+    let mut s = state.prng_state;
+    if s == 0 {
+        s = 0x9E37_79B9_7F4A_7C15 ^ state.clock_ticks.wrapping_mul(0xA076_1D64_78BD_642F);
+        if s == 0 {
+            s = 1;
+        }
+    }
+    for chunk in buf.chunks_mut(8) {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        let sample = s.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes();
+        chunk.copy_from_slice(&sample[..chunk.len()]);
+    }
+    state.prng_state = s;
 }
 
 fn mount_table_reset(state: &mut VfsState) {
@@ -511,6 +532,7 @@ fn ensure_init(state: &mut VfsState) {
     let _ = create_virtual_file_inner(state, "/dev/null", NodeBackend::DevNull);
     let _ = create_virtual_file_inner(state, "/dev/zero", NodeBackend::DevZero);
     let _ = create_virtual_file_inner(state, "/dev/console", NodeBackend::DevConsole);
+    let _ = create_virtual_file_inner(state, "/dev/urandom", NodeBackend::DevUrandom);
 
     let _ = mkdir_virtual_inner(state, "/proc");
     let _ = create_virtual_file_inner(state, "/proc/uptime", NodeBackend::ProcUptime);
@@ -970,9 +992,10 @@ fn create_virtual_file_inner(
             | NodeBackend::ProcMeminfo
             | NodeBackend::ProcMounts
             | NodeBackend::ProcVersion => (STAT_S_IFREG | 0o444) as u16,
-            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
-                (STAT_S_IFREG | 0o666) as u16
-            }
+            NodeBackend::DevNull
+            | NodeBackend::DevZero
+            | NodeBackend::DevConsole
+            | NodeBackend::DevUrandom => (STAT_S_IFREG | 0o666) as u16,
             _ => node.mode,
         };
     }
@@ -3675,6 +3698,10 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
                     dst.len()
                 }
                 NodeBackend::DevConsole => 0,
+                NodeBackend::DevUrandom => {
+                    fill_xorshift_bytes(state, dst);
+                    dst.len()
+                }
                 NodeBackend::ProcUptime
                 | NodeBackend::ProcMeminfo
                 | NodeBackend::ProcMounts
@@ -3764,7 +3791,10 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
             | NodeBackend::ProcMeminfo
             | NodeBackend::ProcMounts
             | NodeBackend::ProcVersion => return Err(EROFS),
-            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
+            NodeBackend::DevNull
+            | NodeBackend::DevZero
+            | NodeBackend::DevConsole
+            | NodeBackend::DevUrandom => {
                 let next = offset.saturating_add(src.len() as u64);
                 WriteResult {
                     written: src.len(),
@@ -3808,7 +3838,10 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
                 let mut buf = [0u8; PROCFS_BUFFER_MAX];
                 format_proc_payload(state, node.backend, &mut buf) as u64
             }
-            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => current,
+            NodeBackend::DevNull
+            | NodeBackend::DevZero
+            | NodeBackend::DevConsole
+            | NodeBackend::DevUrandom => current,
         };
 
         let base = match whence {
@@ -3846,7 +3879,10 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
                     return Err(EINVAL);
                 }
             }
-            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => {
+            NodeBackend::DevNull
+            | NodeBackend::DevZero
+            | NodeBackend::DevConsole
+            | NodeBackend::DevUrandom => {
                 if target > u64::MAX as i128 {
                     return Err(EINVAL);
                 }
@@ -3885,11 +3921,125 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
                 let mut buf = [0u8; PROCFS_BUFFER_MAX];
                 format_proc_payload(state, node.backend, &mut buf) as u64
             }
-            NodeBackend::DevNull | NodeBackend::DevZero | NodeBackend::DevConsole => 0,
+            NodeBackend::DevNull
+            | NodeBackend::DevZero
+            | NodeBackend::DevConsole
+            | NodeBackend::DevUrandom => 0,
         };
 
         Ok(size)
     })
+}
+
+pub fn truncate(inode: u16) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+
+        if inode as usize >= VFS_MAX_INODES {
+            return Err(ENOENT);
+        }
+        let (used, file_type, backend, ext2_ino) = {
+            let node = &state.inodes[inode as usize];
+            (node.used, node.file_type, node.backend, node.ext2_ino)
+        };
+        if !used {
+            return Err(ENOENT);
+        }
+        if file_type != FileType::Regular {
+            return Err(EINVAL);
+        }
+        if !backend_mutable(backend) {
+            return Err(EROFS);
+        }
+
+        match backend {
+            NodeBackend::Tmpfs => {
+                state.inodes[inode as usize].size = 0;
+                state.inodes[inode as usize].data.fill(0);
+                touch_inode_metadata(state, inode, false, true, true);
+            }
+            NodeBackend::Ext2 => {
+                if ext2_ino == 0 {
+                    return Err(EIO);
+                }
+                ext2_truncate_to_zero(state, ext2_ino)?;
+                state.inodes[inode as usize].size = 0;
+                touch_inode_metadata(state, inode, false, true, true);
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+}
+
+pub fn truncate_to(inode: u16, length: u64) -> Result<(), i64> {
+    if length == 0 {
+        return truncate(inode);
+    }
+    with_state(|state| {
+        ensure_init(state);
+
+        if inode as usize >= VFS_MAX_INODES {
+            return Err(ENOENT);
+        }
+        let (used, file_type, backend) = {
+            let node = &state.inodes[inode as usize];
+            (node.used, node.file_type, node.backend)
+        };
+        if !used {
+            return Err(ENOENT);
+        }
+        if file_type != FileType::Regular {
+            return Err(EINVAL);
+        }
+        if !backend_mutable(backend) {
+            return Err(EROFS);
+        }
+
+        match backend {
+            NodeBackend::Tmpfs => {
+                let new_len = length as usize;
+                if new_len > TMPFS_MAX_FILE_SIZE {
+                    return Err(ENOSPC);
+                }
+                let node = &mut state.inodes[inode as usize];
+                let old_size = node.size as usize;
+                if new_len < old_size {
+                    node.data[new_len..old_size].fill(0);
+                } else if new_len > old_size {
+                    node.data[old_size..new_len].fill(0);
+                }
+                node.size = new_len as u32;
+                touch_inode_metadata(state, inode, false, true, true);
+            }
+            NodeBackend::Ext2 => {
+                return Err(EINVAL);
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+}
+
+pub fn inode_backend_is_ext2(inode: u16) -> bool {
+    with_state(|state| {
+        if inode as usize >= VFS_MAX_INODES {
+            return false;
+        }
+        state.inodes[inode as usize].backend == NodeBackend::Ext2
+    })
+}
+
+pub fn ext2_block_size() -> u64 {
+    with_state(|state| state.ext2_meta.block_size as u64)
+}
+
+pub fn ext2_total_blocks() -> u64 {
+    with_state(|state| state.ext2_meta.total_blocks as u64)
+}
+
+pub fn ext2_total_inodes() -> u64 {
+    with_state(|state| state.ext2_meta.total_inodes as u64)
 }
 
 #[cfg(test)]

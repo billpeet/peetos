@@ -133,6 +133,13 @@ const SYS_MKNODAT: u64 = 259;
 const SYS_UTIMENSAT: u64 = 280;
 const SYS_DUP3: u64 = 292;
 const SYS_PIPE2: u64 = 293;
+const SYS_FTRUNCATE: u64 = 77;
+const SYS_GETRUSAGE: u64 = 98;
+const SYS_SYSINFO: u64 = 99;
+const SYS_STATFS: u64 = 137;
+const SYS_FSTATFS: u64 = 138;
+const SYS_PRLIMIT64: u64 = 302;
+const SYS_GETRANDOM: u64 = 318;
 const SYS_COPY_FILE_RANGE: u64 = 326;
 const SYS_FACCESSAT2: u64 = 439;
 
@@ -510,6 +517,38 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         "faccessat2",
         SyscallMode::UserTask,
         sys_faccessat2,
+    ),
+    syscall_def(
+        SYS_FTRUNCATE,
+        "ftruncate",
+        SyscallMode::UserTask,
+        sys_ftruncate,
+    ),
+    syscall_def(
+        SYS_GETRANDOM,
+        "getrandom",
+        SyscallMode::UserTask,
+        sys_getrandom,
+    ),
+    syscall_def(SYS_SYSINFO, "sysinfo", SyscallMode::UserTask, sys_sysinfo),
+    syscall_def(
+        SYS_PRLIMIT64,
+        "prlimit64",
+        SyscallMode::UserTask,
+        sys_prlimit64,
+    ),
+    syscall_def(
+        SYS_GETRUSAGE,
+        "getrusage",
+        SyscallMode::UserTask,
+        sys_getrusage,
+    ),
+    syscall_def(SYS_STATFS, "statfs", SyscallMode::UserTask, sys_statfs),
+    syscall_def(
+        SYS_FSTATFS,
+        "fstatfs",
+        SyscallMode::UserTask,
+        sys_fstatfs,
     ),
 ];
 
@@ -4673,6 +4712,297 @@ fn sys_exit(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
 fn sys_exit_group(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     sys_exit_common(ctx, call.arg(0) as i32)
+}
+
+// ---------------------------------------------------------------------------
+// ftruncate (77)
+// ---------------------------------------------------------------------------
+fn sys_ftruncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let length = call.arg(1);
+
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let (kind, inode) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+        )
+    };
+    if kind != task::USER_FD_KIND_VFS {
+        return -EBADF;
+    }
+
+    let result = if length == 0 {
+        fs::truncate(inode)
+    } else {
+        fs::truncate_to(inode, length)
+    };
+
+    match result {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// getrandom (318)
+// ---------------------------------------------------------------------------
+fn sys_getrandom(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let buf_ptr = call.arg(0);
+    let buflen = call.arg(1) as usize;
+    let _flags = call.arg(2);
+
+    if buf_ptr == 0 {
+        return -EFAULT;
+    }
+
+    let cap = cmp::min(buflen, 256);
+    let mut tmp = [0u8; 256];
+
+    let mut state =
+        0x9E37_79B9_7F4A_7C15u64 ^ pit::ticks().wrapping_mul(0xA076_1D64_78BD_642F);
+    let pid = if ctx.has_task() {
+        unsafe { (*ctx.current).pid as u64 }
+    } else {
+        0
+    };
+    state ^= pid.wrapping_mul(0x517C_C1B7_2722_0A95);
+    if state == 0 {
+        state = 1;
+    }
+
+    for chunk in tmp[..cap].chunks_mut(8) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let sample = state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes();
+        chunk.copy_from_slice(&sample[..chunk.len()]);
+    }
+
+    match copy_to_user_task(ctx.current, buf_ptr, &tmp[..cap]) {
+        Ok(()) => cap as i64,
+        Err(err) => -err,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sysinfo (99)
+// ---------------------------------------------------------------------------
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSysinfo {
+    uptime: i64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    pad2: u32,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+    _padding: [u8; 4],
+}
+
+fn sys_sysinfo(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let out_ptr = call.arg(0);
+    if out_ptr == 0 {
+        return -EFAULT;
+    }
+
+    let pmm = pmm::get_stats();
+
+    let info = LinuxSysinfo {
+        uptime: pit::uptime_seconds() as i64,
+        loads: [0; 3],
+        totalram: pmm.total_bytes,
+        freeram: pmm.free_bytes,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs: 1,
+        pad: 0,
+        pad2: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        _padding: [0; 4],
+    };
+
+    match write_struct_to_user(ctx.current, out_ptr, &info) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// prlimit64 (302) — stub returning success
+// ---------------------------------------------------------------------------
+fn sys_prlimit64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let new_limit_ptr = call.arg(2);
+    let old_limit_ptr = call.arg(3);
+
+    // If old_limit_ptr is set, write a zeroed rlimit (cur=RLIM_INFINITY, max=RLIM_INFINITY).
+    if old_limit_ptr != 0 {
+        let rlimit = [u64::MAX, u64::MAX]; // [rlim_cur, rlim_max]
+        if let Err(err) = write_struct_to_user(ctx.current, old_limit_ptr, &rlimit) {
+            return -err;
+        }
+    }
+    let _ = new_limit_ptr;
+    0
+}
+
+// ---------------------------------------------------------------------------
+// getrusage (98) — stub returning zeroed struct
+// ---------------------------------------------------------------------------
+fn sys_getrusage(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let _who = call.arg(0) as i32;
+    let usage_ptr = call.arg(1);
+
+    if usage_ptr == 0 {
+        return -EFAULT;
+    }
+
+    // struct rusage is 144 bytes on x86-64.
+    let zeroed = [0u8; 144];
+    match copy_to_user_task(ctx.current, usage_ptr, &zeroed) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// statfs (137) / fstatfs (138)
+// ---------------------------------------------------------------------------
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxStatfs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: i64,
+    f_bfree: i64,
+    f_bavail: i64,
+    f_files: i64,
+    f_ffree: i64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+const TMPFS_MAGIC: i64 = 0x01021994;
+const EXT2_SUPER_MAGIC_STATFS: i64 = 0xEF53;
+
+fn fill_statfs_for_inode(inode: u16) -> LinuxStatfs {
+    let is_ext2 = fs::inode_backend_is_ext2(inode);
+    if is_ext2 {
+        let bsize = fs::ext2_block_size() as i64;
+        let blocks = fs::ext2_total_blocks() as i64;
+        LinuxStatfs {
+            f_type: EXT2_SUPER_MAGIC_STATFS,
+            f_bsize: bsize,
+            f_blocks: blocks,
+            f_bfree: blocks / 4,
+            f_bavail: blocks / 4,
+            f_files: fs::ext2_total_inodes() as i64,
+            f_ffree: 16,
+            f_fsid: [0; 2],
+            f_namelen: 255,
+            f_frsize: bsize,
+            f_flags: 0,
+            f_spare: [0; 4],
+        }
+    } else {
+        LinuxStatfs {
+            f_type: TMPFS_MAGIC,
+            f_bsize: 4096,
+            f_blocks: 1024,
+            f_bfree: 512,
+            f_bavail: 512,
+            f_files: 256,
+            f_ffree: 128,
+            f_fsid: [0; 2],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: 0,
+            f_spare: [0; 4],
+        }
+    }
+}
+
+fn sys_statfs(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(call.arg(0), &mut path_buf) {
+        Ok(p) => p,
+        Err(err) => return err,
+    };
+    if path.is_empty() {
+        return -ENOENT;
+    }
+
+    let dir_inode = match resolve_dir_for_path(ctx, fs::AT_FDCWD, path) {
+        Ok(ino) => ino,
+        Err(err) => return err,
+    };
+    let inode = match fs::lookupat(dir_inode, path) {
+        Ok(ino) => ino,
+        Err(err) => return -fs_to_errno(err),
+    };
+
+    let sfs = fill_statfs_for_inode(inode);
+    match write_struct_to_user(ctx.current, call.arg(1), &sfs) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
+}
+
+fn sys_fstatfs(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let idx = match fd_index(fd) {
+        Ok(idx) => idx,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let (kind, inode) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+        )
+    };
+    if kind != task::USER_FD_KIND_VFS {
+        // For pipes, return tmpfs-like statfs.
+        let sfs = fill_statfs_for_inode(0);
+        return match write_struct_to_user(ctx.current, call.arg(1), &sfs) {
+            Ok(()) => 0,
+            Err(err) => -err,
+        };
+    }
+
+    let sfs = fill_statfs_for_inode(inode);
+    match write_struct_to_user(ctx.current, call.arg(1), &sfs) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
 }
 
 fn install_user_signal_frame_syscall(

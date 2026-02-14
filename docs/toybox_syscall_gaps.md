@@ -29,6 +29,7 @@ Currently implemented in `kernel/src/syscall.rs`:
 - `getpid`, `getppid`, `gettid`, `set_tid_address`
 - `uname`
 - `arch_prctl`, `umask`
+- `ftruncate`, `getrandom`, `sysinfo`, `prlimit64`, `getrusage`, `statfs`, `fstatfs`
 
 ## Current Staged Applets
 
@@ -40,8 +41,25 @@ multicall binary:
 - `wc`, `head`, `tail`, `tee`, `sort`, `uniq`, `tr`, `cut`
 - `chmod`, `chown`, `uname`
 
+Next-wave applets (26 additions):
+- Scripting essentials: `find`, `grep`, `sed`, `xargs`
+- Common utilities: `date`, `id`, `printf`, `readlink`, `stat`, `du`, `kill`, `which`, `dd`, `mktemp`, `yes`, `nohup`, `rmdir`, `cmp`, `strings`
+- Text processing: `paste`, `nl`, `rev`, `comm`, `fold`
+- System info: `free`, `uptime`
+
 P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`)
 are now implemented; `chmod`/`chown` applets use the new handlers.
+
+Next-wave syscalls now implemented:
+- `ftruncate` (77) - done (truncate-to-zero for tmpfs/ext2; truncate-to-length for tmpfs)
+- `getrandom` (318) - done (XORshift PRNG, capped at 256 bytes per call)
+- `sysinfo` (99) - done (PIT uptime, PMM memory stats)
+- `prlimit64` (302) - done (stub returning RLIM_INFINITY)
+- `getrusage` (98) - done (stub returning zeroed rusage)
+- `statfs` (137) / `fstatfs` (138) - done (tmpfs/ext2 backend-aware values)
+
+Virtual device additions:
+- `/dev/urandom` - done (XORshift PRNG read, DevNull-like write)
 
 ## Latest Smoke Observation (2026-02-13)
 

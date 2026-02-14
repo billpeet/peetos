@@ -84,6 +84,32 @@ toybox seq 1 3 || fail=1
 toybox sleep 0 || fail=1
 toybox env || fail=1
 
+# -- next-wave utilities --
+toybox find /tmp -maxdepth 1 -type f 2>/dev/null || fail=1
+echo findme >/tmp/greptest && toybox grep findme /tmp/greptest && toybox rm -f /tmp/greptest || fail=1
+echo hello | toybox sed 's/hello/world/' || fail=1
+echo one two three | toybox xargs echo || fail=1
+toybox date || fail=1
+toybox id || fail=1
+toybox printf 'fmt %s\n' ok || fail=1
+toybox readlink /bin/toybox 2>/dev/null; true
+toybox stat /bin/toybox || fail=1
+toybox du -s /bin || fail=1
+toybox which toybox || fail=1
+toybox dd if=/dev/zero of=/tmp/dd_out bs=64 count=1 2>/dev/null && toybox rm -f /tmp/dd_out || fail=1
+toybox mktemp /tmp/tmp.XXXXXX >/dev/null && toybox rm -f /tmp/tmp.* || fail=1
+toybox yes | toybox head -n 1 || fail=1
+toybox rmdir /tmp/smoke 2>/dev/null; toybox mkdir /tmp/smoke && toybox rmdir /tmp/smoke || fail=1
+echo abc >/tmp/cmp1 && echo abc >/tmp/cmp2 && toybox cmp /tmp/cmp1 /tmp/cmp2 && toybox rm -f /tmp/cmp1 /tmp/cmp2 || fail=1
+echo -e "a\tb" | toybox paste -s || fail=1
+echo hello | toybox nl || fail=1
+echo hello | toybox rev || fail=1
+echo hello | toybox fold -w 3 || fail=1
+toybox seq 1 3 | toybox comm - - 2>/dev/null; true
+toybox free || fail=1
+toybox uptime || fail=1
+toybox strings /bin/toybox | toybox head -n 1 || fail=1
+
 echo [musl-ext2-cmd-smoke] done
 if [ "$fail" -ne 0 ]; then
   echo [musl-ext2-cmd-smoke] failures
@@ -94,7 +120,7 @@ chmod 0755 "${STAGE_ROOT}/bin/next_smoke.sh"
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact for QEMU smoke runs while leaving room for the
 # static Toybox multicall payload.
-mke2fs -q -t ext2 -F -b 1024 -I 256 -N 128 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 512
+mke2fs -q -t ext2 -F -b 1024 -I 256 -N 192 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 768
 
 mv "${TMP_IMG}" "${OUT_IMG}"
 chmod 0644 "${OUT_IMG}"
