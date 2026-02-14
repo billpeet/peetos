@@ -13,39 +13,39 @@ if [[ ! -f "${LAUNCHER}" ]]; then
   exit 1
 fi
 
-if ! rg -q '"/mnt/ext2/bin/toybox"' "${LAUNCHER}"; then
+if ! grep -q '"/mnt/ext2/bin/toybox"' "${LAUNCHER}"; then
   echo "musl ext2 command smoke launcher is not targeting /mnt/ext2/bin/toybox" >&2
   exit 1
 fi
 
-if ! rg -q '"sh"' "${LAUNCHER}"; then
+if ! grep -q '"sh"' "${LAUNCHER}"; then
   echo "musl ext2 command smoke launcher is missing toybox sh argv0" >&2
   exit 1
 fi
 
-if ! rg -q '"bin/next_smoke.sh"' "${LAUNCHER}"; then
+if ! grep -q '"bin/next_smoke.sh"' "${LAUNCHER}"; then
   echo "musl ext2 command smoke launcher is missing bin/next_smoke.sh script path" >&2
   exit 1
 fi
 
 for token in 'toybox cp' 'toybox mv' 'toybox ln' 'toybox touch' 'next_smoke.sh' 'musl-ext2-cmd-smoke] failures'; do
-  if ! rg -q "${token}" "${ROOT_DIR}/scripts/build_ext2_musl_execve.sh"; then
+  if ! grep -q "${token}" "${ROOT_DIR}/scripts/build_ext2_musl_execve.sh"; then
     echo "ext2 smoke script payload is missing ${token}" >&2
     exit 1
   fi
 done
 
-if ! rg -q 'musl-ext2-cmd-smoke' "${KERNEL_CARGO}"; then
+if ! grep -q 'musl-ext2-cmd-smoke' "${KERNEL_CARGO}"; then
   echo "kernel feature musl-ext2-cmd-smoke missing" >&2
   exit 1
 fi
 
-if ! rg -q 'log_stub_enosys' "${SYSCALL_RS}"; then
+if ! grep -q 'log_stub_enosys' "${SYSCALL_RS}"; then
   echo "syscall stub ENOSYS logging helper missing" >&2
   exit 1
 fi
 
-if ! rg -q 'run-shell-smoke' "${MAKEFILE}"; then
+if ! grep -q 'run-shell-smoke' "${MAKEFILE}"; then
   echo "Makefile run-shell-smoke target missing" >&2
   exit 1
 fi

@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-make -C "${ROOT_DIR}" image PROFILE=debug KERNEL_FEATURES=test-exit
+make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES=test-exit
 
 set +e
 timeout 5s qemu-system-x86_64 \

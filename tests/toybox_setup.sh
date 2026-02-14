@@ -38,7 +38,7 @@ if [[ ! -f "${ROOT_DIR}/toybox/configs/shell-core.config" ]]; then
 fi
 
 for symbol in CONFIG_SH CONFIG_ECHO CONFIG_CAT CONFIG_LS CONFIG_MKDIR CONFIG_RM CONFIG_PWD CONFIG_CP CONFIG_MV CONFIG_LN CONFIG_TOUCH; do
-  if ! rg -q "^${symbol}=y$" "${ROOT_DIR}/toybox/configs/shell-core.config"; then
+  if ! grep -q "^${symbol}=y$" "${ROOT_DIR}/toybox/configs/shell-core.config"; then
     echo "shell-core config missing ${symbol}=y" >&2
     exit 1
   fi

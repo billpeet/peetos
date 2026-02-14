@@ -3298,6 +3298,95 @@ fn set_times_inner(state: &mut VfsState, inode: u16, atime: u64, mtime: u64) -> 
     }
 }
 
+fn chmod_inner(state: &mut VfsState, inode: u16, mode: u16) -> Result<(), i64> {
+    if inode as usize >= VFS_MAX_INODES {
+        return Err(ENOENT);
+    }
+    if !state.inodes[inode as usize].used {
+        return Err(ENOENT);
+    }
+
+    let backend = state.inodes[inode as usize].backend;
+    if !backend_mutable(backend) {
+        return Err(EROFS);
+    }
+
+    let ctime = fs_time_tick(state);
+    match backend {
+        NodeBackend::Tmpfs => {
+            let node = &mut state.inodes[inode as usize];
+            let file_type_bits = node.mode & EXT2_S_IFMT;
+            node.mode = file_type_bits | (mode & 0o7777);
+            node.ctime = ctime;
+            Ok(())
+        }
+        NodeBackend::Ext2 => {
+            let ext2_ino = state.inodes[inode as usize].ext2_ino;
+            if ext2_ino == 0 {
+                return Err(EINVAL);
+            }
+            let mut ext_inode = ext2_read_inode_from_state(state, ext2_ino)?;
+            let file_type_bits = ext_inode.mode & EXT2_S_IFMT;
+            ext_inode.mode = file_type_bits | (mode & 0o7777);
+            ext_inode.ctime = ctime as u32;
+            ext2_write_inode_to_state(state, ext2_ino, &ext_inode)?;
+            ext2_refresh_alias_nodes(state, ext2_ino, &ext_inode);
+            Ok(())
+        }
+        _ => Err(EROFS),
+    }
+}
+
+fn chown_inner(state: &mut VfsState, inode: u16, uid: u32, gid: u32) -> Result<(), i64> {
+    if inode as usize >= VFS_MAX_INODES {
+        return Err(ENOENT);
+    }
+    if !state.inodes[inode as usize].used {
+        return Err(ENOENT);
+    }
+
+    let backend = state.inodes[inode as usize].backend;
+    if !backend_mutable(backend) {
+        return Err(EROFS);
+    }
+
+    let new_uid = if uid == 0xFFFF_FFFF {
+        state.inodes[inode as usize].uid
+    } else {
+        uid as u16
+    };
+    let new_gid = if gid == 0xFFFF_FFFF {
+        state.inodes[inode as usize].gid
+    } else {
+        gid as u16
+    };
+
+    let ctime = fs_time_tick(state);
+    match backend {
+        NodeBackend::Tmpfs => {
+            let node = &mut state.inodes[inode as usize];
+            node.uid = new_uid;
+            node.gid = new_gid;
+            node.ctime = ctime;
+            Ok(())
+        }
+        NodeBackend::Ext2 => {
+            let ext2_ino = state.inodes[inode as usize].ext2_ino;
+            if ext2_ino == 0 {
+                return Err(EINVAL);
+            }
+            let mut ext_inode = ext2_read_inode_from_state(state, ext2_ino)?;
+            ext_inode.uid = new_uid;
+            ext_inode.gid = new_gid;
+            ext_inode.ctime = ctime as u32;
+            ext2_write_inode_to_state(state, ext2_ino, &ext_inode)?;
+            ext2_refresh_alias_nodes(state, ext2_ino, &ext_inode);
+            Ok(())
+        }
+        _ => Err(EROFS),
+    }
+}
+
 pub fn root_inode() -> u16 {
     ROOT_INODE
 }
@@ -3523,6 +3612,20 @@ pub fn set_times(inode: u16, atime: u64, mtime: u64) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
         set_times_inner(state, inode, atime, mtime)
+    })
+}
+
+pub fn chmod(inode: u16, mode: u16) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        chmod_inner(state, inode, mode)
+    })
+}
+
+pub fn chown(inode: u16, uid: u32, gid: u32) -> Result<(), i64> {
+    with_state(|state| {
+        ensure_init(state);
+        chown_inner(state, inode, uid, gid)
     })
 }
 

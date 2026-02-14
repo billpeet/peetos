@@ -2436,19 +2436,115 @@ fn sys_readlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
-fn sys_fchmodat(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
-    log_stub_enosys("fchmodat");
-    -ENOSYS
+fn sys_fchmodat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let dirfd = call.arg(0) as i32;
+    let path_ptr = call.arg(1);
+    let mode = call.arg(2) as u32;
+
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(path_ptr, &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let inode = match lookup_inode_for_at_path(ctx, dirfd, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    match fs::chmod(inode, (mode & 0o7777) as u16) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
 }
 
-fn sys_fchownat(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
-    log_stub_enosys("fchownat");
-    -ENOSYS
+fn sys_fchownat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let dirfd = call.arg(0) as i32;
+    let path_ptr = call.arg(1);
+    let owner = call.arg(2) as u32;
+    let group = call.arg(3) as u32;
+    let flags = call.arg(4) as u32;
+
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 {
+        return -EINVAL;
+    }
+
+    let inode = if path_ptr == 0 || {
+        let mut probe = [0u8; 1];
+        copy_from_user_task(ctx.current, path_ptr, &mut probe).is_ok() && probe[0] == 0
+    } {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return -ENOENT;
+        }
+        match resolve_vfs_fd_inode(ctx, dirfd) {
+            Ok(inode) => inode,
+            Err(err) => return err,
+        }
+    } else {
+        let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+        let path = match read_user_path(path_ptr, &mut path_buf) {
+            Ok(path) => path,
+            Err(err) => return err,
+        };
+        match lookup_inode_for_at_path(ctx, dirfd, path) {
+            Ok(inode) => inode,
+            Err(err) => return err,
+        }
+    };
+
+    match fs::chown(inode, owner, group) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
 }
 
-fn sys_mknodat(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
-    log_stub_enosys("mknodat");
-    -ENOSYS
+fn sys_mknodat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let dirfd = call.arg(0) as i32;
+    let path_ptr = call.arg(1);
+    let mode = call.arg(2) as u32;
+    let _dev = call.arg(3);
+
+    let file_type = mode & 0xF000;
+    // Only support S_IFREG (regular file create) and mode==0 (bare create);
+    // reject S_IFCHR, S_IFBLK, S_IFIFO as unsupported.
+    if file_type != 0x8000 && file_type != 0 {
+        return -EINVAL;
+    }
+
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(path_ptr, &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let dir_inode = match resolve_dir_for_path(ctx, dirfd, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    let opened = match fs::openat(
+        dir_inode,
+        path,
+        fs::O_CREAT | fs::O_EXCL | fs::O_WRONLY,
+        0,
+    ) {
+        Ok(opened) => opened,
+        Err(err) => return -fs_to_errno(err),
+    };
+
+    let perm = (mode & 0o7777) as u16;
+    if perm != 0 {
+        let _ = fs::chmod(opened.inode, perm);
+    }
+
+    sync_ext2_backing();
+    0
 }
 
 fn sys_utimensat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -2518,14 +2614,75 @@ fn sys_utimensat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
-fn sys_utimes(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
-    log_stub_enosys("utimensat");
-    -ENOSYS
+fn sys_utimes(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let path_ptr = call.arg(0);
+    let times_ptr = call.arg(1);
+
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(path_ptr, &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let inode = match lookup_inode_for_at_path(ctx, fs::AT_FDCWD, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    let now = pit::ticks();
+    let (atime, mtime) = if times_ptr == 0 {
+        (now, now)
+    } else {
+        let tv = match read_struct_from_user::<[LinuxTimeVal; 2]>(ctx.current, times_ptr) {
+            Ok(tv) => tv,
+            Err(err) => return -err,
+        };
+        (tv[0].tv_sec as u64, tv[1].tv_sec as u64)
+    };
+
+    match fs::set_times(inode, atime, mtime) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
 }
 
-fn sys_futimesat(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
-    log_stub_enosys("utimensat");
-    -ENOSYS
+fn sys_futimesat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let dirfd = call.arg(0) as i32;
+    let path_ptr = call.arg(1);
+    let times_ptr = call.arg(2);
+
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    let path = match read_user_path(path_ptr, &mut path_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let inode = match lookup_inode_for_at_path(ctx, dirfd, path) {
+        Ok(inode) => inode,
+        Err(err) => return err,
+    };
+
+    let now = pit::ticks();
+    let (atime, mtime) = if times_ptr == 0 {
+        (now, now)
+    } else {
+        let tv = match read_struct_from_user::<[LinuxTimeVal; 2]>(ctx.current, times_ptr) {
+            Ok(tv) => tv,
+            Err(err) => return -err,
+        };
+        (tv[0].tv_sec as u64, tv[1].tv_sec as u64)
+    };
+
+    match fs::set_times(inode, atime, mtime) {
+        Ok(()) => {
+            sync_ext2_backing();
+            0
+        }
+        Err(err) => -fs_to_errno(err),
+    }
 }
 
 fn sys_copy_file_range(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {

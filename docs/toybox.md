@@ -50,10 +50,10 @@ Use the QEMU display window for keyboard input (TTY-backed shell stdin).
 
 ## Limitations / Simplifications
 
-- Current smoke staging enables a narrow shell-core applet set (`sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`).
+- Current smoke staging enables a shell-core applet set: `sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`, `true`, `false`, `test`, `sleep`, `seq`, `env`, `basename`, `dirname`, `wc`, `head`, `tail`, `tee`, `sort`, `uniq`, `tr`, `cut`, `chmod`, `chown`, `uname`.
 - The ext2 smoke path installs one `/bin/toybox` multicall binary; applets are invoked as `toybox <applet>`.
 - Runtime shell/smoke commands expect `user/sample_ext2_musl.img` to be attached as a second AHCI disk in QEMU.
-- `cp`/`mv`/`ln`/`touch` are currently staged primarily for syscall-gap smoke; VFS link/metadata/time syscalls are still baseline-stubbed, so full behavior is not yet parity-complete.
+- P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`) are now implemented; `chmod`/`chown` applets exercise the new handlers.
 - `scripts/run_toybox_next_smoke.sh` now continues through command failures and reports both completion and a failure marker so syscall gaps can be captured in one run.
 - Broader utility coverage (`find`, `tar`, etc.) and syscall-gap hardening are still pending.
 - `make toybox` still builds the standalone `echo` staging artifact (`toybox/out/echo`); shell-core staging uses `scripts/build_toybox_core.sh`.

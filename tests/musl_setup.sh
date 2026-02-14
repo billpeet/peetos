@@ -42,8 +42,8 @@ DRY_RUN_OUT="$("${ROOT_DIR}/musl/configure-musl.sh" \
   --cross-prefix "x86_64-peetos-" \
   --dry-run)"
 
-echo "${DRY_RUN_OUT}" | rg -q -- "--target=x86_64-linux-musl"
-echo "${DRY_RUN_OUT}" | rg -q -- "CC=x86_64-peetos-gcc"
+echo "${DRY_RUN_OUT}" | grep -q -- "--target=x86_64-linux-musl"
+echo "${DRY_RUN_OUT}" | grep -q -- "CC=x86_64-peetos-gcc"
 
 "${ROOT_DIR}/musl/configure-musl.sh" \
   --musl-dir "${WORK_DIR}/musl-src" \
@@ -59,10 +59,10 @@ if [[ ! -f "${WORK_DIR}/musl-src/config.mak" ]]; then
   exit 1
 fi
 
-rg -q -- "--target=x86_64-linux-musl" "${WORK_DIR}/musl-src/configure.args"
-rg -q -- "CC=fake-cc" "${WORK_DIR}/musl-src/configure.args"
-rg -q -- "AR=fake-ar" "${WORK_DIR}/musl-src/configure.args"
-rg -q -- "RANLIB=fake-ranlib" "${WORK_DIR}/musl-src/configure.args"
+grep -q -- "--target=x86_64-linux-musl" "${WORK_DIR}/musl-src/configure.args"
+grep -q -- "CC=fake-cc" "${WORK_DIR}/musl-src/configure.args"
+grep -q -- "AR=fake-ar" "${WORK_DIR}/musl-src/configure.args"
+grep -q -- "RANLIB=fake-ranlib" "${WORK_DIR}/musl-src/configure.args"
 
 if MUSL_CC="${WORK_DIR}/missing-musl-gcc" "${ROOT_DIR}/scripts/build_musl_echo.sh" >/dev/null 2>&1; then
   echo "build_musl_echo.sh should fail when musl compiler wrapper is missing" >&2

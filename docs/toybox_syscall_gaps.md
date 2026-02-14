@@ -1,6 +1,6 @@
 # Toybox Syscall Gaps
 
-Last reviewed: 2026-02-13
+Last reviewed: 2026-02-14
 
 This document tracks missing Linux syscalls needed to bring up Toybox utilities on PeetOS in a staged way.
 
@@ -36,10 +36,12 @@ The `musl-ext2-exec` smoke image now stages a shell-core set from one Toybox
 multicall binary:
 
 - `sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`
+- `true`, `false`, `test`, `sleep`, `seq`, `env`, `basename`, `dirname`
+- `wc`, `head`, `tail`, `tee`, `sort`, `uniq`, `tr`, `cut`
+- `chmod`, `chown`, `uname`
 
-`cp`/`mv`/`ln`/`touch` are staged for syscall-gap probing via
-`scripts/run_toybox_next_smoke.sh`; metadata ownership/mode and node creation
-paths are still pending.
+P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`)
+are now implemented; `chmod`/`chown` applets use the new handlers.
 
 ## Latest Smoke Observation (2026-02-13)
 
@@ -68,11 +70,11 @@ Implement these first to unblock common Toybox utilities:
 - `readlinkat` (267) - done (baseline `/proc/self/exe` + non-symlink `-EINVAL`)
 
 3. Metadata/time ownership:
-- `fchmodat` (268) - stubbed (`-ENOSYS`)
-- `fchownat` (260) - stubbed (`-ENOSYS`)
+- `fchmodat` (268) - done (baseline permission-bit update for tmpfs/ext2)
+- `fchownat` (260) - done (baseline uid/gid update; `-1` preserve convention; `AT_EMPTY_PATH`/`AT_SYMLINK_NOFOLLOW` accepted)
 - `utimensat` (280) - done (baseline atime/mtime update with `UTIME_NOW`/`UTIME_OMIT`)
-- `mknodat` (259) - stubbed (`-ENOSYS`)
-- `utimes` (235) / `futimesat` (261) - compatibility aliases still return `-ENOSYS` (wrapper not wired yet)
+- `mknodat` (259) - done (baseline `S_IFREG` regular-file creation only; char/block/fifo devices unsupported)
+- `utimes` (235) / `futimesat` (261) - done (baseline `struct timeval` time update wrappers)
 
 4. CWD + identity:
 - `chdir` (80) - done
@@ -152,3 +154,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
   - `wait4` currently supports `WNOHANG`; `rusage` output is unimplemented.
   - `ioctl` currently supports a minimal console tty subset with static/default behavior.
   - process-group/session syscalls are baseline and still need hardening for full job-control parity.
+  - `fchmodat` updates permission bits without full ownership/capability permission checks.
+  - `fchownat` truncates uid/gid to u16 to match current VFS inode field width; no privilege checks.
+  - `mknodat` only supports `S_IFREG` regular file creation; character/block/fifo device nodes are unsupported.
+  - `utimes`/`futimesat` convert `struct timeval` tv_sec directly; microsecond precision is discarded.
