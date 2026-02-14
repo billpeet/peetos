@@ -21,6 +21,7 @@ mod keyboard;
 mod memory;
 mod mmio;
 mod net;
+mod pty;
 mod qemu;
 mod sched;
 mod serial;
@@ -149,6 +150,9 @@ pub extern "C" fn kmain() -> ! {
 
     shm::init();
     serial_println!("[SHM] Initialized");
+
+    pty::init();
+    serial_println!("[PTY] Initialized");
 
     pit::set_tick_hook(sched::tick);
     idt::set_post_handler_hook(sched::isr_hook);

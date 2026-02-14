@@ -29,7 +29,13 @@ pub const USER_FD_KIND_CONSOLE: u8 = 1;
 pub const USER_FD_KIND_VFS: u8 = 2;
 pub const USER_FD_KIND_PIPE: u8 = 3;
 pub const USER_FD_KIND_SOCKET: u8 = 4;
+pub const USER_FD_KIND_PTY_MASTER: u8 = 5;
+pub const USER_FD_KIND_PTY_SLAVE: u8 = 6;
 pub const USER_FD_NONE: u16 = u16::MAX;
+
+pub const CTTY_NONE: u8 = 0;
+pub const CTTY_CONSOLE: u8 = 1;
+pub const CTTY_PTY: u8 = 2;
 
 const KERNEL_CS: u64 = 0x08;
 const KERNEL_DS: u64 = 0x10;
@@ -53,6 +59,8 @@ pub struct Task {
     pub(crate) ppid: Pid,
     pub(crate) pgid: Pid,
     pub(crate) sid: Pid,
+    pub(crate) ctty_type: u8,
+    pub(crate) ctty_id: u16,
     pub(crate) name: [u8; TASK_NAME_MAX],
     pub(crate) state: TaskState,
     pub(crate) flags: u32,
@@ -147,6 +155,8 @@ pub fn init() {
             ppid: 0,
             pgid: 0,
             sid: 0,
+            ctty_type: CTTY_CONSOLE,
+            ctty_id: 0,
             name: [0; TASK_NAME_MAX],
             state: TaskState::Running,
             flags: TASK_FLAG_KERNEL,
@@ -243,6 +253,8 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.ppid = current().as_ref().map(|t| t.pid).unwrap_or(0);
         task.pgid = task.pid;
         task.sid = task.pid;
+        task.ctty_type = CTTY_NONE;
+        task.ctty_id = 0;
         task.state = TaskState::Created;
         task.flags = flags;
         task.exit_code = 0;
@@ -483,6 +495,8 @@ impl Task {
             ppid: 0,
             pgid: pid,
             sid: pid,
+            ctty_type: CTTY_NONE,
+            ctty_id: 0,
             name: [0; TASK_NAME_MAX],
             state: TaskState::Ready,
             flags: TASK_FLAG_KERNEL,

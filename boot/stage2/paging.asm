@@ -91,8 +91,8 @@
 ; For higher-half kernel mapping (permanent):
 ;   - PML4[511] -> PDPT_HIGH -> PD_HIGH
 ;   - PD_HIGH[0] -> PT (4KB pages for first 2MB) - FIXES BSS CLEARING
-;   - PD_HIGH[1-7] -> 2MB pages for remaining 14MB
-;   - Total: 16 MB mapped at 0xFFFFFFFF80000000
+;   - PD_HIGH[1-63] -> 2MB pages for remaining 126MB
+;   - Total: 128 MB mapped at 0xFFFFFFFF80000000
 ;
 ; We use 4KB pages for the kernel's first 2MB to avoid write buffer
 ; coherency issues with 2MB pages that were preventing BSS clearing.
@@ -293,15 +293,15 @@ setup_paging:
     ; Save framebuffer base address
     mov [.fb_base], eax
 
-    ; Map framebuffer to higher-half virtual address 0xFFFFFFFF81000000
-    ; This uses PML4[511] -> PDPT_HIGH[510] -> PD_HIGH[8+]
-    ; (PD_HIGH[0-7] are used for kernel code/data)
+    ; Map framebuffer to higher-half virtual address 0xFFFFFFFF88000000
+    ; This uses PML4[511] -> PDPT_HIGH[510] -> PD_HIGH[64+]
+    ; (PD_HIGH[0-63] are used for kernel physical memory mapping)
     ;
-    ; We'll map 16 MB starting at PD_HIGH[8] to cover the framebuffer
+    ; We'll map 16 MB starting at PD_HIGH[64] to cover the framebuffer
 
-    ; Use PD_HIGH for framebuffer mapping (entries 8-15 for 16MB)
+    ; Use PD_HIGH for framebuffer mapping (entries 64-71 for 16MB)
     mov edi, PD_HIGH_ADDR
-    add edi, 8 * 8                  ; Start at PD_HIGH[8] (8 bytes per entry)
+    add edi, 64 * 8                 ; Start at PD_HIGH[64] (8 bytes per entry)
 
     ; Get base address aligned to 2MB boundary
     mov eax, [.fb_base]
@@ -340,14 +340,14 @@ setup_paging:
     ;   - PDPT_HIGH[510] -> PD_HIGH at 0x15000
     ;   - PD_HIGH[0] -> PT at 0x13000 (Page Table for first 2MB)
     ;   - PT[0..511] -> 512 x 4KB pages at physical 0x00000000 - 0x001FFFFF (2 MB)
-    ;   - PD_HIGH[1..7] -> 7 x 2MB pages at physical 0x00200000 - 0x00FFFFFF (14 MB)
-    ;   - Virtual 0xFFFFFFFF80000000 - 0xFFFFFFFF80FFFFFF -> Physical 0x00000000 - 0x00FFFFFF
+    ;   - PD_HIGH[1..63] -> 63 x 2MB pages at physical 0x00200000 - 0x07FFFFFF (126 MB)
+    ;   - Virtual 0xFFFFFFFF80000000 - 0xFFFFFFFF87FFFFFF -> Physical 0x00000000 - 0x07FFFFFF
     ;   NOTE: First 2MB uses 4KB pages to fix BSS clearing issues!
     ;
     ; Framebuffer mapping (if VESA enabled, mapped to higher-half):
     ;   - PML4[511] -> PDPT_HIGH[510] -> PD_HIGH (same as kernel)
-    ;   - PD_HIGH[8..15] -> 8 x 2MB pages for framebuffer physical address
-    ;   - Virtual 0xFFFFFFFF81000000 - 0xFFFFFFFF81FFFFFF -> Physical fb_addr (16MB)
+    ;   - PD_HIGH[64..71] -> 8 x 2MB pages for framebuffer physical address
+    ;   - Virtual 0xFFFFFFFF88000000 - 0xFFFFFFFF88FFFFFF -> Physical fb_addr (16MB)
     ;
     ; VGA text buffer:
     ;   - Physical 0xB8000 is within the kernel mapping (first 2 MB, 4KB pages)

@@ -11,7 +11,7 @@ const EXT2_SUPER_MAGIC_OFFSET: usize = EXT2_SUPERBLOCK_OFFSET + 56;
 const EXT2_BLOCKS_COUNT_OFFSET: usize = EXT2_SUPERBLOCK_OFFSET + 4;
 const EXT2_LOG_BLOCK_SIZE_OFFSET: usize = EXT2_SUPERBLOCK_OFFSET + 24;
 const EXT2_SUPER_MAGIC: u16 = 0xEF53;
-const EXT2_MAX_IMAGE_SIZE: usize = 512 * 1024;
+const EXT2_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 
 const BLOCK_SECTOR_SIZE: usize = 512;
 const BLOCK_IO_CHUNK: usize = 4096;
@@ -101,20 +101,40 @@ fn try_mount_ext2_from_block() -> bool {
     let mut devices = [block::BlockDevice::EMPTY; block::MAX_BLOCK_DEVICES];
     let count = block::snapshot(&mut devices);
 
+    // First pass: probe each device with a small read to find the ext2 superblock.
+    // Only allocate the full image buffer once we know which device has ext2.
+    const PROBE_SIZE: usize = 2048; // enough to read the superblock (at offset 1024)
+
     for (index, dev) in devices.iter().take(count).enumerate() {
         if dev.logical_block_size as usize != BLOCK_SECTOR_SIZE {
             continue;
         }
-
-        let max_len = cmp::min(
-            EXT2_MAX_IMAGE_SIZE,
-            dev.sectors.saturating_mul(BLOCK_SECTOR_SIZE as u64) as usize,
-        );
-        let read_len = max_len - (max_len % BLOCK_SECTOR_SIZE);
-        if read_len < EXT2_SUPER_MAGIC_OFFSET + 2 {
+        let dev_bytes = dev.sectors.saturating_mul(BLOCK_SECTOR_SIZE as u64) as usize;
+        if dev_bytes < PROBE_SIZE {
             continue;
         }
 
+        let probe_ptr = heap::kmalloc(PROBE_SIZE);
+        if probe_ptr.is_null() {
+            continue;
+        }
+
+        let mut ext2_len: Option<usize> = None;
+        unsafe {
+            let probe = core::slice::from_raw_parts_mut(probe_ptr, PROBE_SIZE);
+            if read_block_image(index, probe).is_ok() {
+                ext2_len = detect_ext2_image_len(probe);
+            }
+        }
+        heap::kfree(probe_ptr);
+
+        let image_len = match ext2_len {
+            Some(len) if len <= EXT2_MAX_IMAGE_SIZE && len <= dev_bytes => len,
+            _ => continue,
+        };
+
+        // Now allocate the full image and read+mount.
+        let read_len = image_len + (BLOCK_SECTOR_SIZE - (image_len % BLOCK_SECTOR_SIZE)) % BLOCK_SECTOR_SIZE;
         let image_ptr = heap::kmalloc(read_len);
         if image_ptr.is_null() {
             continue;
@@ -124,24 +144,22 @@ fn try_mount_ext2_from_block() -> bool {
         unsafe {
             let image = core::slice::from_raw_parts_mut(image_ptr, read_len);
             if read_block_image(index, image).is_ok() {
-                if let Some(image_len) = detect_ext2_image_len(image) {
-                    match fs::mount_ext2_image(EXT2_MOUNT_POINT, &image[..image_len]) {
-                        Ok(()) => {
-                            EXT2_BLOCK_BACKING = Ext2BlockBacking {
-                                active: true,
-                                device_index: index,
-                                image_len,
-                            };
-                            serial_println!(
-                                "[VFS] Mounted ext2 from block dev{} at {} ({} KiB)",
-                                index,
-                                EXT2_MOUNT_POINT,
-                                image_len / 1024
-                            );
-                            mounted = true;
-                        }
-                        Err(_) => {}
+                match fs::mount_ext2_image(EXT2_MOUNT_POINT, &image[..image_len]) {
+                    Ok(()) => {
+                        EXT2_BLOCK_BACKING = Ext2BlockBacking {
+                            active: true,
+                            device_index: index,
+                            image_len,
+                        };
+                        serial_println!(
+                            "[VFS] Mounted ext2 from block dev{} at {} ({} KiB)",
+                            index,
+                            EXT2_MOUNT_POINT,
+                            image_len / 1024
+                        );
+                        mounted = true;
                     }
+                    Err(_) => {}
                 }
             }
         }
@@ -244,7 +262,7 @@ fn detect_ext2_image_len(image: &[u8]) -> Option<usize> {
 
     let block_size = 1024usize.checked_shl(log_block_size)?;
     let total_len = blocks_count.checked_mul(block_size)?;
-    if total_len == 0 || total_len > image.len() {
+    if total_len == 0 {
         return None;
     }
 
@@ -290,12 +308,13 @@ mod tests {
     }
 
     #[test]
-    fn ext2_length_rejects_oversized_claim() {
+    fn ext2_length_reports_size_from_superblock() {
         let mut image = [0u8; 4096];
         write_u16_le(&mut image, EXT2_SUPER_MAGIC_OFFSET, EXT2_SUPER_MAGIC);
         write_u32_le(&mut image, EXT2_BLOCKS_COUNT_OFFSET, 1024);
         write_u32_le(&mut image, EXT2_LOG_BLOCK_SIZE_OFFSET, 0);
 
-        assert_eq!(detect_ext2_image_len(&image), None);
+        // Reports 1024 * 1024 = 1 MiB even though the buffer is only 4 KiB.
+        assert_eq!(detect_ext2_image_len(&image), Some(1024 * 1024));
     }
 }

@@ -86,16 +86,61 @@ pub fn _print(args: fmt::Arguments) {
     }
 }
 
+/// ANSI escape stripping state for serial output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum AnsiFilterState {
+    Normal = 0,
+    Esc = 1,
+    Csi = 2,
+}
+
+/// Returns true if the byte should be suppressed (part of an ANSI escape).
+fn ansi_filter(state: &mut AnsiFilterState, byte: u8) -> bool {
+    match *state {
+        AnsiFilterState::Normal => {
+            if byte == 0x1B {
+                *state = AnsiFilterState::Esc;
+                return true;
+            }
+            false
+        }
+        AnsiFilterState::Esc => {
+            if byte == b'[' {
+                *state = AnsiFilterState::Csi;
+                return true;
+            }
+            // Not a CSI, emit the byte normally
+            *state = AnsiFilterState::Normal;
+            false
+        }
+        AnsiFilterState::Csi => {
+            // CSI: drop all bytes until a final letter (0x40-0x7E)
+            if byte >= 0x40 && byte <= 0x7E {
+                *state = AnsiFilterState::Normal;
+            }
+            true
+        }
+    }
+}
+
 pub fn write_bytes(bytes: &[u8]) {
+    // Send raw bytes to framebuffer console (ANSI-aware rendering)
+    crate::fb_console::write_bytes(bytes);
+
+    // Send filtered bytes to serial (ANSI escapes stripped)
+    let mut filter_state = AnsiFilterState::Normal;
     unsafe {
         for &byte in bytes {
+            if ansi_filter(&mut filter_state, byte) {
+                continue;
+            }
             if byte == b'\n' {
                 SERIAL1.write_byte(b'\r');
             }
             SERIAL1.write_byte(byte);
         }
     }
-    crate::fb_console::write_bytes(bytes);
 }
 
 #[macro_export]
@@ -118,7 +163,7 @@ macro_rules! serial_println {
 mod tests {
     extern crate std;
 
-    use super::write_str_with_crlf;
+    use super::{write_str_with_crlf, ansi_filter, AnsiFilterState};
 
     #[test]
     fn crlf_translation() {
@@ -139,5 +184,32 @@ mod tests {
         let mut out = std::vec::Vec::new();
         write_str_with_crlf("serial", |byte| out.push(byte));
         assert_eq!(out, b"serial");
+    }
+
+    #[test]
+    fn ansi_filter_strips_csi_sequences() {
+        let input = b"\x1b[2Jhello\x1b[1;32mworld";
+        let mut state = AnsiFilterState::Normal;
+        let mut out = std::vec::Vec::new();
+        for &b in input {
+            if !ansi_filter(&mut state, b) {
+                out.push(b);
+            }
+        }
+        assert_eq!(out, b"helloworld");
+    }
+
+    #[test]
+    fn ansi_filter_passes_non_csi_after_esc() {
+        let input = b"\x1bXhello";
+        let mut state = AnsiFilterState::Normal;
+        let mut out = std::vec::Vec::new();
+        for &b in input {
+            if !ansi_filter(&mut state, b) {
+                out.push(b);
+            }
+        }
+        // ESC is suppressed, X falls through, hello passes
+        assert_eq!(out, b"Xhello");
     }
 }

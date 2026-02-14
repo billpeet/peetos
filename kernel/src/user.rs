@@ -861,6 +861,8 @@ pub fn spawn_init() {
         (*task_ptr).user_base_addr = elf_result.base_addr;
         (*task_ptr).user_interp_base = interp_base;
         (*task_ptr).user_is_dynamic = elf_result.is_dynamic;
+        (*task_ptr).ctty_type = crate::task::CTTY_CONSOLE;
+        (*task_ptr).ctty_id = 0;
 
         let stack_top = (*task_ptr).kernel_stack_top;
         let mut frame_addr = stack_top - size_of::<InterruptFrame>() as u64;

@@ -10,6 +10,16 @@ const TAB_WIDTH: usize = 4;
 const FG_COLOR: u32 = 0x00E6_E6E6;
 const BG_COLOR: u32 = 0x0011_1111;
 
+const ANSI_MAX_PARAMS: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum AnsiState {
+    Normal = 0,
+    Esc = 1,
+    Csi = 2,
+}
+
 #[derive(Clone, Copy)]
 struct FbConsoleState {
     initialized: bool,
@@ -18,6 +28,10 @@ struct FbConsoleState {
     rows: usize,
     cursor_col: usize,
     cursor_row: usize,
+    ansi_state: AnsiState,
+    ansi_params: [u16; ANSI_MAX_PARAMS],
+    ansi_param_count: u8,
+    ansi_current_param: u16,
 }
 
 impl FbConsoleState {
@@ -29,6 +43,10 @@ impl FbConsoleState {
             rows: 0,
             cursor_col: 0,
             cursor_row: 0,
+            ansi_state: AnsiState::Normal,
+            ansi_params: [0; ANSI_MAX_PARAMS],
+            ansi_param_count: 0,
+            ansi_current_param: 0,
         }
     }
 }
@@ -142,7 +160,164 @@ fn backspace_cursor(state: &mut FbConsoleState) {
     }
 }
 
+fn ansi_get_param(state: &FbConsoleState, idx: usize, default: u16) -> u16 {
+    if idx < state.ansi_param_count as usize && state.ansi_params[idx] > 0 {
+        state.ansi_params[idx]
+    } else {
+        default
+    }
+}
+
+fn ansi_reset(state: &mut FbConsoleState) {
+    state.ansi_state = AnsiState::Normal;
+    state.ansi_param_count = 0;
+    state.ansi_current_param = 0;
+    let mut i = 0;
+    while i < ANSI_MAX_PARAMS {
+        state.ansi_params[i] = 0;
+        i += 1;
+    }
+}
+
+fn move_cursor_to(state: &mut FbConsoleState, row: usize, col: usize) {
+    state.cursor_row = if row < state.rows { row } else { state.rows.saturating_sub(1) };
+    state.cursor_col = if col < state.cols { col } else { state.cols.saturating_sub(1) };
+}
+
+fn clear_from_cursor_to_end(state: &FbConsoleState) {
+    let mut col = state.cursor_col;
+    while col < state.cols {
+        clear_cell(state, col, state.cursor_row);
+        col += 1;
+    }
+    let mut row = state.cursor_row + 1;
+    while row < state.rows {
+        let mut c = 0;
+        while c < state.cols {
+            clear_cell(state, c, row);
+            c += 1;
+        }
+        row += 1;
+    }
+}
+
+fn clear_line_from_cursor(state: &FbConsoleState) {
+    let mut col = state.cursor_col;
+    while col < state.cols {
+        clear_cell(state, col, state.cursor_row);
+        col += 1;
+    }
+}
+
+fn ansi_dispatch_csi(state: &mut FbConsoleState, cmd: u8) {
+    if state.ansi_current_param > 0 || state.ansi_param_count > 0 {
+        if (state.ansi_param_count as usize) < ANSI_MAX_PARAMS {
+            state.ansi_params[state.ansi_param_count as usize] = state.ansi_current_param;
+            state.ansi_param_count += 1;
+        }
+    }
+
+    match cmd {
+        b'H' | b'f' => {
+            let row = ansi_get_param(state, 0, 1).saturating_sub(1) as usize;
+            let col = ansi_get_param(state, 1, 1).saturating_sub(1) as usize;
+            move_cursor_to(state, row, col);
+        }
+        b'A' => {
+            let n = ansi_get_param(state, 0, 1) as usize;
+            state.cursor_row = state.cursor_row.saturating_sub(n);
+        }
+        b'B' => {
+            let n = ansi_get_param(state, 0, 1) as usize;
+            let max_row = state.rows.saturating_sub(1);
+            state.cursor_row = core::cmp::min(state.cursor_row.saturating_add(n), max_row);
+        }
+        b'C' => {
+            let n = ansi_get_param(state, 0, 1) as usize;
+            let max_col = state.cols.saturating_sub(1);
+            state.cursor_col = core::cmp::min(state.cursor_col.saturating_add(n), max_col);
+        }
+        b'D' => {
+            let n = ansi_get_param(state, 0, 1) as usize;
+            state.cursor_col = state.cursor_col.saturating_sub(n);
+        }
+        b'J' => {
+            let mode = ansi_get_param(state, 0, 0);
+            match mode {
+                0 => {
+                    clear_from_cursor_to_end(state);
+                }
+                2 => {
+                    clear_screen(state);
+                    state.cursor_col = 0;
+                    state.cursor_row = 0;
+                }
+                _ => {}
+            }
+        }
+        b'K' => {
+            clear_line_from_cursor(state);
+        }
+        b'm' => {}
+        _ => {}
+    }
+
+    ansi_reset(state);
+}
+
+fn ansi_process_char(state: &mut FbConsoleState, byte: u8) -> bool {
+    match state.ansi_state {
+        AnsiState::Normal => {
+            if byte == 0x1B {
+                state.ansi_state = AnsiState::Esc;
+                state.ansi_param_count = 0;
+                state.ansi_current_param = 0;
+                let mut i = 0;
+                while i < ANSI_MAX_PARAMS {
+                    state.ansi_params[i] = 0;
+                    i += 1;
+                }
+                return true;
+            }
+            false
+        }
+        AnsiState::Esc => {
+            if byte == b'[' {
+                state.ansi_state = AnsiState::Csi;
+                return true;
+            }
+            ansi_reset(state);
+            false
+        }
+        AnsiState::Csi => {
+            if byte >= b'0' && byte <= b'9' {
+                state.ansi_current_param =
+                    state.ansi_current_param.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                return true;
+            }
+            if byte == b';' {
+                if (state.ansi_param_count as usize) < ANSI_MAX_PARAMS {
+                    state.ansi_params[state.ansi_param_count as usize] = state.ansi_current_param;
+                    state.ansi_param_count += 1;
+                }
+                state.ansi_current_param = 0;
+                return true;
+            }
+            if byte >= 0x40 && byte <= 0x7E {
+                ansi_dispatch_csi(state, byte);
+                return true;
+            }
+            ansi_reset(state);
+            false
+        }
+    }
+}
+
 fn write_byte_locked(state: &mut FbConsoleState, byte: u8) {
+    if ansi_process_char(state, byte) {
+        return;
+    }
+
     match byte {
         b'\r' => {
             state.cursor_col = 0;
@@ -188,6 +363,7 @@ pub fn init() {
     state.rows = rows;
     state.cursor_col = 0;
     state.cursor_row = 0;
+    ansi_reset(&mut state);
     clear_screen(&state);
 }
 
@@ -210,6 +386,13 @@ pub fn write_bytes(bytes: &[u8]) {
 mod tests {
     use super::*;
 
+    fn test_state(cols: usize, rows: usize) -> FbConsoleState {
+        let mut s = FbConsoleState::unavailable();
+        s.cols = cols;
+        s.rows = rows;
+        s
+    }
+
     #[test]
     fn tab_stops_are_four_columns() {
         assert_eq!(tab_spaces(0), 4);
@@ -221,9 +404,7 @@ mod tests {
 
     #[test]
     fn printable_wraps_at_end_of_row() {
-        let mut state = FbConsoleState::unavailable();
-        state.cols = 4;
-        state.rows = 2;
+        let mut state = test_state(4, 2);
         state.cursor_col = 3;
         state.cursor_row = 0;
 
@@ -234,14 +415,100 @@ mod tests {
 
     #[test]
     fn backspace_moves_to_previous_row_tail() {
-        let mut state = FbConsoleState::unavailable();
-        state.cols = 10;
-        state.rows = 3;
+        let mut state = test_state(10, 3);
         state.cursor_col = 0;
         state.cursor_row = 2;
 
         backspace_cursor(&mut state);
         assert_eq!(state.cursor_col, 9);
         assert_eq!(state.cursor_row, 1);
+    }
+
+    #[test]
+    fn ansi_clear_screen_resets_cursor() {
+        let mut state = test_state(80, 25);
+        state.cursor_col = 10;
+        state.cursor_row = 5;
+
+        for &b in b"\x1b[2J" {
+            ansi_process_char(&mut state, b);
+        }
+        assert_eq!(state.cursor_col, 0);
+        assert_eq!(state.cursor_row, 0);
+    }
+
+    #[test]
+    fn ansi_cursor_position() {
+        let mut state = test_state(80, 25);
+
+        for &b in b"\x1b[5;10H" {
+            ansi_process_char(&mut state, b);
+        }
+        assert_eq!(state.cursor_row, 4);
+        assert_eq!(state.cursor_col, 9);
+    }
+
+    #[test]
+    fn ansi_cursor_up() {
+        let mut state = test_state(80, 25);
+        state.cursor_row = 10;
+        state.cursor_col = 5;
+
+        for &b in b"\x1b[3A" {
+            ansi_process_char(&mut state, b);
+        }
+        assert_eq!(state.cursor_row, 7);
+        assert_eq!(state.cursor_col, 5);
+    }
+
+    #[test]
+    fn ansi_cursor_down_clamps() {
+        let mut state = test_state(80, 25);
+        state.cursor_row = 23;
+
+        for &b in b"\x1b[5B" {
+            ansi_process_char(&mut state, b);
+        }
+        assert_eq!(state.cursor_row, 24);
+    }
+
+    #[test]
+    fn ansi_cursor_forward_and_back() {
+        let mut state = test_state(80, 25);
+        state.cursor_col = 10;
+
+        for &b in b"\x1b[5C" {
+            ansi_process_char(&mut state, b);
+        }
+        assert_eq!(state.cursor_col, 15);
+
+        for &b in b"\x1b[3D" {
+            ansi_process_char(&mut state, b);
+        }
+        assert_eq!(state.cursor_col, 12);
+    }
+
+    #[test]
+    fn incomplete_sequence_recovers() {
+        let mut state = test_state(80, 25);
+
+        ansi_process_char(&mut state, 0x1B);
+        assert_eq!(state.ansi_state, AnsiState::Esc);
+        ansi_process_char(&mut state, b'A');
+        assert_eq!(state.ansi_state, AnsiState::Normal);
+    }
+
+    #[test]
+    fn sgr_is_ignored() {
+        let mut state = test_state(80, 25);
+        state.cursor_col = 5;
+        state.cursor_row = 3;
+
+        for &b in b"\x1b[1;32m" {
+            ansi_process_char(&mut state, b);
+        }
+        assert_eq!(state.cursor_col, 5);
+        assert_eq!(state.cursor_row, 3);
+        assert_eq!(state.ansi_state, AnsiState::Normal);
     }
 }

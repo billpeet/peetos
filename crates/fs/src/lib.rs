@@ -69,7 +69,7 @@ const EXT2_ROOT_INODE: u32 = 2;
 const EXT2_GROUP_DESC_SIZE: usize = 32;
 const EXT2_INODE_DIRECT_COUNT: usize = 12;
 const EXT2_MAX_RECURSION: u8 = 16;
-const EXT2_MAX_IMAGE_SIZE: usize = 768 * 1024;
+const EXT2_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
@@ -105,6 +105,9 @@ enum NodeBackend {
     ProcMounts = 7,
     ProcVersion = 8,
     DevUrandom = 9,
+    DevTty = 10,
+    DevPtmx = 11,
+    DevPtsSlave = 12,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +115,10 @@ pub struct OpenResult {
     pub inode: u16,
     pub file_type: FileType,
     pub is_console: bool,
+    pub is_tty: bool,
+    pub is_ptmx: bool,
+    pub is_pts_slave: bool,
+    pub pts_id: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -516,6 +523,21 @@ fn setup_root(state: &mut VfsState) {
     root.ctime = 1;
 }
 
+/// Format "/dev/pts/N" into buf, return length written.
+fn format_pts_path(idx: u16, buf: &mut [u8; 16]) -> usize {
+    let prefix = b"/dev/pts/";
+    let plen = prefix.len();
+    buf[..plen].copy_from_slice(prefix);
+    if idx >= 10 {
+        buf[plen] = b'0' + (idx / 10) as u8;
+        buf[plen + 1] = b'0' + (idx % 10) as u8;
+        plen + 2
+    } else {
+        buf[plen] = b'0' + idx as u8;
+        plen + 1
+    }
+}
+
 fn ensure_init(state: &mut VfsState) {
     if state.initialized {
         return;
@@ -533,6 +555,23 @@ fn ensure_init(state: &mut VfsState) {
     let _ = create_virtual_file_inner(state, "/dev/zero", NodeBackend::DevZero);
     let _ = create_virtual_file_inner(state, "/dev/console", NodeBackend::DevConsole);
     let _ = create_virtual_file_inner(state, "/dev/urandom", NodeBackend::DevUrandom);
+    let _ = create_virtual_file_inner(state, "/dev/tty", NodeBackend::DevTty);
+    let _ = create_virtual_file_inner(state, "/dev/ptmx", NodeBackend::DevPtmx);
+
+    let _ = mkdir_virtual_inner(state, "/dev/pts");
+    {
+        let mut pty_idx: u16 = 0;
+        while (pty_idx as usize) < 4 {
+            let mut path_buf = [0u8; 16];
+            let path_len = format_pts_path(pty_idx, &mut path_buf);
+            // Safety: path_buf contains only ASCII digits prefixed by /dev/pts/
+            let path = unsafe { core::str::from_utf8_unchecked(&path_buf[..path_len]) };
+            if let Ok(inode) = create_virtual_file_inner(state, path, NodeBackend::DevPtsSlave) {
+                state.inodes[inode as usize].ext2_ino = pty_idx as u32;
+            }
+            pty_idx += 1;
+        }
+    }
 
     let _ = mkdir_virtual_inner(state, "/proc");
     let _ = create_virtual_file_inner(state, "/proc/uptime", NodeBackend::ProcUptime);
@@ -995,7 +1034,10 @@ fn create_virtual_file_inner(
             NodeBackend::DevNull
             | NodeBackend::DevZero
             | NodeBackend::DevConsole
-            | NodeBackend::DevUrandom => (STAT_S_IFREG | 0o666) as u16,
+            | NodeBackend::DevUrandom
+            | NodeBackend::DevTty
+            | NodeBackend::DevPtmx
+            | NodeBackend::DevPtsSlave => (STAT_S_IFREG | 0o666) as u16,
             _ => node.mode,
         };
     }
@@ -2690,10 +2732,20 @@ fn open_at_inner(
         }
     }
 
+    let pts_id = if inode_backend == NodeBackend::DevPtsSlave {
+        state.inodes[inode_idx as usize].ext2_ino as u16
+    } else {
+        0
+    };
+
     Ok(OpenResult {
         inode: inode_idx,
         file_type: inode_file_type,
         is_console: inode_backend == NodeBackend::DevConsole,
+        is_tty: inode_backend == NodeBackend::DevTty,
+        is_ptmx: inode_backend == NodeBackend::DevPtmx,
+        is_pts_slave: inode_backend == NodeBackend::DevPtsSlave,
+        pts_id,
     })
 }
 
@@ -3706,6 +3758,7 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
                 | NodeBackend::ProcMeminfo
                 | NodeBackend::ProcMounts
                 | NodeBackend::ProcVersion => read_proc(node, state, offset, dst)?,
+                NodeBackend::DevTty | NodeBackend::DevPtmx | NodeBackend::DevPtsSlave => 0,
             }
         };
         touch_inode_metadata(state, inode, true, false, false);
@@ -3794,7 +3847,10 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
             NodeBackend::DevNull
             | NodeBackend::DevZero
             | NodeBackend::DevConsole
-            | NodeBackend::DevUrandom => {
+            | NodeBackend::DevUrandom
+            | NodeBackend::DevTty
+            | NodeBackend::DevPtmx
+            | NodeBackend::DevPtsSlave => {
                 let next = offset.saturating_add(src.len() as u64);
                 WriteResult {
                     written: src.len(),
@@ -3841,7 +3897,10 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
             NodeBackend::DevNull
             | NodeBackend::DevZero
             | NodeBackend::DevConsole
-            | NodeBackend::DevUrandom => current,
+            | NodeBackend::DevUrandom
+            | NodeBackend::DevTty
+            | NodeBackend::DevPtmx
+            | NodeBackend::DevPtsSlave => current,
         };
 
         let base = match whence {
@@ -3882,7 +3941,10 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
             NodeBackend::DevNull
             | NodeBackend::DevZero
             | NodeBackend::DevConsole
-            | NodeBackend::DevUrandom => {
+            | NodeBackend::DevUrandom
+            | NodeBackend::DevTty
+            | NodeBackend::DevPtmx
+            | NodeBackend::DevPtsSlave => {
                 if target > u64::MAX as i128 {
                     return Err(EINVAL);
                 }
@@ -3924,7 +3986,10 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
             NodeBackend::DevNull
             | NodeBackend::DevZero
             | NodeBackend::DevConsole
-            | NodeBackend::DevUrandom => 0,
+            | NodeBackend::DevUrandom
+            | NodeBackend::DevTty
+            | NodeBackend::DevPtmx
+            | NodeBackend::DevPtsSlave => 0,
         };
 
         Ok(size)
@@ -4400,7 +4465,7 @@ mod tests {
         let hello = open("/mnt/ext2/hello.txt", O_WRONLY | O_TRUNC, 0).expect("truncate hello");
         let _ = write(hello.inode, 0, b"rewritten", false).expect("rewrite hello");
 
-        let mut exported = [0u8; EXT2_MAX_IMAGE_SIZE];
+        let mut exported = std::vec![0u8; EXT2_MAX_IMAGE_SIZE];
         let image_len = export_ext2_image(&mut exported).expect("export image");
 
         let remount_image = std::vec::Vec::from(&exported[..image_len]);
@@ -4511,7 +4576,7 @@ mod tests {
             ENOENT
         );
 
-        let mut exported = [0u8; EXT2_MAX_IMAGE_SIZE];
+        let mut exported = std::vec![0u8; EXT2_MAX_IMAGE_SIZE];
         let image_len = export_ext2_image(&mut exported).expect("export");
 
         init();

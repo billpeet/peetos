@@ -36,6 +36,7 @@ const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
 const EIO: i64 = 5;
+const ENXIO: i64 = 6;
 const E2BIG: i64 = 7;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
@@ -226,8 +227,13 @@ const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_VFORK: u64 = 0x0000_4000;
 
 const TIOCGWINSZ: u64 = 0x5413;
+const TIOCSWINSZ: u64 = 0x5414;
 const TIOCGPGRP: u64 = 0x540F;
 const TIOCSPGRP: u64 = 0x5410;
+const TIOCSCTTY: u64 = 0x540E;
+const TIOCNOTTY: u64 = 0x5422;
+const TIOCSPTLCK: u64 = 0x40045431;
+const TIOCGPTN: u64 = 0x80045430;
 const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
 const TCSETSW: u64 = 0x5403;
@@ -839,6 +845,8 @@ fn fd_write_slot(
             if kind == task::USER_FD_KIND_VFS
                 || kind == task::USER_FD_KIND_PIPE
                 || kind == task::USER_FD_KIND_SOCKET
+                || kind == task::USER_FD_KIND_PTY_MASTER
+                || kind == task::USER_FD_KIND_PTY_SLAVE
             {
                 inode
             } else {
@@ -891,6 +899,12 @@ fn fd_dup_from(
     };
     let new_flags = fd_set_cloexec(src_flags, cloexec);
     fd_write_slot(task_ptr, dst_idx, kind, inode, offset, new_flags);
+    if kind == task::USER_FD_KIND_PTY_MASTER && inode != task::USER_FD_NONE {
+        crate::pty::master_retain(inode);
+    }
+    if kind == task::USER_FD_KIND_PTY_SLAVE && inode != task::USER_FD_NONE {
+        crate::pty::slave_retain(inode);
+    }
     Ok(dst_idx as i64)
 }
 
@@ -931,6 +945,12 @@ fn fd_dup_to(
     };
     let new_flags = fd_set_cloexec(src_flags, cloexec);
     fd_write_slot(task_ptr, dst_idx, kind, inode, offset, new_flags);
+    if kind == task::USER_FD_KIND_PTY_MASTER && inode != task::USER_FD_NONE {
+        crate::pty::master_retain(inode);
+    }
+    if kind == task::USER_FD_KIND_PTY_SLAVE && inode != task::USER_FD_NONE {
+        crate::pty::slave_retain(inode);
+    }
     Ok(new_fd as i64)
 }
 
@@ -960,6 +980,14 @@ fn fd_close(task_ptr: *mut task::Task, fd: i32) -> Result<(), i64> {
     } else if kind == task::USER_FD_KIND_SOCKET {
         if inode != task::USER_FD_NONE {
             let _ = socket::socket_close(inode);
+        }
+    } else if kind == task::USER_FD_KIND_PTY_MASTER {
+        if inode != task::USER_FD_NONE {
+            crate::pty::master_close(inode);
+        }
+    } else if kind == task::USER_FD_KIND_PTY_SLAVE {
+        if inode != task::USER_FD_NONE {
+            crate::pty::slave_close(inode);
         }
     }
 
@@ -1112,16 +1140,7 @@ struct LinuxWinSize {
     ws_ypixel: u16,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct LinuxTermios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 19],
-}
+use crate::tty::LinuxTermios;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1776,8 +1795,22 @@ fn execve_common(
         env[idx] = env_buf[idx].as_bytes();
     }
 
-    let dir_inode = resolve_dir_for_path(ctx, fs::AT_FDCWD, path)?;
-    let inode = fs::lookupat(dir_inode, path).map_err(|err| -fs_to_errno(err))?;
+    let dir_inode = match resolve_dir_for_path(ctx, fs::AT_FDCWD, path) {
+        Ok(d) => d,
+        Err(err) => {
+            heap::kfree(env_buf_ptr as *mut u8);
+            heap::kfree(argv_buf_ptr as *mut u8);
+            return Err(err);
+        }
+    };
+    let inode = match fs::lookupat(dir_inode, path) {
+        Ok(i) => i,
+        Err(err) => {
+            heap::kfree(env_buf_ptr as *mut u8);
+            heap::kfree(argv_buf_ptr as *mut u8);
+            return Err(-fs_to_errno(err));
+        }
+    };
     let image = match read_exec_image_from_inode(inode) {
         Ok(image) => image,
         Err(err) => {
@@ -2279,6 +2312,67 @@ fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(opened) => opened,
         Err(err) => return -fs_to_errno(err),
     };
+
+    // /dev/tty → route to controlling terminal
+    if opened.is_tty {
+        let ctty_type = unsafe { (*ctx.current).ctty_type };
+        return match ctty_type {
+            task::CTTY_CONSOLE => {
+                match fd_alloc(ctx.current, task::USER_FD_KIND_CONSOLE, 0, fd_flags) {
+                    Ok(fd) => fd,
+                    Err(err) => err,
+                }
+            }
+            task::CTTY_PTY => {
+                let pty_id = unsafe { (*ctx.current).ctty_id };
+                if crate::pty::is_in_use(pty_id) {
+                    if let Err(e) = crate::pty::slave_open(pty_id) {
+                        return e as i64;
+                    }
+                    match fd_alloc(ctx.current, task::USER_FD_KIND_PTY_SLAVE, pty_id, fd_flags) {
+                        Ok(fd) => fd,
+                        Err(err) => err,
+                    }
+                } else {
+                    -ENXIO
+                }
+            }
+            _ => -ENXIO,
+        };
+    }
+
+    // /dev/ptmx → allocate a new PTY, return master FD
+    if opened.is_ptmx {
+        let pty_id = match crate::pty::pty_alloc() {
+            Ok(id) => id,
+            Err(e) => return e as i64,
+        };
+        return match fd_alloc(ctx.current, task::USER_FD_KIND_PTY_MASTER, pty_id, fd_flags) {
+            Ok(fd) => fd,
+            Err(err) => {
+                crate::pty::master_close(pty_id);
+                err
+            }
+        };
+    }
+
+    // /dev/pts/N → open PTY slave
+    if opened.is_pts_slave {
+        let pty_id = opened.pts_id;
+        if !crate::pty::is_in_use(pty_id) || crate::pty::is_locked(pty_id) {
+            return -EIO;
+        }
+        if let Err(e) = crate::pty::slave_open(pty_id) {
+            return e as i64;
+        }
+        return match fd_alloc(ctx.current, task::USER_FD_KIND_PTY_SLAVE, pty_id, fd_flags) {
+            Ok(fd) => fd,
+            Err(err) => {
+                crate::pty::slave_close(pty_id);
+                err
+            }
+        };
+    }
 
     let fd_kind = if opened.is_console {
         task::USER_FD_KIND_CONSOLE
@@ -3098,31 +3192,7 @@ fn wait_status_from_exit_code(code: i32) -> i32 {
 }
 
 fn default_termios() -> LinuxTermios {
-    let mut tio = LinuxTermios {
-        c_iflag: 0,
-        c_oflag: 0,
-        c_cflag: 0,
-        c_lflag: 0,
-        c_line: 0,
-        c_cc: [0; 19],
-    };
-
-    // Baseline canonical tty behavior compatible with common libc defaults.
-    tio.c_iflag = 0o0000400 | 0o0002000; // ICRNL | IXON
-    tio.c_oflag = 0o0000001 | 0o0000004; // OPOST | ONLCR
-    tio.c_cflag = 0o0000060 | 0o0000400 | 0o00000600 | 0o0000040000; // CS8 | CREAD | B38400 | CLOCAL
-    tio.c_lflag = 0o0000002 | 0o0000010 | 0o0000100 | 0o0001000 | 0o0010000; // ICANON | ECHO | ECHOE | ECHOK | ISIG
-    tio.c_cc[0] = 3; // VINTR
-    tio.c_cc[1] = 28; // VQUIT
-    tio.c_cc[2] = 127; // VERASE
-    tio.c_cc[3] = 21; // VKILL
-    tio.c_cc[4] = 4; // VEOF
-    tio.c_cc[5] = 0; // VTIME
-    tio.c_cc[6] = 1; // VMIN
-    tio.c_cc[8] = 17; // VSTART
-    tio.c_cc[9] = 19; // VSTOP
-    tio.c_cc[10] = 26; // VSUSP
-    tio
+    tty::default_termios()
 }
 
 fn process_group_exists_in_session(sid: i32, pgid: i32) -> bool {
@@ -3181,7 +3251,7 @@ fn ioctl_console(ctx: &SyscallContext, request: u64, argp: u64) -> i64 {
             if argp == 0 {
                 return -EFAULT;
             }
-            let tio = default_termios();
+            let tio = tty::console_termios();
             match write_struct_to_user(ctx.current, argp, &tio) {
                 Ok(()) => 0,
                 Err(err) => -err,
@@ -3192,7 +3262,10 @@ fn ioctl_console(ctx: &SyscallContext, request: u64, argp: u64) -> i64 {
                 return -EFAULT;
             }
             match read_struct_from_user::<LinuxTermios>(ctx.current, argp) {
-                Ok(_) => 0,
+                Ok(tio) => {
+                    tty::set_console_termios(&tio);
+                    0
+                }
                 Err(err) => -err,
             }
         }
@@ -3222,6 +3295,128 @@ fn ioctl_console(ctx: &SyscallContext, request: u64, argp: u64) -> i64 {
                 return -EPERM;
             }
             0
+        }
+        _ => -ENOTTY,
+    }
+}
+
+fn ioctl_pty(ctx: &SyscallContext, pty_id: u16, request: u64, argp: u64) -> i64 {
+    match request {
+        TIOCGWINSZ => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let (rows, cols) = crate::pty::get_winsize(pty_id);
+            let ws = LinuxWinSize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            match write_struct_to_user(ctx.current, argp, &ws) {
+                Ok(()) => 0,
+                Err(err) => -err,
+            }
+        }
+        TIOCSWINSZ => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            match read_struct_from_user::<LinuxWinSize>(ctx.current, argp) {
+                Ok(ws) => {
+                    crate::pty::set_winsize(pty_id, ws.ws_row, ws.ws_col);
+                    0
+                }
+                Err(err) => -err,
+            }
+        }
+        TCGETS => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let tio = crate::pty::get_termios(pty_id);
+            match write_struct_to_user(ctx.current, argp, &tio) {
+                Ok(()) => 0,
+                Err(err) => -err,
+            }
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            match read_struct_from_user::<LinuxTermios>(ctx.current, argp) {
+                Ok(tio) => {
+                    crate::pty::set_termios(pty_id, &tio);
+                    0
+                }
+                Err(err) => -err,
+            }
+        }
+        TIOCSCTTY => {
+            unsafe {
+                (*ctx.current).ctty_type = task::CTTY_PTY;
+                (*ctx.current).ctty_id = pty_id;
+            }
+            0
+        }
+        TIOCNOTTY => {
+            unsafe {
+                (*ctx.current).ctty_type = task::CTTY_NONE;
+                (*ctx.current).ctty_id = 0;
+            }
+            0
+        }
+        TIOCGPGRP => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let pgrp = unsafe { (*ctx.current).pgid };
+            match write_i32_to_user(ctx.current, argp, pgrp) {
+                Ok(()) => 0,
+                Err(err) => -err,
+            }
+        }
+        TIOCSPGRP => {
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let requested = match read_i32_from_user(ctx.current, argp) {
+                Ok(value) => value,
+                Err(err) => return -err,
+            };
+            if requested <= 0 {
+                return -EINVAL;
+            }
+            let sid = unsafe { (*ctx.current).sid };
+            if !process_group_exists_in_session(sid, requested) {
+                return -EPERM;
+            }
+            0
+        }
+        TIOCSPTLCK => {
+            // Lock/unlock the slave side. argp points to an int: 0 = unlock, nonzero = lock.
+            if argp == 0 {
+                return -EFAULT;
+            }
+            let lock_val = match read_i32_from_user(ctx.current, argp) {
+                Ok(v) => v,
+                Err(err) => return -err,
+            };
+            if lock_val == 0 {
+                crate::pty::unlock(pty_id);
+            }
+            // lock_val != 0: re-lock (not typically used, ignore for simplicity)
+            0
+        }
+        TIOCGPTN => {
+            // Return the PTY number (slave index)
+            if argp == 0 {
+                return -EFAULT;
+            }
+            match write_i32_to_user(ctx.current, argp, pty_id as i32) {
+                Ok(()) => 0,
+                Err(err) => -err,
+            }
         }
         _ => -ENOTTY,
     }
@@ -3263,6 +3458,12 @@ fn clone_parent_fds_for_child(parent: *mut task::Task, child: *mut task::Task) -
             let retain_read = fd_can_read(flags);
             let retain_write = fd_can_write(flags);
             ipc::pipe_retain(inode, retain_read, retain_write).map_err(|err| -ipc_to_errno(err))?;
+        }
+        if kind == task::USER_FD_KIND_PTY_MASTER && inode != task::USER_FD_NONE {
+            crate::pty::master_retain(inode);
+        }
+        if kind == task::USER_FD_KIND_PTY_SLAVE && inode != task::USER_FD_NONE {
+            crate::pty::slave_retain(inode);
         }
     }
 
@@ -3322,6 +3523,8 @@ fn create_fork_child(ctx: &SyscallContext, child_frame: &InterruptFrame) -> Resu
         (*child).user_cwd_inode = (*parent).user_cwd_inode;
         (*child).pgid = (*parent).pgid;
         (*child).sid = (*parent).sid;
+        (*child).ctty_type = (*parent).ctty_type;
+        (*child).ctty_id = (*parent).ctty_id;
         (*child).signal_handlers = (*parent).signal_handlers;
         (*child).signal_flags = (*parent).signal_flags;
         (*child).signal_mask_saved = (*parent).signal_mask_saved;
@@ -4217,6 +4420,26 @@ fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                     return err;
                 }
             }
+        } else if kind == task::USER_FD_KIND_PTY_MASTER {
+            match crate::pty::master_read(ctx.current, inode, &mut chunk[..take]) {
+                Ok(n) => n,
+                Err(err) => {
+                    if read_total > 0 {
+                        return read_total as i64;
+                    }
+                    return -err;
+                }
+            }
+        } else if kind == task::USER_FD_KIND_PTY_SLAVE {
+            match crate::pty::slave_read(ctx.current, inode, &mut chunk[..take]) {
+                Ok(n) => n,
+                Err(err) => {
+                    if read_total > 0 {
+                        return read_total as i64;
+                    }
+                    return -err;
+                }
+            }
         } else {
             return -EBADF;
         };
@@ -4368,6 +4591,40 @@ fn write_from_user_fd(
             continue;
         }
 
+        if kind == task::USER_FD_KIND_PTY_MASTER {
+            let wrote = match crate::pty::master_write(ctx.current, inode, &chunk[..take]) {
+                Ok(n) => n,
+                Err(err) => {
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    return Err(-err);
+                }
+            };
+            if wrote == 0 {
+                break;
+            }
+            written += wrote;
+            continue;
+        }
+
+        if kind == task::USER_FD_KIND_PTY_SLAVE {
+            let wrote = match crate::pty::slave_write(ctx.current, inode, &chunk[..take]) {
+                Ok(n) => n,
+                Err(err) => {
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    return Err(-err);
+                }
+            };
+            if wrote == 0 {
+                break;
+            }
+            written += wrote;
+            continue;
+        }
+
         if written > 0 {
             return Ok(written);
         }
@@ -4489,7 +4746,11 @@ fn sys_lseek(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             (*ctx.current).user_fd_offset[idx],
         )
     };
-    if kind == task::USER_FD_KIND_CONSOLE || kind == task::USER_FD_KIND_PIPE {
+    if kind == task::USER_FD_KIND_CONSOLE
+        || kind == task::USER_FD_KIND_PIPE
+        || kind == task::USER_FD_KIND_PTY_MASTER
+        || kind == task::USER_FD_KIND_PTY_SLAVE
+    {
         return -ESPIPE;
     }
     if kind != task::USER_FD_KIND_VFS {
@@ -4526,8 +4787,13 @@ fn sys_ioctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     let kind = unsafe { (*ctx.current).user_fd_kind[idx] };
+    let inode = unsafe { (*ctx.current).user_fd_inode[idx] };
     if kind == task::USER_FD_KIND_CONSOLE {
         ioctl_console(ctx, call.arg(1), call.arg(2))
+    } else if kind == task::USER_FD_KIND_PTY_MASTER
+        || kind == task::USER_FD_KIND_PTY_SLAVE
+    {
+        ioctl_pty(ctx, inode, call.arg(1), call.arg(2))
     } else {
         -ENOTTY
     }
@@ -4758,6 +5024,8 @@ fn sys_setsid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     unsafe {
         (*ctx.current).sid = pid;
         (*ctx.current).pgid = pid;
+        (*ctx.current).ctty_type = task::CTTY_NONE;
+        (*ctx.current).ctty_id = 0;
     }
     pid as i64
 }
@@ -5357,7 +5625,11 @@ fn sys_pread64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if !fd_can_read(flags) {
         return -EBADF;
     }
-    if kind == task::USER_FD_KIND_PIPE || kind == task::USER_FD_KIND_CONSOLE {
+    if kind == task::USER_FD_KIND_PIPE
+        || kind == task::USER_FD_KIND_CONSOLE
+        || kind == task::USER_FD_KIND_PTY_MASTER
+        || kind == task::USER_FD_KIND_PTY_SLAVE
+    {
         return -ESPIPE;
     }
     if kind != task::USER_FD_KIND_VFS {
@@ -5445,7 +5717,11 @@ fn sys_pwrite64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if !fd_can_write(flags) {
         return -EBADF;
     }
-    if kind == task::USER_FD_KIND_PIPE || kind == task::USER_FD_KIND_CONSOLE {
+    if kind == task::USER_FD_KIND_PIPE
+        || kind == task::USER_FD_KIND_CONSOLE
+        || kind == task::USER_FD_KIND_PTY_MASTER
+        || kind == task::USER_FD_KIND_PTY_SLAVE
+    {
         return -ESPIPE;
     }
     if kind != task::USER_FD_KIND_VFS {
@@ -5983,6 +6259,22 @@ fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16) -> i16 {
         let sock_events = socket::socket_poll_events(inode) as i16;
         // Always report POLLERR/POLLHUP/POLLNVAL regardless of requested
         revents = sock_events & (requested | POLLERR | POLLHUP | POLLNVAL);
+    } else if kind == task::USER_FD_KIND_PTY_MASTER {
+        let (has_data, can_write) = crate::pty::master_poll(inode);
+        if (requested & POLLIN) != 0 && has_data {
+            revents |= POLLIN;
+        }
+        if (requested & POLLOUT) != 0 && can_write {
+            revents |= POLLOUT;
+        }
+    } else if kind == task::USER_FD_KIND_PTY_SLAVE {
+        let (has_data, can_write) = crate::pty::slave_poll(inode);
+        if (requested & POLLIN) != 0 && has_data {
+            revents |= POLLIN;
+        }
+        if (requested & POLLOUT) != 0 && can_write {
+            revents |= POLLOUT;
+        }
     }
 
     revents

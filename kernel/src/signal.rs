@@ -281,6 +281,33 @@ pub fn consume_next(task: *mut Task) -> DeliveryAction {
     }
 }
 
+pub fn send_to_foreground_group(pgid: i32, signum: u32) {
+    if !valid_signal(signum) {
+        return;
+    }
+    for idx in 0..crate::task::MAX_TASKS {
+        let task_ptr = crate::task::get_by_index(idx);
+        if task_ptr.is_null() {
+            continue;
+        }
+        unsafe {
+            let task_state = (*task_ptr).state;
+            let task_pgid = (*task_ptr).pgid;
+            let task_flags = (*task_ptr).flags;
+            if task_state == TaskState::Dead || task_state == TaskState::Zombie {
+                continue;
+            }
+            if (task_flags & crate::task::TASK_FLAG_USER) == 0 {
+                continue;
+            }
+            if pgid != 0 && task_pgid != pgid {
+                continue;
+            }
+            let _ = send(task_ptr, signum);
+        }
+    }
+}
+
 pub fn restore_mask(task: *mut Task, mask: u64) -> Result<(), i64> {
     if task.is_null() {
         return Err(ESRCH);

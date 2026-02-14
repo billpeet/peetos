@@ -79,8 +79,9 @@ $(BUILD_DIR):
 $(BOOT_BIN): $(BOOT_STAGE1_SRC) $(BOOT_CONSTANTS) | $(BUILD_DIR)
 	$(ASM) -f bin -g -o $@ $<
 
-$(STAGE2_BIN): $(BOOT_STAGE2_SRC) $(BOOT_CONSTANTS) | $(BUILD_DIR)
-	$(ASM) -f bin -g -o $@ $<
+BOOT_STAGE2_INCLUDES := $(wildcard boot/stage2/*.asm) $(BOOT_CONSTANTS)
+$(STAGE2_BIN): $(BOOT_STAGE2_INCLUDES) | $(BUILD_DIR)
+	$(ASM) -f bin -g -o $@ $(BOOT_STAGE2_SRC)
 
 bootloader: $(BOOT_BIN) $(STAGE2_BIN)
 
