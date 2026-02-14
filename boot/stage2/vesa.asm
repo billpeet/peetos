@@ -23,7 +23,7 @@
 ;      - Verify VBE is supported
 ;      - Get pointer to mode list
 ;
-;   2. Search mode list for 1280x1024x32
+;   2. Search mode list for 1024x768x32
 ;      - For each mode, get mode info (INT 0x10, AX=0x4F01)
 ;      - Check resolution and color depth
 ;
@@ -45,7 +45,7 @@
 ; ===========================================================================
 ; SUBROUTINE: vesa_init
 ; ===========================================================================
-; Attempts to set VESA mode 1280x1024x32. Falls back to VGA text mode if
+; Attempts to set VESA mode 1024x768x32. Falls back to VGA text mode if
 ; VESA is not available or the desired mode is not found.
 ;
 ; Input:
@@ -123,7 +123,7 @@ vesa_init:
     call vesa_print_version
 
     ; -----------------------------------------------------------------------
-    ; STEP 2: Search mode list for 1280x1024x32
+    ; STEP 2: Search mode list for 1024x768x32
     ; -----------------------------------------------------------------------
     ; The mode list is a far pointer at offset 14-17 of VbeInfoBlock
     ; Format: Segment at offset 16, Offset at offset 14
@@ -499,7 +499,7 @@ vesa_putchar:
 msg_vesa_detecting:     db "[SERIAL] VESA: Detecting VBE support...", 13, 10, 0
 msg_vesa_found:         db "[SERIAL] VESA: VBE controller found, version ", 0
 msg_vesa_version:       db "VBE ", 0
-msg_vesa_searching:     db "[SERIAL] VESA: Searching for 1280x1024x32 mode...", 13, 10, 0
+msg_vesa_searching:     db "[SERIAL] VESA: Searching for 1024x768x32 mode...", 13, 10, 0
 msg_vesa_mode_found:    db "[SERIAL] VESA: Found matching mode: 0x", 0
 msg_vesa_setting:       db "[SERIAL] VESA: Setting graphics mode...", 13, 10, 0
 msg_vesa_success:       db "[SERIAL] VESA: Graphics mode set successfully", 13, 10, 0
@@ -507,7 +507,7 @@ msg_vesa_fb_addr:       db "[SERIAL] VESA: Framebuffer at 0x", 0
 msg_vesa_resolution:    db "[SERIAL] VESA: Resolution: ", 0
 msg_vesa_x:             db "x", 0
 msg_vesa_not_supported: db "[SERIAL] VESA: VBE not supported", 13, 10, 0
-msg_vesa_mode_not_found:db "[SERIAL] VESA: 1280x1024x32 mode not found", 13, 10, 0
+msg_vesa_mode_not_found:db "[SERIAL] VESA: 1024x768x32 mode not found", 13, 10, 0
 msg_vesa_set_failed:    db "[SERIAL] VESA: Failed to set graphics mode", 13, 10, 0
 msg_vesa_vga_fallback:  db "[SERIAL] VESA: Using VGA text mode fallback", 13, 10, 0
 msg_newline:            db 13, 10, 0

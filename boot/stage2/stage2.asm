@@ -127,7 +127,7 @@ stage2_start:
     ; -----------------------------------------------------------------------
     ; STEP 4.5: Initialize VESA/VBE Graphics
     ; -----------------------------------------------------------------------
-    ; Attempt to set 1280x1024x32 graphics mode using VBE.
+    ; Attempt to set 1024x768x32 graphics mode using VBE.
     ; Falls back to VGA text mode if VESA is not available.
     ; MUST be done before Protected Mode (BIOS INT 0x10 required).
 

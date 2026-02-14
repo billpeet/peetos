@@ -237,8 +237,8 @@ VESA_STATUS_ADDR        equ 0xB00       ; Status flags (8 bytes)
 ;   Bytes 4-7:  Framebuffer physical address
 
 ; Desired VESA mode parameters
-VESA_DESIRED_WIDTH      equ 1280        ; Target width in pixels
-VESA_DESIRED_HEIGHT     equ 1024        ; Target height in pixels
+VESA_DESIRED_WIDTH      equ 1024        ; Target width in pixels
+VESA_DESIRED_HEIGHT     equ 768         ; Target height in pixels
 VESA_DESIRED_BPP        equ 32          ; Target bits per pixel (32-bit ARGB)
 
 ; VBE function codes (passed in AX to INT 0x10)

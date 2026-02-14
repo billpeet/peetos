@@ -4,8 +4,8 @@ use crate::font8x8_basic::FONT8X8_BASIC;
 use crate::framebuffer::{self, FramebufferInfo};
 use crate::sync::SpinLock;
 
-const GLYPH_WIDTH: usize = 8;
-const GLYPH_HEIGHT: usize = 8;
+const GLYPH_WIDTH: usize = 16;
+const GLYPH_HEIGHT: usize = 16;
 const TAB_WIDTH: usize = 4;
 const FG_COLOR: u32 = 0x00E6_E6E6;
 const BG_COLOR: u32 = 0x0011_1111;
@@ -97,10 +97,15 @@ fn draw_glyph(state: &FbConsoleState, col: usize, row: usize, byte: u8) {
     let glyph = &FONT8X8_BASIC[byte as usize];
 
     for (gy, bits) in glyph.iter().copied().enumerate() {
-        for gx in 0..GLYPH_WIDTH {
+        for gx in 0..8 {
             let on = ((bits >> gx) & 1) != 0;
             let color = if on { FG_COLOR } else { BG_COLOR };
-            put_pixel(state.fb, x0 + gx, y0 + gy, color);
+            let sx = x0 + gx * 2;
+            let sy = y0 + gy * 2;
+            put_pixel(state.fb, sx, sy, color);
+            put_pixel(state.fb, sx + 1, sy, color);
+            put_pixel(state.fb, sx, sy + 1, color);
+            put_pixel(state.fb, sx + 1, sy + 1, color);
         }
     }
 }
