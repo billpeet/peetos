@@ -4,6 +4,7 @@ This document describes the phase-7 framebuffer initialization path currently wi
 
 **Where It Lives**
 - `kernel/src/framebuffer.rs`
+- `kernel/src/mouse.rs`
 - `kernel/src/main.rs`
 - `boot/stage2/vesa.asm`
 - `boot/stage2/paging.asm`
@@ -51,12 +52,18 @@ If validation fails, framebuffer is marked unavailable and kernel continues with
 - `tick()` - advance cursor blink timing and refresh cursor visibility
 - `set_theme(preset)` - switch between built-in terminal theme presets (`Midnight`, `Amber`, `Green`, `Solarized`)
 
+`kernel/src/mouse.rs` exposes:
+- `init()` - initialize PS/2 mouse streaming and render the initial software cursor when framebuffer is available
+- `begin_framebuffer_update()` / `end_framebuffer_update()` - hide/redraw cursor around framebuffer console updates
+- `tick()` - apply queued mouse deltas and move the software cursor
+
 Color values are treated as 32-bit packed pixels (current baseline assumes 32-bpp layout from VBE mode).
 
 Limitations / Simplifications
 - Only bootloader-provided VESA mode is supported; kernel-side mode discovery/switching is not implemented.
 - Pixel format is treated as packed 32-bpp without decoding VBE channel masks.
 - Text rendering is still baseline: fixed 8x16 VGA-compatible bitmap glyphs, static panel chrome, a blinking underline cursor, and partial ANSI CSI support (`H`/`f`, `A`/`B`/`C`/`D`, `J`, `K`, `m`) with SGR limited to 16-color fg/bg + bold/default resets.
+- Mouse cursor rendering is software-only over the same framebuffer; it relies on save/restore and can still show artifacts if non-console code draws directly into cursor-covered pixels without using cursor hide/show hooks.
 - Full VT terminal semantics are not implemented (no scrollback buffer, no DEC private modes, and no 256-color/truecolor SGR).
 - No double buffering, dirty-region tracking, or acceleration path exists.
 - Mapping is boot-time fixed-size (`16 MiB`) and not dynamically expanded/remapped.

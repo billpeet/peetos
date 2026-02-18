@@ -1,6 +1,6 @@
 # Device Drivers (Phase 7 Progress)
 
-This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI bring-up through AHCI command-engine `IDENTIFY`, AHCI LBA48 DMA read/write commands, baseline block-device API integration, keyboard input wiring, and framebuffer setup.
+This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI bring-up through AHCI command-engine `IDENTIFY`, AHCI LBA48 DMA read/write commands, baseline block-device API integration, keyboard/mouse input wiring, and framebuffer setup.
 
 **Where It Lives**
 - `crates/drivers/src/pci.rs`
@@ -10,6 +10,7 @@ This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI 
 - `kernel/src/storage.rs`
 - `kernel/src/block.rs`
 - `kernel/src/keyboard.rs`
+- `kernel/src/mouse.rs`
 - `kernel/src/tty.rs`
 - `kernel/src/framebuffer.rs`
 - `kernel/src/main.rs`
@@ -66,6 +67,17 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
   - serial echo for typed bytes/newline/backspace
 - Console `read` in syscall dispatch now pulls from this TTY queue and blocks while no full line is available.
 
+**Mouse Driver + Movable Cursor Baseline**
+- Mouse IRQ12 is registered in the IDT and unmasked on the PIC after PS/2 auxiliary-device setup.
+- The driver programs the i8042/PS2 controller for mouse streaming (`0xF6` defaults + `0xF4` enable reporting) and parses 3-byte PS/2 packets.
+- Packet decode currently supports:
+  - button state bits (left/right/middle)
+  - signed relative motion (`dx`/`dy`)
+  - overflow rejection and first-byte sync-bit resynchronization
+- Motion deltas are accumulated in IRQ context and applied in the main loop to a software framebuffer cursor.
+- Cursor rendering uses save/restore of covered pixels and clamps movement to screen bounds.
+- Framebuffer console writes/ticks temporarily hide the cursor and redraw it after updates so text rendering and cursor overlay stay coherent.
+
 **Framebuffer Baseline**
 - Bootloader-provided VESA handoff structures are consumed from fixed higher-half addresses:
   - status block: `0xFFFF_FFFF_8000_0B00`
@@ -86,6 +98,8 @@ Limitations / Simplifications
 - MMIO window mapping is currently bounded (`AHCI_MMIO_WINDOW_LIMIT`) and boot-time only.
 - Hotplug, power management, and controller reset/error-recovery flows are minimal.
 - Keyboard input is US-layout set-1 only; extended keys and key-repeat handling are minimal.
+- Mouse support is baseline PS/2 packet mode only (no wheel, no extra buttons, no absolute positioning, and no sensitivity/acceleration tuning).
+- Cursor composition is software-only over the shared framebuffer; there is no true hardware cursor plane, alpha blending, or z-order compositor yet.
 - TTY is canonical-line buffered only; no `termios`, ptys, or virtual terminal switching yet.
 - Framebuffer currently assumes packed 32-bpp layout and does not yet decode VBE color masks.
 - Framebuffer text rendering is still baseline: serial output is mirrored into a fixed 8x16 bitmap text grid with terminal panel styling, preset themes, a blinking cursor, and partial ANSI/SGR handling (16-color fg/bg + bold/default), but full VT emulation is not implemented.

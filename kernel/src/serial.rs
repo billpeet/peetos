@@ -126,7 +126,9 @@ fn ansi_filter(state: &mut AnsiFilterState, byte: u8) -> bool {
 
 pub fn write_bytes(bytes: &[u8]) {
     // Send raw bytes to framebuffer console (ANSI-aware rendering)
+    crate::mouse::begin_framebuffer_update();
     crate::fb_console::write_bytes(bytes);
+    crate::mouse::end_framebuffer_update();
 
     // Send filtered bytes to serial (ANSI escapes stripped)
     let mut filter_state = AnsiFilterState::Normal;

@@ -20,6 +20,7 @@ mod ipv4;
 mod keyboard;
 mod memory;
 mod mmio;
+mod mouse;
 mod net;
 mod pty;
 mod qemu;
@@ -95,6 +96,8 @@ pub extern "C" fn kmain() -> ! {
 
     keyboard::init();
     serial_println!("[KBD] Initialized");
+
+    mouse::init();
 
     pmm::init();
     serial_println!("[PMM] Initialized");
@@ -172,7 +175,10 @@ pub extern "C" fn kmain() -> ! {
 
     loop {
         net::poll();
+        mouse::begin_framebuffer_update();
         fb_console::tick();
+        mouse::end_framebuffer_update();
+        mouse::tick();
         unsafe {
             core::arch::asm!("hlt");
         }
