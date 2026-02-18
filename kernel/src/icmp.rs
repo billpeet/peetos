@@ -1,5 +1,5 @@
 use arch_x86_64::pit;
-use net::{htons, ntohs, net_checksum, Ipv4Addr, IP_PROTO_ICMP};
+use net::{htons, net_checksum, ntohs, Ipv4Addr, IP_PROTO_ICMP};
 
 use crate::ipv4;
 use crate::serial_println;
@@ -40,7 +40,13 @@ static mut PING_SEQUENCE: u16 = 0;
 // Send
 // ---------------------------------------------------------------------------
 
-fn send_echo(dst: &Ipv4Addr, icmp_type: u8, identifier: u16, sequence: u16, data: &[u8]) -> Result<(), net::NetError> {
+fn send_echo(
+    dst: &Ipv4Addr,
+    icmp_type: u8,
+    identifier: u16,
+    sequence: u16,
+    data: &[u8],
+) -> Result<(), net::NetError> {
     let total_len = ICMP_ECHO_HDR_LEN + data.len();
     if total_len > ICMP_MAX_PACKET {
         return Err(net::NetError::BufferTooLarge);
@@ -49,7 +55,7 @@ fn send_echo(dst: &Ipv4Addr, icmp_type: u8, identifier: u16, sequence: u16, data
     let mut packet = [0u8; ICMP_MAX_PACKET];
     packet[0] = icmp_type;
     packet[1] = 0; // code
-    // checksum [2..4] = 0 for now
+                   // checksum [2..4] = 0 for now
     let id = htons(identifier);
     packet[4] = (id & 0xFF) as u8;
     packet[5] = ((id >> 8) & 0xFF) as u8;
@@ -69,15 +75,29 @@ fn send_echo(dst: &Ipv4Addr, icmp_type: u8, identifier: u16, sequence: u16, data
     ipv4::send(dst, IP_PROTO_ICMP, &packet[..total_len])
 }
 
-pub fn send_echo_request(dst: &Ipv4Addr, identifier: u16, sequence: u16, data: &[u8]) -> Result<(), net::NetError> {
+pub fn send_echo_request(
+    dst: &Ipv4Addr,
+    identifier: u16,
+    sequence: u16,
+    data: &[u8],
+) -> Result<(), net::NetError> {
     serial_println!(
         "[ICMP] Sending Echo Request to {}.{}.{}.{} seq={}",
-        dst.0[0], dst.0[1], dst.0[2], dst.0[3], sequence
+        dst.0[0],
+        dst.0[1],
+        dst.0[2],
+        dst.0[3],
+        sequence
     );
     send_echo(dst, ICMP_TYPE_ECHO_REQUEST, identifier, sequence, data)
 }
 
-pub fn send_echo_reply(dst: &Ipv4Addr, identifier: u16, sequence: u16, data: &[u8]) -> Result<(), net::NetError> {
+pub fn send_echo_reply(
+    dst: &Ipv4Addr,
+    identifier: u16,
+    sequence: u16,
+    data: &[u8],
+) -> Result<(), net::NetError> {
     send_echo(dst, ICMP_TYPE_ECHO_REPLY, identifier, sequence, data)
 }
 
@@ -96,7 +116,11 @@ fn handle_echo_request(payload: &[u8], src: &Ipv4Addr) {
 
     serial_println!(
         "[ICMP] Echo Request from {}.{}.{}.{} seq={}",
-        src.0[0], src.0[1], src.0[2], src.0[3], sequence
+        src.0[0],
+        src.0[1],
+        src.0[2],
+        src.0[3],
+        sequence
     );
 
     let _ = send_echo_reply(src, identifier, sequence, data);
@@ -122,13 +146,21 @@ fn handle_echo_reply(payload: &[u8], src: &Ipv4Addr) {
 
             serial_println!(
                 "[ICMP] Echo Reply from {}.{}.{}.{} seq={} time={} ms",
-                src.0[0], src.0[1], src.0[2], src.0[3],
-                sequence, PING_STATE.rtt
+                src.0[0],
+                src.0[1],
+                src.0[2],
+                src.0[3],
+                sequence,
+                PING_STATE.rtt
             );
         } else {
             serial_println!(
                 "[ICMP] Echo Reply from {}.{}.{}.{} seq={}",
-                src.0[0], src.0[1], src.0[2], src.0[3], sequence
+                src.0[0],
+                src.0[1],
+                src.0[2],
+                src.0[3],
+                sequence
             );
         }
     }
@@ -140,7 +172,11 @@ fn handle_dest_unreachable(payload: &[u8], src: &Ipv4Addr) {
     }
     serial_println!(
         "[ICMP] Destination Unreachable from {}.{}.{}.{} code={}",
-        src.0[0], src.0[1], src.0[2], src.0[3], payload[1]
+        src.0[0],
+        src.0[1],
+        src.0[2],
+        src.0[3],
+        payload[1]
     );
 
     unsafe {
@@ -157,7 +193,11 @@ fn handle_time_exceeded(payload: &[u8], src: &Ipv4Addr) {
     }
     serial_println!(
         "[ICMP] Time Exceeded from {}.{}.{}.{} code={}",
-        src.0[0], src.0[1], src.0[2], src.0[3], payload[1]
+        src.0[0],
+        src.0[1],
+        src.0[2],
+        src.0[3],
+        payload[1]
     );
 }
 
@@ -188,9 +228,7 @@ pub fn icmp_ip_receive(payload: &[u8], src: &Ipv4Addr, _dst: &Ipv4Addr) {
 // ---------------------------------------------------------------------------
 
 pub fn ping(target: &Ipv4Addr, timeout_ms: u64) -> Result<u64, net::NetError> {
-    let identifier = unsafe {
-        PING_IDENTIFIER
-    };
+    let identifier = unsafe { PING_IDENTIFIER };
     let sequence = unsafe {
         PING_SEQUENCE = PING_SEQUENCE.wrapping_add(1);
         PING_SEQUENCE

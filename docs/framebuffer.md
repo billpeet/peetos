@@ -20,7 +20,7 @@ The kernel reads:
 
 **Kernel Mapping Model**
 Boot paging pre-maps a framebuffer window at:
-- `0xFFFF_FFFF_8100_0000` (size: `16 MiB`)
+- `0xFFFF_FFFF_8800_0000` (size: `16 MiB`)
 
 The kernel computes the active framebuffer virtual base as:
 - `window_base + (phys_addr & 0x1F_FFFF)`
@@ -46,15 +46,18 @@ If validation fails, framebuffer is marked unavailable and kernel continues with
 - `clear(color)` - full-screen fill (including pitch padding)
 
 `kernel/src/fb_console.rs` exposes:
-- `init()` - initialize a simple 8x8 text console over the active framebuffer
+- `init()` - initialize a styled framebuffer terminal with an 8x16 bitmap text grid
 - `write_bytes(bytes)` - mirror console/serial output into the framebuffer text grid
+- `tick()` - advance cursor blink timing and refresh cursor visibility
+- `set_theme(preset)` - switch between built-in terminal theme presets (`Midnight`, `Amber`, `Green`, `Solarized`)
 
 Color values are treated as 32-bit packed pixels (current baseline assumes 32-bpp layout from VBE mode).
 
 Limitations / Simplifications
 - Only bootloader-provided VESA mode is supported; kernel-side mode discovery/switching is not implemented.
 - Pixel format is treated as packed 32-bpp without decoding VBE channel masks.
-- Text rendering is intentionally minimal: fixed 8x8 bitmap glyphs, no color attributes, no cursor styling, and no ANSI/VT escape processing.
+- Text rendering is still baseline: fixed 8x16 VGA-compatible bitmap glyphs, static panel chrome, a blinking underline cursor, and partial ANSI CSI support (`H`/`f`, `A`/`B`/`C`/`D`, `J`, `K`, `m`) with SGR limited to 16-color fg/bg + bold/default resets.
+- Full VT terminal semantics are not implemented (no scrollback buffer, no DEC private modes, and no 256-color/truecolor SGR).
 - No double buffering, dirty-region tracking, or acceleration path exists.
 - Mapping is boot-time fixed-size (`16 MiB`) and not dynamically expanded/remapped.
 - Kernel bring-up does not clear the full framebuffer during early boot; only probe/logging is done at init.

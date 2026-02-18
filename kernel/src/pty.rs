@@ -2,7 +2,7 @@ use core::ptr;
 
 use crate::sync::SpinLock;
 use crate::task::Task;
-use crate::tty::{self, Tty, LinuxTermios};
+use crate::tty::{self, LinuxTermios, Tty};
 
 pub const PTY_MAX: usize = 4;
 const PTY_BUF_SIZE: usize = 1024;
@@ -542,7 +542,9 @@ fn wake_slave_waiters(pty_id: u16) {
             if !valid_pty(&state, pty_id) {
                 return;
             }
-            state.entries[pty_id as usize].tty.collect_waiters(&mut tasks)
+            state.entries[pty_id as usize]
+                .tty
+                .collect_waiters(&mut tasks)
         };
         if woke == 0 {
             break;

@@ -932,7 +932,6 @@ fn control_bar_base(bar: pci::PciBar, default: u16) -> u16 {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

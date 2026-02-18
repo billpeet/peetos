@@ -134,7 +134,8 @@ fn try_mount_ext2_from_block() -> bool {
         };
 
         // Now allocate the full image and read+mount.
-        let read_len = image_len + (BLOCK_SECTOR_SIZE - (image_len % BLOCK_SECTOR_SIZE)) % BLOCK_SECTOR_SIZE;
+        let read_len =
+            image_len + (BLOCK_SECTOR_SIZE - (image_len % BLOCK_SECTOR_SIZE)) % BLOCK_SECTOR_SIZE;
         let image_ptr = heap::kmalloc(read_len);
         if image_ptr.is_null() {
             continue;

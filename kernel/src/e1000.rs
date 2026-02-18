@@ -169,8 +169,7 @@ fn init_rx(dev: &mut E1000Device) -> bool {
     dev.rx_descs_phys = desc_phys;
 
     for i in 0..regs::NUM_RX_DESC {
-        let Some((buf_ptr, buf_phys)) =
-            alloc_buffer(regs::RX_BUFFER_SIZE, regs::BUFFER_ALIGN)
+        let Some((buf_ptr, buf_phys)) = alloc_buffer(regs::RX_BUFFER_SIZE, regs::BUFFER_ALIGN)
         else {
             serial_println!("[E1000] Failed to allocate RX buffer");
             return false;
@@ -187,8 +186,16 @@ fn init_rx(dev: &mut E1000Device) -> bool {
 
     // Program registers
     let base = dev.mmio_base;
-    write_reg(base, regs::E1000_REG_RDBAL, (dev.rx_descs_phys & 0xFFFF_FFFF) as u32);
-    write_reg(base, regs::E1000_REG_RDBAH, (dev.rx_descs_phys >> 32) as u32);
+    write_reg(
+        base,
+        regs::E1000_REG_RDBAL,
+        (dev.rx_descs_phys & 0xFFFF_FFFF) as u32,
+    );
+    write_reg(
+        base,
+        regs::E1000_REG_RDBAH,
+        (dev.rx_descs_phys >> 32) as u32,
+    );
     write_reg(base, regs::E1000_REG_RDLEN, desc_ring_size as u32);
     write_reg(base, regs::E1000_REG_RDH, 0);
     write_reg(base, regs::E1000_REG_RDT, (regs::NUM_RX_DESC - 1) as u32);
@@ -217,8 +224,7 @@ fn init_tx(dev: &mut E1000Device) -> bool {
     dev.tx_descs_phys = desc_phys;
 
     for i in 0..regs::NUM_TX_DESC {
-        let Some((buf_ptr, buf_phys)) =
-            alloc_buffer(regs::TX_BUFFER_SIZE, regs::BUFFER_ALIGN)
+        let Some((buf_ptr, buf_phys)) = alloc_buffer(regs::TX_BUFFER_SIZE, regs::BUFFER_ALIGN)
         else {
             serial_println!("[E1000] Failed to allocate TX buffer");
             return false;
@@ -236,8 +242,16 @@ fn init_tx(dev: &mut E1000Device) -> bool {
 
     // Program registers
     let base = dev.mmio_base;
-    write_reg(base, regs::E1000_REG_TDBAL, (dev.tx_descs_phys & 0xFFFF_FFFF) as u32);
-    write_reg(base, regs::E1000_REG_TDBAH, (dev.tx_descs_phys >> 32) as u32);
+    write_reg(
+        base,
+        regs::E1000_REG_TDBAL,
+        (dev.tx_descs_phys & 0xFFFF_FFFF) as u32,
+    );
+    write_reg(
+        base,
+        regs::E1000_REG_TDBAH,
+        (dev.tx_descs_phys >> 32) as u32,
+    );
     write_reg(base, regs::E1000_REG_TDLEN, desc_ring_size as u32);
     write_reg(base, regs::E1000_REG_TDH, 0);
     write_reg(base, regs::E1000_REG_TDT, 0);

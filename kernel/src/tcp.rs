@@ -1,4 +1,4 @@
-use net::{htons, ntohs, htonl, ntohl, net_checksum_pseudo, Ipv4Addr, IP_PROTO_TCP, NetError, MTU};
+use net::{htonl, htons, net_checksum_pseudo, ntohl, ntohs, Ipv4Addr, NetError, IP_PROTO_TCP, MTU};
 
 use crate::ipv4;
 use crate::serial_println;
@@ -427,7 +427,16 @@ pub fn connect(dst_ip: &Ipv4Addr, dst_port: u16, timeout_ms: u64) -> Result<usiz
     }
 
     // Send SYN
-    send_segment(dst_ip, local_port, dst_port, iss, 0, TCP_SYN, DEFAULT_WINDOW, &[])?;
+    send_segment(
+        dst_ip,
+        local_port,
+        dst_port,
+        iss,
+        0,
+        TCP_SYN,
+        DEFAULT_WINDOW,
+        &[],
+    )?;
 
     serial_println!(
         "[TCP] SYN sent to {}.{}.{}.{}:{}",
@@ -532,7 +541,11 @@ pub fn send(handle: usize, data: &[u8]) -> Result<usize, NetError> {
 
         let unacked = c.snd_nxt.wrapping_sub(c.snd_una) as usize;
         let window = c.snd_wnd as usize;
-        let avail = if window > unacked { window - unacked } else { 0 };
+        let avail = if window > unacked {
+            window - unacked
+        } else {
+            0
+        };
         let send_len = data.len().min(avail).min(TCP_MSS);
         if send_len == 0 {
             return Ok(0);
@@ -644,8 +657,7 @@ pub fn close(handle: usize) {
                 CONNECTIONS[handle].fin_seq = seq;
                 CONNECTIONS[handle].snd_nxt = seq.wrapping_add(1);
                 CONNECTIONS[handle].state = TcpState::FinWait1;
-                CONNECTIONS[handle].retransmit_time =
-                    arch_x86_64::pit::uptime_ms() + RETRANSMIT_MS;
+                CONNECTIONS[handle].retransmit_time = arch_x86_64::pit::uptime_ms() + RETRANSMIT_MS;
                 CONNECTIONS[handle].retransmit_count = 0;
                 send_ctrl(handle, seq, ack, TCP_FIN | TCP_ACK);
                 serial_println!("[TCP] FIN sent (handle {})", handle);
@@ -656,8 +668,7 @@ pub fn close(handle: usize) {
                 CONNECTIONS[handle].fin_seq = seq;
                 CONNECTIONS[handle].snd_nxt = seq.wrapping_add(1);
                 CONNECTIONS[handle].state = TcpState::LastAck;
-                CONNECTIONS[handle].retransmit_time =
-                    arch_x86_64::pit::uptime_ms() + RETRANSMIT_MS;
+                CONNECTIONS[handle].retransmit_time = arch_x86_64::pit::uptime_ms() + RETRANSMIT_MS;
                 CONNECTIONS[handle].retransmit_count = 0;
                 send_ctrl(handle, seq, ack, TCP_FIN | TCP_ACK);
                 serial_println!("[TCP] FIN sent (CloseWait, handle {})", handle);
@@ -809,7 +820,14 @@ pub fn tcp_ip_receive(payload: &[u8], src: &Ipv4Addr, dst: &Ipv4Addr) {
                 // Send SYN-ACK
                 let rcv_nxt = unsafe { CONNECTIONS[child_idx].rcv_nxt };
                 let _ = send_segment(
-                    src, dst_port, src_port, iss, rcv_nxt, TCP_SYN | TCP_ACK, DEFAULT_WINDOW, &[],
+                    src,
+                    dst_port,
+                    src_port,
+                    iss,
+                    rcv_nxt,
+                    TCP_SYN | TCP_ACK,
+                    DEFAULT_WINDOW,
+                    &[],
                 );
                 serial_println!(
                     "[TCP] SYN-ACK sent to {}.{}.{}.{}:{}",
@@ -832,8 +850,7 @@ pub fn tcp_ip_receive(payload: &[u8], src: &Ipv4Addr, dst: &Ipv4Addr) {
             (ack, 0u32, TCP_RST)
         } else {
             let data_len = data.len() as u32;
-            let syn_fin =
-                ((flags & TCP_SYN) >> 1) as u32 + (flags & TCP_FIN) as u32;
+            let syn_fin = ((flags & TCP_SYN) >> 1) as u32 + (flags & TCP_FIN) as u32;
             (
                 0u32,
                 seq.wrapping_add(data_len).wrapping_add(syn_fin),
@@ -909,14 +926,10 @@ fn handle_segment(idx: usize, seg_seq: u32, seg_ack: u32, flags: u8, window: u16
                 if flags & TCP_FIN != 0 {
                     let fin_seq = seg_seq.wrapping_add(data.len() as u32);
                     if fin_seq == CONNECTIONS[idx].rcv_nxt {
-                        CONNECTIONS[idx].rcv_nxt =
-                            CONNECTIONS[idx].rcv_nxt.wrapping_add(1);
+                        CONNECTIONS[idx].rcv_nxt = CONNECTIONS[idx].rcv_nxt.wrapping_add(1);
                         CONNECTIONS[idx].state = TcpState::CloseWait;
                         send_ack(idx);
-                        serial_println!(
-                            "[TCP] FIN received, entering CloseWait (handle {})",
-                            idx
-                        );
+                        serial_println!("[TCP] FIN received, entering CloseWait (handle {})", idx);
                     }
                 }
             }
@@ -932,8 +945,7 @@ fn handle_segment(idx: usize, seg_seq: u32, seg_ack: u32, flags: u8, window: u16
                 if flags & TCP_FIN != 0 {
                     let fin_seq = seg_seq.wrapping_add(data.len() as u32);
                     if fin_seq == CONNECTIONS[idx].rcv_nxt {
-                        CONNECTIONS[idx].rcv_nxt =
-                            CONNECTIONS[idx].rcv_nxt.wrapping_add(1);
+                        CONNECTIONS[idx].rcv_nxt = CONNECTIONS[idx].rcv_nxt.wrapping_add(1);
                         if fin_acked {
                             CONNECTIONS[idx].state = TcpState::TimeWait;
                             CONNECTIONS[idx].time_wait_expiry =
@@ -958,16 +970,12 @@ fn handle_segment(idx: usize, seg_seq: u32, seg_ack: u32, flags: u8, window: u16
                 if flags & TCP_FIN != 0 {
                     let fin_seq = seg_seq.wrapping_add(data.len() as u32);
                     if fin_seq == CONNECTIONS[idx].rcv_nxt {
-                        CONNECTIONS[idx].rcv_nxt =
-                            CONNECTIONS[idx].rcv_nxt.wrapping_add(1);
+                        CONNECTIONS[idx].rcv_nxt = CONNECTIONS[idx].rcv_nxt.wrapping_add(1);
                         CONNECTIONS[idx].state = TcpState::TimeWait;
                         CONNECTIONS[idx].time_wait_expiry =
                             arch_x86_64::pit::uptime_ms() + TIME_WAIT_MS;
                         send_ack(idx);
-                        serial_println!(
-                            "[TCP] FIN received, entering TimeWait (handle {})",
-                            idx
-                        );
+                        serial_println!("[TCP] FIN received, entering TimeWait (handle {})", idx);
                     }
                 }
             }
@@ -1119,8 +1127,16 @@ fn check_retransmit(idx: usize) {
                     // Copy data out to avoid aliasing
                     let mut buf = [0u8; TCP_MSS];
                     buf[..send_len].copy_from_slice(&CONNECTIONS[idx].tx_buf[..send_len]);
-                    let _ =
-                        send_segment(&rip, lp, rp, snd_una, rcv_nxt, TCP_ACK | TCP_PSH, wnd, &buf[..send_len]);
+                    let _ = send_segment(
+                        &rip,
+                        lp,
+                        rp,
+                        snd_una,
+                        rcv_nxt,
+                        TCP_ACK | TCP_PSH,
+                        wnd,
+                        &buf[..send_len],
+                    );
                     serial_println!("[TCP] Data retransmit #{} ({} bytes)", count, send_len);
                 }
             }

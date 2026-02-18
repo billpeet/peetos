@@ -1,4 +1,4 @@
-use net::{htons, ntohs, net_checksum, Ipv4Addr, MacAddr, NetError, MTU};
+use net::{htons, net_checksum, ntohs, Ipv4Addr, MacAddr, NetError, MTU};
 
 use crate::arp;
 use crate::ethernet::{self, ETHERTYPE_IPV4};

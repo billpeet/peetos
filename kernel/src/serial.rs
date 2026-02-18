@@ -163,7 +163,7 @@ macro_rules! serial_println {
 mod tests {
     extern crate std;
 
-    use super::{write_str_with_crlf, ansi_filter, AnsiFilterState};
+    use super::{ansi_filter, write_str_with_crlf, AnsiFilterState};
 
     #[test]
     fn crlf_translation() {

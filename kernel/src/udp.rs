@@ -1,4 +1,4 @@
-use net::{htons, ntohs, net_checksum_pseudo, Ipv4Addr, IP_PROTO_UDP, NetError, MTU};
+use net::{htons, net_checksum_pseudo, ntohs, Ipv4Addr, NetError, IP_PROTO_UDP, MTU};
 
 use crate::ipv4;
 use crate::serial_println;
@@ -221,7 +221,12 @@ pub fn binding_port(handle: usize) -> Option<u16> {
 // ---------------------------------------------------------------------------
 
 /// Send a UDP datagram to `dst_ip:dst_port` from `src_port`.
-pub fn send(dst_ip: &Ipv4Addr, dst_port: u16, src_port: u16, payload: &[u8]) -> Result<(), NetError> {
+pub fn send(
+    dst_ip: &Ipv4Addr,
+    dst_port: u16,
+    src_port: u16,
+    payload: &[u8],
+) -> Result<(), NetError> {
     if payload.len() > UDP_MAX_PAYLOAD {
         return Err(NetError::BufferTooLarge);
     }
@@ -246,12 +251,7 @@ pub fn send(dst_ip: &Ipv4Addr, dst_port: u16, src_port: u16, payload: &[u8]) -> 
 
     // Compute UDP checksum (with pseudo-header)
     let cfg = crate::net::get_config();
-    let cksum = net_checksum_pseudo(
-        &packet[..total_len as usize],
-        &cfg.ip,
-        dst_ip,
-        IP_PROTO_UDP,
-    );
+    let cksum = net_checksum_pseudo(&packet[..total_len as usize], &cfg.ip, dst_ip, IP_PROTO_UDP);
     // RFC 768: if computed checksum is 0, transmit as 0xFFFF
     let cksum = if cksum == 0 { 0xFFFF } else { cksum };
     packet[6] = (cksum & 0xFF) as u8;
@@ -261,7 +261,12 @@ pub fn send(dst_ip: &Ipv4Addr, dst_port: u16, src_port: u16, payload: &[u8]) -> 
 }
 
 /// Send from a bound handle, using the binding's local port as source.
-pub fn send_from(handle: usize, dst_ip: &Ipv4Addr, dst_port: u16, payload: &[u8]) -> Result<(), NetError> {
+pub fn send_from(
+    handle: usize,
+    dst_ip: &Ipv4Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Result<(), NetError> {
     let src_port = unsafe {
         if handle >= MAX_BINDINGS || !BINDINGS[handle].active {
             return Err(NetError::NotInitialized);
@@ -297,7 +302,11 @@ pub fn recv(handle: usize, buf: &mut [u8]) -> Option<(usize, Ipv4Addr, u16)> {
 }
 
 /// Blocking receive with timeout (ms). Polls the NIC while waiting.
-pub fn recv_timeout(handle: usize, buf: &mut [u8], timeout_ms: u64) -> Result<(usize, Ipv4Addr, u16), NetError> {
+pub fn recv_timeout(
+    handle: usize,
+    buf: &mut [u8],
+    timeout_ms: u64,
+) -> Result<(usize, Ipv4Addr, u16), NetError> {
     let start = arch_x86_64::pit::uptime_ms();
     loop {
         if let Some(result) = recv(handle, buf) {
@@ -348,7 +357,12 @@ pub fn udp_ip_receive(payload: &[u8], src: &Ipv4Addr, dst: &Ipv4Addr) {
         if computed != 0 {
             serial_println!(
                 "[UDP] Bad checksum from {}.{}.{}.{}:{} -> port {}",
-                src.0[0], src.0[1], src.0[2], src.0[3], src_port, dst_port
+                src.0[0],
+                src.0[1],
+                src.0[2],
+                src.0[3],
+                src_port,
+                dst_port
             );
             return;
         }
@@ -361,10 +375,7 @@ pub fn udp_ip_receive(payload: &[u8], src: &Ipv4Addr, dst: &Ipv4Addr) {
         for b in BINDINGS.iter_mut() {
             if b.active && b.local_port == dst_port {
                 if !b.enqueue(data, src, src_port) {
-                    serial_println!(
-                        "[UDP] Receive queue full on port {}, dropping",
-                        dst_port
-                    );
+                    serial_println!("[UDP] Receive queue full on port {}, dropping", dst_port);
                 }
                 return;
             }

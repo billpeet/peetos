@@ -46,7 +46,14 @@ static mut ARP_CACHE: [ArpCacheEntry; ARP_CACHE_SIZE] = [EMPTY_ENTRY; ARP_CACHE_
 // ARP packet layout (28 bytes for Ethernet/IPv4)
 // ---------------------------------------------------------------------------
 
-fn build_arp_packet(buf: &mut [u8; ARP_PACKET_LEN], operation: u16, sender_mac: &MacAddr, sender_ip: &Ipv4Addr, target_mac: &MacAddr, target_ip: &Ipv4Addr) {
+fn build_arp_packet(
+    buf: &mut [u8; ARP_PACKET_LEN],
+    operation: u16,
+    sender_mac: &MacAddr,
+    sender_ip: &Ipv4Addr,
+    target_mac: &MacAddr,
+    target_ip: &Ipv4Addr,
+) {
     let hw_type = htons(ARP_HW_ETHERNET);
     let proto_type = htons(ARP_PROTO_IPV4);
     let op = htons(operation);
@@ -218,7 +225,14 @@ fn send_request(target_ip: &Ipv4Addr) {
     let cfg = crate::net::get_config();
     let our_mac = ethernet::get_mac();
     let mut pkt = [0u8; ARP_PACKET_LEN];
-    build_arp_packet(&mut pkt, ARP_OP_REQUEST, &our_mac, &cfg.ip, &MacAddr::ZERO, target_ip);
+    build_arp_packet(
+        &mut pkt,
+        ARP_OP_REQUEST,
+        &our_mac,
+        &cfg.ip,
+        &MacAddr::ZERO,
+        target_ip,
+    );
     let _ = ethernet::send(&MacAddr::BROADCAST, ETHERTYPE_ARP, &pkt);
 }
 
@@ -230,7 +244,14 @@ pub fn send_gratuitous() {
     serial_println!("[ARP] Sending gratuitous ARP");
     let our_mac = ethernet::get_mac();
     let mut pkt = [0u8; ARP_PACKET_LEN];
-    build_arp_packet(&mut pkt, ARP_OP_REQUEST, &our_mac, &cfg.ip, &MacAddr::ZERO, &cfg.ip);
+    build_arp_packet(
+        &mut pkt,
+        ARP_OP_REQUEST,
+        &our_mac,
+        &cfg.ip,
+        &MacAddr::ZERO,
+        &cfg.ip,
+    );
     let _ = ethernet::send(&MacAddr::BROADCAST, ETHERTYPE_ARP, &pkt);
 }
 
@@ -264,7 +285,14 @@ fn handle_request(data: &[u8]) {
     serial_println!("[ARP] Sending reply");
     let our_mac = ethernet::get_mac();
     let mut pkt = [0u8; ARP_PACKET_LEN];
-    build_arp_packet(&mut pkt, ARP_OP_REPLY, &our_mac, &cfg.ip, &sender_mac, &sender_ip);
+    build_arp_packet(
+        &mut pkt,
+        ARP_OP_REPLY,
+        &our_mac,
+        &cfg.ip,
+        &sender_mac,
+        &sender_ip,
+    );
     let _ = ethernet::send(&sender_mac, ETHERTYPE_ARP, &pkt);
 }
 

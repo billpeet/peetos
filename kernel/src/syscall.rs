@@ -617,12 +617,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_getrusage,
     ),
     syscall_def(SYS_STATFS, "statfs", SyscallMode::UserTask, sys_statfs),
-    syscall_def(
-        SYS_FSTATFS,
-        "fstatfs",
-        SyscallMode::UserTask,
-        sys_fstatfs,
-    ),
+    syscall_def(SYS_FSTATFS, "fstatfs", SyscallMode::UserTask, sys_fstatfs),
     syscall_def(SYS_FCHMOD, "fchmod", SyscallMode::UserTask, sys_fchmod),
     syscall_def(SYS_FCHOWN, "fchown", SyscallMode::UserTask, sys_fchown),
     syscall_def(
@@ -632,12 +627,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_truncate,
     ),
     syscall_def(SYS_SYNC, "sync", SyscallMode::AnyTask, sys_sync),
-    syscall_def(
-        SYS_PREAD64,
-        "pread64",
-        SyscallMode::UserTask,
-        sys_pread64,
-    ),
+    syscall_def(SYS_PREAD64, "pread64", SyscallMode::UserTask, sys_pread64),
     syscall_def(
         SYS_PWRITE64,
         "pwrite64",
@@ -660,10 +650,20 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_CONNECT, "connect", SyscallMode::UserTask, sys_connect),
     syscall_def(SYS_ACCEPT, "accept", SyscallMode::UserTask, sys_accept),
     syscall_def(SYS_SENDTO, "sendto", SyscallMode::UserTask, sys_sendto),
-    syscall_def(SYS_RECVFROM, "recvfrom", SyscallMode::UserTask, sys_recvfrom),
+    syscall_def(
+        SYS_RECVFROM,
+        "recvfrom",
+        SyscallMode::UserTask,
+        sys_recvfrom,
+    ),
     syscall_def(SYS_SENDMSG, "sendmsg", SyscallMode::UserTask, sys_sendmsg),
     syscall_def(SYS_RECVMSG, "recvmsg", SyscallMode::UserTask, sys_recvmsg),
-    syscall_def(SYS_SHUTDOWN, "shutdown", SyscallMode::UserTask, sys_shutdown),
+    syscall_def(
+        SYS_SHUTDOWN,
+        "shutdown",
+        SyscallMode::UserTask,
+        sys_shutdown,
+    ),
     syscall_def(SYS_BIND, "bind", SyscallMode::UserTask, sys_bind),
     syscall_def(SYS_LISTEN, "listen", SyscallMode::UserTask, sys_listen),
     syscall_def(
@@ -841,17 +841,16 @@ fn fd_write_slot(
 ) {
     unsafe {
         (*task_ptr).user_fd_kind[idx] = kind;
-        (*task_ptr).user_fd_inode[idx] =
-            if kind == task::USER_FD_KIND_VFS
-                || kind == task::USER_FD_KIND_PIPE
-                || kind == task::USER_FD_KIND_SOCKET
-                || kind == task::USER_FD_KIND_PTY_MASTER
-                || kind == task::USER_FD_KIND_PTY_SLAVE
-            {
-                inode
-            } else {
-                task::USER_FD_NONE
-            };
+        (*task_ptr).user_fd_inode[idx] = if kind == task::USER_FD_KIND_VFS
+            || kind == task::USER_FD_KIND_PIPE
+            || kind == task::USER_FD_KIND_SOCKET
+            || kind == task::USER_FD_KIND_PTY_MASTER
+            || kind == task::USER_FD_KIND_PTY_SLAVE
+        {
+            inode
+        } else {
+            task::USER_FD_NONE
+        };
         (*task_ptr).user_fd_offset[idx] = offset;
         (*task_ptr).user_fd_flags[idx] = flags;
     }
@@ -2831,12 +2830,7 @@ fn sys_mknodat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => return err,
     };
 
-    let opened = match fs::openat(
-        dir_inode,
-        path,
-        fs::O_CREAT | fs::O_EXCL | fs::O_WRONLY,
-        0,
-    ) {
+    let opened = match fs::openat(dir_inode, path, fs::O_CREAT | fs::O_EXCL | fs::O_WRONLY, 0) {
         Ok(opened) => opened,
         Err(err) => return -fs_to_errno(err),
     };
@@ -3858,7 +3852,11 @@ fn sys_shmctl(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
-fn stat_path(ctx: &SyscallContext, path_ptr: u64, follow_symlinks: bool) -> Result<fs::FileStat, i64> {
+fn stat_path(
+    ctx: &SyscallContext,
+    path_ptr: u64,
+    follow_symlinks: bool,
+) -> Result<fs::FileStat, i64> {
     let mut path_buf = [0u8; fs::VFS_MAX_PATH];
     let path = read_user_path(path_ptr, &mut path_buf)?;
     if path.is_empty() {
@@ -4790,9 +4788,7 @@ fn sys_ioctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let inode = unsafe { (*ctx.current).user_fd_inode[idx] };
     if kind == task::USER_FD_KIND_CONSOLE {
         ioctl_console(ctx, call.arg(1), call.arg(2))
-    } else if kind == task::USER_FD_KIND_PTY_MASTER
-        || kind == task::USER_FD_KIND_PTY_SLAVE
-    {
+    } else if kind == task::USER_FD_KIND_PTY_MASTER || kind == task::USER_FD_KIND_PTY_SLAVE {
         ioctl_pty(ctx, inode, call.arg(1), call.arg(2))
     } else {
         -ENOTTY
@@ -5236,8 +5232,7 @@ fn sys_getrandom(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let cap = cmp::min(buflen, 256);
     let mut tmp = [0u8; 256];
 
-    let mut state =
-        0x9E37_79B9_7F4A_7C15u64 ^ pit::ticks().wrapping_mul(0xA076_1D64_78BD_642F);
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ pit::ticks().wrapping_mul(0xA076_1D64_78BD_642F);
     let pid = if ctx.has_task() {
         unsafe { (*ctx.current).pid as u64 }
     } else {
@@ -5734,7 +5729,9 @@ fn sys_pwrite64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     while written < len {
         let take = cmp::min(chunk.len(), len - written);
-        if let Err(err) = copy_from_user_task(ctx.current, buf_ptr + written as u64, &mut chunk[..take]) {
+        if let Err(err) =
+            copy_from_user_task(ctx.current, buf_ptr + written as u64, &mut chunk[..take])
+        {
             if written > 0 {
                 return written as i64;
             }
@@ -5919,7 +5916,7 @@ fn write_sockaddr_in(
     let mut buf = [0u8; SOCKADDR_IN_SIZE];
     buf[0] = AF_INET as u8;
     buf[1] = 0; // AF_INET fits in one byte on little-endian
-    // Port in network byte order (big endian)
+                // Port in network byte order (big endian)
     buf[2] = (port >> 8) as u8;
     buf[3] = (port & 0xFF) as u8;
     buf[4] = ip.0[0];
@@ -5944,7 +5941,10 @@ fn fd_to_socket_id(task_ptr: *mut task::Task, fd: i32) -> Result<(usize, u16), i
         return Err(-EBADF);
     }
     let (kind, inode) = unsafe {
-        ((*task_ptr).user_fd_kind[idx], (*task_ptr).user_fd_inode[idx])
+        (
+            (*task_ptr).user_fd_kind[idx],
+            (*task_ptr).user_fd_inode[idx],
+        )
     };
     if kind != task::USER_FD_KIND_SOCKET {
         return Err(-ENOTSOCK);
@@ -6083,7 +6083,9 @@ fn sys_accept4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     // Write remote address to user if requested
     if addr_ptr != 0 {
-        if let Err(e) = write_sockaddr_in(ctx.current, addr_ptr, addrlen_ptr, &remote_ip, remote_port) {
+        if let Err(e) =
+            write_sockaddr_in(ctx.current, addr_ptr, addrlen_ptr, &remote_ip, remote_port)
+        {
             let _ = socket::socket_close(new_sock_id);
             return e;
         }
@@ -6100,7 +6102,12 @@ fn sys_accept4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         new_fd_flags
     });
 
-    match fd_alloc(ctx.current, task::USER_FD_KIND_SOCKET, new_sock_id, new_fd_flags) {
+    match fd_alloc(
+        ctx.current,
+        task::USER_FD_KIND_SOCKET,
+        new_sock_id,
+        new_fd_flags,
+    ) {
         Ok(fd) => fd,
         Err(e) => {
             let _ = socket::socket_close(new_sock_id);
@@ -6231,9 +6238,7 @@ fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16) -> i16 {
             revents |= POLLOUT;
         }
     } else if kind == task::USER_FD_KIND_PIPE {
-        if let Ok((has_data, has_space, read_eof, write_broken)) =
-            ipc::pipe_poll_status(inode)
-        {
+        if let Ok((has_data, has_space, read_eof, write_broken)) = ipc::pipe_poll_status(inode) {
             let can_read = fd_can_read(flags);
             let can_write = fd_can_write(flags);
             if can_read {
@@ -6280,12 +6285,7 @@ fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16) -> i16 {
     revents
 }
 
-fn do_poll(
-    ctx: &SyscallContext,
-    fds_ptr: u64,
-    nfds: usize,
-    deadline: Option<u64>,
-) -> i64 {
+fn do_poll(ctx: &SyscallContext, fds_ptr: u64, nfds: usize, deadline: Option<u64>) -> i64 {
     if nfds > POLL_MAX_FDS {
         return -EINVAL;
     }
@@ -6294,15 +6294,15 @@ fn do_poll(
     }
 
     // Read PollFd array from user
-    let mut fds = [PollFd { fd: -1, events: 0, revents: 0 }; POLL_MAX_FDS];
+    let mut fds = [PollFd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    }; POLL_MAX_FDS];
     if nfds > 0 {
         let byte_len = nfds * size_of::<PollFd>();
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                fds.as_mut_ptr() as *mut u8,
-                byte_len,
-            )
-        };
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, byte_len) };
         if let Err(e) = copy_from_user_task(ctx.current, fds_ptr, bytes) {
             return -(e);
         }
@@ -6325,12 +6325,8 @@ fn do_poll(
             // Write back
             if nfds > 0 {
                 let byte_len = nfds * size_of::<PollFd>();
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        fds.as_ptr() as *const u8,
-                        byte_len,
-                    )
-                };
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(fds.as_ptr() as *const u8, byte_len) };
                 if let Err(e) = copy_to_user_task(ctx.current, fds_ptr, bytes) {
                     return -(e);
                 }
@@ -6344,12 +6340,8 @@ fn do_poll(
                 // Timeout — write back zero revents
                 if nfds > 0 {
                     let byte_len = nfds * size_of::<PollFd>();
-                    let bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            fds.as_ptr() as *const u8,
-                            byte_len,
-                        )
-                    };
+                    let bytes =
+                        unsafe { core::slice::from_raw_parts(fds.as_ptr() as *const u8, byte_len) };
                     let _ = copy_to_user_task(ctx.current, fds_ptr, bytes);
                 }
                 return 0;
@@ -6379,8 +6371,8 @@ fn sys_ppoll(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
                     return -EINVAL;
                 }
-                let timeout_ms =
-                    (ts.tv_sec as u64).saturating_mul(1000)
+                let timeout_ms = (ts.tv_sec as u64)
+                    .saturating_mul(1000)
                     .saturating_add((ts.tv_nsec as u64) / 1_000_000);
                 Some(pit::uptime_ms().saturating_add(timeout_ms))
             }
@@ -6430,8 +6422,7 @@ fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
 
     let fd_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
-    let nb = (fd_open_flags(fd_flags) & O_NONBLOCK) != 0
-        || (msg_flags_arg & 0x40) != 0; // MSG_DONTWAIT
+    let nb = (fd_open_flags(fd_flags) & O_NONBLOCK) != 0 || (msg_flags_arg & 0x40) != 0; // MSG_DONTWAIT
 
     // Read msghdr from user
     let hdr = match read_struct_from_user::<LinuxMsgHdr>(ctx.current, msghdr_ptr) {
@@ -6446,7 +6437,10 @@ fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     let mut total_len: usize = 0;
-    let mut iovecs = [LinuxIovec { iov_base: 0, iov_len: 0 }; 64];
+    let mut iovecs = [LinuxIovec {
+        iov_base: 0,
+        iov_len: 0,
+    }; 64];
     for i in 0..iov_count {
         let entry_ptr = hdr.msg_iov + (i * size_of::<LinuxIovec>()) as u64;
         match read_struct_from_user::<LinuxIovec>(ctx.current, entry_ptr) {
@@ -6477,7 +6471,11 @@ fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
         let chunk = remaining.min(iovecs[i].iov_len as usize);
         if chunk > 0 && iovecs[i].iov_base != 0 {
-            if let Err(e) = copy_to_user_task(ctx.current, iovecs[i].iov_base, &kbuf[src_off..src_off + chunk]) {
+            if let Err(e) = copy_to_user_task(
+                ctx.current,
+                iovecs[i].iov_base,
+                &kbuf[src_off..src_off + chunk],
+            ) {
                 return -(e);
             }
         }
@@ -6873,7 +6871,10 @@ fn dispatch_syscall(call: SyscallArgs) -> i64 {
 
 #[inline]
 fn log_execve_result(result: &Result<user::ExecImageStart, i64>) {
-    if !cfg!(any(feature = "musl-ext2-exec", feature = "musl-ext2-cmd-smoke")) {
+    if !cfg!(any(
+        feature = "musl-ext2-exec",
+        feature = "musl-ext2-cmd-smoke"
+    )) {
         return;
     }
     match result {

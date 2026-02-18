@@ -11,7 +11,7 @@ This document covers serial output, exception reporting, and test-only QEMU exit
 
 **Serial Console**
 The serial console is configured for COM1 (`0x3F8`) at 38400 baud with 8N1 framing. Output is synchronous and translates `\n` to CRLF. Macros `serial_print!` and `serial_println!` wrap the formatter.
-When framebuffer mode is active, serial bytes are also mirrored into a simple on-screen text grid (`kernel/src/fb_console.rs`) so output is visible in the QEMU display window.
+When framebuffer mode is active, serial bytes are also mirrored into an on-screen styled text grid (`kernel/src/fb_console.rs`) using 8x16 bitmap glyphs, baseline ANSI 16-color handling, and a PIT-driven blinking cursor so output is visible in the QEMU display window.
 
 Limitations / Simplifications
 - Busy-wait transmit loop; no interrupts or buffering.

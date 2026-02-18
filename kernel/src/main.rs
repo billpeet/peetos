@@ -43,11 +43,12 @@ mod fb_console;
 #[cfg(feature = "test-exit")]
 mod fb_console {
     pub fn init() {}
+    pub fn tick() {}
     pub fn write_bytes(_bytes: &[u8]) {}
 }
 
 #[cfg(not(feature = "test-exit"))]
-mod font8x8_basic;
+mod font8x16_vga;
 
 use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall, tss};
 use drivers::pci;
@@ -171,6 +172,7 @@ pub extern "C" fn kmain() -> ! {
 
     loop {
         net::poll();
+        fb_console::tick();
         unsafe {
             core::arch::asm!("hlt");
         }

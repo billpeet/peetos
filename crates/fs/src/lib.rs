@@ -3094,7 +3094,9 @@ fn link_at_inner(
             )?;
             {
                 let now = fs_time_tick(state);
-                let old_links = state.inodes[old_inode as usize].links_count.saturating_add(1);
+                let old_links = state.inodes[old_inode as usize]
+                    .links_count
+                    .saturating_add(1);
                 let old = &mut state.inodes[old_inode as usize];
                 old.links_count = old_links;
                 old.ctime = now;
@@ -3144,8 +3146,7 @@ fn link_at_inner(
             ) {
                 Ok(inode) => inode,
                 Err(err) => {
-                    let _ =
-                        ext2_remove_dir_entry(state, new_parent_ext2_ino, &new_name[..new_len]);
+                    let _ = ext2_remove_dir_entry(state, new_parent_ext2_ino, &new_name[..new_len]);
                     if ext_inode.links_count > 0 {
                         ext_inode.links_count -= 1;
                     }
@@ -3302,7 +3303,12 @@ fn symlink_at_inner(
     }
 }
 
-fn readlink_at_inner(state: &VfsState, start: u16, path: &str, dst: &mut [u8]) -> Result<usize, i64> {
+fn readlink_at_inner(
+    state: &VfsState,
+    start: u16,
+    path: &str,
+    dst: &mut [u8],
+) -> Result<usize, i64> {
     if path.is_empty() {
         return Err(ENOENT);
     }
@@ -4180,8 +4186,13 @@ mod tests {
 
         let opened = open("/tmp/link-src.txt", O_CREAT | O_RDWR, 0).expect("create src");
         let _ = write(opened.inode, 0, b"linkdata", false).expect("write src");
-        linkat(ROOT_INODE, "/tmp/link-src.txt", ROOT_INODE, "/tmp/link-dst.txt")
-            .expect("create link");
+        linkat(
+            ROOT_INODE,
+            "/tmp/link-src.txt",
+            ROOT_INODE,
+            "/tmp/link-dst.txt",
+        )
+        .expect("create link");
 
         let linked = open("/tmp/link-dst.txt", O_RDONLY, 0).expect("open linked name");
         let mut out = [0u8; 16];

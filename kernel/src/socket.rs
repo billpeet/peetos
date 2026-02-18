@@ -43,7 +43,7 @@ struct SocketEntry {
     used: bool,
     protocol: u8,
     state: u8,
-    handle: u16,       // tcp/udp connection/binding handle
+    handle: u16, // tcp/udp connection/binding handle
     local_port: u16,
     remote_port: u16,
     remote_ip: Ipv4Addr,
@@ -155,7 +155,11 @@ pub fn socket_create(sock_type: u32) -> Result<u16, i64> {
         s.protocol = protocol;
         s.state = STATE_CREATED;
     }
-    serial_println!("[SOCK] Created socket {} ({})", id, if protocol == PROTO_TCP { "TCP" } else { "UDP" });
+    serial_println!(
+        "[SOCK] Created socket {} ({})",
+        id,
+        if protocol == PROTO_TCP { "TCP" } else { "UDP" }
+    );
     Ok(id)
 }
 
@@ -232,8 +236,15 @@ pub fn socket_connect(id: u16, ip: &Ipv4Addr, port: u16, nonblocking: bool) -> R
         s.remote_port = rp;
     }
 
-    serial_println!("[SOCK] Socket {} connected to {}.{}.{}.{}:{}", id,
-        ip.0[0], ip.0[1], ip.0[2], ip.0[3], port);
+    serial_println!(
+        "[SOCK] Socket {} connected to {}.{}.{}.{}:{}",
+        id,
+        ip.0[0],
+        ip.0[1],
+        ip.0[2],
+        ip.0[3],
+        port
+    );
     Ok(())
 }
 
@@ -252,8 +263,7 @@ pub fn socket_accept(id: u16, nonblocking: bool) -> Result<(u16, Ipv4Addr, u16),
         return Err(-EAGAIN);
     }
 
-    let child_handle = tcp::accept(listen_handle, TCP_TIMEOUT_MS)
-        .map_err(|e| -net_to_errno(e))?;
+    let child_handle = tcp::accept(listen_handle, TCP_TIMEOUT_MS).map_err(|e| -net_to_errno(e))?;
 
     let (remote_ip, remote_port) = match tcp::connection_info(child_handle) {
         Some((_, rip, rp)) => (rip, rp),
@@ -274,8 +284,16 @@ pub fn socket_accept(id: u16, nonblocking: bool) -> Result<(u16, Ipv4Addr, u16),
         ns.remote_port = remote_port;
     }
 
-    serial_println!("[SOCK] Socket {} accepted connection -> socket {} from {}.{}.{}.{}:{}",
-        id, new_id, remote_ip.0[0], remote_ip.0[1], remote_ip.0[2], remote_ip.0[3], remote_port);
+    serial_println!(
+        "[SOCK] Socket {} accepted connection -> socket {} from {}.{}.{}.{}:{}",
+        id,
+        new_id,
+        remote_ip.0[0],
+        remote_ip.0[1],
+        remote_ip.0[2],
+        remote_ip.0[3],
+        remote_port
+    );
     Ok((new_id, remote_ip, remote_port))
 }
 

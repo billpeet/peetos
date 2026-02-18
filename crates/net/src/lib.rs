@@ -292,7 +292,7 @@ mod tests {
         hdr[7] = 0x00; // flags + frag offset (DF)
         hdr[8] = 0x40; // TTL = 64
         hdr[9] = 0x06; // protocol = TCP
-        // checksum bytes [10..12] = 0
+                       // checksum bytes [10..12] = 0
         hdr[12] = 10;
         hdr[13] = 0;
         hdr[14] = 2;
