@@ -1,0 +1,55 @@
+# QuickJS Makefile for PeetOS userspace staging
+
+MUSL_CC ?= cc
+CC := $(MUSL_CC)
+AR ?= ar
+STRIP ?= strip
+CONFIG_VERSION ?= 2024-01-13-peetos
+
+CFLAGS ?=
+CFLAGS += -g -Wall -Wextra
+CFLAGS += -Wno-sign-compare -Wno-missing-field-initializers
+CFLAGS += -Wundef -Wuninitialized -Wunused -Wno-unused-parameter
+CFLAGS += -Wwrite-strings -Wchar-subscripts -funsigned-char -fwrapv
+CFLAGS += -Os -fno-stack-protector -fno-omit-frame-pointer
+CFLAGS += -ffunction-sections -fdata-sections
+CFLAGS += -D_GNU_SOURCE
+CFLAGS += -DCONFIG_VERSION=\"$(CONFIG_VERSION)\"
+# Disable atomics/worker path for this staged build.
+CFLAGS += -DEMSCRIPTEN
+
+LDFLAGS ?=
+LDFLAGS += -static -no-pie -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections
+
+OBJDIR := .obj
+
+QJS_LIB_OBJS = \
+	$(OBJDIR)/quickjs.o \
+	$(OBJDIR)/libregexp.o \
+	$(OBJDIR)/libunicode.o \
+	$(OBJDIR)/cutils.o \
+	$(OBJDIR)/quickjs-libc.o \
+	$(OBJDIR)/libbf.o
+
+QJS_OBJS = $(OBJDIR)/qjs.o $(OBJDIR)/repl_stub.o
+
+.PHONY: all clean
+
+all: $(OBJDIR) libquickjs.a qjs
+
+$(OBJDIR):
+	mkdir -p $(OBJDIR)
+
+$(OBJDIR)/%.o: %.c
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+libquickjs.a: $(QJS_LIB_OBJS)
+	$(AR) rcs $@ $(QJS_LIB_OBJS)
+
+qjs: $(QJS_OBJS) libquickjs.a
+	$(CC) $(LDFLAGS) -o $@ $(QJS_OBJS) libquickjs.a -lm -ldl
+
+clean:
+	rm -rf $(OBJDIR) libquickjs.a qjs
+
+-include $(OBJDIR)/*.d

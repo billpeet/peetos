@@ -6,8 +6,13 @@
 /toybox/toybox-src
 /toybox/out
 /toybox/toybox-*.tar.gz
+/quickjs/quickjs-src
+/quickjs/out
+/quickjs/quickjs-*.tar.xz
 /user/musl_echo.elf
 /user/musl_execve_ext2.elf
+/user/musl_execve_ext2_quickjs_smoke.elf
+/user/qjs
 /user/toybox_echo.elf
 /user/sample_ext2_musl.img
 *.img

@@ -15,7 +15,9 @@ Related Stage-9 userspace bootstrap artifacts live outside this directory:
 - `user/musl_execve_ext2.elf`: feature-gated musl launcher that calls `execve("/mnt/ext2/bin/toybox", {"sh", ...})` for interactive TTY shell bring-up (`KERNEL_FEATURES=musl-ext2-exec`).
 - `user/musl_execve_ext2_smoke.elf`: feature-gated musl launcher that runs scripted shell smoke commands from `/mnt/ext2/bin/next_smoke.sh` for syscall-gap capture (`KERNEL_FEATURES=musl-ext2-cmd-smoke`).
 - `user/musl_execve_ext2_ping_smoke.elf`: feature-gated musl launcher that runs scripted ping smoke from `/mnt/ext2/bin/ping_smoke.sh` (`KERNEL_FEATURES=musl-ext2-ping-smoke`).
-- `user/sample_ext2_musl.img`: feature-gated ext2 image that includes `/bin/toybox` (shell/core + networking applets including `ping`) for shell and ping smoke testing (`KERNEL_FEATURES=musl-ext2-exec` / `musl-ext2-cmd-smoke` / `musl-ext2-ping-smoke`).
+- `user/musl_execve_ext2_quickjs_smoke.elf`: feature-gated musl launcher that runs scripted QuickJS smoke from `/mnt/ext2/bin/quickjs_smoke.sh` (`KERNEL_FEATURES=musl-ext2-quickjs-smoke`).
+- `user/sample_ext2_musl.img`: feature-gated ext2 image that includes `/bin/toybox` (shell/core + networking applets including `ping`) and optionally `/bin/qjs` + staged scripts for QuickJS smoke (`KERNEL_FEATURES=musl-ext2-exec` / `musl-ext2-cmd-smoke` / `musl-ext2-ping-smoke` / `musl-ext2-quickjs-smoke`).
+- `user/qjs`: local staged QuickJS interpreter copy produced by `make quickjs` and inserted into ext2 as `/bin/qjs` for smoke runs.
 - `user/toybox_echo.elf`: optional local copy of the staged Toybox `echo` binary (`scripts/build_toybox_echo.sh`).
 - `user/toybox_sh.elf`: optional local copy of the staged Toybox `sh` binary (`scripts/build_toybox_sh.sh`).
 - `user/toybox_core.elf`: optional local copy of the staged shell-core Toybox multicall binary (`scripts/build_toybox_core.sh`).

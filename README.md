@@ -22,6 +22,7 @@ Key references in the C project:
 - `crates/` Subsystem crates (`arch_x86_64`, `fs`, and now `drivers` for baseline PCI enumeration are active; `net`, `syscall`, and `userabi` remain placeholders).
 - `musl/` Stage-9 musl source/bootstrap build glue for user-space runtime bring-up.
 - `toybox/` Stage-9 toybox source/bootstrap build glue for staged userspace utilities.
+- `quickjs/` Stage-9 quickjs source/bootstrap build glue for staged JavaScript runtime smoke.
 - `linker/` Linker script for the kernel.
 - `docs/PORTING_PLAN.md` High-level implementation roadmap.
 - `docs/` Implementation docs grouped by subsystem, each with a limitations/simplifications section.
@@ -44,6 +45,7 @@ Key references in the C project:
 - Baseline keyboard/TTY input is now wired in-kernel: PS/2 IRQ1 set-1 scancode decode feeds a canonical line-buffered console input path used by user `read` on stdio.
 - Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, basic pixel/clear primitives, and a styled framebuffer terminal mirror with 8x16 VGA-compatible bitmap glyphs, baseline ANSI color handling, cursor blink, and preset themes.
 - Stage-9 userspace bootstrap plumbing is now present: musl source/sysroot build (`make musl-fetch`, `make musl-configure`, `make musl`) and toybox staging (`make toybox-fetch`, `make toybox`) with a shell-core Toybox set (`sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`) integrated into the ext2 `execve` smoke path.
+- QuickJS userspace staging is now wired (`make quickjs-fetch`, `make quickjs`) with ext2 smoke coverage via `make run-quickjs-smoke` (`KERNEL_FEATURES=musl-ext2-quickjs-smoke`) that executes staged JS scripts with `/bin/qjs`.
 - Toybox networking applet staging now includes `ping` in addition to `netcat`/`wget`/`httpd`/`sntp`/`microcom`/`ftpget`, backed by AF_INET datagram ICMP socket support in the kernel socket layer.
 - Remaining placeholder crates are `net`, `syscall`, and `userabi`; advanced device drivers and full user space are still pending.
 
@@ -63,6 +65,7 @@ Key references in the C project:
 - `docs/subsystems.md` Subsystem crate status and intended usage.
 - `docs/musl.md` Stage-9 musl bootstrap workflow and current limitations.
 - `docs/toybox.md` Stage-9 toybox bootstrap workflow and current limitations.
+- `docs/quickjs.md` Stage-9 quickjs bootstrap workflow and current limitations.
 
 ## Build Prerequisites
 
@@ -75,7 +78,7 @@ Optional but commonly required:
 
 - `rust-src` component if you need to rebuild `core` for a target.
 - `mke2fs` (`e2fsprogs`) if you want to regenerate `user/sample_ext2.img`.
-- `curl` or `wget` if you want to fetch musl/toybox source via `make musl-fetch` or `make toybox-fetch`.
+- `curl` or `wget` if you want to fetch musl/toybox/quickjs source via `make musl-fetch`, `make toybox-fetch`, or `make quickjs-fetch`.
 
 ## Build
 
@@ -126,6 +129,14 @@ scripts/run_toybox_next_smoke.sh
 scripts/run_toybox_ping_smoke.sh
 ```
 
+Bootstrap quickjs source and build staged `qjs`:
+
+```bash
+make quickjs-fetch
+make quickjs
+scripts/run_toybox_quickjs_smoke.sh
+```
+
 Boot a musl-linked runtime smoke program (`echo`-style static binary) as the initial user task:
 
 ```bash
@@ -155,6 +166,7 @@ Shell shortcut targets:
 make run-shell
 make run-shell-smoke
 make run-ping-smoke
+make run-quickjs-smoke
 ```
 
 Expected serial output includes `[musl-ext2-exec] launching interactive toybox sh` when the ext2 handoff succeeds.

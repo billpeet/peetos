@@ -20,7 +20,9 @@ USER_MUSL_SMOKE_ELF := user/musl_echo.elf
 USER_MUSL_EXT2_INIT_ELF := user/musl_execve_ext2.elf
 USER_MUSL_EXT2_SMOKE_ELF := user/musl_execve_ext2_smoke.elf
 USER_MUSL_EXT2_PING_SMOKE_ELF := user/musl_execve_ext2_ping_smoke.elf
+USER_MUSL_EXT2_QUICKJS_SMOKE_ELF := user/musl_execve_ext2_quickjs_smoke.elf
 USER_EXT2_MUSL_IMG := user/sample_ext2_musl.img
+USER_QUICKJS_BIN := user/qjs
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 KERNEL_BIN := $(BUILD_DIR)/kernel.bin
@@ -36,6 +38,7 @@ USER_MUSL_SMOKE_SCRIPT := scripts/build_musl_echo.sh
 USER_EXT2_MUSL_SCRIPT := scripts/build_ext2_musl_execve.sh
 USER_TOYBOX_SH_SCRIPT := scripts/build_toybox_sh.sh
 USER_TOYBOX_CORE_SCRIPT := scripts/build_toybox_core.sh
+USER_EXT2_MUSL_OPTIONAL_DEPS :=
 
 PROFILE ?= release
 ifeq ($(PROFILE),release)
@@ -64,9 +67,14 @@ else
 CARGO_FEATURES :=
 endif
 
-.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke clean run run-current run-image run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke test ext2-image \
+ifneq ($(findstring musl-ext2-quickjs-smoke,$(KERNEL_FEATURES)),)
+USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_QUICKJS_BIN) quickjs/test_hello.js quickjs/test_math.js
+endif
+
+.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke user-musl-ext2-quickjs-smoke clean run run-current run-image run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke run-quickjs-smoke test ext2-image \
 	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
-	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info run-shell-smoke
+	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info \
+	quickjs-fetch quickjs quickjs-clean quickjs-distclean quickjs-info run-shell-smoke
 
 all: image
 
@@ -123,7 +131,13 @@ $(USER_MUSL_EXT2_SMOKE_ELF): user/musl_execve_ext2_smoke.c $(USER_MUSL_SMOKE_SCR
 $(USER_MUSL_EXT2_PING_SMOKE_ELF): user/musl_execve_ext2_ping_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
 
-$(USER_EXT2_MUSL_IMG): $(USER_EXT2_MUSL_SCRIPT) $(USER_TOYBOX_CORE_SCRIPT) toybox/Makefile toybox/fetch-toybox.sh toybox/configs/shell-core.config user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt user/ext2_root/etc/resolv.conf
+$(USER_MUSL_EXT2_QUICKJS_SMOKE_ELF): user/musl_execve_ext2_quickjs_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
+	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
+
+$(USER_QUICKJS_BIN): scripts/build_quickjs_qjs.sh quickjs/Makefile quickjs/fetch-quickjs.sh quickjs/peetos/Makefile.peetos quickjs/peetos/repl_stub.c
+	$(MAKE) quickjs
+
+$(USER_EXT2_MUSL_IMG): $(USER_EXT2_MUSL_SCRIPT) $(USER_TOYBOX_CORE_SCRIPT) toybox/Makefile toybox/fetch-toybox.sh toybox/configs/shell-core.config user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt user/ext2_root/etc/resolv.conf $(USER_EXT2_MUSL_OPTIONAL_DEPS)
 	$(USER_EXT2_MUSL_SCRIPT)
 
 ifneq ($(findstring musl-smoke,$(KERNEL_FEATURES)),)
@@ -150,16 +164,24 @@ else
 KERNEL_MUSL_EXT2_PING_SMOKE_DEP :=
 endif
 
+ifneq ($(findstring musl-ext2-quickjs-smoke,$(KERNEL_FEATURES)),)
+KERNEL_MUSL_EXT2_QUICKJS_SMOKE_DEP := $(USER_MUSL_EXT2_QUICKJS_SMOKE_ELF) $(USER_QUICKJS_BIN) $(USER_EXT2_MUSL_IMG)
+else
+KERNEL_MUSL_EXT2_QUICKJS_SMOKE_DEP :=
+endif
+
 user: $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG)
 
 user-musl-smoke: $(USER_MUSL_SMOKE_ELF)
 user-musl-ext2-exec: $(USER_MUSL_EXT2_INIT_ELF) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-cmd-smoke: $(USER_MUSL_EXT2_SMOKE_ELF) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-ping-smoke: $(USER_MUSL_EXT2_PING_SMOKE_ELF) $(USER_EXT2_MUSL_IMG)
+user-musl-ext2-quickjs-smoke: $(USER_MUSL_EXT2_QUICKJS_SMOKE_ELF) $(USER_QUICKJS_BIN) $(USER_EXT2_MUSL_IMG)
 
-kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PING_SMOKE_DEP)
+kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PING_SMOKE_DEP) $(KERNEL_MUSL_EXT2_QUICKJS_SMOKE_DEP)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@case " $(KERNEL_FEATURES) " in \
+		*" musl-ext2-quickjs-smoke "*) init_dep="musl_execve_ext2_quickjs_smoke.elf" ;; \
 		*" musl-ext2-ping-smoke "*) init_dep="musl_execve_ext2_ping_smoke.elf" ;; \
 		*" musl-ext2-cmd-smoke "*) init_dep="musl_execve_ext2_smoke.elf" ;; \
 		*" musl-ext2-exec "*) init_dep="musl_execve_ext2.elf" ;; \
@@ -290,6 +312,9 @@ run-shell-smoke:
 run-ping-smoke:
 	scripts/run_toybox_ping_smoke.sh
 
+run-quickjs-smoke:
+	scripts/run_toybox_quickjs_smoke.sh
+
 test:
 	@tests/run.sh
 
@@ -339,6 +364,29 @@ toybox-distclean:
 
 toybox-info:
 	$(MAKE) -C toybox info
+
+# ---------------------------------------------------------------------------
+# quickjs userspace staging (stage 9 prep)
+# ---------------------------------------------------------------------------
+
+quickjs-fetch:
+	$(MAKE) -C quickjs fetch
+
+quickjs:
+	$(MAKE) -C quickjs qjs
+	cp quickjs/out/qjs $(USER_QUICKJS_BIN)
+	chmod 0755 $(USER_QUICKJS_BIN)
+
+quickjs-clean:
+	$(MAKE) -C quickjs clean
+	rm -f $(USER_QUICKJS_BIN)
+
+quickjs-distclean:
+	$(MAKE) -C quickjs distclean
+	rm -f $(USER_QUICKJS_BIN)
+
+quickjs-info:
+	$(MAKE) -C quickjs info
 
 clean:
 	@rm -rf $(BUILD_DIR)

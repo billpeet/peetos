@@ -27,13 +27,15 @@ const EXEC_MAX_INTERP_IMAGE: usize = 2 * 1024 * 1024;
 #[cfg(any(
     feature = "musl-ext2-exec",
     feature = "musl-ext2-cmd-smoke",
-    feature = "musl-ext2-ping-smoke"
+    feature = "musl-ext2-ping-smoke",
+    feature = "musl-ext2-quickjs-smoke"
 ))]
 const INIT_ARGV0: &[u8] = b"/init-ext2\0";
 #[cfg(all(
     not(feature = "musl-ext2-exec"),
     not(feature = "musl-ext2-cmd-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
     feature = "musl-smoke"
 ))]
 const INIT_ARGV0: &[u8] = b"/bin/echo\0";
@@ -41,6 +43,7 @@ const INIT_ARGV0: &[u8] = b"/bin/echo\0";
     not(feature = "musl-ext2-exec"),
     not(feature = "musl-ext2-cmd-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-smoke")
 ))]
 const INIT_ARGV0: &[u8] = b"/init\0";
@@ -70,14 +73,21 @@ const EINVAL: i64 = 22;
 const E2BIG: i64 = 7;
 const EACCES: i64 = 13;
 
-#[cfg(feature = "musl-ext2-ping-smoke")]
+#[cfg(feature = "musl-ext2-quickjs-smoke")]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_quickjs_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-quickjs-smoke"),
+    feature = "musl-ext2-ping-smoke"
+))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_ping_smoke.elf");
 #[cfg(all(
+    not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
     feature = "musl-ext2-cmd-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_smoke.elf");
 #[cfg(all(
+    not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
     not(feature = "musl-ext2-cmd-smoke"),
     feature = "musl-ext2-exec"
@@ -87,6 +97,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2.elf");
     not(feature = "musl-ext2-exec"),
     not(feature = "musl-ext2-cmd-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
     feature = "musl-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
@@ -94,6 +105,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
     not(feature = "musl-ext2-exec"),
     not(feature = "musl-ext2-cmd-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-smoke")
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/hello_dyn.elf");
@@ -723,7 +735,9 @@ fn populate_user_stack<const ARGC: usize, const ENVC: usize, const AUXC: usize>(
 
 pub fn spawn_init() {
     serial_println!("[USER] Setting up initial user task...");
-    if cfg!(feature = "musl-ext2-ping-smoke") {
+    if cfg!(feature = "musl-ext2-quickjs-smoke") {
+        serial_println!("[USER] musl-ext2-quickjs-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-ping-smoke") {
         serial_println!("[USER] musl-ext2-ping-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-cmd-smoke") {
         serial_println!("[USER] musl-ext2-cmd-smoke init image selected");
@@ -804,7 +818,8 @@ pub fn spawn_init() {
         feature = "musl-smoke",
         not(feature = "musl-ext2-exec"),
         not(feature = "musl-ext2-cmd-smoke"),
-        not(feature = "musl-ext2-ping-smoke")
+        not(feature = "musl-ext2-ping-smoke"),
+        not(feature = "musl-ext2-quickjs-smoke")
     ))]
     let stack_plan = match populate_user_stack::<3, 2, 13>(
         pml4,
@@ -825,6 +840,7 @@ pub fn spawn_init() {
         feature = "musl-ext2-exec",
         feature = "musl-ext2-cmd-smoke",
         feature = "musl-ext2-ping-smoke",
+        feature = "musl-ext2-quickjs-smoke",
         not(feature = "musl-smoke")
     ))]
     let stack_plan = match populate_user_stack::<1, 2, 13>(

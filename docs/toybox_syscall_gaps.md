@@ -10,6 +10,7 @@ For shell-specific bring-up priorities, see `docs/toybox_shell_syscalls.md`.
 
 - Focus first on core file/text/process utilities (`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `ln`, `touch`, `find`, `tar`).
 - Network/system-management tools were initially deferred; seventh-wave staging now includes baseline networking bring-up (`netcat`/`wget`/`httpd`/`sntp`/`microcom`/`ftpget`/`ping`) while admin-heavy tooling remains deferred.
+- QuickJS runtime smoke is staged through the same ext2 launcher path (`musl-ext2-quickjs-smoke`) to validate JavaScript userspace execution on top of the current toybox/musl baseline.
 - Use `kernel/src/syscall.rs` as current implemented surface.
 
 ## Current Kernel Syscalls (Baseline)
@@ -115,6 +116,13 @@ From `scripts/run_toybox_ping_smoke.sh` / `make run-ping-smoke` on `KERNEL_FEATU
 - Failure marker not observed: `[musl-ext2-ping-smoke] failures`
 - Reply evidence observed: `bytes from 10.0.2.2`
 - Implementation note: ICMP datagram socket send path now normalizes/recomputes ICMP checksum for toybox `ping` payloads before transmit.
+
+From `scripts/run_toybox_quickjs_smoke.sh` / `make run-quickjs-smoke` on `KERNEL_FEATURES=musl-ext2-quickjs-smoke`:
+
+- Completion marker observed: `[musl-ext2-quickjs-smoke] done`
+- Failure marker not observed: `[musl-ext2-quickjs-smoke] failures`
+- Output evidence observed: `Hello from QuickJS on PeetOS!`
+- Staging note: ext2 payload includes `/mnt/ext2/bin/qjs` plus `/mnt/ext2/tmp/test_hello.js` and `/mnt/ext2/tmp/test_math.js`.
 
 ## Definitive Remaining Applets + Blockers (2026-02-18)
 
@@ -422,6 +430,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 - Some Toybox applets live under `toys/pending/`; those may need extra work unrelated to syscalls.
 - Syscall implementation alone is not sufficient for deferred areas (networking, mount namespaces, full tty/pty, multi-process job control).
 - `ping` smoke currently asserts only the QEMU user-mode NAT gateway path (`10.0.2.2`); broader ICMP interoperability is not yet a pass criterion in this document.
+- QuickJS smoke currently validates interpreter boot and staged script execution only; it is not a toybox syscall-gap oracle and does not replace applet-by-applet syscall triage.
 - Newly added P0 handlers are baseline-only:
   - `access`/`faccessat` checks use current VFS metadata and simple uid/gid permission selection.
   - `linkat` currently supports regular-file links only; tmpfs path is a pragmatic clone-style fallback.

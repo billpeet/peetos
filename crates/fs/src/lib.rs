@@ -69,7 +69,7 @@ const EXT2_ROOT_INODE: u32 = 2;
 const EXT2_GROUP_DESC_SIZE: usize = 32;
 const EXT2_INODE_DIRECT_COUNT: usize = 12;
 const EXT2_MAX_RECURSION: u8 = 16;
-const EXT2_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+const EXT2_MAX_IMAGE_SIZE: usize = 16 * 1024 * 1024;
 
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;

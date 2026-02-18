@@ -2621,7 +2621,10 @@ fn sys_nanosleep(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
 #[inline]
 fn log_stub_enosys(name: &str) {
-    if cfg!(feature = "musl-ext2-cmd-smoke") {
+    if cfg!(any(
+        feature = "musl-ext2-cmd-smoke",
+        feature = "musl-ext2-quickjs-smoke"
+    )) {
         sys_log!("[SYSCALL] {} -> -ENOSYS", name);
     }
 }
@@ -6886,7 +6889,8 @@ fn dispatch_syscall(call: SyscallArgs) -> i64 {
 fn log_execve_result(result: &Result<user::ExecImageStart, i64>) {
     if !cfg!(any(
         feature = "musl-ext2-exec",
-        feature = "musl-ext2-cmd-smoke"
+        feature = "musl-ext2-cmd-smoke",
+        feature = "musl-ext2-quickjs-smoke"
     )) {
         return;
     }

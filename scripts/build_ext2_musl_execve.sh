@@ -30,6 +30,21 @@ mkdir -p "${STAGE_ROOT}/bin"
   --out "${STAGE_ROOT}/bin/toybox"
 chmod 0755 "${STAGE_ROOT}/bin/toybox"
 ln "${STAGE_ROOT}/bin/toybox" "${STAGE_ROOT}/bin/sh"
+mkdir -p "${STAGE_ROOT}/tmp"
+
+# Stage QuickJS interpreter + sample scripts when available.
+if [[ -x "${ROOT_DIR}/user/qjs" ]]; then
+  cp "${ROOT_DIR}/user/qjs" "${STAGE_ROOT}/bin/qjs"
+  chmod 0755 "${STAGE_ROOT}/bin/qjs"
+fi
+if [[ -f "${ROOT_DIR}/quickjs/test_hello.js" ]]; then
+  cp "${ROOT_DIR}/quickjs/test_hello.js" "${STAGE_ROOT}/tmp/test_hello.js"
+  chmod 0644 "${STAGE_ROOT}/tmp/test_hello.js"
+fi
+if [[ -f "${ROOT_DIR}/quickjs/test_math.js" ]]; then
+  cp "${ROOT_DIR}/quickjs/test_math.js" "${STAGE_ROOT}/tmp/test_math.js"
+  chmod 0644 "${STAGE_ROOT}/tmp/test_math.js"
+fi
 
 # Applets are invoked as `toybox <applet>` to keep the smoke image compact.
 cat > "${STAGE_ROOT}/bin/next_smoke.sh" <<'EOS'
@@ -220,10 +235,45 @@ fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/ping_smoke.sh"
 
+cat > "${STAGE_ROOT}/bin/quickjs_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/qjs ]; then
+  echo [musl-ext2-quickjs-smoke] missing bin/qjs
+  fail=1
+else
+  if [ -f tmp/test_hello.js ]; then
+    bin/qjs tmp/test_hello.js || fail=1
+  else
+    echo [musl-ext2-quickjs-smoke] missing tmp/test_hello.js
+    fail=1
+  fi
+
+  if [ -f tmp/test_math.js ]; then
+    bin/qjs tmp/test_math.js || fail=1
+  else
+    echo [musl-ext2-quickjs-smoke] missing tmp/test_math.js
+    fail=1
+  fi
+fi
+
+echo [musl-ext2-quickjs-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-quickjs-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/quickjs_smoke.sh"
+
 TMP_IMG="${TMP_DIR}/ext2.img"
-# Keep image compact for QEMU smoke runs while leaving room for the
-# static Toybox multicall payload (expanded for networking applets).
-mke2fs -q -t ext2 -F -b 1024 -I 256 -N 384 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" 3072
+# Keep image compact but size it from staged payload so larger binaries
+# (for example QuickJS qjs) do not overflow ext2 population.
+payload_kib="$(du -sk "${STAGE_ROOT}" | awk '{print $1}')"
+# Keep a modest metadata/slack margin above staged payload size.
+img_kib=$((payload_kib + 1024))
+if [[ "${img_kib}" -lt 3072 ]]; then
+  img_kib=3072
+fi
+mke2fs -q -t ext2 -F -b 1024 -I 256 -N 384 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" "${img_kib}"
 
 mv "${TMP_IMG}" "${OUT_IMG}"
 chmod 0644 "${OUT_IMG}"
