@@ -1,6 +1,6 @@
 # Toybox Syscall Gaps
 
-Last reviewed: 2026-02-14
+Last reviewed: 2026-02-18
 
 This document tracks missing Linux syscalls needed to bring up Toybox utilities on PeetOS in a staged way.
 
@@ -9,7 +9,7 @@ For shell-specific bring-up priorities, see `docs/toybox_shell_syscalls.md`.
 ## Scope
 
 - Focus first on core file/text/process utilities (`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `ln`, `touch`, `find`, `tar`).
-- Defer network and system-management tools until core userspace is stable.
+- Network/system-management tools were initially deferred; seventh-wave staging now includes baseline networking bring-up (`netcat`/`wget`/`httpd`/`sntp`/`microcom`/`ftpget`/`ping`) while admin-heavy tooling remains deferred.
 - Use `kernel/src/syscall.rs` as current implemented surface.
 
 ## Current Kernel Syscalls (Baseline)
@@ -61,19 +61,20 @@ Fourth-wave applets (2 additions):
 
 Fifth-wave applets (35 additions, no new syscalls required):
 - posix: `chgrp`, `cksum`, `cpio`, `getconf`, `iconv`, `link`, `time`, `tsort`, `uudecode`, `uuencode`, `ulimit`
-- other: `ascii`, `base64`, `bunzip2`, `bzcat`, `clear`, `dos2unix`, `unix2dos`, `factor`, `fmt`, `getopt`, `hd`, `help`, `mcookie`, `nologin`, `pwgen`, `readelf`, `reset`, `setsid`, `shred`, `shuf`, `ts`, `usleep`, `uuidgen`, `xxd`
-- pending: `hexdump`, `csplit`
+- other: `ascii`, `base64`, `bunzip2`, `bzcat`, `clear`, `dos2unix`, `unix2dos`, `factor`, `fmt`, `getopt`, `hd`, `help`, `mcookie`, `nologin`, `pwgen`, `readelf`, `reset`, `setsid`, `shred`, `shuf`, `ts`, `usleep`, `uuidgen`, `xxd`, `hexdump`, `csplit`
 
-Sixth-wave applets (15 additions, no new syscalls required):
+Sixth-wave applets (16 additions, no new syscalls required):
 - posix aliases: `whoami` (id.c alias), `arch` (uname.c), `egrep`/`fgrep` (grep.c aliases), `crc32` (cksum.c), `[` test glue (test.c alias)
 - lsb: `zcat` (gzip.c), `sha1sum`/`sha224sum`/`sha256sum`/`sha384sum`/`sha512sum` (md5sum.c aliases)
 - other: `base32` (base64.c), `unicode` (ascii.c), `sha3sum` (sha3sum.c), `mountpoint` (mountpoint.c)
 
-Seventh-wave networking applets (6 additions, staged for BSD sockets + poll/recvmsg):
+Seventh-wave networking applets (7 additions, staged for BSD sockets + poll/recvmsg):
 - TCP/UDP tools: `netcat` (SOCK_STREAM/DGRAM), `wget` (TCP), `httpd` (TCP server), `ftpget` (TCP dual-channel), `sntp` (UDP)
 - Serial/TTY: `microcom` (uses poll() on TTY, not network)
+- ICMP: `ping` (SOCK_DGRAM + `IPPROTO_ICMP` via ICMP datagram socket support)
+- dedicated smoke target: `make run-ping-smoke` (feature `musl-ext2-ping-smoke`) validates userspace `toybox ping` against `10.0.2.2`
 - All use `xgetaddrinfo()` → musl `getaddrinfo()` which handles numeric IPs via `inet_pton()` without DNS; hostname resolution requires `/etc/resolv.conf` (staged with QEMU DNS forwarder at 10.0.2.3)
-- Blocked applets (not staged): `ping` (needs IPPROTO_ICMP socket support), `host` (needs libresolv)
+- Blocked applets (not staged): `host` (needs libresolv)
 - Interactive networking available via `make run-net-shell` (ext2 shell + E1000)
 
 P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`)
@@ -101,15 +102,218 @@ Third-wave syscalls now implemented:
 Virtual device additions:
 - `/dev/urandom` - done (XORshift PRNG read, DevNull-like write)
 
-## Latest Smoke Observation (2026-02-13)
+## Latest Smoke Observations (2026-02-18)
 
-From `scripts/run_toybox_next_smoke.sh` on `KERNEL_FEATURES=musl-ext2-cmd-smoke`
-after adding `symlinkat`/`copy_file_range`:
+From `scripts/run_toybox_next_smoke.sh` on `KERNEL_FEATURES=musl-ext2-cmd-smoke`:
 
-- Observed syscall stub hits:
-  - none
+- Observed syscall stub hits: none
+- No additional unknown-syscall logs were emitted in that run (legacy syscall numbers now map to named handlers/stubs).
 
-No additional unknown-syscall logs were emitted in that run (legacy syscall numbers now map to named handlers/stubs).
+From `scripts/run_toybox_ping_smoke.sh` / `make run-ping-smoke` on `KERNEL_FEATURES=musl-ext2-ping-smoke`:
+
+- Completion marker observed: `[musl-ext2-ping-smoke] done`
+- Failure marker not observed: `[musl-ext2-ping-smoke] failures`
+- Reply evidence observed: `bytes from 10.0.2.2`
+- Implementation note: ICMP datagram socket send path now normalizes/recomputes ICMP checksum for toybox `ping` payloads before transmit.
+
+## Definitive Remaining Applets + Blockers (2026-02-18)
+
+This section is generated from the current tree by diffing:
+
+- all Toybox applets discovered in `toybox/toybox-src/generated/newtoys.h`
+- enabled symbols in `toybox/configs/shell-core.config`
+
+Summary:
+
+- total applets discovered: 350
+- currently staged/enabled: 143
+- remaining (unstaged): 181
+
+Blocker buckets (high-confidence):
+
+1. Explicitly blocked in this document:
+- `host` (needs `libresolv`)
+
+2. Blocked by pending mount/namespace syscall surface (P2):
+- `mount`, `umount`, `switch_root`, `pivot_root`, `nsenter`, `unshare`
+
+3. Blocked by pending scheduler/ioprio syscall surface (P2):
+- `taskset`, `uclampset`, `ionice`, `iorenice`
+
+4. Blocked by pending module syscall surface (P2):
+- `insmod`, `lsmod`, `modinfo`, `modprobe`, `rmmod`
+
+5. Remaining unstaged applets (165) are not enabled in `shell-core.config` yet; per-applet blockers are not fully triaged in this doc and may include the pending syscall/subsystem items listed in P1/P2.
+
+Remaining unstaged applets (165):
+
+```text
+acpi
+addgroup
+adduser
+arp
+arping
+bc
+blkdiscard
+blkid
+blockdev
+bootchartd
+brctl
+chattr
+chcon
+chroot
+chrt
+chsh
+chvt
+count
+crond
+crontab
+deallocvt
+delgroup
+deluser
+demo_many_options
+demo_number
+demo_scankey
+demo_utf8towc
+devmem
+dhcp
+dhcp6
+dhcpd
+dmesg
+dnsdomainname
+dumpleases
+eject
+fallocate
+fdisk
+flock
+freeramdisk
+fsck
+fsfreeze
+fstype
+fsync
+ftpput
+getenforce
+getfattr
+getty
+gitcheckout
+gitclone
+gitfetch
+gitinit
+gitremote
+gpiodetect
+gpiofind
+gpioget
+gpioinfo
+gpioset
+groupadd
+groupdel
+halt
+hello
+hexedit
+hostid
+hwclock
+i2cdetect
+i2cdump
+i2cget
+i2cset
+i2ctransfer
+ifconfig
+init
+inotifyd
+iotop
+ip
+ipaddr
+ipcrm
+ipcs
+iplink
+iproute
+iprule
+iptunnel
+killall
+killall5
+klogd
+last
+linux32
+load_policy
+log
+logger
+login
+logpath
+losetup
+lsattr
+lsof
+lspci
+lsusb
+makedevs
+man
+mdev
+memeater
+mix
+mkfifo
+mknod
+mkpasswd
+mkswap
+more
+nbd-client
+nbd-server
+nbd_client
+nbd_server
+netstat
+nice
+oneit
+openvt
+partprobe
+passwd
+pgrep
+pidof
+pkill
+pmap
+poweroff
+ps
+pwdx
+readahead
+reboot
+renice
+restorecon
+rfkill
+route
+rtcwake
+runcon
+sendevent
+setenforce
+setfattr
+skeleton
+skeleton_alias
+strace
+stty
+su
+sulogin
+swapoff
+swapon
+sysctl
+syslogd
+tcpsvd
+telnet
+telnetd
+tftp
+tftpd
+timeout
+top
+traceroute
+traceroute6
+tunctl
+udpsvd
+useradd
+userdel
+vconfig
+vi
+vmstat
+w
+watch
+watchdog
+who
+xzcat
+```
 
 ## Priority Backlog
 
@@ -165,10 +369,13 @@ Needed once we move beyond single-utility exec and toward richer shell flows:
 
 These depend on kernel subsystems not yet complete or intentionally out of scope for early bring-up.
 
-1. Networking tools (`wget`, `ping`, `ifconfig`, `netcat`, etc.):
-- `socket` (41), `connect` (42), `accept` (43), `sendto` (44), `recvfrom` (45)
-- `bind` (49), `listen` (50), `setsockopt` (54), `getsockopt` (55) — now implemented
-- `poll` (7), `ppoll` (271), `recvmsg` (47) — now implemented
+1. Networking tools (`wget`, `ifconfig`, `netcat`, etc.):
+- Core userspace networking syscalls needed by staged seventh-wave applets are now implemented:
+  `socket`/`connect`/`accept`/`sendto`/`recvfrom`, `bind`/`listen`/`setsockopt`/`getsockopt`, `poll`/`ppoll`/`recvmsg`.
+- Remaining blockers are now mostly subsystem/runtime level, not syscall-number gaps:
+  - resolver/library dependency for `host` (`libresolv`)
+  - net-admin/ioctl/netlink-heavy tools (`ifconfig`, `ip*`, `route`, etc.)
+  - advanced diagnostic/raw-socket behavior (for example traceroute-family semantics)
 
 2. Mount/admin tools (`mount`, `umount`, `switch_root`, namespace tooling):
 - `mount` (165), `umount2` (166), `pivot_root` (155), `setns` (308), `unshare` (272)
@@ -193,6 +400,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 - `nproc`: `sched_getaffinity`
 - `df`: `statfs`
 - `sync`: `sync` (162)
+- `ping`: `socket` (`SOCK_DGRAM` + `IPPROTO_ICMP`), `sendto`, `recvmsg`/`recvfrom`, `poll`/`ppoll`
 - `ps`/`time` and process wrappers: `wait4`, session/process-group syscalls
 - `cpio`: `open`, `read`, `write`, `stat`, `fchown`, `fchmod`, `mkdir`, `symlink`, `utimensat`, `fork`
 - `iconv`: `read`, `write` (musl self-contained iconv)
@@ -203,16 +411,17 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 
 ## Execution Plan
 
-1. Implement remaining P0 metadata/device syscall stubs and kernel-side minimal semantics.
-2. Expand/validate the feature-gated Toybox smoke image beyond the current shell-core applets (`echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`) as syscall gaps close.
-3. Validate each staged applet under `execve` from ext2 and record missing syscalls from serial logs.
-4. Move to P1 only after P0 core utility set is stable.
+1. Keep the generated applet inventory (`newtoys.h` vs `shell-core.config`) current and treat it as the source of truth for "remaining" utilities.
+2. Implement known blocker syscall/subsystem gaps first (P1/P2 items), then promote directly affected applets into the staged config.
+3. Expand/validate the feature-gated Toybox smoke image in waves and record failures by applet + syscall/subsystem dependency.
+4. Triage the 165 "unstaged/unknown blocker" applets into concrete blocker classes (syscall, VFS/device capability, runtime/lib dependency, or explicit out-of-scope).
 
 ## Limitations / Simplifications
 
 - This is a staged gap list, not full Linux parity.
 - Some Toybox applets live under `toys/pending/`; those may need extra work unrelated to syscalls.
 - Syscall implementation alone is not sufficient for deferred areas (networking, mount namespaces, full tty/pty, multi-process job control).
+- `ping` smoke currently asserts only the QEMU user-mode NAT gateway path (`10.0.2.2`); broader ICMP interoperability is not yet a pass criterion in this document.
 - Newly added P0 handlers are baseline-only:
   - `access`/`faccessat` checks use current VFS metadata and simple uid/gid permission selection.
   - `linkat` currently supports regular-file links only; tmpfs path is a pragmatic clone-style fallback.

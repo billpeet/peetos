@@ -50,6 +50,14 @@ Scripted command smoke path (boots a shell-script launcher and captures syscall-
 scripts/run_toybox_next_smoke.sh
 ```
 
+Scripted ping smoke path (boots a shell-script launcher and validates userspace ICMP ping through E1000):
+
+```bash
+scripts/run_toybox_ping_smoke.sh
+# or:
+make run-ping-smoke
+```
+
 Common overrides:
 
 ```bash
@@ -72,3 +80,4 @@ make musl CC=clang AR=llvm-ar RANLIB=llvm-ranlib
 - The default repository tests intentionally avoid networked musl builds and instead validate script behavior/pathing.
 - `KERNEL_FEATURES=musl-ext2-exec` currently requires `PROFILE=release` in this tree because debug kernels can exceed stage2 low-memory kernel staging limits.
 - ext2 shell runtime/smoke flows currently expect attaching `user/sample_ext2_musl.img` as a second block device in QEMU.
+- Ping smoke currently validates the QEMU user-mode NAT gateway (`10.0.2.2`) and is not yet a general network interoperability test suite.

@@ -272,7 +272,10 @@ const SOL_SOCKET: u32 = 1;
 const SO_ERROR: u32 = 4;
 const SO_REUSEADDR: u32 = 2;
 const SO_KEEPALIVE: u32 = 9;
+const IPPROTO_ICMP: u32 = 1;
+const IPPROTO_IP: u32 = 0;
 const IPPROTO_TCP: u32 = 6;
+const IPPROTO_UDP: u32 = 17;
 const TCP_NODELAY: u32 = 1;
 
 const F_DUPFD: u32 = 0;
@@ -5959,7 +5962,7 @@ fn fd_to_socket_id(task_ptr: *mut task::Task, fd: i32) -> Result<(usize, u16), i
 fn sys_socket(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let domain = call.arg(0) as u32;
     let raw_type = call.arg(1) as u32;
-    let _protocol = call.arg(2) as u32;
+    let protocol = call.arg(2) as u32;
 
     if domain != AF_INET {
         return -EAFNOSUPPORT;
@@ -5970,7 +5973,17 @@ fn sys_socket(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EPROTONOSUPPORT;
     }
 
-    let socket_id = match socket::socket_create(base_type) {
+    // Accept protocol defaults (0/IPPROTO_IP) and protocol-specific requests.
+    let normalized_protocol = if protocol == IPPROTO_IP { 0 } else { protocol };
+    if normalized_protocol != 0
+        && normalized_protocol != IPPROTO_TCP
+        && normalized_protocol != IPPROTO_UDP
+        && normalized_protocol != IPPROTO_ICMP
+    {
+        return -EPROTONOSUPPORT;
+    }
+
+    let socket_id = match socket::socket_create(base_type, normalized_protocol) {
         Ok(id) => id,
         Err(e) => return e,
     };

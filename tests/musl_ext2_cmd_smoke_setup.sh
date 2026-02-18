@@ -28,7 +28,7 @@ if ! grep -q '"bin/next_smoke.sh"' "${LAUNCHER}"; then
   exit 1
 fi
 
-for token in 'toybox cp' 'toybox mv' 'toybox ln' 'toybox touch' 'next_smoke.sh' 'musl-ext2-cmd-smoke] failures'; do
+for token in 'toybox cp' 'toybox mv' 'toybox ln' 'toybox touch' 'toybox ping' 'next_smoke.sh' 'musl-ext2-cmd-smoke] failures'; do
   if ! grep -q "${token}" "${ROOT_DIR}/scripts/build_ext2_musl_execve.sh"; then
     echo "ext2 smoke script payload is missing ${token}" >&2
     exit 1

@@ -44,6 +44,7 @@ Key references in the C project:
 - Baseline keyboard/TTY input is now wired in-kernel: PS/2 IRQ1 set-1 scancode decode feeds a canonical line-buffered console input path used by user `read` on stdio.
 - Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, basic pixel/clear primitives, and a styled framebuffer terminal mirror with 8x16 VGA-compatible bitmap glyphs, baseline ANSI color handling, cursor blink, and preset themes.
 - Stage-9 userspace bootstrap plumbing is now present: musl source/sysroot build (`make musl-fetch`, `make musl-configure`, `make musl`) and toybox staging (`make toybox-fetch`, `make toybox`) with a shell-core Toybox set (`sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`) integrated into the ext2 `execve` smoke path.
+- Toybox networking applet staging now includes `ping` in addition to `netcat`/`wget`/`httpd`/`sntp`/`microcom`/`ftpget`, backed by AF_INET datagram ICMP socket support in the kernel socket layer.
 - Remaining placeholder crates are `net`, `syscall`, and `userabi`; advanced device drivers and full user space are still pending.
 
 ## Documentation
@@ -122,6 +123,7 @@ make toybox
 scripts/build_toybox_sh.sh
 scripts/build_toybox_core.sh
 scripts/run_toybox_next_smoke.sh
+scripts/run_toybox_ping_smoke.sh
 ```
 
 Boot a musl-linked runtime smoke program (`echo`-style static binary) as the initial user task:
@@ -152,6 +154,7 @@ Shell shortcut targets:
 ```bash
 make run-shell
 make run-shell-smoke
+make run-ping-smoke
 ```
 
 Expected serial output includes `[musl-ext2-exec] launching interactive toybox sh` when the ext2 handoff succeeds.

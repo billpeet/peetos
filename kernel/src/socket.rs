@@ -1,5 +1,6 @@
 use net::{Ipv4Addr, NetError};
 
+use crate::icmp;
 use crate::serial_println;
 use crate::{tcp, udp};
 
@@ -13,6 +14,11 @@ const TCP_TIMEOUT_MS: u64 = 30_000;
 // Socket protocol types
 const PROTO_TCP: u8 = 1;
 const PROTO_UDP: u8 = 2;
+const PROTO_ICMP: u8 = 3;
+
+const IPPROTO_ICMP: u32 = 1;
+const IPPROTO_TCP: u32 = 6;
+const IPPROTO_UDP: u32 = 17;
 
 // Socket states
 const STATE_CREATED: u8 = 0;
@@ -139,26 +145,51 @@ fn get_socket(id: u16) -> Result<&'static mut SocketEntry, i64> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Create a new socket. `sock_type`: 1=SOCK_STREAM(TCP), 2=SOCK_DGRAM(UDP).
-pub fn socket_create(sock_type: u32) -> Result<u16, i64> {
-    let protocol = match sock_type {
-        1 => PROTO_TCP,
-        2 => PROTO_UDP,
+/// Create a new socket. `sock_type`: 1=SOCK_STREAM, 2=SOCK_DGRAM.
+pub fn socket_create(sock_type: u32, protocol: u32) -> Result<u16, i64> {
+    let proto = match sock_type {
+        1 => {
+            if protocol == 0 || protocol == IPPROTO_TCP {
+                PROTO_TCP
+            } else {
+                return Err(-EPROTONOSUPPORT);
+            }
+        }
+        2 => {
+            if protocol == 0 || protocol == IPPROTO_UDP {
+                PROTO_UDP
+            } else if protocol == IPPROTO_ICMP {
+                PROTO_ICMP
+            } else {
+                return Err(-EPROTONOSUPPORT);
+            }
+        }
         _ => return Err(-EPROTONOSUPPORT),
     };
 
     let id = alloc_socket().ok_or(-ENOMEM)?;
+    let icmp_handle = if proto == PROTO_ICMP {
+        Some(icmp::socket_open().map_err(|e| -net_to_errno(e))? as u16)
+    } else {
+        None
+    };
     unsafe {
         let s = &mut SOCKETS[id as usize];
         s.reset();
         s.used = true;
-        s.protocol = protocol;
+        s.protocol = proto;
         s.state = STATE_CREATED;
+        s.handle = icmp_handle.unwrap_or(0);
     }
     serial_println!(
         "[SOCK] Created socket {} ({})",
         id,
-        if protocol == PROTO_TCP { "TCP" } else { "UDP" }
+        match proto {
+            PROTO_TCP => "TCP",
+            PROTO_UDP => "UDP",
+            PROTO_ICMP => "ICMP",
+            _ => "?",
+        }
     );
     Ok(id)
 }
@@ -174,6 +205,12 @@ pub fn socket_bind(id: u16, _ip: &Ipv4Addr, port: u16) -> Result<(), i64> {
         let handle = udp::bind(port).map_err(|e| -net_to_errno(e))?;
         s.handle = handle as u16;
         s.local_port = port;
+        s.state = STATE_BOUND;
+    } else if s.protocol == PROTO_ICMP {
+        // ICMP datagram sockets use protocol dispatch, not ports.
+        if port != 0 {
+            return Err(-EINVAL);
+        }
         s.state = STATE_BOUND;
     } else {
         // TCP: just record the port, actual binding happens at listen/connect
@@ -208,7 +245,7 @@ pub fn socket_listen(id: u16, _backlog: u32) -> Result<(), i64> {
 pub fn socket_connect(id: u16, ip: &Ipv4Addr, port: u16, nonblocking: bool) -> Result<(), i64> {
     let s = get_socket(id)?;
 
-    if s.protocol == PROTO_UDP {
+    if s.protocol == PROTO_UDP || s.protocol == PROTO_ICMP {
         // UDP "connect" just stores the default destination
         s.remote_ip.copy_from(ip);
         s.remote_port = port;
@@ -310,7 +347,7 @@ pub fn socket_send(id: u16, data: &[u8], nonblocking: bool) -> Result<usize, i64
             return Err(-EAGAIN);
         }
         tcp::send(handle, data).map_err(|e| -net_to_errno(e))
-    } else {
+    } else if s.protocol == PROTO_UDP {
         // UDP send to connected destination
         if s.remote_ip.is_zero() && s.remote_port == 0 {
             return Err(-ENOTCONN);
@@ -332,12 +369,27 @@ pub fn socket_send(id: u16, data: &[u8], nonblocking: bool) -> Result<usize, i64
             udp::send_from(handle, &rip, rport, data).map_err(|e| -net_to_errno(e))?;
         }
         Ok(data.len())
+    } else {
+        // ICMP datagram send to connected destination.
+        if s.remote_ip.is_zero() {
+            return Err(-ENOTCONN);
+        }
+        let rip = s.remote_ip;
+        let handle = s.handle as usize;
+        icmp::socket_sendto(handle, &rip, data).map_err(|e| -net_to_errno(e))?;
+        Ok(data.len())
     }
 }
 
 /// Send data to a specific destination (UDP sendto).
 pub fn socket_sendto(id: u16, data: &[u8], ip: &Ipv4Addr, port: u16) -> Result<usize, i64> {
     let s = get_socket(id)?;
+    if s.protocol == PROTO_ICMP {
+        let handle = s.handle as usize;
+        icmp::socket_sendto(handle, ip, data).map_err(|e| -net_to_errno(e))?;
+        return Ok(data.len());
+    }
+
     if s.protocol != PROTO_UDP {
         // TCP ignores dest addr in sendto, just use send
         return socket_send(id, data, false);
@@ -389,7 +441,7 @@ pub fn socket_recv(id: u16, buf: &mut [u8], nonblocking: bool) -> Result<usize, 
                 Err(e) => Err(-net_to_errno(e)),
             }
         }
-    } else {
+    } else if s.protocol == PROTO_UDP {
         // UDP recv
         let handle = s.handle as usize;
         if s.state == STATE_CREATED {
@@ -404,6 +456,21 @@ pub fn socket_recv(id: u16, buf: &mut [u8], nonblocking: bool) -> Result<usize, 
         } else {
             match udp::recv_timeout(handle, buf, TCP_TIMEOUT_MS) {
                 Ok((n, _, _)) => Ok(n),
+                Err(NetError::Timeout) => Err(-EAGAIN),
+                Err(e) => Err(-net_to_errno(e)),
+            }
+        }
+    } else {
+        // ICMP recv
+        let handle = s.handle as usize;
+        if nonblocking {
+            match icmp::socket_recv(handle, buf) {
+                Some((n, _)) => Ok(n),
+                None => Err(-EAGAIN),
+            }
+        } else {
+            match icmp::socket_recv_timeout(handle, buf, TCP_TIMEOUT_MS) {
+                Ok((n, _)) => Ok(n),
                 Err(NetError::Timeout) => Err(-EAGAIN),
                 Err(e) => Err(-net_to_errno(e)),
             }
@@ -446,7 +513,7 @@ pub fn socket_recvfrom(
                 Err(e) => Err(-net_to_errno(e)),
             }
         }
-    } else {
+    } else if s.protocol == PROTO_UDP {
         let handle = s.handle as usize;
         if s.state == STATE_CREATED {
             return Err(-EINVAL);
@@ -460,6 +527,20 @@ pub fn socket_recvfrom(
         } else {
             match udp::recv_timeout(handle, buf, TCP_TIMEOUT_MS) {
                 Ok((n, ip, port)) => Ok((n, ip, port)),
+                Err(NetError::Timeout) => Err(-EAGAIN),
+                Err(e) => Err(-net_to_errno(e)),
+            }
+        }
+    } else {
+        let handle = s.handle as usize;
+        if nonblocking {
+            match icmp::socket_recv(handle, buf) {
+                Some((n, ip)) => Ok((n, ip, 0)),
+                None => Err(-EAGAIN),
+            }
+        } else {
+            match icmp::socket_recv_timeout(handle, buf, TCP_TIMEOUT_MS) {
+                Ok((n, ip)) => Ok((n, ip, 0)),
                 Err(NetError::Timeout) => Err(-EAGAIN),
                 Err(e) => Err(-net_to_errno(e)),
             }
@@ -508,7 +589,7 @@ pub fn socket_poll_events(id: u16) -> u16 {
             }
             _ => {}
         }
-    } else {
+    } else if s.protocol == PROTO_UDP {
         // UDP
         let handle = s.handle as usize;
         if s.state == STATE_BOUND || s.state == STATE_CONNECTED {
@@ -517,6 +598,12 @@ pub fn socket_poll_events(id: u16) -> u16 {
             }
             events |= POLLOUT; // UDP can always send
         }
+    } else if s.protocol == PROTO_ICMP {
+        let handle = s.handle as usize;
+        if icmp::socket_rx_pending(handle) > 0 {
+            events |= POLLIN;
+        }
+        events |= POLLOUT;
     }
 
     events
@@ -552,6 +639,8 @@ pub fn socket_close(id: u16) -> Result<(), i64> {
             if s.state == STATE_BOUND || s.state == STATE_CONNECTED {
                 udp::unbind(s.handle as usize);
             }
+        } else if s.protocol == PROTO_ICMP {
+            icmp::socket_close(s.handle as usize);
         }
 
         serial_println!("[SOCK] Closed socket {}", id);
@@ -585,7 +674,7 @@ pub fn smoke_test() {
     serial_println!("[SOCK] Running socket smoke test...");
 
     // Test 1: TCP socket → bind → listen → close
-    match socket_create(1) {
+    match socket_create(1, IPPROTO_TCP) {
         Ok(id) => {
             serial_println!("[SOCK] Smoke: created TCP socket {}", id);
             match socket_bind(id, &Ipv4Addr::ZERO, 8080) {
@@ -603,7 +692,7 @@ pub fn smoke_test() {
     }
 
     // Test 2: UDP socket → bind → close
-    match socket_create(2) {
+    match socket_create(2, IPPROTO_UDP) {
         Ok(id) => {
             serial_println!("[SOCK] Smoke: created UDP socket {}", id);
             match socket_bind(id, &Ipv4Addr::ZERO, 9090) {
@@ -617,7 +706,7 @@ pub fn smoke_test() {
     }
 
     // Test 3: TCP connect to gateway (exercises active open path)
-    match socket_create(1) {
+    match socket_create(1, IPPROTO_TCP) {
         Ok(id) => {
             serial_println!("[SOCK] Smoke: attempting connect to 10.0.2.2:80");
             let target = Ipv4Addr::new(10, 0, 2, 2);

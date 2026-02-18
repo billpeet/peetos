@@ -1,5 +1,5 @@
 use arch_x86_64::pit;
-use net::{htons, net_checksum, ntohs, Ipv4Addr, IP_PROTO_ICMP};
+use net::{htons, net_checksum, ntohs, Ipv4Addr, NetError, IP_PROTO_ICMP};
 
 use crate::ipv4;
 use crate::serial_println;
@@ -12,6 +12,9 @@ const ICMP_TYPE_TIME_EXCEEDED: u8 = 11;
 const ICMP_ECHO_HDR_LEN: usize = 8;
 const ICMP_MAX_PACKET: usize = 1500;
 const ICMP_ECHO_DATA_SIZE: usize = 56;
+const ICMP_SOCKET_MAX: usize = 8;
+const ICMP_SOCKET_RX_QUEUE: usize = 4;
+const ICMP_SOCKET_RX_BUF: usize = 4096;
 
 struct PingState {
     target: Ipv4Addr,
@@ -35,6 +38,218 @@ static mut PING_STATE: PingState = PingState {
 
 static mut PING_IDENTIFIER: u16 = 1;
 static mut PING_SEQUENCE: u16 = 0;
+
+struct IcmpSocketRxEntry {
+    data: [u8; ICMP_SOCKET_RX_BUF],
+    len: usize,
+    src_ip: Ipv4Addr,
+    used: bool,
+}
+
+impl IcmpSocketRxEntry {
+    const fn empty() -> Self {
+        Self {
+            data: [0u8; ICMP_SOCKET_RX_BUF],
+            len: 0,
+            src_ip: Ipv4Addr::ZERO,
+            used: false,
+        }
+    }
+}
+
+struct IcmpSocketBinding {
+    active: bool,
+    rx_queue: [IcmpSocketRxEntry; ICMP_SOCKET_RX_QUEUE],
+    rx_head: usize,
+    rx_tail: usize,
+    rx_count: usize,
+}
+
+impl IcmpSocketBinding {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            rx_queue: [
+                IcmpSocketRxEntry::empty(),
+                IcmpSocketRxEntry::empty(),
+                IcmpSocketRxEntry::empty(),
+                IcmpSocketRxEntry::empty(),
+            ],
+            rx_head: 0,
+            rx_tail: 0,
+            rx_count: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.active = false;
+        self.rx_head = 0;
+        self.rx_tail = 0;
+        self.rx_count = 0;
+        for slot in self.rx_queue.iter_mut() {
+            slot.used = false;
+            slot.len = 0;
+            slot.src_ip = Ipv4Addr::ZERO;
+        }
+    }
+
+    fn enqueue(&mut self, data: &[u8], src_ip: &Ipv4Addr) -> bool {
+        if self.rx_count >= ICMP_SOCKET_RX_QUEUE {
+            return false;
+        }
+        let slot = &mut self.rx_queue[self.rx_tail];
+        let copy_len = data.len().min(ICMP_SOCKET_RX_BUF);
+        slot.data[..copy_len].copy_from_slice(&data[..copy_len]);
+        slot.len = copy_len;
+        slot.src_ip = *src_ip;
+        slot.used = true;
+        self.rx_tail = (self.rx_tail + 1) % ICMP_SOCKET_RX_QUEUE;
+        self.rx_count += 1;
+        true
+    }
+
+    fn peek_data(&self) -> Option<&[u8]> {
+        if self.rx_count == 0 {
+            return None;
+        }
+        let slot = &self.rx_queue[self.rx_head];
+        if !slot.used {
+            return None;
+        }
+        Some(&slot.data[..slot.len])
+    }
+
+    fn dequeue(&mut self) -> Option<(usize, Ipv4Addr)> {
+        if self.rx_count == 0 {
+            return None;
+        }
+        let slot = &self.rx_queue[self.rx_head];
+        if !slot.used {
+            return None;
+        }
+        let len = slot.len;
+        let src_ip = slot.src_ip;
+        self.rx_head = (self.rx_head + 1) % ICMP_SOCKET_RX_QUEUE;
+        self.rx_count -= 1;
+        Some((len, src_ip))
+    }
+}
+
+macro_rules! empty_icmp_sockets {
+    ($n:expr) => {{
+        const EMPTY: IcmpSocketBinding = IcmpSocketBinding::empty();
+        [EMPTY; $n]
+    }};
+}
+
+static mut ICMP_SOCKETS: [IcmpSocketBinding; ICMP_SOCKET_MAX] = empty_icmp_sockets!(ICMP_SOCKET_MAX);
+
+fn enqueue_to_icmp_sockets(payload: &[u8], src: &Ipv4Addr) {
+    unsafe {
+        for binding in ICMP_SOCKETS.iter_mut() {
+            if binding.active {
+                let _ = binding.enqueue(payload, src);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ICMP datagram socket bridge
+// ---------------------------------------------------------------------------
+
+pub fn socket_open() -> Result<usize, NetError> {
+    unsafe {
+        for (i, binding) in ICMP_SOCKETS.iter_mut().enumerate() {
+            if !binding.active {
+                binding.reset();
+                binding.active = true;
+                return Ok(i);
+            }
+        }
+    }
+    Err(NetError::NoResources)
+}
+
+pub fn socket_close(handle: usize) {
+    unsafe {
+        if handle < ICMP_SOCKET_MAX {
+            ICMP_SOCKETS[handle].reset();
+        }
+    }
+}
+
+pub fn socket_sendto(handle: usize, dst: &Ipv4Addr, payload: &[u8]) -> Result<(), NetError> {
+    unsafe {
+        if handle >= ICMP_SOCKET_MAX || !ICMP_SOCKETS[handle].active {
+            return Err(NetError::NotInitialized);
+        }
+    }
+
+    if payload.len() > ICMP_MAX_PACKET {
+        return Err(NetError::BufferTooLarge);
+    }
+
+    // Toybox ping uses SOCK_DGRAM/IPPROTO_ICMP and does not provide a final
+    // wire checksum. Normalize the packet so it goes out with a valid ICMP
+    // checksum.
+    let mut packet = [0u8; ICMP_MAX_PACKET];
+    let total_len = payload.len();
+    packet[..total_len].copy_from_slice(payload);
+    if total_len >= 4 {
+        packet[2] = 0;
+        packet[3] = 0;
+        let cksum = net_checksum(&packet[..total_len]);
+        packet[2] = (cksum & 0xFF) as u8;
+        packet[3] = ((cksum >> 8) & 0xFF) as u8;
+    }
+
+    ipv4::send(dst, IP_PROTO_ICMP, &packet[..total_len])
+}
+
+pub fn socket_recv(handle: usize, buf: &mut [u8]) -> Option<(usize, Ipv4Addr)> {
+    unsafe {
+        if handle >= ICMP_SOCKET_MAX || !ICMP_SOCKETS[handle].active {
+            return None;
+        }
+        let binding = &mut ICMP_SOCKETS[handle];
+        if let Some(data) = binding.peek_data() {
+            let copy_len = data.len().min(buf.len());
+            buf[..copy_len].copy_from_slice(&data[..copy_len]);
+            if let Some((len, src_ip)) = binding.dequeue() {
+                return Some((copy_len.min(len), src_ip));
+            }
+        }
+    }
+    None
+}
+
+pub fn socket_recv_timeout(
+    handle: usize,
+    buf: &mut [u8],
+    timeout_ms: u64,
+) -> Result<(usize, Ipv4Addr), NetError> {
+    let start = pit::uptime_ms();
+    loop {
+        if let Some(result) = socket_recv(handle, buf) {
+            return Ok(result);
+        }
+        if (pit::uptime_ms() - start) >= timeout_ms {
+            return Err(NetError::Timeout);
+        }
+        crate::e1000::poll();
+        pit::sleep_ms(1);
+    }
+}
+
+pub fn socket_rx_pending(handle: usize) -> usize {
+    unsafe {
+        if handle >= ICMP_SOCKET_MAX || !ICMP_SOCKETS[handle].active {
+            return 0;
+        }
+        ICMP_SOCKETS[handle].rx_count
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Send
@@ -221,6 +436,12 @@ pub fn icmp_ip_receive(payload: &[u8], src: &Ipv4Addr, _dst: &Ipv4Addr) {
         ICMP_TYPE_TIME_EXCEEDED => handle_time_exceeded(payload, src),
         _ => {}
     }
+
+    // Feed userspace ICMP datagram sockets (toybox ping path). Skip inbound
+    // echo requests so user ping readers don't treat them as replies.
+    if icmp_type != ICMP_TYPE_ECHO_REQUEST {
+        enqueue_to_icmp_sockets(payload, src);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +507,9 @@ pub fn init() {
     unsafe {
         PING_STATE.pending = false;
         PING_STATE.received = false;
+        for binding in ICMP_SOCKETS.iter_mut() {
+            binding.reset();
+        }
     }
 
     // Register with IP layer

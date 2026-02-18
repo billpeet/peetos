@@ -19,6 +19,7 @@ USER_INTERP_OBJ := $(BUILD_DIR)/user_ld_peetos.o
 USER_MUSL_SMOKE_ELF := user/musl_echo.elf
 USER_MUSL_EXT2_INIT_ELF := user/musl_execve_ext2.elf
 USER_MUSL_EXT2_SMOKE_ELF := user/musl_execve_ext2_smoke.elf
+USER_MUSL_EXT2_PING_SMOKE_ELF := user/musl_execve_ext2_ping_smoke.elf
 USER_EXT2_MUSL_IMG := user/sample_ext2_musl.img
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
@@ -63,7 +64,7 @@ else
 CARGO_FEATURES :=
 endif
 
-.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke clean run run-current run-image run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke test ext2-image \
+.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke clean run run-current run-image run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke test ext2-image \
 	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
 	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info run-shell-smoke
 
@@ -119,6 +120,9 @@ $(USER_MUSL_EXT2_INIT_ELF): user/musl_execve_ext2.c $(USER_MUSL_SMOKE_SCRIPT)
 $(USER_MUSL_EXT2_SMOKE_ELF): user/musl_execve_ext2_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
 
+$(USER_MUSL_EXT2_PING_SMOKE_ELF): user/musl_execve_ext2_ping_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
+	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
+
 $(USER_EXT2_MUSL_IMG): $(USER_EXT2_MUSL_SCRIPT) $(USER_TOYBOX_CORE_SCRIPT) toybox/Makefile toybox/fetch-toybox.sh toybox/configs/shell-core.config user/ext2_root/hello.txt user/ext2_root/etc/motd user/ext2_root/bin/readme.txt user/ext2_root/etc/resolv.conf
 	$(USER_EXT2_MUSL_SCRIPT)
 
@@ -140,15 +144,23 @@ else
 KERNEL_MUSL_EXT2_CMD_SMOKE_DEP :=
 endif
 
+ifneq ($(findstring musl-ext2-ping-smoke,$(KERNEL_FEATURES)),)
+KERNEL_MUSL_EXT2_PING_SMOKE_DEP := $(USER_MUSL_EXT2_PING_SMOKE_ELF) $(USER_EXT2_MUSL_IMG)
+else
+KERNEL_MUSL_EXT2_PING_SMOKE_DEP :=
+endif
+
 user: $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG)
 
 user-musl-smoke: $(USER_MUSL_SMOKE_ELF)
 user-musl-ext2-exec: $(USER_MUSL_EXT2_INIT_ELF) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-cmd-smoke: $(USER_MUSL_EXT2_SMOKE_ELF) $(USER_EXT2_MUSL_IMG)
+user-musl-ext2-ping-smoke: $(USER_MUSL_EXT2_PING_SMOKE_ELF) $(USER_EXT2_MUSL_IMG)
 
-kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP)
+kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PING_SMOKE_DEP)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@case " $(KERNEL_FEATURES) " in \
+		*" musl-ext2-ping-smoke "*) init_dep="musl_execve_ext2_ping_smoke.elf" ;; \
 		*" musl-ext2-cmd-smoke "*) init_dep="musl_execve_ext2_smoke.elf" ;; \
 		*" musl-ext2-exec "*) init_dep="musl_execve_ext2.elf" ;; \
 		*" musl-smoke "*) init_dep="musl_echo.elf" ;; \
@@ -274,6 +286,9 @@ run-shell-smoke:
 		-drive id=disk1,file=$(USER_EXT2_MUSL_IMG),if=none,format=raw \
 		-device ide-hd,drive=disk1,bus=ahci.1 \
 		-serial stdio -display none -no-reboot -no-shutdown
+
+run-ping-smoke:
+	scripts/run_toybox_ping_smoke.sh
 
 test:
 	@tests/run.sh

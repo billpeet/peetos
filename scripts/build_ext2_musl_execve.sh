@@ -196,6 +196,8 @@ toybox wget --help 2>&1 | toybox head -n 1 || fail=1
 toybox ftpget --help 2>&1 | toybox head -n 1 || fail=1
 toybox sntp --help 2>&1 | toybox head -n 1 || fail=1
 toybox microcom --help 2>&1 | toybox head -n 1 || fail=1
+# ping in this toybox profile doesn't support --help, so just assert applet presence.
+toybox | toybox grep -w ping >/dev/null || fail=1
 
 echo [musl-ext2-cmd-smoke] done
 if [ "$fail" -ne 0 ]; then
@@ -203,6 +205,20 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/next_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/ping_smoke.sh" <<'EOS'
+fail=0
+target=10.0.2.2
+
+echo [musl-ext2-ping-smoke] pinging ${target}
+toybox ping -c 1 -W 2 "${target}" || fail=1
+
+echo [musl-ext2-ping-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-ping-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/ping_smoke.sh"
 
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact for QEMU smoke runs while leaving room for the
