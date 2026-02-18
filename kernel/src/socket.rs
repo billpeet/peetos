@@ -47,6 +47,7 @@ const EINPROGRESS: i64 = 115;
 
 struct SocketEntry {
     used: bool,
+    refs: u16,
     protocol: u8,
     state: u8,
     handle: u16, // tcp/udp connection/binding handle
@@ -60,6 +61,7 @@ impl SocketEntry {
     const fn empty() -> Self {
         Self {
             used: false,
+            refs: 0,
             protocol: 0,
             state: STATE_CREATED,
             handle: 0,
@@ -72,6 +74,7 @@ impl SocketEntry {
 
     fn reset(&mut self) {
         self.used = false;
+        self.refs = 0;
         self.protocol = 0;
         self.state = STATE_CREATED;
         self.handle = 0;
@@ -177,6 +180,7 @@ pub fn socket_create(sock_type: u32, protocol: u32) -> Result<u16, i64> {
         let s = &mut SOCKETS[id as usize];
         s.reset();
         s.used = true;
+        s.refs = 1;
         s.protocol = proto;
         s.state = STATE_CREATED;
         s.handle = icmp_handle.unwrap_or(0);
@@ -619,6 +623,21 @@ pub fn socket_shutdown(id: u16, _how: i32) -> Result<(), i64> {
     Ok(())
 }
 
+/// Retain a socket reference when an FD is duplicated/forked.
+pub fn socket_retain(id: u16) -> Result<(), i64> {
+    let idx = id as usize;
+    if idx >= MAX_SOCKETS {
+        return Err(-ENOTSOCK);
+    }
+    unsafe {
+        if !SOCKETS[idx].used || SOCKETS[idx].refs == 0 {
+            return Err(-ENOTSOCK);
+        }
+        SOCKETS[idx].refs = SOCKETS[idx].refs.saturating_add(1);
+    }
+    Ok(())
+}
+
 /// Close and free a socket.
 pub fn socket_close(id: u16) -> Result<(), i64> {
     let idx = id as usize;
@@ -631,6 +650,11 @@ pub fn socket_close(id: u16) -> Result<(), i64> {
         }
 
         let s = &mut SOCKETS[idx];
+        if s.refs > 1 {
+            s.refs -= 1;
+            return Ok(());
+        }
+
         if s.protocol == PROTO_TCP {
             if s.state == STATE_CONNECTED || s.state == STATE_LISTENING {
                 tcp::close(s.handle as usize);

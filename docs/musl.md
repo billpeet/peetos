@@ -74,6 +74,14 @@ scripts/run_toybox_micropython_smoke.sh
 make run-micropython-smoke
 ```
 
+Scripted Dropbear smoke path (boots a shell-script launcher and validates staged `/bin/dropbear` + `/bin/dropbearkey` on ext2):
+
+```bash
+scripts/run_toybox_dropbear_smoke.sh
+# or:
+make run-dropbear-smoke
+```
+
 Common overrides:
 
 ```bash
@@ -99,3 +107,4 @@ make musl CC=clang AR=llvm-ar RANLIB=llvm-ranlib
 - Ping smoke currently validates the QEMU user-mode NAT gateway (`10.0.2.2`) and is not yet a general network interoperability test suite.
 - QuickJS smoke currently validates staged script execution (`/mnt/ext2/tmp/test_hello.js`, `/mnt/ext2/tmp/test_math.js`) and not broader JS engine conformance.
 - MicroPython smoke currently validates staged script execution (`/mnt/ext2/tmp/test_hello.py`, `/mnt/ext2/tmp/test_math.py`) and not broader module/runtime compatibility.
+- Dropbear smoke currently validates basic tool bring-up (`dropbear -V`, `dropbearkey -h`), staged host-key usage, and daemonized startup (`dropbear ... -p 2222` with same-port bind-collision probe) only; full authenticated SSH session/interoperability testing remain pending.

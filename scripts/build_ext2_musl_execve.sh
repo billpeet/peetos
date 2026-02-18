@@ -31,6 +31,21 @@ mkdir -p "${STAGE_ROOT}/bin"
 chmod 0755 "${STAGE_ROOT}/bin/toybox"
 ln "${STAGE_ROOT}/bin/toybox" "${STAGE_ROOT}/bin/sh"
 mkdir -p "${STAGE_ROOT}/tmp"
+mkdir -p "${STAGE_ROOT}/etc" "${STAGE_ROOT}/root/.ssh" "${STAGE_ROOT}/etc/dropbear"
+
+if [[ ! -f "${STAGE_ROOT}/etc/passwd" ]]; then
+  cat > "${STAGE_ROOT}/etc/passwd" <<'EOS'
+root:x:0:0:root:/root:/bin/sh
+EOS
+  chmod 0644 "${STAGE_ROOT}/etc/passwd"
+fi
+
+if [[ ! -f "${STAGE_ROOT}/etc/group" ]]; then
+  cat > "${STAGE_ROOT}/etc/group" <<'EOS'
+root:x:0:
+EOS
+  chmod 0644 "${STAGE_ROOT}/etc/group"
+fi
 
 # Stage QuickJS interpreter + sample scripts when available.
 if [[ -x "${ROOT_DIR}/user/qjs" ]]; then
@@ -58,6 +73,20 @@ fi
 if [[ -f "${ROOT_DIR}/micropython/test_math.py" ]]; then
   cp "${ROOT_DIR}/micropython/test_math.py" "${STAGE_ROOT}/tmp/test_math.py"
   chmod 0644 "${STAGE_ROOT}/tmp/test_math.py"
+fi
+
+# Stage Dropbear binaries when available.
+if [[ -x "${ROOT_DIR}/user/dropbear" ]]; then
+  cp "${ROOT_DIR}/user/dropbear" "${STAGE_ROOT}/bin/dropbear"
+  chmod 0755 "${STAGE_ROOT}/bin/dropbear"
+fi
+if [[ -x "${ROOT_DIR}/user/dropbearkey" ]]; then
+  cp "${ROOT_DIR}/user/dropbearkey" "${STAGE_ROOT}/bin/dropbearkey"
+  chmod 0755 "${STAGE_ROOT}/bin/dropbearkey"
+fi
+if [[ -f "${ROOT_DIR}/user/dropbear_ed25519_host_key" ]]; then
+  cp "${ROOT_DIR}/user/dropbear_ed25519_host_key" "${STAGE_ROOT}/etc/dropbear/dropbear_ed25519_host_key"
+  chmod 0600 "${STAGE_ROOT}/etc/dropbear/dropbear_ed25519_host_key"
 fi
 
 # Applets are invoked as `toybox <applet>` to keep the smoke image compact.
@@ -306,6 +335,72 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/micropython_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/dropbear_smoke.sh" <<'EOS'
+fail=0
+daemon_pid=
+pidfile=/tmp/dropbear.pid
+key_path=etc/dropbear/dropbear_ed25519_host_key
+
+if [ ! -x bin/dropbear ]; then
+  echo [musl-ext2-dropbear-smoke] missing bin/dropbear
+  fail=1
+else
+  bin/dropbear -V || fail=1
+fi
+
+if [ ! -x bin/dropbearkey ]; then
+  echo [musl-ext2-dropbear-smoke] missing bin/dropbearkey
+  fail=1
+else
+  bin/dropbearkey -h >/tmp/dropbearkey_help.txt 2>&1 || fail=1
+fi
+
+if [ "$fail" -eq 0 ]; then
+  if [ ! -f "$key_path" ]; then
+    echo [musl-ext2-dropbear-smoke] missing "$key_path"
+    fail=1
+  fi
+fi
+
+if [ "$fail" -eq 0 ]; then
+  rm -f "$pidfile"
+  bin/dropbear -r "$key_path" -p 2222 -P "$pidfile" >/tmp/dropbeard.log 2>&1 || fail=1
+  sleep 2
+  if [ -f "$pidfile" ]; then
+    daemon_pid="$(cat "$pidfile" 2>/dev/null)"
+  fi
+  if [ -n "$daemon_pid" ]; then
+    echo [musl-ext2-dropbear-smoke] daemon running pid="$daemon_pid"
+    toybox kill "$daemon_pid" >/dev/null 2>&1 || true
+    daemon_pid=
+  else
+    bin/dropbear -F -r "$key_path" -p 2222 >/tmp/dropbear_probe.log 2>&1 &
+    probe_pid="$!"
+    sleep 1
+    if toybox kill -0 "$probe_pid" >/dev/null 2>&1; then
+      echo [musl-ext2-dropbear-smoke] daemon bind probe did not fail
+      toybox kill "$probe_pid" >/dev/null 2>&1 || true
+      wait "$probe_pid" >/dev/null 2>&1 || true
+      fail=1
+    else
+      wait "$probe_pid" >/dev/null 2>&1 || true
+      echo [musl-ext2-dropbear-smoke] daemon running
+    fi
+  fi
+fi
+
+if [ -n "$daemon_pid" ]; then
+  toybox kill "$daemon_pid" >/dev/null 2>&1 || true
+  wait "$daemon_pid" >/dev/null 2>&1 || true
+fi
+
+echo [musl-ext2-dropbear-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-dropbear-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/dropbear_smoke.sh"
 
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact but size it from staged payload so larger binaries

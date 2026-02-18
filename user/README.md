@@ -17,9 +17,11 @@ Related Stage-9 userspace bootstrap artifacts live outside this directory:
 - `user/musl_execve_ext2_ping_smoke.elf`: feature-gated musl launcher that runs scripted ping smoke from `/mnt/ext2/bin/ping_smoke.sh` (`KERNEL_FEATURES=musl-ext2-ping-smoke`).
 - `user/musl_execve_ext2_quickjs_smoke.elf`: feature-gated musl launcher that runs scripted QuickJS smoke from `/mnt/ext2/bin/quickjs_smoke.sh` (`KERNEL_FEATURES=musl-ext2-quickjs-smoke`).
 - `user/musl_execve_ext2_micropython_smoke.elf`: feature-gated musl launcher that runs scripted MicroPython smoke from `/mnt/ext2/bin/micropython_smoke.sh` (`KERNEL_FEATURES=musl-ext2-micropython-smoke`).
-- `user/sample_ext2_musl.img`: feature-gated ext2 image that includes `/bin/toybox` (shell/core + networking applets including `ping`) and optionally `/bin/qjs` or `/bin/micropython` + staged scripts for runtime smoke (`KERNEL_FEATURES=musl-ext2-exec` / `musl-ext2-cmd-smoke` / `musl-ext2-ping-smoke` / `musl-ext2-quickjs-smoke` / `musl-ext2-micropython-smoke`).
+- `user/musl_execve_ext2_dropbear_smoke.elf`: feature-gated musl launcher that runs scripted Dropbear smoke from `/mnt/ext2/bin/dropbear_smoke.sh` (`KERNEL_FEATURES=musl-ext2-dropbear-smoke`).
+- `user/sample_ext2_musl.img`: feature-gated ext2 image that includes `/bin/toybox` (shell/core + networking applets including `ping`) and optionally `/bin/qjs`, `/bin/micropython`, or `/bin/dropbear` + staged scripts for runtime smoke (`KERNEL_FEATURES=musl-ext2-exec` / `musl-ext2-cmd-smoke` / `musl-ext2-ping-smoke` / `musl-ext2-quickjs-smoke` / `musl-ext2-micropython-smoke` / `musl-ext2-dropbear-smoke`).
 - `user/qjs`: local staged QuickJS interpreter copy produced by `make quickjs` and inserted into ext2 as `/bin/qjs` for smoke runs.
 - `user/micropython`: local staged MicroPython interpreter copy produced by `make micropython` and inserted into ext2 as `/bin/micropython` for smoke runs.
+- `user/dropbear`, `user/dropbearkey`: local staged Dropbear daemon/keygen copies produced by `make dropbear` and inserted into ext2 as `/bin/dropbear` and `/bin/dropbearkey` for smoke runs.
 - `user/toybox_echo.elf`: optional local copy of the staged Toybox `echo` binary (`scripts/build_toybox_echo.sh`).
 - `user/toybox_sh.elf`: optional local copy of the staged Toybox `sh` binary (`scripts/build_toybox_sh.sh`).
 - `user/toybox_core.elf`: optional local copy of the staged shell-core Toybox multicall binary (`scripts/build_toybox_core.sh`).

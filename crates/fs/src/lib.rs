@@ -2712,7 +2712,17 @@ fn open_at_inner(
 
     if (flags & O_TRUNC) != 0 && inode_file_type == FileType::Regular && access != O_RDONLY {
         if !backend_mutable(inode_backend) {
-            return Err(EROFS);
+            match inode_backend {
+                // Character-device style nodes tolerate O_TRUNC as a no-op.
+                NodeBackend::DevNull
+                | NodeBackend::DevZero
+                | NodeBackend::DevConsole
+                | NodeBackend::DevUrandom
+                | NodeBackend::DevTty
+                | NodeBackend::DevPtmx
+                | NodeBackend::DevPtsSlave => {}
+                _ => return Err(EROFS),
+            }
         }
 
         match inode_backend {

@@ -86,6 +86,7 @@ const SYS_RT_SIGRETURN: u64 = 15;
 const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
 const SYS_ACCESS: u64 = 21;
+const SYS_SELECT: u64 = 23;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
 const SYS_NANOSLEEP: u64 = 35;
@@ -101,11 +102,13 @@ const SYS_SHMGET: u64 = 29;
 const SYS_SHMAT: u64 = 30;
 const SYS_SHMCTL: u64 = 31;
 const SYS_FCNTL: u64 = 72;
+const SYS_FSYNC: u64 = 74;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
 const SYS_FCHDIR: u64 = 81;
 const SYS_RENAME: u64 = 82;
 const SYS_LINK: u64 = 86;
+const SYS_UNLINK: u64 = 87;
 const SYS_READLINK: u64 = 89;
 const SYS_UMASK: u64 = 95;
 const SYS_GETTIMEOFDAY: u64 = 96;
@@ -489,6 +492,8 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_SETSID, "setsid", SyscallMode::UserTask, sys_setsid),
     syscall_def(SYS_GETSID, "getsid", SyscallMode::UserTask, sys_getsid),
     syscall_def(SYS_FCNTL, "fcntl", SyscallMode::UserTask, sys_fcntl),
+    syscall_def(SYS_FSYNC, "fsync", SyscallMode::UserTask, sys_fsync),
+    syscall_def(SYS_UNLINK, "unlink", SyscallMode::UserTask, sys_unlink),
     syscall_def(
         SYS_ARCH_PRCTL,
         "arch_prctl",
@@ -652,7 +657,8 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_sched_getaffinity,
     ),
     syscall_def(SYS_GETPGID, "getpgid", SyscallMode::UserTask, sys_getpgid),
-    // Poll syscalls
+    // Poll/select syscalls
+    syscall_def(SYS_SELECT, "select", SyscallMode::UserTask, sys_select),
     syscall_def(SYS_POLL, "poll", SyscallMode::UserTask, sys_poll),
     syscall_def(SYS_PPOLL, "ppoll", SyscallMode::UserTask, sys_ppoll),
     // Socket syscalls
@@ -914,6 +920,9 @@ fn fd_dup_from(
     if kind == task::USER_FD_KIND_PTY_SLAVE && inode != task::USER_FD_NONE {
         crate::pty::slave_retain(inode);
     }
+    if kind == task::USER_FD_KIND_SOCKET && inode != task::USER_FD_NONE {
+        socket::socket_retain(inode)?;
+    }
     Ok(dst_idx as i64)
 }
 
@@ -959,6 +968,9 @@ fn fd_dup_to(
     }
     if kind == task::USER_FD_KIND_PTY_SLAVE && inode != task::USER_FD_NONE {
         crate::pty::slave_retain(inode);
+    }
+    if kind == task::USER_FD_KIND_SOCKET && inode != task::USER_FD_NONE {
+        socket::socket_retain(inode)?;
     }
     Ok(new_fd as i64)
 }
@@ -2631,7 +2643,8 @@ fn log_stub_enosys(name: &str) {
     if cfg!(any(
         feature = "musl-ext2-cmd-smoke",
         feature = "musl-ext2-quickjs-smoke",
-        feature = "musl-ext2-micropython-smoke"
+        feature = "musl-ext2-micropython-smoke",
+        feature = "musl-ext2-dropbear-smoke"
     )) {
         sys_log!("[SYSCALL] {} -> -ENOSYS", name);
     }
@@ -3488,6 +3501,9 @@ fn clone_parent_fds_for_child(parent: *mut task::Task, child: *mut task::Task) -
         if kind == task::USER_FD_KIND_PTY_SLAVE && inode != task::USER_FD_NONE {
             crate::pty::slave_retain(inode);
         }
+        if kind == task::USER_FD_KIND_SOCKET && inode != task::USER_FD_NONE {
+            socket::socket_retain(inode)?;
+        }
     }
 
     Ok(())
@@ -4213,6 +4229,14 @@ fn sys_unlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
         Err(err) => -fs_to_errno(err),
     }
+}
+
+fn sys_unlink(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let compat = SyscallArgs {
+        num: SYS_UNLINKAT,
+        args: [fs::AT_FDCWD as i64 as u64, call.arg(0), 0, 0, 0, 0],
+    };
+    sys_unlinkat(ctx, &compat)
 }
 
 fn sys_renameat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -5613,6 +5637,33 @@ fn sys_sync(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     0
 }
 
+fn sys_fsync(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let idx = match fd_index(fd) {
+        Ok(i) => i,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+
+    let kind = unsafe { (*ctx.current).user_fd_kind[idx] };
+    if kind == task::USER_FD_KIND_VFS {
+        sync_ext2_backing();
+        return 0;
+    }
+    if kind == task::USER_FD_KIND_PIPE
+        || kind == task::USER_FD_KIND_CONSOLE
+        || kind == task::USER_FD_KIND_SOCKET
+        || kind == task::USER_FD_KIND_PTY_MASTER
+        || kind == task::USER_FD_KIND_PTY_SLAVE
+    {
+        return 0;
+    }
+
+    -EBADF
+}
+
 // ---------------------------------------------------------------------------
 // pread64 (17)
 // ---------------------------------------------------------------------------
@@ -6240,6 +6291,195 @@ fn sys_recvfrom(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 // ---------------------------------------------------------------------------
 
 const POLL_MAX_FDS: usize = 32;
+const SELECT_MAX_FDS: usize = 1024;
+const SELECT_FDSET_WORD_BITS: usize = size_of::<u64>() * 8;
+const SELECT_FDSET_WORDS: usize = SELECT_MAX_FDS / SELECT_FDSET_WORD_BITS;
+
+type SelectFdSet = [u64; SELECT_FDSET_WORDS];
+
+#[inline]
+fn select_fdset_words(nfds: usize) -> usize {
+    if nfds == 0 {
+        0
+    } else {
+        (nfds + SELECT_FDSET_WORD_BITS - 1) / SELECT_FDSET_WORD_BITS
+    }
+}
+
+#[inline]
+fn select_fdset_bytes(nfds: usize) -> usize {
+    select_fdset_words(nfds) * size_of::<u64>()
+}
+
+#[inline]
+fn select_fdset_is_set(set: &SelectFdSet, fd: usize) -> bool {
+    let word = fd / SELECT_FDSET_WORD_BITS;
+    let bit = fd % SELECT_FDSET_WORD_BITS;
+    (set[word] & (1u64 << bit)) != 0
+}
+
+#[inline]
+fn select_fdset_set(set: &mut SelectFdSet, fd: usize) {
+    let word = fd / SELECT_FDSET_WORD_BITS;
+    let bit = fd % SELECT_FDSET_WORD_BITS;
+    set[word] |= 1u64 << bit;
+}
+
+fn read_select_fdset(
+    task_ptr: *mut task::Task,
+    user_ptr: u64,
+    nfds: usize,
+) -> Result<SelectFdSet, i64> {
+    let mut bits = [0u64; SELECT_FDSET_WORDS];
+    if user_ptr == 0 || nfds == 0 {
+        return Ok(bits);
+    }
+
+    if nfds > SELECT_MAX_FDS {
+        return Err(-EINVAL);
+    }
+
+    let byte_len = select_fdset_bytes(nfds);
+    let raw = unsafe { core::slice::from_raw_parts_mut(bits.as_mut_ptr() as *mut u8, byte_len) };
+    copy_from_user_task(task_ptr, user_ptr, raw).map_err(|e| -e)?;
+    Ok(bits)
+}
+
+fn write_select_fdset(
+    task_ptr: *mut task::Task,
+    user_ptr: u64,
+    nfds: usize,
+    bits: &SelectFdSet,
+) -> Result<(), i64> {
+    if user_ptr == 0 || nfds == 0 {
+        return Ok(());
+    }
+
+    if nfds > SELECT_MAX_FDS {
+        return Err(-EINVAL);
+    }
+
+    let byte_len = select_fdset_bytes(nfds);
+    let raw = unsafe { core::slice::from_raw_parts(bits.as_ptr() as *const u8, byte_len) };
+    copy_to_user_task(task_ptr, user_ptr, raw).map_err(|e| -e)
+}
+
+fn validate_select_fds(
+    task_ptr: *mut task::Task,
+    nfds: usize,
+    read_bits: &SelectFdSet,
+    write_bits: &SelectFdSet,
+    except_bits: &SelectFdSet,
+) -> i64 {
+    for fd in 0..nfds {
+        let requested = select_fdset_is_set(read_bits, fd)
+            || select_fdset_is_set(write_bits, fd)
+            || select_fdset_is_set(except_bits, fd);
+        if !requested {
+            continue;
+        }
+        if fd >= task::MAX_TASK_FDS || !fd_slot_is_open(task_ptr, fd) {
+            return -EBADF;
+        }
+    }
+    0
+}
+
+fn do_select(
+    ctx: &SyscallContext,
+    nfds: usize,
+    read_ptr: u64,
+    write_ptr: u64,
+    except_ptr: u64,
+    deadline: Option<u64>,
+) -> i64 {
+    if nfds > SELECT_MAX_FDS {
+        return -EINVAL;
+    }
+
+    let read_req = match read_select_fdset(ctx.current, read_ptr, nfds) {
+        Ok(bits) => bits,
+        Err(e) => return e,
+    };
+    let write_req = match read_select_fdset(ctx.current, write_ptr, nfds) {
+        Ok(bits) => bits,
+        Err(e) => return e,
+    };
+    let except_req = match read_select_fdset(ctx.current, except_ptr, nfds) {
+        Ok(bits) => bits,
+        Err(e) => return e,
+    };
+
+    let validate = validate_select_fds(ctx.current, nfds, &read_req, &write_req, &except_req);
+    if validate != 0 {
+        return validate;
+    }
+
+    loop {
+        let mut out_read = [0u64; SELECT_FDSET_WORDS];
+        let mut out_write = [0u64; SELECT_FDSET_WORDS];
+        let mut out_except = [0u64; SELECT_FDSET_WORDS];
+        let mut ready_count: i64 = 0;
+
+        let eval_nfds = cmp::min(nfds, task::MAX_TASK_FDS);
+        for fd in 0..eval_nfds {
+            let fd_i32 = fd as i32;
+
+            if select_fdset_is_set(&read_req, fd) {
+                let revents = poll_fd_revents(ctx.current, fd_i32, POLLIN | POLLPRI);
+                if (revents & (POLLIN | POLLERR | POLLHUP)) != 0 {
+                    select_fdset_set(&mut out_read, fd);
+                    ready_count += 1;
+                }
+            }
+
+            if select_fdset_is_set(&write_req, fd) {
+                let revents = poll_fd_revents(ctx.current, fd_i32, POLLOUT);
+                if (revents & (POLLOUT | POLLERR)) != 0 {
+                    select_fdset_set(&mut out_write, fd);
+                    ready_count += 1;
+                }
+            }
+
+            if select_fdset_is_set(&except_req, fd) {
+                let revents = poll_fd_revents(ctx.current, fd_i32, POLLPRI);
+                if (revents & (POLLPRI | POLLERR)) != 0 {
+                    select_fdset_set(&mut out_except, fd);
+                    ready_count += 1;
+                }
+            }
+        }
+
+        if ready_count > 0 || deadline == Some(0) {
+            if let Err(e) = write_select_fdset(ctx.current, read_ptr, nfds, &out_read) {
+                return e;
+            }
+            if let Err(e) = write_select_fdset(ctx.current, write_ptr, nfds, &out_write) {
+                return e;
+            }
+            if let Err(e) = write_select_fdset(ctx.current, except_ptr, nfds, &out_except) {
+                return e;
+            }
+            return ready_count;
+        }
+
+        if let Some(dl) = deadline {
+            if pit::uptime_ms() >= dl {
+                let zero = [0u64; SELECT_FDSET_WORDS];
+                let _ = write_select_fdset(ctx.current, read_ptr, nfds, &zero);
+                let _ = write_select_fdset(ctx.current, write_ptr, nfds, &zero);
+                let _ = write_select_fdset(ctx.current, except_ptr, nfds, &zero);
+                return 0;
+            }
+        }
+
+        #[cfg(not(test))]
+        {
+            crate::net::poll();
+            crate::sched::yield_now();
+        }
+    }
+}
 
 /// Compute revents for a single FD.
 fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16) -> i16 {
@@ -6420,6 +6660,36 @@ fn sys_ppoll(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
 
     do_poll(ctx, fds_ptr, nfds, deadline)
+}
+
+fn sys_select(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let nfds_raw = call.arg(0) as i64;
+    if nfds_raw < 0 {
+        return -EINVAL;
+    }
+    let nfds = nfds_raw as usize;
+    let read_ptr = call.arg(1);
+    let write_ptr = call.arg(2);
+    let except_ptr = call.arg(3);
+    let timeout_ptr = call.arg(4);
+
+    let deadline = if timeout_ptr == 0 {
+        None
+    } else {
+        match read_struct_from_user::<LinuxTimeVal>(ctx.current, timeout_ptr) {
+            Ok(tv) => {
+                if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+                    return -EINVAL;
+                }
+                let sec_ms = (tv.tv_sec as u64).saturating_mul(1000);
+                let usec_ms = (tv.tv_usec as u64).saturating_add(999) / 1000;
+                Some(pit::uptime_ms().saturating_add(sec_ms.saturating_add(usec_ms)))
+            }
+            Err(e) => return -e,
+        }
+    };
+
+    do_select(ctx, nfds, read_ptr, write_ptr, except_ptr, deadline)
 }
 
 fn sys_poll(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -6914,7 +7184,8 @@ fn log_execve_result(result: &Result<user::ExecImageStart, i64>) {
         feature = "musl-ext2-exec",
         feature = "musl-ext2-cmd-smoke",
         feature = "musl-ext2-quickjs-smoke",
-        feature = "musl-ext2-micropython-smoke"
+        feature = "musl-ext2-micropython-smoke",
+        feature = "musl-ext2-dropbear-smoke"
     )) {
         return;
     }
@@ -7160,6 +7431,7 @@ mod tests {
     #[test]
     fn syscall_lookup_includes_vfs_extensions() {
         assert_eq!(lookup_syscall(SYS_PIPE).map(|d| d.name), Some("pipe"));
+        assert_eq!(lookup_syscall(SYS_SELECT).map(|d| d.name), Some("select"));
         assert_eq!(lookup_syscall(SYS_STAT).map(|d| d.name), Some("stat"));
         assert_eq!(lookup_syscall(SYS_LSTAT).map(|d| d.name), Some("lstat"));
         assert_eq!(lookup_syscall(SYS_KILL).map(|d| d.name), Some("kill"));
@@ -7186,6 +7458,7 @@ mod tests {
         assert_eq!(lookup_syscall(SYS_DUP).map(|d| d.name), Some("dup"));
         assert_eq!(lookup_syscall(SYS_DUP2).map(|d| d.name), Some("dup2"));
         assert_eq!(lookup_syscall(SYS_FCNTL).map(|d| d.name), Some("fcntl"));
+        assert_eq!(lookup_syscall(SYS_FSYNC).map(|d| d.name), Some("fsync"));
         assert_eq!(lookup_syscall(SYS_SHMGET).map(|d| d.name), Some("shmget"));
         assert_eq!(lookup_syscall(SYS_SHMAT).map(|d| d.name), Some("shmat"));
         assert_eq!(lookup_syscall(SYS_SHMDT).map(|d| d.name), Some("shmdt"));
@@ -7235,6 +7508,7 @@ mod tests {
         assert_eq!(lookup_syscall(SYS_FCHDIR).map(|d| d.name), Some("fchdir"));
         assert_eq!(lookup_syscall(SYS_RENAME).map(|d| d.name), Some("rename"));
         assert_eq!(lookup_syscall(SYS_LINK).map(|d| d.name), Some("link"));
+        assert_eq!(lookup_syscall(SYS_UNLINK).map(|d| d.name), Some("unlink"));
         assert_eq!(
             lookup_syscall(SYS_READLINK).map(|d| d.name),
             Some("readlink")

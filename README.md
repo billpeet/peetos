@@ -24,6 +24,7 @@ Key references in the C project:
 - `toybox/` Stage-9 toybox source/bootstrap build glue for staged userspace utilities.
 - `quickjs/` Stage-9 quickjs source/bootstrap build glue for staged JavaScript runtime smoke.
 - `micropython/` Stage-9 micropython source/bootstrap build glue for staged Python runtime smoke.
+- `dropbear/` Stage-9 dropbear source/bootstrap build glue for staged SSH runtime smoke.
 - `linker/` Linker script for the kernel.
 - `docs/PORTING_PLAN.md` High-level implementation roadmap.
 - `docs/` Implementation docs grouped by subsystem, each with a limitations/simplifications section.
@@ -44,10 +45,12 @@ Key references in the C project:
 - A phase-5 baseline VFS is now active with concrete tmpfs behavior, virtual `devfs`/`procfs` nodes, a mount table-backed `/proc/mounts`, and an ext2 importer mounted at `/mnt/ext2` where file and directory mutations (`create`/`mkdir`/`unlink`/`rmdir`/`rename`/`write`) update ext2 data/metadata in the mounted image buffer. VFS attempts block-backed ext2 mount first and performs best-effort sync-back on mutating operations when block-backed ext2 is active.
 - Phase-7 PCI enumeration is active in `crates/drivers` (config mechanism #1, bus/device/function scan, bounded boot-time serial inventory output), and ATA/AHCI bring-up now includes AHCI command-engine setup/teardown, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write commands behind the kernel block API, ATA PIO `IDENTIFY`, and a minimal in-kernel block-device inventory.
 - Baseline keyboard/TTY input is now wired in-kernel: PS/2 IRQ1 set-1 scancode decode feeds a canonical line-buffered console input path used by user `read` on stdio.
-- Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, basic pixel/clear primitives, and a styled framebuffer terminal mirror with 8x16 VGA-compatible bitmap glyphs, baseline ANSI color handling, cursor blink, and preset themes.
+- Baseline PS/2 mouse support is now wired in-kernel: IRQ12 packet decode updates a software-rendered framebuffer cursor with clamped screen-space movement.
+- Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, basic pixel/clear primitives, and a styled framebuffer terminal mirror with 8x16 VGA-compatible bitmap glyphs, baseline ANSI color handling, cursor blink, preset themes, and a movable mouse cursor overlay.
 - Stage-9 userspace bootstrap plumbing is now present: musl source/sysroot build (`make musl-fetch`, `make musl-configure`, `make musl`) and toybox staging (`make toybox-fetch`, `make toybox`) with a shell-core Toybox set (`sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`) integrated into the ext2 `execve` smoke path.
 - QuickJS userspace staging is now wired (`make quickjs-fetch`, `make quickjs`) with ext2 smoke coverage via `make run-quickjs-smoke` (`KERNEL_FEATURES=musl-ext2-quickjs-smoke`) that executes staged JS scripts with `/bin/qjs`.
 - MicroPython userspace staging is now wired (`make micropython-fetch`, `make micropython`) with ext2 smoke coverage via `make run-micropython-smoke` (`KERNEL_FEATURES=musl-ext2-micropython-smoke`) that executes staged Python scripts with `/bin/micropython`.
+- Dropbear userspace staging is now wired (`make dropbear-fetch`, `make dropbear`) with ext2 smoke coverage via `make run-dropbear-smoke` (`KERNEL_FEATURES=musl-ext2-dropbear-smoke`) that validates staged `/bin/dropbear` + `/bin/dropbearkey` bring-up, staged host-key usage, and daemonization startup marker.
 - Toybox networking applet staging now includes `ping` in addition to `netcat`/`wget`/`httpd`/`sntp`/`microcom`/`ftpget`, backed by AF_INET datagram ICMP socket support in the kernel socket layer.
 - Remaining placeholder crates are `net`, `syscall`, and `userabi`; advanced device drivers and full user space are still pending.
 
@@ -69,6 +72,7 @@ Key references in the C project:
 - `docs/toybox.md` Stage-9 toybox bootstrap workflow and current limitations.
 - `docs/quickjs.md` Stage-9 quickjs bootstrap workflow and current limitations.
 - `docs/micropython.md` Stage-9 micropython bootstrap workflow and current limitations.
+- `docs/dropbear.md` Stage-9 dropbear bootstrap workflow and current limitations.
 
 ## Build Prerequisites
 
@@ -81,7 +85,7 @@ Optional but commonly required:
 
 - `rust-src` component if you need to rebuild `core` for a target.
 - `mke2fs` (`e2fsprogs`) if you want to regenerate `user/sample_ext2.img`.
-- `curl` or `wget` if you want to fetch musl/toybox/quickjs/micropython source via `make musl-fetch`, `make toybox-fetch`, `make quickjs-fetch`, or `make micropython-fetch`.
+- `curl` or `wget` if you want to fetch musl/toybox/quickjs/micropython/dropbear source via `make musl-fetch`, `make toybox-fetch`, `make quickjs-fetch`, `make micropython-fetch`, or `make dropbear-fetch`.
 
 ## Build
 
@@ -148,6 +152,14 @@ make micropython
 scripts/run_toybox_micropython_smoke.sh
 ```
 
+Bootstrap dropbear source and build staged `dropbear`/`dropbearkey`:
+
+```bash
+make dropbear-fetch
+make dropbear
+scripts/run_toybox_dropbear_smoke.sh
+```
+
 Boot a musl-linked runtime smoke program (`echo`-style static binary) as the initial user task:
 
 ```bash
@@ -179,11 +191,13 @@ make run-shell-smoke
 make run-ping-smoke
 make run-quickjs-smoke
 make run-micropython-smoke
+make run-dropbear-smoke
 ```
 
 Expected serial output includes `[musl-ext2-exec] launching interactive toybox sh` when the ext2 handoff succeeds.
 Keyboard input is captured from the QEMU display window and surfaced through the kernel TTY.
-When framebuffer mode is active, console output is mirrored into the QEMU display via a styled 8x16 text renderer with baseline ANSI 16-color support, cursor blink, and preset themes.
+Mouse input is captured from the QEMU display window and drives the on-screen software cursor when framebuffer mode is active.
+When framebuffer mode is active, console output is mirrored into the QEMU display via a styled 8x16 text renderer with baseline ANSI 16-color support, cursor blink, preset themes, and the software mouse cursor overlay.
 Note: `PROFILE=debug` may exceed the current stage2 low-memory kernel staging window for this feature set.
 
 ## Testing

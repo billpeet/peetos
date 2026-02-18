@@ -12,6 +12,7 @@ For shell-specific bring-up priorities, see `docs/toybox_shell_syscalls.md`.
 - Network/system-management tools were initially deferred; seventh-wave staging now includes baseline networking bring-up (`netcat`/`wget`/`httpd`/`sntp`/`microcom`/`ftpget`/`ping`) while admin-heavy tooling remains deferred.
 - QuickJS runtime smoke is staged through the same ext2 launcher path (`musl-ext2-quickjs-smoke`) to validate JavaScript userspace execution on top of the current toybox/musl baseline.
 - MicroPython runtime smoke is staged through the same ext2 launcher path (`musl-ext2-micropython-smoke`) to validate Python userspace execution on top of the current toybox/musl baseline.
+- Dropbear runtime smoke is staged through the same ext2 launcher path (`musl-ext2-dropbear-smoke`) to validate SSH daemon/key tool userspace execution on top of the current toybox/musl baseline.
 - Use `kernel/src/syscall.rs` as current implemented surface.
 
 ## Current Kernel Syscalls (Baseline)
@@ -132,6 +133,15 @@ From `scripts/run_toybox_micropython_smoke.sh` / `make run-micropython-smoke` on
 - Output evidence observed: `Hello from MicroPython on PeetOS!`
 - Bring-up note: MicroPython probe paths required legacy syscall `readlink` (89); kernel now exposes it as a compatibility wrapper over `readlinkat`.
 - Staging note: ext2 payload includes `/mnt/ext2/bin/micropython` plus `/mnt/ext2/tmp/test_hello.py` and `/mnt/ext2/tmp/test_math.py`.
+
+From `scripts/run_toybox_dropbear_smoke.sh` / `make run-dropbear-smoke` on `KERNEL_FEATURES=musl-ext2-dropbear-smoke`:
+
+- Completion marker observed: `[musl-ext2-dropbear-smoke] done`
+- Failure marker not observed: `[musl-ext2-dropbear-smoke] failures`
+- Output evidence observed: `Dropbear` (version/help output)
+- Runtime marker observed: `[musl-ext2-dropbear-smoke] daemon running`
+- Bring-up note: smoke now stages host key material and launches daemon mode (`dropbear ... -p 2222`), then validates detached startup by forcing a same-port bind collision from a probe launch.
+- Staging note: ext2 payload includes `/mnt/ext2/bin/dropbear`, `/mnt/ext2/bin/dropbearkey`, `/mnt/ext2/etc/dropbear/dropbear_ed25519_host_key`, and `/mnt/ext2/bin/dropbear_smoke.sh`.
 
 ## Definitive Remaining Applets + Blockers (2026-02-18)
 
@@ -441,6 +451,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 - `ping` smoke currently asserts only the QEMU user-mode NAT gateway path (`10.0.2.2`); broader ICMP interoperability is not yet a pass criterion in this document.
 - QuickJS smoke currently validates interpreter boot and staged script execution only; it is not a toybox syscall-gap oracle and does not replace applet-by-applet syscall triage.
 - MicroPython smoke currently validates interpreter boot and staged script execution only; it is not a toybox syscall-gap oracle and does not replace applet-by-applet syscall triage.
+- Dropbear smoke currently validates tool bring-up, staged host-key usage, and daemonization startup marker only; full SSH auth/session validation remains pending and it does not replace applet-by-applet syscall triage.
 - Newly added P0 handlers are baseline-only:
   - `access`/`faccessat` checks use current VFS metadata and simple uid/gid permission selection.
   - `linkat` currently supports regular-file links only; tmpfs path is a pragmatic clone-style fallback.

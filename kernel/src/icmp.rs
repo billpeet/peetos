@@ -142,7 +142,8 @@ macro_rules! empty_icmp_sockets {
     }};
 }
 
-static mut ICMP_SOCKETS: [IcmpSocketBinding; ICMP_SOCKET_MAX] = empty_icmp_sockets!(ICMP_SOCKET_MAX);
+static mut ICMP_SOCKETS: [IcmpSocketBinding; ICMP_SOCKET_MAX] =
+    empty_icmp_sockets!(ICMP_SOCKET_MAX);
 
 fn enqueue_to_icmp_sockets(payload: &[u8], src: &Ipv4Addr) {
     unsafe {
