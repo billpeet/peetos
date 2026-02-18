@@ -66,6 +66,14 @@ scripts/run_toybox_quickjs_smoke.sh
 make run-quickjs-smoke
 ```
 
+Scripted MicroPython smoke path (boots a shell-script launcher and validates staged `/bin/micropython` on ext2):
+
+```bash
+scripts/run_toybox_micropython_smoke.sh
+# or:
+make run-micropython-smoke
+```
+
 Common overrides:
 
 ```bash
@@ -90,3 +98,4 @@ make musl CC=clang AR=llvm-ar RANLIB=llvm-ranlib
 - ext2 shell runtime/smoke flows currently expect attaching `user/sample_ext2_musl.img` as a second block device in QEMU.
 - Ping smoke currently validates the QEMU user-mode NAT gateway (`10.0.2.2`) and is not yet a general network interoperability test suite.
 - QuickJS smoke currently validates staged script execution (`/mnt/ext2/tmp/test_hello.js`, `/mnt/ext2/tmp/test_math.js`) and not broader JS engine conformance.
+- MicroPython smoke currently validates staged script execution (`/mnt/ext2/tmp/test_hello.py`, `/mnt/ext2/tmp/test_math.py`) and not broader module/runtime compatibility.

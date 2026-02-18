@@ -46,6 +46,20 @@ if [[ -f "${ROOT_DIR}/quickjs/test_math.js" ]]; then
   chmod 0644 "${STAGE_ROOT}/tmp/test_math.js"
 fi
 
+# Stage MicroPython interpreter + sample scripts when available.
+if [[ -x "${ROOT_DIR}/user/micropython" ]]; then
+  cp "${ROOT_DIR}/user/micropython" "${STAGE_ROOT}/bin/micropython"
+  chmod 0755 "${STAGE_ROOT}/bin/micropython"
+fi
+if [[ -f "${ROOT_DIR}/micropython/test_hello.py" ]]; then
+  cp "${ROOT_DIR}/micropython/test_hello.py" "${STAGE_ROOT}/tmp/test_hello.py"
+  chmod 0644 "${STAGE_ROOT}/tmp/test_hello.py"
+fi
+if [[ -f "${ROOT_DIR}/micropython/test_math.py" ]]; then
+  cp "${ROOT_DIR}/micropython/test_math.py" "${STAGE_ROOT}/tmp/test_math.py"
+  chmod 0644 "${STAGE_ROOT}/tmp/test_math.py"
+fi
+
 # Applets are invoked as `toybox <applet>` to keep the smoke image compact.
 cat > "${STAGE_ROOT}/bin/next_smoke.sh" <<'EOS'
 fail=0
@@ -263,6 +277,35 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/quickjs_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/micropython_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/micropython ]; then
+  echo [musl-ext2-micropython-smoke] missing bin/micropython
+  fail=1
+else
+  if [ -f tmp/test_hello.py ]; then
+    bin/micropython tmp/test_hello.py || fail=1
+  else
+    echo [musl-ext2-micropython-smoke] missing tmp/test_hello.py
+    fail=1
+  fi
+
+  if [ -f tmp/test_math.py ]; then
+    bin/micropython tmp/test_math.py || fail=1
+  else
+    echo [musl-ext2-micropython-smoke] missing tmp/test_math.py
+    fail=1
+  fi
+fi
+
+echo [musl-ext2-micropython-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-micropython-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/micropython_smoke.sh"
 
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact but size it from staged payload so larger binaries

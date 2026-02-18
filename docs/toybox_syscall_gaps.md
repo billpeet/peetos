@@ -11,6 +11,7 @@ For shell-specific bring-up priorities, see `docs/toybox_shell_syscalls.md`.
 - Focus first on core file/text/process utilities (`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `ln`, `touch`, `find`, `tar`).
 - Network/system-management tools were initially deferred; seventh-wave staging now includes baseline networking bring-up (`netcat`/`wget`/`httpd`/`sntp`/`microcom`/`ftpget`/`ping`) while admin-heavy tooling remains deferred.
 - QuickJS runtime smoke is staged through the same ext2 launcher path (`musl-ext2-quickjs-smoke`) to validate JavaScript userspace execution on top of the current toybox/musl baseline.
+- MicroPython runtime smoke is staged through the same ext2 launcher path (`musl-ext2-micropython-smoke`) to validate Python userspace execution on top of the current toybox/musl baseline.
 - Use `kernel/src/syscall.rs` as current implemented surface.
 
 ## Current Kernel Syscalls (Baseline)
@@ -19,8 +20,8 @@ Currently implemented in `kernel/src/syscall.rs`:
 
 - `read`, `write`, `writev`, `readv`, `pread64`, `pwrite64`, `open`, `openat`, `close`, `lseek`
 - `stat`, `lstat`, `fstat`, `newfstatat`, `getdents64`
-- `mkdirat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`, `readlinkat`, `utimensat`
-- legacy compatibility aliases: `rename` (82), `link` (86)
+- `mkdirat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`, `readlink`, `readlinkat`, `utimensat`
+- legacy compatibility aliases: `rename` (82), `link` (86), `readlink` (89 -> `readlinkat` + `AT_FDCWD`)
 - `mmap`, `mprotect`, `munmap`, `brk`
 - `dup`, `dup2`, `dup3`, `fcntl`, `pipe`, `pipe2`
 - `ioctl` (console tty baseline)
@@ -123,6 +124,14 @@ From `scripts/run_toybox_quickjs_smoke.sh` / `make run-quickjs-smoke` on `KERNEL
 - Failure marker not observed: `[musl-ext2-quickjs-smoke] failures`
 - Output evidence observed: `Hello from QuickJS on PeetOS!`
 - Staging note: ext2 payload includes `/mnt/ext2/bin/qjs` plus `/mnt/ext2/tmp/test_hello.js` and `/mnt/ext2/tmp/test_math.js`.
+
+From `scripts/run_toybox_micropython_smoke.sh` / `make run-micropython-smoke` on `KERNEL_FEATURES=musl-ext2-micropython-smoke`:
+
+- Completion marker observed: `[musl-ext2-micropython-smoke] done`
+- Failure marker not observed: `[musl-ext2-micropython-smoke] failures`
+- Output evidence observed: `Hello from MicroPython on PeetOS!`
+- Bring-up note: MicroPython probe paths required legacy syscall `readlink` (89); kernel now exposes it as a compatibility wrapper over `readlinkat`.
+- Staging note: ext2 payload includes `/mnt/ext2/bin/micropython` plus `/mnt/ext2/tmp/test_hello.py` and `/mnt/ext2/tmp/test_math.py`.
 
 ## Definitive Remaining Applets + Blockers (2026-02-18)
 
@@ -431,6 +440,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 - Syscall implementation alone is not sufficient for deferred areas (networking, mount namespaces, full tty/pty, multi-process job control).
 - `ping` smoke currently asserts only the QEMU user-mode NAT gateway path (`10.0.2.2`); broader ICMP interoperability is not yet a pass criterion in this document.
 - QuickJS smoke currently validates interpreter boot and staged script execution only; it is not a toybox syscall-gap oracle and does not replace applet-by-applet syscall triage.
+- MicroPython smoke currently validates interpreter boot and staged script execution only; it is not a toybox syscall-gap oracle and does not replace applet-by-applet syscall triage.
 - Newly added P0 handlers are baseline-only:
   - `access`/`faccessat` checks use current VFS metadata and simple uid/gid permission selection.
   - `linkat` currently supports regular-file links only; tmpfs path is a pragmatic clone-style fallback.

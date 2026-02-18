@@ -106,6 +106,7 @@ const SYS_CHDIR: u64 = 80;
 const SYS_FCHDIR: u64 = 81;
 const SYS_RENAME: u64 = 82;
 const SYS_LINK: u64 = 86;
+const SYS_READLINK: u64 = 89;
 const SYS_UMASK: u64 = 95;
 const SYS_GETTIMEOFDAY: u64 = 96;
 const SYS_GETUID: u64 = 102;
@@ -462,6 +463,12 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_FCHDIR, "fchdir", SyscallMode::UserTask, sys_fchdir),
     syscall_def(SYS_RENAME, "rename", SyscallMode::UserTask, sys_rename),
     syscall_def(SYS_LINK, "link", SyscallMode::UserTask, sys_link),
+    syscall_def(
+        SYS_READLINK,
+        "readlink",
+        SyscallMode::UserTask,
+        sys_readlink,
+    ),
     syscall_def(
         SYS_GETTIMEOFDAY,
         "gettimeofday",
@@ -2623,7 +2630,8 @@ fn sys_nanosleep(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 fn log_stub_enosys(name: &str) {
     if cfg!(any(
         feature = "musl-ext2-cmd-smoke",
-        feature = "musl-ext2-quickjs-smoke"
+        feature = "musl-ext2-quickjs-smoke",
+        feature = "musl-ext2-micropython-smoke"
     )) {
         sys_log!("[SYSCALL] {} -> -ENOSYS", name);
     }
@@ -2742,6 +2750,21 @@ fn sys_readlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
         Err(err) => -fs_to_errno(err),
     }
+}
+
+fn sys_readlink(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let compat = SyscallArgs {
+        num: SYS_READLINKAT,
+        args: [
+            fs::AT_FDCWD as i64 as u64,
+            call.arg(0),
+            call.arg(1),
+            call.arg(2),
+            0,
+            0,
+        ],
+    };
+    sys_readlinkat(ctx, &compat)
 }
 
 fn sys_fchmodat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -6890,7 +6913,8 @@ fn log_execve_result(result: &Result<user::ExecImageStart, i64>) {
     if !cfg!(any(
         feature = "musl-ext2-exec",
         feature = "musl-ext2-cmd-smoke",
-        feature = "musl-ext2-quickjs-smoke"
+        feature = "musl-ext2-quickjs-smoke",
+        feature = "musl-ext2-micropython-smoke"
     )) {
         return;
     }
@@ -7211,6 +7235,10 @@ mod tests {
         assert_eq!(lookup_syscall(SYS_FCHDIR).map(|d| d.name), Some("fchdir"));
         assert_eq!(lookup_syscall(SYS_RENAME).map(|d| d.name), Some("rename"));
         assert_eq!(lookup_syscall(SYS_LINK).map(|d| d.name), Some("link"));
+        assert_eq!(
+            lookup_syscall(SYS_READLINK).map(|d| d.name),
+            Some("readlink")
+        );
         assert_eq!(lookup_syscall(SYS_LINKAT).map(|d| d.name), Some("linkat"));
         assert_eq!(
             lookup_syscall(SYS_SYMLINKAT).map(|d| d.name),

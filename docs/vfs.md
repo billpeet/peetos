@@ -21,7 +21,7 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
   - The mounted ext2 image is kept as mutable fs state, and `export_ext2_image(out)` can snapshot the current mutated image bytes.
   - Kernel init first attempts to load ext2 from discovered block devices (`kernel/src/block.rs`).
   - Host-side fs tests use `user/sample_ext2.img`; current bare-metal kernel builds do not embed that sample fallback image by default.
-  - Runtime shell/smoke flows (`musl-ext2-exec`, `musl-ext2-cmd-smoke`, `musl-ext2-ping-smoke`, `musl-ext2-quickjs-smoke`) use `user/sample_ext2_musl.img` as a second block-backed ext2 payload so Toybox `sh`/staged userspace tools can be launched via `/mnt/ext2/bin/...`.
+  - Runtime shell/smoke flows (`musl-ext2-exec`, `musl-ext2-cmd-smoke`, `musl-ext2-ping-smoke`, `musl-ext2-quickjs-smoke`, `musl-ext2-micropython-smoke`) use `user/sample_ext2_musl.img` as a second block-backed ext2 payload so Toybox `sh`/staged userspace tools can be launched via `/mnt/ext2/bin/...`.
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
   - `mkdir`/`mkdirat`
