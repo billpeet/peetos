@@ -36,11 +36,12 @@ Limitations / Simplifications
 4. Initialize PMM, VMM, and the kernel heap.
 5. Run baseline PCI enumeration and print a bounded serial inventory.
 6. Run storage-controller bring-up (IDE/AHCI classification, AHCI ABAR capture, AHCI command-bit setup, AHCI MMIO capability/port probing, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write command path wiring, ATA PIO `IDENTIFY`), register discovered block devices, then print storage/block summaries.
-7. Initialize VFS (attempt block-backed ext2 mount and enable block sync bridge for mutating VFS syscalls), then tasking/scheduler, IPC, and shared-memory subsystems.
-8. Configure syscall MSRs and dispatch state.
-9. Enable interrupts.
-10. Optionally exit QEMU when `test-exit` is enabled.
-11. Halt in an infinite loop.
+7. Initialize networking (E1000 path), then attempt USB UHCI HID-tablet bring-up for absolute pointer input.
+8. Initialize VFS (attempt block-backed ext2 mount and enable block sync bridge for mutating VFS syscalls), then tasking/scheduler, IPC, and shared-memory subsystems.
+9. Configure syscall MSRs and dispatch state.
+10. Enable interrupts.
+11. Optionally exit QEMU when `test-exit` is enabled.
+12. Halt in an infinite loop.
 
 Limitations / Simplifications
 - Single-core bring-up only; there is no per-CPU initialization yet.

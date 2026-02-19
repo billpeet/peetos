@@ -85,7 +85,7 @@ ifneq ($(findstring musl-ext2-dropbear-smoke,$(KERNEL_FEATURES)),)
 USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_DROPBEAR_BIN) $(USER_DROPBEARKEY_BIN)
 endif
 
-.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke user-musl-ext2-quickjs-smoke user-musl-ext2-micropython-smoke user-musl-ext2-dropbear-smoke clean run run-current run-image run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke run-quickjs-smoke run-micropython-smoke run-dropbear-smoke test ext2-image \
+.PHONY: all image bootloader kernel user user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke user-musl-ext2-quickjs-smoke user-musl-ext2-micropython-smoke user-musl-ext2-dropbear-smoke clean run run-current run-image run-tablet run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke run-quickjs-smoke run-micropython-smoke run-dropbear-smoke test ext2-image \
 	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
 	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info \
 	quickjs-fetch quickjs quickjs-clean quickjs-distclean quickjs-info \
@@ -283,6 +283,13 @@ run-current:
 
 run-image: image
 	$(QEMU) -drive format=raw,file=$(IMAGE) -serial stdio
+
+run-tablet: image
+	$(QEMU) \
+		-drive format=raw,file=$(IMAGE) \
+		-usb \
+		-device usb-tablet \
+		-serial stdio -no-reboot -no-shutdown
 
 run-shell:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=musl-ext2-exec

@@ -6,7 +6,7 @@ use arch_x86_64::{interrupts, pic, port};
 #[cfg(target_os = "none")]
 use core::ptr;
 #[cfg(target_os = "none")]
-use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 #[cfg(target_os = "none")]
 use crate::framebuffer;
@@ -24,6 +24,8 @@ const PS2_COMMAND_PORT: u16 = 0x64;
 const PS2_STATUS_OUTPUT_FULL: u8 = 1 << 0;
 #[cfg(target_os = "none")]
 const PS2_STATUS_INPUT_FULL: u8 = 1 << 1;
+#[cfg(target_os = "none")]
+const PS2_STATUS_AUX_DATA: u8 = 1 << 5;
 
 #[cfg(target_os = "none")]
 const PS2_CMD_ENABLE_AUX: u8 = 0xA8;
@@ -50,9 +52,9 @@ const PS2_CONFIG_DISABLE_AUX_CLOCK: u8 = 1 << 5;
 const PS2_IO_TIMEOUT: usize = 100_000;
 
 #[cfg(target_os = "none")]
-const CURSOR_WIDTH: usize = 10;
+const CURSOR_WIDTH: usize = 8;
 #[cfg(target_os = "none")]
-const CURSOR_HEIGHT: usize = 16;
+const CURSOR_HEIGHT: usize = 14;
 #[cfg(target_os = "none")]
 const CURSOR_PIXELS: usize = CURSOR_WIDTH * CURSOR_HEIGHT;
 
@@ -63,22 +65,20 @@ const CURSOR_FILL_COLOR: u32 = 0x00FF_FFFF;
 
 #[cfg(target_os = "none")]
 const CURSOR_BITMAP: [&[u8; CURSOR_WIDTH]; CURSOR_HEIGHT] = [
-    b"X.........",
-    b"XX........",
-    b"XoX.......",
-    b"XooX......",
-    b"XoooX.....",
-    b"XooooX....",
-    b"XoooooX...",
-    b"XooooooX..",
-    b"XoooooooX.",
-    b"XooooooooX",
-    b"XXXXXXXXXX",
-    b"...XX.....",
-    b"..XooX....",
-    b".X.oo.X...",
-    b"X..oo..X..",
-    b"...oo...X.",
+    b"X.......",
+    b"XX......",
+    b"XoX.....",
+    b"XooX....",
+    b"XoooX...",
+    b"XooooX..",
+    b"XoooooX.",
+    b"XooooooX",
+    b"Xooooooo",
+    b"XooooX..",
+    b"XooXoX..",
+    b"XX..oX..",
+    b"X....X..",
+    b".....X..",
 ];
 
 #[derive(Clone, Copy)]
@@ -182,6 +182,8 @@ static PENDING_DX: AtomicI32 = AtomicI32::new(0);
 static PENDING_DY: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "none")]
 static BUTTON_STATE: AtomicU8 = AtomicU8::new(0);
+#[cfg(target_os = "none")]
+static RELATIVE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 #[cfg(target_os = "none")]
 #[inline]
@@ -260,6 +262,18 @@ fn write_data(byte: u8) -> bool {
 #[cfg(target_os = "none")]
 fn read_data() -> Option<u8> {
     if !wait_for_read_ready() {
+        return None;
+    }
+    Some(unsafe { port::inb(PS2_DATA_PORT) })
+}
+
+#[cfg(target_os = "none")]
+fn read_aux_data_nonblocking() -> Option<u8> {
+    let status = unsafe { port::inb(PS2_STATUS_PORT) };
+    if (status & PS2_STATUS_OUTPUT_FULL) == 0 {
+        return None;
+    }
+    if (status & PS2_STATUS_AUX_DATA) == 0 {
         return None;
     }
     Some(unsafe { port::inb(PS2_DATA_PORT) })
@@ -429,8 +443,7 @@ fn queue_packet(packet: MousePacket) {
 }
 
 #[cfg(target_os = "none")]
-extern "C" fn mouse_irq_handler(_frame: &mut InterruptFrame) {
-    let byte = unsafe { port::inb(PS2_DATA_PORT) };
+fn consume_mouse_byte(byte: u8) {
     let packet = {
         let mut assembler = PACKET_ASSEMBLER.lock();
         assembler.push(byte)
@@ -441,8 +454,32 @@ extern "C" fn mouse_irq_handler(_frame: &mut InterruptFrame) {
             queue_packet(decoded);
         }
     }
+}
+
+#[cfg(target_os = "none")]
+extern "C" fn mouse_irq_handler(_frame: &mut InterruptFrame) {
+    if RELATIVE_ENABLED.load(Ordering::Relaxed) {
+        let byte = unsafe { port::inb(PS2_DATA_PORT) };
+        consume_mouse_byte(byte);
+    } else {
+        let _ = unsafe { port::inb(PS2_DATA_PORT) };
+    }
 
     pic::send_eoi(pic::IRQ_MOUSE);
+}
+
+#[cfg(target_os = "none")]
+fn poll_mouse_packets() {
+    // Fallback for environments where PS/2 IRQ delivery is unreliable.
+    let mut reads = 0usize;
+    while reads < 32 {
+        let byte = match read_aux_data_nonblocking() {
+            Some(v) => v,
+            None => break,
+        };
+        consume_mouse_byte(byte);
+        reads += 1;
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -456,6 +493,7 @@ pub fn init() {
 
     pic::unmask_irq(pic::IRQ_MOUSE);
     initialize_cursor();
+    RELATIVE_ENABLED.store(true, Ordering::Release);
 
     crate::serial_println!("[MOUSE] Initialized");
 }
@@ -481,13 +519,18 @@ pub fn end_framebuffer_update() {}
 
 #[cfg(target_os = "none")]
 pub fn tick() {
+    let relative_enabled = RELATIVE_ENABLED.load(Ordering::Acquire);
+    if relative_enabled {
+        interrupts::without_interrupts(poll_mouse_packets);
+    }
+
     let dx = PENDING_DX.swap(0, Ordering::AcqRel);
     let dy = PENDING_DY.swap(0, Ordering::AcqRel);
     let buttons = BUTTON_STATE.load(Ordering::Acquire);
 
     with_cursor_state(|state| {
         state.buttons = buttons;
-        if dx == 0 && dy == 0 {
+        if !relative_enabled || (dx == 0 && dy == 0) {
             return;
         }
 
@@ -501,6 +544,73 @@ pub fn tick() {
 
 #[cfg(not(target_os = "none"))]
 pub fn tick() {}
+
+#[cfg(target_os = "none")]
+pub fn set_relative_enabled(enabled: bool) {
+    RELATIVE_ENABLED.store(enabled, Ordering::Release);
+    PENDING_DX.store(0, Ordering::Release);
+    PENDING_DY.store(0, Ordering::Release);
+    if !enabled {
+        let mut assembler = PACKET_ASSEMBLER.lock();
+        *assembler = PacketAssembler::new();
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_relative_enabled(_enabled: bool) {}
+
+fn map_absolute_axis(raw: i32, logical_min: i32, logical_max: i32, screen_max: i32) -> i32 {
+    if screen_max <= 0 || logical_max <= logical_min {
+        return 0;
+    }
+    let clamped = raw.clamp(logical_min, logical_max) - logical_min;
+    let span = (logical_max - logical_min) as i64;
+    ((clamped as i64 * screen_max as i64) / span) as i32
+}
+
+#[cfg(target_os = "none")]
+pub fn set_absolute_position(
+    raw_x: i32,
+    raw_y: i32,
+    logical_min_x: i32,
+    logical_max_x: i32,
+    logical_min_y: i32,
+    logical_max_y: i32,
+    buttons: u8,
+) {
+    with_cursor_state(|state| {
+        state.buttons = buttons;
+        let next_x =
+            map_absolute_axis(raw_x, logical_min_x, logical_max_x, state.max_x).clamp(0, state.max_x);
+        let next_y =
+            map_absolute_axis(raw_y, logical_min_y, logical_max_y, state.max_y).clamp(0, state.max_y);
+
+        if state.x == next_x && state.y == next_y {
+            if !state.drawn {
+                draw_cursor(state);
+            }
+            return;
+        }
+
+        hide_cursor(state);
+        state.x = next_x;
+        state.y = next_y;
+        draw_cursor(state);
+    });
+}
+
+#[cfg(not(target_os = "none"))]
+#[allow(clippy::too_many_arguments)]
+pub fn set_absolute_position(
+    _raw_x: i32,
+    _raw_y: i32,
+    _logical_min_x: i32,
+    _logical_max_x: i32,
+    _logical_min_y: i32,
+    _logical_max_y: i32,
+    _buttons: u8,
+) {
+}
 
 #[cfg(test)]
 mod tests {
@@ -539,5 +649,12 @@ mod tests {
         let (x2, y2) = apply_motion(x, y, -20, -20, 8, 8);
         assert_eq!(x2, 0);
         assert_eq!(y2, 8);
+    }
+
+    #[test]
+    fn map_absolute_axis_clamps_and_scales() {
+        assert_eq!(map_absolute_axis(50, 0, 100, 200), 100);
+        assert_eq!(map_absolute_axis(-5, 0, 100, 200), 0);
+        assert_eq!(map_absolute_axis(200, 0, 100, 200), 200);
     }
 }
