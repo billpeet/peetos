@@ -27,7 +27,7 @@ Limitations / Simplifications
 - No boot-info structure is passed to `kmain()` yet; the kernel relies on fixed memory locations for early data.
 - SSE enablement is unconditional and does not check CPUID feature bits.
 - The early stack is a fixed 64 KB region with no guard pages.
-- Stage2 uses a fixed low-memory kernel staging window (`0x18000..0x9FFFF`) before relocating to `0x100000`; oversized kernels must be rejected at build time.
+- Stage2 uses a fixed low-memory kernel staging window (`0x18000..0xB7FFF`) before relocating to `0x100000`; oversized kernels must be rejected at build time.
 
 **Kernel Initialization Sequence (`kmain`)**
 1. Initialize serial output and print the boot banner.

@@ -36,6 +36,7 @@ mod task;
 mod tcp;
 mod tty;
 mod udp;
+#[cfg(feature = "usb-tablet")]
 mod usb;
 mod user;
 mod vfs;
@@ -141,6 +142,7 @@ pub extern "C" fn kmain() -> ! {
     storage::init(&pci_devices[..pci_summary.stored_devices]);
 
     net::init(&pci_devices[..pci_summary.stored_devices]);
+    #[cfg(feature = "usb-tablet")]
     usb::init(&pci_devices[..pci_summary.stored_devices]);
 
     vfs::init();
@@ -177,6 +179,7 @@ pub extern "C" fn kmain() -> ! {
 
     loop {
         net::poll();
+        #[cfg(feature = "usb-tablet")]
         usb::poll();
         mouse::begin_framebuffer_update();
         fb_console::tick();

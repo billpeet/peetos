@@ -63,6 +63,7 @@ If validation fails, framebuffer is marked unavailable and kernel continues with
 `kernel/src/usb.rs` exposes:
 - `init(pci_devices)` - discover and initialize UHCI + HID-tablet path if present
 - `poll()` - fetch interrupt-IN tablet reports and update cursor absolute position
+This USB path is feature-gated behind `KERNEL_FEATURES=usb-tablet`.
 
 Color values are treated as 32-bit packed pixels (current baseline assumes 32-bpp layout from VBE mode).
 

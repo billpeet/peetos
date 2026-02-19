@@ -174,6 +174,7 @@ fn parse_hid_tablet_interface(config_bytes: &[u8]) -> Option<HidTabletInterface>
     })
 }
 
+#[cfg(test)]
 fn hid_value_u32(data: &[u8], size: usize) -> u32 {
     match size {
         0 => 0,
@@ -183,6 +184,7 @@ fn hid_value_u32(data: &[u8], size: usize) -> u32 {
     }
 }
 
+#[cfg(test)]
 fn hid_value_i32(data: &[u8], size: usize) -> i32 {
     match size {
         0 => 0,
@@ -192,6 +194,7 @@ fn hid_value_i32(data: &[u8], size: usize) -> i32 {
     }
 }
 
+#[cfg(test)]
 fn resolve_local_usage(
     usages: &[u16; 16],
     usage_count: usize,
@@ -214,6 +217,7 @@ fn resolve_local_usage(
     None
 }
 
+#[cfg(test)]
 fn parse_hid_report_layout(descriptor: &[u8]) -> Option<TabletReportLayout> {
     let mut usage_page: u16 = 0;
     let mut logical_min: i32 = 0;
@@ -382,6 +386,7 @@ fn parse_hid_report_layout(descriptor: &[u8]) -> Option<TabletReportLayout> {
     })
 }
 
+#[cfg(test)]
 fn extract_bits_le(data: &[u8], bit_offset: u16, bit_size: u8) -> Option<u32> {
     if bit_size == 0 || bit_size > 32 {
         return None;
@@ -401,6 +406,7 @@ fn extract_bits_le(data: &[u8], bit_offset: u16, bit_size: u8) -> Option<u32> {
     Some(value)
 }
 
+#[cfg(test)]
 fn sign_extend(value: u32, bits: u8) -> i32 {
     if bits == 0 || bits >= 32 {
         return value as i32;
@@ -409,6 +415,7 @@ fn sign_extend(value: u32, bits: u8) -> i32 {
     ((value << shift) as i32) >> shift
 }
 
+#[cfg(test)]
 fn decode_tablet_report(layout: TabletReportLayout, report: &[u8]) -> Option<TabletSample> {
     let payload = if let Some(id) = layout.report_id {
         if report.first().copied()? != id {
@@ -445,6 +452,17 @@ fn decode_tablet_report(layout: TabletReportLayout, report: &[u8]) -> Option<Tab
     };
 
     Some(TabletSample { x, y, buttons })
+}
+
+fn decode_qemu_tablet_report(report: &[u8]) -> Option<TabletSample> {
+    if report.len() < 5 {
+        return None;
+    }
+    Some(TabletSample {
+        buttons: report[0] & 0x07,
+        x: u16::from_le_bytes([report[1], report[2]]) as i32,
+        y: u16::from_le_bytes([report[3], report[4]]) as i32,
+    })
 }
 
 #[cfg(target_os = "none")]
@@ -1147,31 +1165,7 @@ mod hw {
             None => return false,
         };
 
-        let mut report_layout = TabletReportLayout::qemu_default();
-        if interface.report_descriptor_len > 0 && interface.report_descriptor_len <= driver.data_buf.size {
-            let mut report_desc = [0u8; USB_DATA_BUF_BYTES];
-            let setup_report = SetupPacket {
-                request_type: 0x81,
-                request: USB_REQ_GET_DESCRIPTOR,
-                value: ((USB_DESCRIPTOR_REPORT as u16) << 8),
-                index: interface.interface_number as u16,
-                length: interface.report_descriptor_len as u16,
-            };
-            if control_transfer(
-                driver,
-                address,
-                setup_report,
-                Some(&mut report_desc[..interface.report_descriptor_len]),
-            )
-            .is_some()
-            {
-                if let Some(layout) =
-                    parse_hid_report_layout(&report_desc[..interface.report_descriptor_len])
-                {
-                    report_layout = layout;
-                }
-            }
-        }
+        let report_layout = TabletReportLayout::qemu_default();
 
         let set_config = SetupPacket {
             request_type: 0x00,
@@ -1202,7 +1196,7 @@ mod hw {
         driver.interrupt_toggle = 0;
 
         crate::serial_println!(
-            "[USB] HID tablet configured addr={} iface={} ep=0x{:02X} mps={} poll={}ms report={}B subclass={} proto={}",
+            "[USB] HID tablet configured addr={} iface={} ep=0x{:02X} mps={} poll={}ms report={}B subclass={} proto={} desc_report_len={}",
             driver.device_address,
             interface.interface_number,
             driver.endpoint_address,
@@ -1210,7 +1204,8 @@ mod hw {
             driver.poll_interval_ms,
             driver.report_layout.report_bytes,
             interface.subclass,
-            interface.protocol
+            interface.protocol,
+            interface.report_descriptor_len
         );
 
         true
@@ -1378,9 +1373,7 @@ mod hw {
                 return;
             }
 
-            if let Some(decoded) =
-                decode_tablet_report(state.report_layout, &report[..report_len])
-            {
+            if let Some(decoded) = decode_qemu_tablet_report(&report[..report_len]) {
                 state.last_report_len = report_len;
                 state.last_report[..report_len].copy_from_slice(&report[..report_len]);
                 sample = Some(decoded);

@@ -57,7 +57,7 @@ SECTOR_SIZE := 512
 STAGE2_SECTORS := 16
 DISK_SECTORS := 20480
 STAGE2_KERNEL_LOAD_ADDR := 0x18000
-LOW_MEM_HOLE_ADDR := 0xA0000
+LOW_MEM_HOLE_ADDR := 0xB8000
 
 BOOT_STAGE1_SRC := boot/stage1/boot.asm
 BOOT_STAGE2_SRC := boot/stage2/stage2.asm
@@ -284,7 +284,8 @@ run-current:
 run-image: image
 	$(QEMU) -drive format=raw,file=$(IMAGE) -serial stdio
 
-run-tablet: image
+run-tablet:
+	$(MAKE) image PROFILE=release KERNEL_FEATURES="$(strip $(KERNEL_FEATURES) usb-tablet)"
 	$(QEMU) \
 		-drive format=raw,file=$(IMAGE) \
 		-usb \

@@ -80,6 +80,7 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
 - Framebuffer console writes/ticks temporarily hide the cursor and redraw it after updates so text rendering and cursor overlay stay coherent.
 
 **USB UHCI Tablet Baseline**
+- Feature-gated behind `KERNEL_FEATURES=usb-tablet` so default builds remain within the stage2 staging-size limit.
 - UHCI host-controller discovery is wired from PCI class/subclass/prog-if (`0x0C:0x03:0x00`) and currently uses I/O BAR programming.
 - The kernel initializes a minimal UHCI schedule (frame list + queue head + TD pool), performs root-port reset/enable, and issues control transfers for device/config/report descriptors.
 - HID configuration parsing selects an interrupt-IN endpoint and a report descriptor parser extracts absolute X/Y + button fields when possible.
