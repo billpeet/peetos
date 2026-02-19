@@ -65,11 +65,25 @@ ENTRY_SRC := kernel/arch/x86_64/entry.asm
 KERNEL_TARGET_DIR := target/x86_64-unknown-none/$(PROFILE)
 
 KERNEL_FEATURES ?=
+empty :=
+space := $(empty) $(empty)
+comma := ,
 ifneq ($(strip $(KERNEL_FEATURES)),)
-CARGO_FEATURES := --features $(KERNEL_FEATURES)
+CARGO_FEATURES := --features $(subst $(space),$(comma),$(strip $(KERNEL_FEATURES)))
 else
 CARGO_FEATURES :=
 endif
+
+ALL_KERNEL_FEATURES := $(strip $(shell awk '\
+	BEGIN { in_features = 0; } \
+	/^\[features\]/ { in_features = 1; next; } \
+	/^\[/ { if (in_features) exit; } \
+	in_features && /^[A-Za-z0-9][A-Za-z0-9_-]*[[:space:]]*=/ { \
+		split($$0, parts, "="); \
+		gsub(/[[:space:]]/, "", parts[1]); \
+		printf "%s ", parts[1]; \
+	}' kernel/Cargo.toml))
+RUN_ALL_FEATURES ?= $(filter-out default test-exit vga %-smoke,$(ALL_KERNEL_FEATURES))
 
 ifneq ($(findstring musl-ext2-quickjs-smoke,$(KERNEL_FEATURES)),)
 USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_QUICKJS_BIN) quickjs/test_hello.js quickjs/test_math.js
@@ -289,7 +303,19 @@ image: bootloader kernel
 	dd if=$(KERNEL_BIN) of=$(IMAGE) bs=$(SECTOR_SIZE) seek=$$kernel_payload_lba conv=notrunc status=none
 	@echo "Built $(IMAGE)"
 
-run: run-image
+run:
+	$(MAKE) image PROFILE=release KERNEL_FEATURES="$(RUN_ALL_FEATURES)"
+	$(QEMU) \
+		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
+		-device ich9-ahci,id=ahci \
+		-device ide-hd,drive=disk0,bus=ahci.0 \
+		-drive id=disk1,file=$(USER_EXT2_MUSL_IMG),if=none,format=raw \
+		-device ide-hd,drive=disk1,bus=ahci.1 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0 \
+		-usb \
+		-device usb-tablet \
+		-serial stdio -no-reboot -no-shutdown
 
 run-current:
 	@if [ ! -f $(IMAGE) ]; then \

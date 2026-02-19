@@ -107,7 +107,7 @@ Run in QEMU with serial output:
 make run
 ```
 
-`make run` now builds and boots the shell runtime path (`PROFILE=release KERNEL_FEATURES=musl-ext2-exec`).
+`make run` now builds and boots a full runtime profile by enabling every kernel feature defined in `kernel/Cargo.toml` except `test-exit` (test-only auto-exit), `vga` (legacy text-mode path), and all `*-smoke` features, with AHCI disk0 (`build/peetos.img`) and AHCI disk1 (`user/sample_ext2_musl.img`) attached.
 Use `make run-current` to boot the current `build/peetos.img` without rebuilding.
 Use `make run-image` to rebuild with current flags first.
 
