@@ -13,7 +13,7 @@
 ; 0x00007C00 - 0x00007DFF : Stage 1 Bootloader (MBR, loaded by BIOS)
 ; 0x00007E00 - 0x0000FFFF : Stage 2 Bootloader area
 ; 0x00010000 - 0x00013FFF : Page Tables (16 KB for 4-level paging)
-; 0x00018000 - 0x000B7FFF : Kernel staging area (up to 640 KB)
+; 0x00018000 - 0x000B7FFF : Kernel chunk staging buffer for BIOS reads
 ; 0x000A0000 - 0x000BFFFF : VGA Video Memory
 ; 0x000B8000 - 0x000B8F9F : VGA Text Mode Buffer (80x25 characters)
 ; 0x000C0000 - 0x000FFFFF : BIOS ROM
@@ -79,17 +79,13 @@ KERNEL_LOAD_ADDR    equ 0x18000
 ; Segment for kernel loading (0x18000 / 16 = 0x1800)
 KERNEL_SEGMENT      equ 0x1800
 
-; Disk sector where kernel starts.
-; MBR = sector 1, Stage 2 = sectors 2-17, Kernel = sector 18+
-KERNEL_START_SECTOR equ 18
+; Disk sector where kernel metadata starts.
+; MBR = sector 1, Stage 2 = sectors 2-17, metadata = sector 18.
+KERNEL_META_SECTOR  equ 18
 
-; Number of sectors to read for the kernel.
-; 1280 sectors = 640 KB.
-; This keeps the staging buffer below 0xB8000 (VGA text buffer), leaving
-; room for kernel growth while still staying below the relocation gap to
-; KERNEL_START.
-; Note: Must be large enough to include .data section (check build/kernel.bin).
-KERNEL_SECTORS      equ 1280
+; Disk sector where kernel payload starts.
+; Payload immediately follows metadata.
+KERNEL_START_SECTOR equ 19
 
 ; Final kernel address after relocation (1 MB mark).
 ; This is in extended memory, beyond the legacy 640KB limit.

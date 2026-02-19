@@ -56,8 +56,6 @@ endif
 SECTOR_SIZE := 512
 STAGE2_SECTORS := 16
 DISK_SECTORS := 20480
-STAGE2_KERNEL_LOAD_ADDR := 0x18000
-LOW_MEM_HOLE_ADDR := 0xB8000
 
 BOOT_STAGE1_SRC := boot/stage1/boot.asm
 BOOT_STAGE2_SRC := boot/stage2/stage2.asm
@@ -253,13 +251,6 @@ kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_I
 	fi; \
 	cp "$$kernel_artifact" $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
-	@kernel_size=$$(stat -c%s $(KERNEL_BIN)); \
-	stage2_cap=$$(( $(LOW_MEM_HOLE_ADDR) - $(STAGE2_KERNEL_LOAD_ADDR) )); \
-	if [ $$kernel_size -gt $$stage2_cap ]; then \
-		echo "ERROR: kernel.bin ($$kernel_size bytes) exceeds stage2 staging window ($$stage2_cap bytes)."; \
-		echo "Reduce kernel image size or update bootloader staging strategy."; \
-		exit 1; \
-	fi
 
 # ---------------------------------------------------------------------------
 # Disk Image
@@ -269,7 +260,33 @@ image: bootloader kernel
 	@dd if=/dev/zero of=$(IMAGE) bs=$(SECTOR_SIZE) count=$(DISK_SECTORS) status=none
 	@dd if=$(BOOT_BIN) of=$(IMAGE) conv=notrunc status=none
 	@dd if=$(STAGE2_BIN) of=$(IMAGE) bs=$(SECTOR_SIZE) seek=1 conv=notrunc status=none
-	@dd if=$(KERNEL_BIN) of=$(IMAGE) bs=$(SECTOR_SIZE) seek=$(shell expr 1 + $(STAGE2_SECTORS)) conv=notrunc status=none
+	@kernel_size=$$(stat -c%s $(KERNEL_BIN)); \
+	kernel_sectors=$$(( (kernel_size + $(SECTOR_SIZE) - 1) / $(SECTOR_SIZE) )); \
+	if [ $$kernel_sectors -gt 65535 ]; then \
+		echo "ERROR: kernel payload uses $$kernel_sectors sectors; stage2 metadata format supports at most 65535."; \
+		exit 1; \
+	fi; \
+	kernel_meta_lba=$$((1 + $(STAGE2_SECTORS))); \
+	kernel_payload_lba=$$((kernel_meta_lba + 1)); \
+	if [ $$((kernel_payload_lba + kernel_sectors)) -gt $(DISK_SECTORS) ]; then \
+		echo "ERROR: kernel payload does not fit in disk image ($$kernel_sectors sectors starting at LBA $$kernel_payload_lba)."; \
+		exit 1; \
+	fi; \
+	kernel_meta_bin="$(BUILD_DIR)/kernel.meta.bin"; \
+	dd if=/dev/zero of="$$kernel_meta_bin" bs=$(SECTOR_SIZE) count=1 status=none; \
+	printf 'PKRN' | dd of="$$kernel_meta_bin" bs=1 seek=0 conv=notrunc status=none; \
+	printf '%b' "$$(printf '\\%03o\\%03o\\%03o\\%03o' \
+		$$((kernel_size & 0xFF)) \
+		$$(((kernel_size >> 8) & 0xFF)) \
+		$$(((kernel_size >> 16) & 0xFF)) \
+		$$(((kernel_size >> 24) & 0xFF)))" \
+		| dd of="$$kernel_meta_bin" bs=1 seek=4 conv=notrunc status=none; \
+	printf '%b' "$$(printf '\\%03o\\%03o' \
+		$$((kernel_sectors & 0xFF)) \
+		$$(((kernel_sectors >> 8) & 0xFF)))" \
+		| dd of="$$kernel_meta_bin" bs=1 seek=8 conv=notrunc status=none; \
+	dd if="$$kernel_meta_bin" of=$(IMAGE) bs=$(SECTOR_SIZE) seek=$$kernel_meta_lba conv=notrunc status=none; \
+	dd if=$(KERNEL_BIN) of=$(IMAGE) bs=$(SECTOR_SIZE) seek=$$kernel_payload_lba conv=notrunc status=none
 	@echo "Built $(IMAGE)"
 
 run: run-image

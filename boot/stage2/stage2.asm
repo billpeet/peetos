@@ -162,9 +162,9 @@ stage2_start:
     ; -----------------------------------------------------------------------
     ; STEP 6: Load kernel from disk
     ; -----------------------------------------------------------------------
-    ; The kernel is stored on disk after Stage 2.
-    ; We load it into memory at KERNEL_LOAD_ADDR (0x18000) as a staging buffer.
-    ; It will be relocated to KERNEL_START (0x100000) in 32-bit mode.
+    ; The kernel payload is stored on disk after Stage 2 + metadata sector.
+    ; Stage2 reads payload chunks into KERNEL_LOAD_ADDR (0x18000) and copies
+    ; each chunk directly to KERNEL_START (0x100000)+offset.
 
     mov si, msg_load_kernel
     call print_string_16
@@ -299,123 +299,185 @@ check_long_mode_support:
 ; ===========================================================================
 
 load_kernel:
-    ; We need to read multiple sectors. BIOS INT 13h AH=02h can read up to
-    ; 127 sectors, but we read in smaller chunks to avoid track boundary issues.
-    ;
-    ; We use INT 13h AH=02h with CHS addressing, reading 32 sectors at a time.
-    ; The drive geometry is assumed to be 63 sectors/track, 16 heads (standard HD).
-    ;
-    ; LBA to CHS conversion:
-    ;   Sector = (LBA mod 63) + 1
-    ;   Head = (LBA / 63) mod 16
-    ;   Cylinder = LBA / (63 * 16) = LBA / 1008
+    ; Stage2 reads a metadata sector first, then loads payload chunks into a
+    ; low-memory staging buffer and uses BIOS INT 15h AH=87h block-move to
+    ; copy each chunk into final high memory at KERNEL_START+offset.
 
-    ; Initialize tracking variables
-    mov word [.sectors_remaining], KERNEL_SECTORS
-    mov word [.current_lba], KERNEL_START_SECTOR - 1   ; LBA 17 (0-indexed)
-    mov word [.dest_offset], 0
-    mov word [.dest_segment], KERNEL_SEGMENT
+    ; Read metadata sector (magic + payload sector count) into staging buffer.
+    mov word [load_kernel_current_lba], KERNEL_META_SECTOR - 1
+    mov word [load_kernel_dest_offset], 0
+    mov word [load_kernel_dest_segment], KERNEL_SEGMENT
+    mov dword [load_kernel_dest_phys], KERNEL_LOAD_ADDR
+    mov byte [load_kernel_sectors_this_read], 1
+    call .read_current_lba
+    jc .error
+
+    ; Validate metadata magic "PKRN".
+    mov ax, KERNEL_SEGMENT
+    mov es, ax
+    xor bx, bx
+    cmp byte [es:bx], 'P'
+    jne .error
+    cmp byte [es:bx + 1], 'K'
+    jne .error
+    cmp byte [es:bx + 2], 'R'
+    jne .error
+    cmp byte [es:bx + 3], 'N'
+    jne .error
+
+    ; Metadata offset +8 stores payload sector count (u16 LE).
+    mov ax, [es:bx + 8]
+    cmp ax, 0
+    je .error
+    mov word [load_kernel_sectors_remaining], ax
+    mov word [load_kernel_current_lba], KERNEL_START_SECTOR - 1
+    mov dword [load_kernel_dest_phys], KERNEL_START
 
 .read_loop:
     ; Check if we're done
-    mov ax, [.sectors_remaining]
+    mov ax, [load_kernel_sectors_remaining]
     cmp ax, 0
     je .success
 
-    ; Calculate sectors to read this iteration
-    ; Read up to 32 sectors at a time, but don't cross track boundary
-    mov bx, [.current_lba]
-
-    ; Calculate sectors remaining in current track
-    mov ax, bx                      ; AX = current LBA
+    ; Read up to 32 sectors at a time, without crossing a track boundary.
+    mov bx, [load_kernel_current_lba]
+    mov ax, bx
     xor dx, dx
-    mov cx, 63                      ; SPT = 63
-    div cx                          ; AX = LBA / 63, DX = LBA mod 63
-    ; DX = sector - 1 (0-indexed within track)
-    ; Sectors remaining in track = 63 - DX
+    mov cx, 63
+    div cx                          ; AX = LBA / 63, DX = LBA % 63
     mov ax, 63
-    sub ax, dx                      ; AX = sectors remaining in track
-
-    ; Take minimum of: sectors remaining in track, 32, total remaining
+    sub ax, dx                      ; sectors remaining in this track
     cmp ax, 32
     jle .check_total
-    mov ax, 32                      ; Limit to 32 sectors per read
+    mov ax, 32
 .check_total:
-    cmp ax, [.sectors_remaining]
+    cmp ax, [load_kernel_sectors_remaining]
     jle .use_count
-    mov ax, [.sectors_remaining]    ; Don't read more than remaining
+    mov ax, [load_kernel_sectors_remaining]
 .use_count:
-    mov [.sectors_this_read], ax    ; Save count for this read
-
-    ; Convert current LBA to CHS
-    ; LBA is in BX (we saved it above)
-    mov ax, bx                      ; AX = LBA
-    xor dx, dx
-    mov cx, 63                      ; SPT = 63
-    div cx                          ; AX = LBA / 63, DX = LBA mod 63
-    inc dx                          ; DX = sector number (1-indexed)
-    mov [.sector], dl               ; Save sector
-
-    ; AX = LBA / 63 (track number across all heads)
-    xor dx, dx
-    mov cx, 16                      ; 16 heads
-    div cx                          ; AX = cylinder, DX = head
-    mov [.head], dl                 ; Save head
-    mov [.cylinder], al             ; Save cylinder (low 8 bits)
-
-    ; Set up for INT 13h AH=02h
-    mov ax, [.dest_segment]
-    mov es, ax
-    mov bx, [.dest_offset]          ; ES:BX = destination
-
-    mov al, [.sectors_this_read]    ; AL = number of sectors
-    mov ah, 0x02                    ; AH = read sectors function
-    mov ch, [.cylinder]             ; CH = cylinder (low 8 bits)
-    mov cl, [.sector]               ; CL = sector (bits 0-5)
-    mov dh, [.head]                 ; DH = head
-    mov dl, 0x80                    ; DL = first hard disk
-
-    int 0x13
+    mov [load_kernel_sectors_this_read], al
+    call .read_current_lba
     jc .error
 
-    ; Update tracking for next iteration
-    mov ax, [.sectors_this_read]
-    sub [.sectors_remaining], ax
-    add [.current_lba], ax
+    ; Update tracking for next iteration.
+    mov al, [load_kernel_sectors_this_read]
+    mov ah, 0
+    shl ax, 9
+    mov [load_kernel_chunk_bytes], ax
+    call copy_chunk_to_high
+    jc .error
 
-    ; Advance destination pointer
-    mov ax, [.sectors_this_read]
-    shl ax, 9                       ; AX = sectors * 512
-    add [.dest_offset], ax
-    jnc .read_loop                  ; If no overflow, continue
+    movzx ax, byte [load_kernel_sectors_this_read]
+    sub [load_kernel_sectors_remaining], ax
+    add [load_kernel_current_lba], ax
 
-    ; Handle offset overflow: advance segment by 0x1000 (64KB)
-    add word [.dest_segment], 0x1000
+    movzx eax, word [load_kernel_chunk_bytes]
+    add dword [load_kernel_dest_phys], eax
     jmp .read_loop
 
 .success:
-    ; Restore ES to 0
     xor ax, ax
     mov es, ax
     clc                             ; Success
     ret
 
 .error:
-    ; Restore ES
     xor ax, ax
     mov es, ax
     stc                             ; Failure
     ret
 
-; Local variables for load_kernel
-.sectors_remaining: dw 0
-.current_lba:       dw 0
-.dest_offset:       dw 0
-.dest_segment:      dw 0
-.sectors_this_read: dw 0
-.sector:            db 0
-.head:              db 0
-.cylinder:          db 0
+; Read sectors_this_read sectors from current_lba into dest_segment:dest_offset.
+.read_current_lba:
+    mov ax, [load_kernel_current_lba]
+    xor dx, dx
+    mov cx, 63
+    div cx                          ; AX = LBA / 63, DX = LBA % 63
+    inc dx
+    mov [load_kernel_sector], dl
+
+    xor dx, dx
+    mov cx, 16
+    div cx                          ; AX = cylinder, DX = head
+    mov [load_kernel_head], dl
+    mov [load_kernel_cylinder], al
+
+    mov ax, [load_kernel_dest_segment]
+    mov es, ax
+    mov bx, [load_kernel_dest_offset]
+
+    mov al, [load_kernel_sectors_this_read]
+    mov ah, 0x02
+    mov ch, [load_kernel_cylinder]
+    mov cl, [load_kernel_sector]
+    mov dh, [load_kernel_head]
+    mov dl, 0x80
+    int 0x13
+    ret
+
+; Copy load_kernel_chunk_bytes from KERNEL_LOAD_ADDR to load_kernel_dest_phys.
+; Uses BIOS INT 15h AH=87h (move block in extended memory).
+copy_chunk_to_high:
+    mov ax, [load_kernel_chunk_bytes]
+    test ax, 1
+    jnz .error
+    cmp ax, 0
+    je .error
+
+    mov cx, ax
+    shr cx, 1                       ; CX = word count for INT 15h/87h
+    mov dx, ax
+    dec dx                          ; descriptor limit = bytes - 1
+    mov [load_kernel_move_gdt + 0x10], dx
+    mov [load_kernel_move_gdt + 0x18], dx
+
+    mov eax, KERNEL_LOAD_ADDR
+    mov [load_kernel_move_gdt + 0x12], al
+    mov [load_kernel_move_gdt + 0x13], ah
+    shr eax, 16
+    mov [load_kernel_move_gdt + 0x14], al
+    mov byte [load_kernel_move_gdt + 0x15], 0x93
+    mov word [load_kernel_move_gdt + 0x16], 0x0000
+
+    mov eax, [load_kernel_dest_phys]
+    test eax, 0xFF000000
+    jnz .error
+    mov [load_kernel_move_gdt + 0x1A], al
+    mov [load_kernel_move_gdt + 0x1B], ah
+    shr eax, 16
+    mov [load_kernel_move_gdt + 0x1C], al
+    mov byte [load_kernel_move_gdt + 0x1D], 0x93
+
+    xor ax, ax
+    mov es, ax
+    mov si, load_kernel_move_gdt
+    mov ah, 0x87
+    int 0x15
+    jc .error
+    cmp ah, 0x00
+    jne .error
+    clc
+    ret
+.error:
+    stc
+    ret
+
+; Shared state used by load_kernel.
+load_kernel_sectors_remaining: dw 0
+load_kernel_current_lba:       dw 0
+load_kernel_dest_offset:       dw 0
+load_kernel_dest_segment:      dw 0
+load_kernel_sectors_this_read: db 0
+load_kernel_sector:            db 0
+load_kernel_head:              db 0
+load_kernel_cylinder:          db 0
+load_kernel_chunk_bytes:       dw 0
+load_kernel_dest_phys:         dd 0
+
+; INT 15h AH=87h GDT work area (48 bytes).
+; Offsets 0x10..0x1D are patched per transfer; the rest remain zero.
+load_kernel_move_gdt:
+    times 0x30 db 0
 
 ; ===========================================================================
 ; INCLUDE 16-BIT HELPER FILES
@@ -537,18 +599,6 @@ protected_mode_start:
     mov gs, ax
     mov ss, ax
     mov esp, STACK_TOP          ; Set up stack
-
-    ; -----------------------------------------------------------------------
-    ; STEP 1.5: Relocate kernel to 1 MB (extended memory)
-    ; -----------------------------------------------------------------------
-    ; The kernel is loaded in low memory for BIOS disk I/O, but its linked
-    ; physical address is 0x100000. Move the image before enabling paging.
-
-    cld
-    mov esi, KERNEL_LOAD_ADDR
-    mov edi, KERNEL_START
-    mov ecx, KERNEL_SECTORS * 128   ; 512 bytes/sector / 4 bytes = 128 dwords
-    rep movsd
 
     ; -----------------------------------------------------------------------
     ; DEBUG: Print to serial that we made it to 32-bit mode
@@ -792,8 +842,8 @@ long_mode_start:
     ; -----------------------------------------------------------------------
     ; STEP 5: Jump to kernel!
     ; -----------------------------------------------------------------------
-    ; The kernel was loaded at KERNEL_LOAD_ADDR and relocated to KERNEL_START.
-    ; Jump to the relocated image (identity-mapped).
+    ; The kernel payload has already been copied to KERNEL_START.
+    ; Jump to the loaded image (identity-mapped).
 
     mov rsi, msg_jumping_serial
     call serial_print_64

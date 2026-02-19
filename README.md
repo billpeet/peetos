@@ -200,7 +200,7 @@ Keyboard input is captured from the QEMU display window and surfaced through the
 Mouse input is captured from the QEMU display window and drives the on-screen software cursor when framebuffer mode is active.
 Use `make run-tablet` to launch QEMU with `-usb -device usb-tablet` for absolute pointer input tests.
 When framebuffer mode is active, console output is mirrored into the QEMU display via a styled 8x16 text renderer with baseline ANSI 16-color support, cursor blink, preset themes, and the software mouse cursor overlay.
-Note: `PROFILE=debug` may exceed the current stage2 low-memory kernel staging window for this feature set.
+Note: kernel size is no longer bounded by the stage2 low-memory chunk buffer; image builds are now constrained by disk image capacity and the current 16-bit sector-count metadata field.
 
 ## Testing
 

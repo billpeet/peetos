@@ -95,5 +95,5 @@ Limitations / Simplifications
 - Block-backed ext2 sync is currently best-effort and coarse-grained (export whole mounted image and write it back), with no journal, crash-consistency protocol, or batched/page-cache flush policy.
 - ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.
 - ext2 import/export paths are currently capped at a 16 MiB mounted image buffer (`EXT2_MAX_IMAGE_SIZE`).
-- Bare-metal kernel builds currently skip embedding the sample ext2 fallback image to stay within stage2 low-memory kernel staging limits.
+- Bare-metal kernel builds currently skip embedding the sample ext2 fallback image to keep the default kernel/image lean.
 - Runtime shell/smoke flows currently require attaching `user/sample_ext2_musl.img` as a second AHCI disk in QEMU.

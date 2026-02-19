@@ -8,7 +8,7 @@ The current feature set is summarized in `../peetos_c/docs/ROADMAP.md` and the k
 
 ## Current Status (Last reviewed: 2026-02-19)
 
-- Phase 0: Complete. Workspace, subsystem crates, bootloader/linker reuse, Makefile, `.cargo/config.toml`, and kernel entry assembly are present.
+- Phase 0: Complete. Workspace, subsystem crates, bootloader/linker reuse, Makefile, `.cargo/config.toml`, and kernel entry assembly are present. Stage2 kernel image loading now uses a metadata sector plus chunked copy to high memory, removing the prior low-memory full-image staging cap.
 - Phase 1: Complete. The kernel boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a loop. The panic handler reports over serial before halting.
 - Phase 2: Complete (baseline). Added `arch_x86_64` port I/O helpers, interrupt enable/disable wrappers (plus RAII guard), GDT/IDT setup with interrupt stubs and handler registration, PIC remap, PIT timer init, syscall entry/MSR setup, and a serial exception report.
 - Phase 3: Complete (baseline). Added typed address helpers, bitmap-based PMM, VMM mapping/address-space support, and a kernel heap allocator.

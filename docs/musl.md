@@ -102,7 +102,7 @@ make musl CC=clang AR=llvm-ar RANLIB=llvm-ranlib
 - This stage sets up source/build plumbing and a narrow shell bring-up path only; full dynamic-linker/runtime verification in-kernel is still pending.
 - The shell-core utility set intentionally includes a small syscall-gap probe tier (`cp`, `mv`, `ln`, `touch`) while VFS metadata/node-creation gaps (`fchmodat`, `fchownat`, `mknodat`) are still being closed.
 - The default repository tests intentionally avoid networked musl builds and instead validate script behavior/pathing.
-- `KERNEL_FEATURES=musl-ext2-exec` currently requires `PROFILE=release` in this tree because debug kernels can exceed stage2 low-memory kernel staging limits.
+- `KERNEL_FEATURES=musl-ext2-exec` is typically run with `PROFILE=release` for faster build/boot iteration on this feature set.
 - ext2 shell runtime/smoke flows currently expect attaching `user/sample_ext2_musl.img` as a second block device in QEMU.
 - Ping smoke currently validates the QEMU user-mode NAT gateway (`10.0.2.2`) and is not yet a general network interoperability test suite.
 - QuickJS smoke currently validates staged script execution (`/mnt/ext2/tmp/test_hello.js`, `/mnt/ext2/tmp/test_math.js`) and not broader JS engine conformance.
