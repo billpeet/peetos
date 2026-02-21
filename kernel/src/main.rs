@@ -206,6 +206,9 @@ fn panic(info: &PanicInfo) -> ! {
 
 extern "C" fn default_exception_handler(frame: &mut idt::InterruptFrame) {
     serial::init();
+    if exception::handle(frame) {
+        return;
+    }
     exception::report(frame);
 
     loop {

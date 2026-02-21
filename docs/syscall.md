@@ -74,7 +74,8 @@ Limitations / Simplifications
 Current implemented handlers:
 - `open/openat/close/read/write/writev/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
 - `dup/dup2/dup3/fcntl` baseline descriptor operations (`F_GETFD`, `F_SETFD`, `F_GETFL`, `F_DUPFD`, `F_DUPFD_CLOEXEC`) with `FD_CLOEXEC`
-- `mmap/mprotect/munmap` for baseline userspace mapping management (anonymous private mappings plus private file-backed mappings from VFS fds, fixed/fixed-noreplace handling, and page-level protection changes)
+- `mmap/mprotect/munmap` for baseline userspace mapping management (anonymous/private plus file-backed private/shared mappings from VFS fds, fixed/fixed-noreplace handling, per-task VMA metadata, lazy page-fault mapping, and page-level protection updates)
+- `msync` baseline shared-file mapping writeback path (range walk + page-cache dirty writeback + backing ext2 sync/flush)
 - `kill`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` for baseline signal control and user-handler return
 - `pipe/pipe2` via in-kernel anonymous pipe state and per-task fd tables
 - `futex` (`WAIT`/`WAKE` baseline ops only)
@@ -114,7 +115,8 @@ Limitations / Simplifications
 - TTY behavior is still minimal: canonical mode only, no pty support, and `ioctl` support is currently a narrow console subset with mostly static responses/defaults.
 - Process-group/session semantics are currently minimal: no full job-control signal semantics yet, and no controlling-tty foreground group state beyond basic group-id validation for `TIOCSPGRP`.
 - `clone`/`vfork` support is intentionally narrow: no `CLONE_THREAD`/TLS/tid-pointer semantics, no thread-group model, and no true Linux `vfork` parent-blocking/shared-address-space behavior.
-- VM syscalls are still simplified: `mmap` currently supports `MAP_PRIVATE` mappings only (anonymous and file-backed), with no shared mappings, no copy-on-write optimization, no demand paging, and no VMA metadata layer.
+- VM syscalls are still simplified: `mmap` now supports `MAP_PRIVATE` (anonymous + file-backed) and baseline file-backed `MAP_SHARED` mappings including writable shared mappings with software dirty tracking and `msync`/`sync`/`fsync` writeback hooks; user-page allocation now does best-effort reclaim by unmapping reclaim-safe file-backed pages and evicting unmapped VM page-cache pages before retrying allocation. There is still no swap-backed reclaim for anonymous/private-writable pages, no copy-on-write fork optimization, and `fork` does not yet preserve shared-file-frame semantics.
+- User-mode page faults now resolve non-present `mmap` pages on demand; invalid faults are handled as fatal user faults (SIGSEGV-style exit path), with no `siginfo_t` fault payload/ucontext delivery yet.
 - VM mappings are currently constrained to a dedicated high user range managed by the kernel mmap allocator (used to avoid touching legacy low-memory bootstrap mappings).
 - `brk` still uses simple contiguous growth/shrink and does not yet integrate with full userspace allocator policies (no overcommit accounting, no guard-page policy).
 - `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.

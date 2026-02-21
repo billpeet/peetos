@@ -84,6 +84,7 @@ const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_RT_SIGRETURN: u64 = 15;
 const SYS_IOCTL: u64 = 16;
+const SYS_MSYNC: u64 = 26;
 const SYS_WRITEV: u64 = 20;
 const SYS_ACCESS: u64 = 21;
 const SYS_SELECT: u64 = 23;
@@ -260,6 +261,9 @@ const MAP_ANONYMOUS: u32 = 0x20;
 const MAP_DENYWRITE: u32 = 0x0800;
 const MAP_EXECUTABLE: u32 = 0x1000;
 const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+const MS_ASYNC: u32 = 0x1;
+const MS_INVALIDATE: u32 = 0x2;
+const MS_SYNC: u32 = 0x4;
 const O_CLOEXEC: u32 = 0x80000;
 const O_NONBLOCK: u32 = 0x800;
 
@@ -308,9 +312,81 @@ const GETCWD_MAX_DEPTH: usize = 32;
 const SIGNAL_FRAME_MAGIC_SYSCALL: u64 = 0x5352_4653_5953_0001;
 const SIGNAL_FRAME_MAGIC_INT80: u64 = 0x5352_4649_3830_0001;
 const UTS_FIELD_LEN: usize = 65;
+const MMAP_MAX_REGIONS_PER_TASK: usize = 32;
+const VM_PAGE_CACHE_MAX_PAGES: usize = 1024;
+const USER_VM_RECLAIM_TARGET_PAGES: usize = 16;
+
+const PAGE_FAULT_ERROR_PRESENT: u64 = 1 << 0;
+const PAGE_FAULT_ERROR_WRITE: u64 = 1 << 1;
+const PAGE_FAULT_ERROR_USER: u64 = 1 << 2;
+const PAGE_FAULT_ERROR_INSTR: u64 = 1 << 4;
+
+#[derive(Clone, Copy)]
+struct VmMapping {
+    start: u64,
+    len: u64,
+    file_offset: u64,
+    file_inode: u16,
+    prot: u32,
+    map_shared: bool,
+    map_shared_can_write: bool,
+}
+
+impl VmMapping {
+    const EMPTY: Self = Self {
+        start: 0,
+        len: 0,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: 0,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+}
 
 static mut UNKNOWN_SYSCALL_LOG_COUNT: u32 = 0;
 static PROCESS_UMASK: AtomicU32 = AtomicU32::new(0o022);
+static mut TASK_VM_OWNER_PID: [i32; task::MAX_TASKS] = [task::INVALID_PID; task::MAX_TASKS];
+static mut TASK_VM_MAPPINGS: [[VmMapping; MMAP_MAX_REGIONS_PER_TASK]; task::MAX_TASKS] =
+    [[VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK]; task::MAX_TASKS];
+#[derive(Clone, Copy)]
+struct VmPageCacheEntry {
+    inode: u16,
+    page_off: u64,
+    page_phys: u64,
+    loaded_len: u16,
+    valid: bool,
+    referenced: bool,
+    mapped_count: u16,
+    dirty: bool,
+}
+
+impl VmPageCacheEntry {
+    const EMPTY: Self = Self {
+        inode: task::USER_FD_NONE,
+        page_off: 0,
+        page_phys: 0,
+        loaded_len: 0,
+        valid: false,
+        referenced: false,
+        mapped_count: 0,
+        dirty: false,
+    };
+}
+
+static mut VM_PAGE_CACHE: [VmPageCacheEntry; VM_PAGE_CACHE_MAX_PAGES] =
+    [VmPageCacheEntry::EMPTY; VM_PAGE_CACHE_MAX_PAGES];
+static mut VM_PAGE_CACHE_CLOCK_HAND: usize = 0;
 
 #[derive(Clone, Copy)]
 struct SyscallArgs {
@@ -421,6 +497,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_mprotect,
     ),
     syscall_def(SYS_MUNMAP, "munmap", SyscallMode::UserTask, sys_munmap),
+    syscall_def(SYS_MSYNC, "msync", SyscallMode::UserTask, sys_msync),
     syscall_def(
         SYS_RT_SIGACTION,
         "rt_sigaction",
@@ -762,6 +839,479 @@ fn fs_to_errno(err: i64) -> i64 {
 #[inline]
 fn sync_ext2_backing() {
     let _ = crate::vfs::sync_ext2_to_block();
+}
+
+#[inline]
+fn flush_ext2_backing() {
+    let _ = crate::vfs::flush_ext2_block_cache();
+}
+
+#[inline]
+fn vm_page_cache_eligible_inode(inode: u16) -> bool {
+    fs::inode_backend_is_ext2(inode)
+}
+
+#[inline]
+fn mmap_region_is_reclaimable(region: &VmMapping) -> bool {
+    if region.file_inode == task::USER_FD_NONE {
+        return false;
+    }
+    if region.map_shared {
+        return true;
+    }
+    (region.prot & PROT_WRITE) == 0
+}
+
+fn vm_page_cache_reclaim_unmapped_pages(target_pages: usize) -> usize {
+    if target_pages == 0 {
+        return 0;
+    }
+    let mut reclaimed = 0usize;
+    for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+        if reclaimed >= target_pages {
+            break;
+        }
+        let (valid, page_phys, mapped_count) = unsafe {
+            let entry = VM_PAGE_CACHE[idx];
+            (entry.valid, entry.page_phys, entry.mapped_count)
+        };
+        if !valid || mapped_count != 0 || page_phys == 0 {
+            continue;
+        }
+        vm_page_cache_free_entry(idx);
+        let now_empty = unsafe { !VM_PAGE_CACHE[idx].valid };
+        if now_empty {
+            reclaimed += 1;
+        }
+    }
+    reclaimed
+}
+
+fn reclaim_user_vm_pages(target_pages: usize) -> usize {
+    if target_pages == 0 {
+        return 0;
+    }
+
+    let mut reclaimed = vm_page_cache_reclaim_unmapped_pages(target_pages);
+    if reclaimed >= target_pages {
+        return reclaimed;
+    }
+
+    for task_idx in 0..task::MAX_TASKS {
+        let task_ptr = task::get_by_index(task_idx);
+        if task_ptr.is_null() {
+            continue;
+        }
+        let (is_user, pml4) = unsafe {
+            (
+                ((*task_ptr).flags & TASK_FLAG_USER) != 0,
+                PhysAddr::new((*task_ptr).pml4_phys),
+            )
+        };
+        if !is_user || pml4.as_u64() == 0 {
+            continue;
+        }
+
+        let slot = match mmap_prepare_task_slot(task_ptr) {
+            Some(slot) => slot,
+            None => continue,
+        };
+
+        for region_idx in 0..MMAP_MAX_REGIONS_PER_TASK {
+            let region = unsafe { TASK_VM_MAPPINGS[slot][region_idx] };
+            if region.is_empty() || !mmap_region_is_reclaimable(&region) {
+                continue;
+            }
+
+            let mut page = region.start;
+            while page < region.end() {
+                let virt = VirtAddr::new(page);
+                let phys = match vmm::get_physical_in(pml4, virt) {
+                    Some(phys) => PhysAddr::new(phys.as_u64() & !(PAGE_SIZE - 1)),
+                    None => {
+                        page = page.saturating_add(PAGE_SIZE);
+                        continue;
+                    }
+                };
+
+                if vmm::unmap_page_in(pml4, virt) == 0 {
+                    if region.map_shared {
+                        if !vm_page_cache_release_mapped_phys(phys) {
+                            pmm::free_page(phys);
+                            reclaimed += 1;
+                        }
+                    } else {
+                        pmm::free_page(phys);
+                        reclaimed += 1;
+                    }
+
+                    if reclaimed >= target_pages {
+                        return reclaimed;
+                    }
+                }
+                page = page.saturating_add(PAGE_SIZE);
+            }
+        }
+    }
+
+    reclaimed += vm_page_cache_reclaim_unmapped_pages(target_pages.saturating_sub(reclaimed));
+    reclaimed
+}
+
+fn alloc_user_vm_page_with_reclaim() -> PhysAddr {
+    let page = pmm::alloc_page();
+    if page.as_u64() != 0 {
+        return page;
+    }
+    let _ = reclaim_user_vm_pages(USER_VM_RECLAIM_TARGET_PAGES);
+    pmm::alloc_page()
+}
+
+fn vm_page_cache_free_entry(idx: usize) {
+    let should_writeback = unsafe {
+        let entry = VM_PAGE_CACHE[idx];
+        entry.valid && entry.mapped_count == 0 && entry.dirty
+    };
+    if should_writeback {
+        let _ = vm_page_cache_writeback_idx(idx);
+    }
+    unsafe {
+        let entry = &mut VM_PAGE_CACHE[idx];
+        if entry.valid && entry.mapped_count != 0 {
+            return;
+        }
+        if entry.valid && entry.page_phys != 0 {
+            pmm::free_page(PhysAddr::new(entry.page_phys));
+        }
+        *entry = VmPageCacheEntry::EMPTY;
+    }
+}
+
+fn vm_page_cache_reset() {
+    for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+        vm_page_cache_free_entry(idx);
+    }
+    unsafe {
+        VM_PAGE_CACHE_CLOCK_HAND = 0;
+    }
+}
+
+fn vm_page_cache_lookup_idx(inode: u16, page_off: u64) -> Option<usize> {
+    unsafe {
+        for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+            let entry = &mut VM_PAGE_CACHE[idx];
+            if entry.valid && entry.inode == inode && entry.page_off == page_off {
+                entry.referenced = true;
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn vm_page_cache_acquire_slot() -> Result<usize, i64> {
+    for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+        unsafe {
+            if !VM_PAGE_CACHE[idx].valid {
+                return Ok(idx);
+            }
+        }
+    }
+
+    let mut scanned = 0usize;
+    while scanned < VM_PAGE_CACHE_MAX_PAGES * 2 {
+        let idx = unsafe {
+            let idx = VM_PAGE_CACHE_CLOCK_HAND;
+            VM_PAGE_CACHE_CLOCK_HAND = (VM_PAGE_CACHE_CLOCK_HAND + 1) % VM_PAGE_CACHE_MAX_PAGES;
+            idx
+        };
+        unsafe {
+            if VM_PAGE_CACHE[idx].referenced {
+                VM_PAGE_CACHE[idx].referenced = false;
+                scanned += 1;
+                continue;
+            }
+            if VM_PAGE_CACHE[idx].mapped_count != 0 {
+                scanned += 1;
+                continue;
+            }
+        }
+        vm_page_cache_writeback_idx(idx)?;
+        vm_page_cache_free_entry(idx);
+        return Ok(idx);
+    }
+    Err(-ENOMEM)
+}
+
+fn vm_page_cache_fill_entry(idx: usize, inode: u16, page_off: u64) -> Result<(), i64> {
+    let page_phys = alloc_user_vm_page_with_reclaim();
+    if page_phys.as_u64() == 0 {
+        return Err(-ENOMEM);
+    }
+
+    let page_ptr = page_phys.to_virt().as_u64() as *mut u8;
+    unsafe {
+        ptr::write_bytes(page_ptr, 0, PAGE_SIZE as usize);
+    }
+    let page_buf = unsafe { core::slice::from_raw_parts_mut(page_ptr, PAGE_SIZE as usize) };
+
+    let mut loaded = 0usize;
+    while loaded < page_buf.len() {
+        let read_n = fs::read(inode, page_off + loaded as u64, &mut page_buf[loaded..])
+            .map_err(|err| -fs_to_errno(err))?;
+        if read_n == 0 {
+            break;
+        }
+        loaded += read_n;
+    }
+
+    unsafe {
+        VM_PAGE_CACHE[idx] = VmPageCacheEntry {
+            inode,
+            page_off,
+            page_phys: page_phys.as_u64(),
+            loaded_len: loaded as u16,
+            valid: true,
+            referenced: true,
+            mapped_count: 0,
+            dirty: false,
+        };
+    }
+    Ok(())
+}
+
+fn vm_page_cache_get_entry(inode: u16, page_off: u64) -> Result<VmPageCacheEntry, i64> {
+    if let Some(idx) = vm_page_cache_lookup_idx(inode, page_off) {
+        unsafe {
+            return Ok(VM_PAGE_CACHE[idx]);
+        }
+    }
+
+    let idx = vm_page_cache_acquire_slot()?;
+    vm_page_cache_fill_entry(idx, inode, page_off)?;
+    unsafe { Ok(VM_PAGE_CACHE[idx]) }
+}
+
+fn vm_page_cache_pin_mapped_page(
+    inode: u16,
+    page_off: u64,
+    writable: bool,
+) -> Result<VmPageCacheEntry, i64> {
+    let idx = if let Some(idx) = vm_page_cache_lookup_idx(inode, page_off) {
+        idx
+    } else {
+        let idx = vm_page_cache_acquire_slot()?;
+        vm_page_cache_fill_entry(idx, inode, page_off)?;
+        idx
+    };
+
+    unsafe {
+        let entry = &mut VM_PAGE_CACHE[idx];
+        entry.mapped_count = entry.mapped_count.saturating_add(1);
+        entry.referenced = true;
+        if writable {
+            entry.dirty = true;
+        }
+        Ok(*entry)
+    }
+}
+
+pub(crate) fn vm_page_cache_release_mapped_phys(phys: PhysAddr) -> bool {
+    let page_phys = phys.as_u64() & !(PAGE_SIZE - 1);
+    unsafe {
+        for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+            let entry = &mut VM_PAGE_CACHE[idx];
+            if !entry.valid || entry.page_phys != page_phys {
+                continue;
+            }
+            if entry.mapped_count != 0 {
+                entry.mapped_count -= 1;
+            }
+            entry.referenced = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn vm_page_cache_mark_dirty_by_phys(phys: PhysAddr) -> bool {
+    let page_phys = phys.as_u64() & !(PAGE_SIZE - 1);
+    unsafe {
+        for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+            let entry = &mut VM_PAGE_CACHE[idx];
+            if !entry.valid || entry.page_phys != page_phys {
+                continue;
+            }
+            entry.dirty = true;
+            entry.referenced = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn vm_page_cache_writeback_idx(idx: usize) -> Result<usize, i64> {
+    let (inode, page_off, page_phys, loaded_len, valid, dirty) = unsafe {
+        let entry = VM_PAGE_CACHE[idx];
+        (
+            entry.inode,
+            entry.page_off,
+            entry.page_phys,
+            entry.loaded_len,
+            entry.valid,
+            entry.dirty,
+        )
+    };
+
+    if !valid || !dirty {
+        return Ok(0);
+    }
+    if loaded_len == 0 {
+        unsafe {
+            if VM_PAGE_CACHE[idx].valid {
+                VM_PAGE_CACHE[idx].dirty = false;
+            }
+        }
+        return Ok(0);
+    }
+
+    let total = loaded_len as usize;
+    let page_ptr = PhysAddr::new(page_phys).to_virt().as_u64() as *const u8;
+    let page = unsafe { core::slice::from_raw_parts(page_ptr, PAGE_SIZE as usize) };
+    let mut written = 0usize;
+    while written < total {
+        let write_res = fs::write(
+            inode,
+            page_off.saturating_add(written as u64),
+            &page[written..total],
+            false,
+        )
+        .map_err(|err| -fs_to_errno(err))?;
+        if write_res.written == 0 {
+            return Err(-EIO);
+        }
+        written += write_res.written;
+    }
+
+    unsafe {
+        let entry = &mut VM_PAGE_CACHE[idx];
+        if entry.valid
+            && entry.page_phys == page_phys
+            && entry.inode == inode
+            && entry.page_off == page_off
+        {
+            entry.dirty = false;
+            if written > entry.loaded_len as usize {
+                entry.loaded_len = written as u16;
+            }
+        }
+    }
+    Ok(written)
+}
+
+fn vm_page_cache_writeback_page(inode: u16, page_off: u64) -> Result<usize, i64> {
+    unsafe {
+        for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+            let entry = VM_PAGE_CACHE[idx];
+            if entry.valid && entry.inode == inode && entry.page_off == page_off {
+                return vm_page_cache_writeback_idx(idx);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn vm_page_cache_writeback_inode(inode: u16) -> Result<usize, i64> {
+    let mut written = 0usize;
+    for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+        let should_flush = unsafe { VM_PAGE_CACHE[idx].valid && VM_PAGE_CACHE[idx].inode == inode };
+        if should_flush {
+            written = written.saturating_add(vm_page_cache_writeback_idx(idx)?);
+        }
+    }
+    Ok(written)
+}
+
+fn vm_page_cache_writeback_all() -> Result<usize, i64> {
+    let mut written = 0usize;
+    for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+        written = written.saturating_add(vm_page_cache_writeback_idx(idx)?);
+    }
+    Ok(written)
+}
+
+fn vm_page_cache_read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
+    if dst.is_empty() {
+        return Ok(0);
+    }
+    if !vm_page_cache_eligible_inode(inode) {
+        refresh_procfs_runtime();
+        return fs::read(inode, offset, dst).map_err(|err| -fs_to_errno(err));
+    }
+
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let file_off = offset.saturating_add(copied as u64);
+        let page_off = align_down(file_off, PAGE_SIZE);
+        let in_page = (file_off - page_off) as usize;
+        let entry = vm_page_cache_get_entry(inode, page_off)?;
+        let loaded = entry.loaded_len as usize;
+        if in_page >= loaded {
+            break;
+        }
+
+        let available = loaded - in_page;
+        let take = cmp::min(available, dst.len() - copied);
+        let page_ptr = PhysAddr::new(entry.page_phys).to_virt().as_u64() as *const u8;
+        unsafe {
+            ptr::copy_nonoverlapping(page_ptr.add(in_page), dst.as_mut_ptr().add(copied), take);
+        }
+        copied += take;
+        if take < PAGE_SIZE as usize - in_page {
+            break;
+        }
+    }
+    Ok(copied)
+}
+
+fn vm_page_cache_invalidate_inode(inode: u16) {
+    for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+        unsafe {
+            if VM_PAGE_CACHE[idx].valid && VM_PAGE_CACHE[idx].inode == inode {
+                vm_page_cache_free_entry(idx);
+            }
+        }
+    }
+}
+
+fn vm_page_cache_invalidate_inode_range(inode: u16, offset: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let start = align_down(offset, PAGE_SIZE);
+    let end = match offset.checked_add(len) {
+        Some(v) => page_align_up(v).unwrap_or(u64::MAX),
+        None => u64::MAX,
+    };
+
+    for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+        let should_invalidate = unsafe {
+            let entry = VM_PAGE_CACHE[idx];
+            if !entry.valid || entry.inode != inode {
+                false
+            } else {
+                let page_end = entry.page_off.saturating_add(PAGE_SIZE);
+                start < page_end && entry.page_off < end
+            }
+        };
+        if should_invalidate {
+            vm_page_cache_free_entry(idx);
+        }
+    }
+}
+
+fn read_vfs_bytes(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
+    vm_page_cache_read(inode, offset, dst)
 }
 
 fn ipc_to_errno(err: i64) -> i64 {
@@ -1848,6 +2398,7 @@ fn execve_common(
     heap::kfree(argv_buf_ptr as *mut u8);
     heap::kfree(image.ptr);
     if result.is_ok() {
+        mmap_clear_task_regions(ctx.current);
         close_cloexec_fds(ctx.current);
     }
     result
@@ -1867,7 +2418,7 @@ fn ensure_user_pages_unmapped(pml4: PhysAddr, start: u64, end: u64) -> Result<()
 fn map_user_pages(pml4: PhysAddr, start: u64, end: u64) -> Result<(), i64> {
     let mut addr = start;
     while addr < end {
-        let phys = pmm::alloc_page();
+        let phys = alloc_user_vm_page_with_reclaim();
         if phys.as_u64() == 0 {
             return Err(ENOMEM);
         }
@@ -1899,7 +2450,10 @@ fn unmap_user_pages(pml4: PhysAddr, start: u64, end: u64) {
         let virt = VirtAddr::new(addr);
         if let Some(phys) = vmm::get_physical_in(pml4, virt) {
             if vmm::unmap_page_in(pml4, virt) == 0 {
-                pmm::free_page(PhysAddr::new(phys.as_u64() & !(PAGE_SIZE - 1)));
+                let phys_page = PhysAddr::new(phys.as_u64() & !(PAGE_SIZE - 1));
+                if !vm_page_cache_release_mapped_phys(phys_page) {
+                    pmm::free_page(phys_page);
+                }
             }
         }
         addr += PAGE_SIZE;
@@ -1915,6 +2469,26 @@ fn mmap_flags_are_supported(flags: u32) -> bool {
         | MAP_EXECUTABLE
         | MAP_FIXED_NOREPLACE;
     (flags & !supported) == 0
+}
+
+fn mmap_parse_sharing_mode(flags: u32) -> Result<(bool, bool), i64> {
+    let is_private = (flags & MAP_PRIVATE) != 0;
+    let is_shared = (flags & MAP_SHARED) != 0;
+    if is_private == is_shared {
+        return Err(-EINVAL);
+    }
+    Ok((is_private, is_shared))
+}
+
+fn msync_flags_are_valid(flags: u32) -> bool {
+    let supported = MS_ASYNC | MS_SYNC | MS_INVALIDATE;
+    if (flags & !supported) != 0 {
+        return false;
+    }
+    if (flags & MS_ASYNC) != 0 && (flags & MS_SYNC) != 0 {
+        return false;
+    }
+    true
 }
 
 fn mmap_prot_to_pte_flags(prot: u32) -> Result<u64, i64> {
@@ -1936,7 +2510,257 @@ fn mmap_prot_to_pte_flags(prot: u32) -> Result<u64, i64> {
     Ok(flags)
 }
 
-fn mmap_range_unmapped(pml4: PhysAddr, start: u64, end: u64) -> bool {
+fn mmap_task_slot(task_ptr: *mut task::Task) -> Option<usize> {
+    if task_ptr.is_null() {
+        return None;
+    }
+    for idx in 0..task::MAX_TASKS {
+        if task::get_by_index(idx) == task_ptr {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn mmap_prepare_task_slot(task_ptr: *mut task::Task) -> Option<usize> {
+    let slot = mmap_task_slot(task_ptr)?;
+    unsafe {
+        let pid = (*task_ptr).pid;
+        if TASK_VM_OWNER_PID[slot] != pid {
+            TASK_VM_OWNER_PID[slot] = pid;
+            TASK_VM_MAPPINGS[slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+        }
+    }
+    Some(slot)
+}
+
+fn mmap_clear_task_regions(task_ptr: *mut task::Task) {
+    let slot = match mmap_task_slot(task_ptr) {
+        Some(slot) => slot,
+        None => return,
+    };
+    unsafe {
+        TASK_VM_OWNER_PID[slot] = task::INVALID_PID;
+        TASK_VM_MAPPINGS[slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    }
+}
+
+fn mmap_regions_find_free(regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK]) -> Option<usize> {
+    for (idx, region) in regions.iter().enumerate() {
+        if region.is_empty() {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn mmap_regions_overlaps(
+    regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    start: u64,
+    end: u64,
+) -> bool {
+    for region in regions {
+        if region.is_empty() {
+            continue;
+        }
+        if start < region.end() && region.start < end {
+            return true;
+        }
+    }
+    false
+}
+
+fn mmap_regions_find_mapping(
+    regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    addr: u64,
+) -> Option<VmMapping> {
+    for region in regions {
+        if region.is_empty() {
+            continue;
+        }
+        if addr >= region.start && addr < region.end() {
+            return Some(*region);
+        }
+    }
+    None
+}
+
+fn mmap_regions_insert(
+    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    mapping: VmMapping,
+) -> Result<(), i64> {
+    if mapping.is_empty() {
+        return Err(-EINVAL);
+    }
+    if mmap_regions_overlaps(regions, mapping.start, mapping.end()) {
+        return Err(-EINVAL);
+    }
+
+    let slot = match mmap_regions_find_free(regions) {
+        Some(slot) => slot,
+        None => return Err(-ENOMEM),
+    };
+    regions[slot] = mapping;
+    Ok(())
+}
+
+#[inline]
+fn mmap_region_allows_prot(region: &VmMapping, prot: u32) -> bool {
+    if region.map_shared && (prot & PROT_WRITE) != 0 && !region.map_shared_can_write {
+        return false;
+    }
+    true
+}
+
+fn mmap_regions_split_at(
+    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    cut: u64,
+) -> Result<(), i64> {
+    for idx in 0..MMAP_MAX_REGIONS_PER_TASK {
+        let region = regions[idx];
+        if region.is_empty() || cut <= region.start || cut >= region.end() {
+            continue;
+        }
+
+        let free_idx = match mmap_regions_find_free(regions) {
+            Some(slot) => slot,
+            None => return Err(-ENOMEM),
+        };
+
+        let mut right = region;
+        right.start = cut;
+        right.len = region.end() - cut;
+        if right.file_inode != task::USER_FD_NONE {
+            right.file_offset = region.file_offset.saturating_add(cut - region.start);
+        }
+
+        regions[idx].len = cut - region.start;
+        regions[free_idx] = right;
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn mmap_regions_range_mapped(
+    regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    start: u64,
+    end: u64,
+) -> bool {
+    let mut cursor = start;
+    while cursor < end {
+        let region = match mmap_regions_find_mapping(regions, cursor) {
+            Some(region) => region,
+            None => return false,
+        };
+        let next = cmp::min(region.end(), end);
+        if next <= cursor {
+            return false;
+        }
+        cursor = next;
+    }
+    true
+}
+
+fn mmap_regions_unmap_range(
+    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    start: u64,
+    end: u64,
+) -> Result<(), i64> {
+    for idx in 0..MMAP_MAX_REGIONS_PER_TASK {
+        let region = regions[idx];
+        if region.is_empty() {
+            continue;
+        }
+
+        let region_start = region.start;
+        let region_end = region.end();
+        if end <= region_start || start >= region_end {
+            continue;
+        }
+
+        if start <= region_start && end >= region_end {
+            regions[idx] = VmMapping::EMPTY;
+            continue;
+        }
+
+        if start <= region_start {
+            let delta = end - region_start;
+            regions[idx].start = end;
+            regions[idx].len = region_end - end;
+            if region.file_inode != task::USER_FD_NONE {
+                regions[idx].file_offset = region.file_offset.saturating_add(delta);
+            }
+            continue;
+        }
+
+        if end >= region_end {
+            regions[idx].len = start - region_start;
+            continue;
+        }
+
+        let free_idx = match mmap_regions_find_free(regions) {
+            Some(slot) => slot,
+            None => return Err(-ENOMEM),
+        };
+        let mut right = region;
+        right.start = end;
+        right.len = region_end - end;
+        if right.file_inode != task::USER_FD_NONE {
+            right.file_offset = region.file_offset.saturating_add(end - region_start);
+        }
+
+        regions[idx].len = start - region_start;
+        regions[free_idx] = right;
+    }
+    Ok(())
+}
+
+fn mmap_regions_protect_range(
+    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    start: u64,
+    end: u64,
+    prot: u32,
+) -> Result<(), i64> {
+    if !mmap_regions_range_mapped(regions, start, end) {
+        return Err(-ENOMEM);
+    }
+
+    mmap_regions_split_at(regions, start)?;
+    mmap_regions_split_at(regions, end)?;
+
+    for region in regions.iter() {
+        if region.is_empty() {
+            continue;
+        }
+        if region.start >= start && region.end() <= end && !mmap_region_allows_prot(region, prot) {
+            return Err(-EINVAL);
+        }
+    }
+
+    for region in regions.iter_mut() {
+        if region.is_empty() {
+            continue;
+        }
+        if region.start >= start && region.end() <= end {
+            region.prot = prot;
+        }
+    }
+    Ok(())
+}
+
+fn mmap_task_overlaps(task_ptr: *mut task::Task, start: u64, end: u64) -> bool {
+    let slot = match mmap_prepare_task_slot(task_ptr) {
+        Some(slot) => slot,
+        None => return false,
+    };
+    unsafe { mmap_regions_overlaps(&TASK_VM_MAPPINGS[slot], start, end) }
+}
+
+fn mmap_range_available(task_ptr: *mut task::Task, pml4: PhysAddr, start: u64, end: u64) -> bool {
+    if mmap_task_overlaps(task_ptr, start, end) {
+        return false;
+    }
+
     let mut addr = start;
     while addr < end {
         if vmm::get_physical_in(pml4, VirtAddr::new(addr)).is_some() {
@@ -1975,7 +2799,7 @@ fn mmap_find_range(ctx: &SyscallContext, pml4: PhysAddr, hint: u64, len: u64) ->
         if end > search_end || end >= KERNEL_VIRT_BASE || cursor < PAGE_SIZE {
             break;
         }
-        if mmap_range_unmapped(pml4, cursor, end) {
+        if mmap_range_available(ctx.current, pml4, cursor, end) {
             return Ok(cursor);
         }
         cursor = match cursor.checked_add(PAGE_SIZE) {
@@ -1991,6 +2815,7 @@ fn mmap_file_inode(
     task_ptr: *mut task::Task,
     fd: i32,
     require_readable: bool,
+    require_writable: bool,
 ) -> Result<(u16, u32), i64> {
     let idx = fd_index(fd)?;
     if !fd_slot_is_open(task_ptr, idx) {
@@ -2010,60 +2835,11 @@ fn mmap_file_inode(
     if require_readable && !fd_can_read(fd_flags) {
         return Err(-EACCES);
     }
-
-    Ok((inode, fd_flags))
-}
-
-fn mmap_map_pages(
-    pml4: PhysAddr,
-    start: u64,
-    len: u64,
-    pte_flags: u64,
-    file_src: Option<(u16, u64)>,
-) -> Result<(), i64> {
-    let end = start.checked_add(len).ok_or(-EINVAL)?;
-    let mut addr = start;
-
-    while addr < end {
-        let page_phys = pmm::alloc_page();
-        if page_phys.as_u64() == 0 {
-            unmap_user_pages(pml4, start, addr);
-            return Err(-ENOMEM);
-        }
-
-        let page_ptr = page_phys.to_virt().as_u64() as *mut u8;
-        unsafe {
-            ptr::write_bytes(page_ptr, 0, PAGE_SIZE as usize);
-        }
-
-        if let Some((inode, file_off)) = file_src {
-            let map_delta = addr - start;
-            let page_off = file_off.checked_add(map_delta).ok_or(-EINVAL)?;
-            let to_read = cmp::min(PAGE_SIZE, end - addr) as usize;
-            if to_read > 0 {
-                let page_slice =
-                    unsafe { core::slice::from_raw_parts_mut(page_ptr, PAGE_SIZE as usize) };
-                match fs::read(inode, page_off, &mut page_slice[..to_read]) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        pmm::free_page(page_phys);
-                        unmap_user_pages(pml4, start, addr);
-                        return Err(-fs_to_errno(err));
-                    }
-                }
-            }
-        }
-
-        if vmm::map_page_in(pml4, VirtAddr::new(addr), page_phys, pte_flags) != 0 {
-            pmm::free_page(page_phys);
-            unmap_user_pages(pml4, start, addr);
-            return Err(-ENOMEM);
-        }
-
-        addr += PAGE_SIZE;
+    if require_writable && !fd_can_write(fd_flags) {
+        return Err(-EACCES);
     }
 
-    Ok(())
+    Ok((inode, fd_flags))
 }
 
 fn set_program_break(ctx: &SyscallContext, requested: u64) -> i64 {
@@ -2135,11 +2911,10 @@ fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EINVAL;
     }
 
-    let is_private = (flags & MAP_PRIVATE) != 0;
-    let is_shared = (flags & MAP_SHARED) != 0;
-    if !is_private || is_shared {
-        return -EINVAL;
-    }
+    let (_is_private, is_shared) = match mmap_parse_sharing_mode(flags) {
+        Ok(mode) => mode,
+        Err(err) => return err,
+    };
 
     let is_anon = (flags & MAP_ANONYMOUS) != 0;
     let is_fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
@@ -2149,16 +2924,15 @@ fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Some(v) if v > 0 => v,
         _ => return -EINVAL,
     };
-    let pte_flags = match mmap_prot_to_pte_flags(prot) {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
     let pml4 = match ctx.user_pml4() {
         Ok(v) => v,
         Err(err) => return err,
     };
 
     let file_src = if is_anon {
+        if is_shared {
+            return -EINVAL;
+        }
         if fd_raw != -1 {
             return -EINVAL;
         }
@@ -2174,8 +2948,25 @@ fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             return -EINVAL;
         }
         let fd = fd_raw as i32;
-        match mmap_file_inode(ctx.current, fd, true) {
-            Ok((inode, _)) => Some((inode, offset)),
+        let require_writable = is_shared && (prot & PROT_WRITE) != 0;
+        match mmap_file_inode(ctx.current, fd, true, require_writable) {
+            Ok((inode, fd_flags)) => {
+                let shared_can_write = is_shared && fd_can_write(fd_flags);
+                if is_shared && (prot & PROT_WRITE) != 0 {
+                    let stat = match fs::stat(inode) {
+                        Ok(stat) => stat,
+                        Err(err) => return -fs_to_errno(err),
+                    };
+                    let end = match offset.checked_add(length) {
+                        Some(v) => v,
+                        None => return -EINVAL,
+                    };
+                    if end > stat.size {
+                        return -EINVAL;
+                    }
+                }
+                Some((inode, offset, shared_can_write))
+            }
             Err(err) => return err,
         }
     };
@@ -2193,10 +2984,19 @@ fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
 
         if is_fixed_noreplace {
-            if !mmap_range_unmapped(pml4, addr_hint, end) {
+            if !mmap_range_available(ctx.current, pml4, addr_hint, end) {
                 return -EEXIST;
             }
         } else {
+            let slot = match mmap_prepare_task_slot(ctx.current) {
+                Some(slot) => slot,
+                None => return -ESRCH,
+            };
+            let unmap_result =
+                unsafe { mmap_regions_unmap_range(&mut TASK_VM_MAPPINGS[slot], addr_hint, end) };
+            if let Err(err) = unmap_result {
+                return err;
+            }
             unmap_user_pages(pml4, addr_hint, end);
         }
         addr_hint
@@ -2212,7 +3012,23 @@ fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
     };
 
-    match mmap_map_pages(pml4, start, len, pte_flags, file_src) {
+    let mapping = VmMapping {
+        start,
+        len,
+        file_offset: file_src.map(|(_, off, _)| off).unwrap_or(0),
+        file_inode: file_src
+            .map(|(inode, _, _)| inode)
+            .unwrap_or(task::USER_FD_NONE),
+        prot,
+        map_shared: is_shared,
+        map_shared_can_write: file_src.map(|(_, _, can)| can).unwrap_or(false),
+    };
+    let slot = match mmap_prepare_task_slot(ctx.current) {
+        Some(slot) => slot,
+        None => return -ESRCH,
+    };
+    let insert_result = unsafe { mmap_regions_insert(&mut TASK_VM_MAPPINGS[slot], mapping) };
+    match insert_result {
         Ok(()) => start as i64,
         Err(err) => err,
     }
@@ -2244,6 +3060,14 @@ fn sys_munmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(v) => v,
         Err(err) => return err,
     };
+    let slot = match mmap_prepare_task_slot(ctx.current) {
+        Some(slot) => slot,
+        None => return -ESRCH,
+    };
+    let unmap_result = unsafe { mmap_regions_unmap_range(&mut TASK_VM_MAPPINGS[slot], addr, end) };
+    if let Err(err) = unmap_result {
+        return err;
+    }
     unmap_user_pages(pml4, addr, end);
     0
 }
@@ -2280,21 +3104,195 @@ fn sys_mprotect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(v) => v,
         Err(err) => return err,
     };
+    let slot = match mmap_prepare_task_slot(ctx.current) {
+        Some(slot) => slot,
+        None => return -ESRCH,
+    };
+    let protect_result =
+        unsafe { mmap_regions_protect_range(&mut TASK_VM_MAPPINGS[slot], addr, end, prot) };
+    if let Err(err) = protect_result {
+        return err;
+    }
 
     let mut page = addr;
     while page < end {
         let phys = match vmm::get_physical_in(pml4, VirtAddr::new(page)) {
             Some(phys) => PhysAddr::new(phys.as_u64() & !(PAGE_SIZE - 1)),
-            None => return -ENOMEM,
+            None => {
+                page += PAGE_SIZE;
+                continue;
+            }
         };
 
         if vmm::map_page_in(pml4, VirtAddr::new(page), phys, pte_flags) != 0 {
             return -ENOMEM;
         }
+        let mapping = unsafe { mmap_regions_find_mapping(&TASK_VM_MAPPINGS[slot], page) };
+        if let Some(mapping) = mapping {
+            if mapping.map_shared
+                && mapping.file_inode != task::USER_FD_NONE
+                && (mapping.prot & PROT_WRITE) != 0
+            {
+                let _ = vm_page_cache_mark_dirty_by_phys(phys);
+            }
+        }
         page += PAGE_SIZE;
     }
 
     0
+}
+
+fn mmap_prot_allows_fault_access(prot: u32, error_code: u64) -> bool {
+    if prot == PROT_NONE {
+        return false;
+    }
+    if (error_code & PAGE_FAULT_ERROR_WRITE) != 0 {
+        return (prot & PROT_WRITE) != 0;
+    }
+    if (error_code & PAGE_FAULT_ERROR_INSTR) != 0 {
+        return (prot & PROT_EXEC) != 0;
+    }
+    (prot & (PROT_READ | PROT_WRITE)) != 0
+}
+
+fn mmap_fault_map_page(pml4: PhysAddr, page_addr: u64, mapping: VmMapping) -> Result<(), i64> {
+    if vmm::get_physical_in(pml4, VirtAddr::new(page_addr)).is_some() {
+        return Ok(());
+    }
+
+    if mapping.map_shared && mapping.file_inode != task::USER_FD_NONE {
+        let map_delta = page_addr.checked_sub(mapping.start).ok_or(-EINVAL)?;
+        let file_off = mapping.file_offset.checked_add(map_delta).ok_or(-EINVAL)?;
+        let page_off = align_down(file_off, PAGE_SIZE);
+        let writable = (mapping.prot & PROT_WRITE) != 0;
+        let entry = vm_page_cache_pin_mapped_page(mapping.file_inode, page_off, writable)?;
+
+        let pte_flags = mmap_prot_to_pte_flags(mapping.prot)?;
+        if vmm::map_page_in(
+            pml4,
+            VirtAddr::new(page_addr),
+            PhysAddr::new(entry.page_phys),
+            pte_flags,
+        ) != 0
+        {
+            let _ = vm_page_cache_release_mapped_phys(PhysAddr::new(entry.page_phys));
+            return Err(-ENOMEM);
+        }
+        return Ok(());
+    }
+
+    let page_phys = alloc_user_vm_page_with_reclaim();
+    if page_phys.as_u64() == 0 {
+        return Err(-ENOMEM);
+    }
+    let page_ptr = page_phys.to_virt().as_u64() as *mut u8;
+    unsafe {
+        ptr::write_bytes(page_ptr, 0, PAGE_SIZE as usize);
+    }
+
+    if mapping.file_inode != task::USER_FD_NONE {
+        let map_delta = page_addr.checked_sub(mapping.start).ok_or(-EINVAL)?;
+        let file_off = mapping.file_offset.checked_add(map_delta).ok_or(-EINVAL)?;
+        let to_read = cmp::min(PAGE_SIZE, mapping.end().saturating_sub(page_addr)) as usize;
+        if to_read > 0 {
+            let page_slice =
+                unsafe { core::slice::from_raw_parts_mut(page_ptr, PAGE_SIZE as usize) };
+            let _ = read_vfs_bytes(mapping.file_inode, file_off, &mut page_slice[..to_read])?;
+        }
+    }
+
+    let pte_flags = mmap_prot_to_pte_flags(mapping.prot)?;
+    if vmm::map_page_in(pml4, VirtAddr::new(page_addr), page_phys, pte_flags) != 0 {
+        pmm::free_page(page_phys);
+        return Err(-ENOMEM);
+    }
+    Ok(())
+}
+
+fn mmap_clone_task_regions(parent: *mut task::Task, child: *mut task::Task) -> Result<(), i64> {
+    let parent_slot = match mmap_prepare_task_slot(parent) {
+        Some(slot) => slot,
+        None => return Err(-ESRCH),
+    };
+    let child_slot = match mmap_task_slot(child) {
+        Some(slot) => slot,
+        None => return Err(-ESRCH),
+    };
+
+    unsafe {
+        TASK_VM_OWNER_PID[child_slot] = (*child).pid;
+        TASK_VM_MAPPINGS[child_slot] = TASK_VM_MAPPINGS[parent_slot];
+    }
+    Ok(())
+}
+
+pub fn try_handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
+    if (error_code & PAGE_FAULT_ERROR_USER) == 0 {
+        return false;
+    }
+    if (error_code & PAGE_FAULT_ERROR_PRESENT) != 0 {
+        return false;
+    }
+    if fault_addr < PAGE_SIZE || fault_addr >= KERNEL_VIRT_BASE || fault_addr > USER_CANON_MAX {
+        return false;
+    }
+
+    let current = task::current();
+    if current.is_null() {
+        return false;
+    }
+    let is_user = unsafe { ((*current).flags & TASK_FLAG_USER) != 0 };
+    if !is_user {
+        return false;
+    }
+
+    let pml4 = unsafe { PhysAddr::new((*current).pml4_phys) };
+    if pml4.as_u64() == 0 {
+        return false;
+    }
+
+    let slot = match mmap_prepare_task_slot(current) {
+        Some(slot) => slot,
+        None => return false,
+    };
+    let page_addr = align_down(fault_addr, PAGE_SIZE);
+    let mapping = unsafe { mmap_regions_find_mapping(&TASK_VM_MAPPINGS[slot], page_addr) };
+    let mapping = match mapping {
+        Some(mapping) => mapping,
+        None => return false,
+    };
+    if !mmap_prot_allows_fault_access(mapping.prot, error_code) {
+        return false;
+    }
+
+    mmap_fault_map_page(pml4, page_addr, mapping).is_ok()
+}
+
+pub fn terminate_current_user_fault(error_code: u64, fault_addr: u64) -> bool {
+    if (error_code & PAGE_FAULT_ERROR_USER) == 0 {
+        return false;
+    }
+
+    let current = task::current();
+    if current.is_null() {
+        return false;
+    }
+    let is_user = unsafe { ((*current).flags & TASK_FLAG_USER) != 0 };
+    if !is_user {
+        return false;
+    }
+
+    let pid = unsafe { (*current).pid };
+    sys_log!(
+        "[SYSCALL] pid {} terminated after page fault at 0x{:x} (err=0x{:x})",
+        pid,
+        fault_addr,
+        error_code
+    );
+
+    let ctx = SyscallContext::new(current);
+    let _ = sys_exit_common(&ctx, 128 + signal::SIGSEGV as i32);
+    true
 }
 
 fn sys_open(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -3105,13 +4103,13 @@ fn sys_copy_file_range(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let mut buf = [0u8; READ_CHUNK_SIZE];
     while copied < len {
         let take = cmp::min(buf.len(), len - copied);
-        let read_n = match fs::read(in_ino, in_off, &mut buf[..take]) {
+        let read_n = match read_vfs_bytes(in_ino, in_off, &mut buf[..take]) {
             Ok(n) => n,
             Err(err) => {
                 if copied > 0 {
                     break;
                 }
-                return -fs_to_errno(err);
+                return err;
             }
         };
         if read_n == 0 {
@@ -3132,6 +4130,7 @@ fn sys_copy_file_range(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
 
         let wrote = write_res.written;
+        vm_page_cache_invalidate_inode_range(out_ino, out_off, wrote as u64);
         in_off = in_off.saturating_add(wrote as u64);
         out_off = write_res.new_offset;
         copied += wrote;
@@ -3462,6 +4461,7 @@ fn fork_cleanup_child(task_ptr: *mut task::Task) {
     if task_ptr.is_null() {
         return;
     }
+    mmap_clear_task_regions(task_ptr);
     close_all_fds(task_ptr);
     let child_pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
     if child_pml4.as_u64() != 0 {
@@ -3575,6 +4575,8 @@ fn create_fork_child(ctx: &SyscallContext, child_frame: &InterruptFrame) -> Resu
         (*child).user_shm_size = [0; task::MAX_TASK_SHM_ATTACH];
         (*child).user_shm_flags = [0; task::MAX_TASK_SHM_ATTACH];
     }
+
+    mmap_clone_task_regions(parent, child)?;
 
     if let Err(err) = clone_parent_fds_for_child(parent, child) {
         fork_cleanup_child(child);
@@ -4440,14 +5442,13 @@ fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 }
             }
         } else if kind == task::USER_FD_KIND_VFS {
-            refresh_procfs_runtime();
-            match fs::read(inode, offset, &mut chunk[..take]) {
+            match read_vfs_bytes(inode, offset, &mut chunk[..take]) {
                 Ok(n) => n,
                 Err(err) => {
                     if read_total > 0 {
                         return read_total as i64;
                     }
-                    return -fs_to_errno(err);
+                    return err;
                 }
             }
         } else if kind == task::USER_FD_KIND_PIPE {
@@ -4591,6 +5592,7 @@ fn write_from_user_fd(
                 break;
             }
 
+            vm_page_cache_invalidate_inode_range(inode, offset, write_res.written as u64);
             unsafe {
                 (*ctx.current).user_fd_offset[idx] = write_res.new_offset;
             }
@@ -5210,6 +6212,7 @@ fn sys_exit_common(ctx: &SyscallContext, code: i32) -> i64 {
     }
 
     clear_child_tid(ctx);
+    mmap_clear_task_regions(ctx.current);
     close_all_fds(ctx.current);
     shm::cleanup_task(ctx.current);
     ipc::remove_task_waiters(ctx.current);
@@ -5263,6 +6266,7 @@ fn sys_ftruncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     match result {
         Ok(()) => {
+            vm_page_cache_invalidate_inode(inode);
             sync_ext2_backing();
             0
         }
@@ -5622,6 +6626,7 @@ fn sys_truncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     match result {
         Ok(()) => {
+            vm_page_cache_invalidate_inode(inode);
             sync_ext2_backing();
             0
         }
@@ -5630,10 +6635,87 @@ fn sys_truncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// msync (26)
+// ---------------------------------------------------------------------------
+fn sys_msync(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let addr = call.arg(0);
+    let length = call.arg(1);
+    let flags = call.arg(2) as u32;
+
+    if length == 0 {
+        return 0;
+    }
+    if (addr & (PAGE_SIZE - 1)) != 0 || addr < MMAP_BASE_ADDR {
+        return -EINVAL;
+    }
+    if !msync_flags_are_valid(flags) {
+        return -EINVAL;
+    }
+
+    let len = match page_align_up(length) {
+        Some(v) if v > 0 => v,
+        _ => return -EINVAL,
+    };
+    let end = match addr.checked_add(len) {
+        Some(v) => v,
+        None => return -EINVAL,
+    };
+    if end >= KERNEL_VIRT_BASE {
+        return -EINVAL;
+    }
+
+    let slot = match mmap_prepare_task_slot(ctx.current) {
+        Some(slot) => slot,
+        None => return -ESRCH,
+    };
+
+    if unsafe { !mmap_regions_range_mapped(&TASK_VM_MAPPINGS[slot], addr, end) } {
+        return -ENOMEM;
+    }
+
+    let mut page = addr;
+    while page < end {
+        let mapping = unsafe { mmap_regions_find_mapping(&TASK_VM_MAPPINGS[slot], page) };
+        let mapping = match mapping {
+            Some(mapping) => mapping,
+            None => return -ENOMEM,
+        };
+
+        if mapping.map_shared
+            && mapping.file_inode != task::USER_FD_NONE
+            && (mapping.prot & PROT_WRITE) != 0
+        {
+            let map_delta = match page.checked_sub(mapping.start) {
+                Some(v) => v,
+                None => return -EINVAL,
+            };
+            let file_off = match mapping.file_offset.checked_add(map_delta) {
+                Some(v) => v,
+                None => return -EINVAL,
+            };
+            let page_off = align_down(file_off, PAGE_SIZE);
+            if let Err(err) = vm_page_cache_writeback_page(mapping.file_inode, page_off) {
+                return err;
+            }
+        }
+
+        page = page.saturating_add(PAGE_SIZE);
+    }
+
+    sync_ext2_backing();
+    flush_ext2_backing();
+    0
+}
+
+// ---------------------------------------------------------------------------
 // sync (162)
 // ---------------------------------------------------------------------------
 fn sys_sync(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    if let Err(err) = vm_page_cache_writeback_all() {
+        return err;
+    }
     sync_ext2_backing();
+    flush_ext2_backing();
     0
 }
 
@@ -5647,9 +6729,18 @@ fn sys_fsync(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EBADF;
     }
 
-    let kind = unsafe { (*ctx.current).user_fd_kind[idx] };
+    let (kind, inode) = unsafe {
+        (
+            (*ctx.current).user_fd_kind[idx],
+            (*ctx.current).user_fd_inode[idx],
+        )
+    };
     if kind == task::USER_FD_KIND_VFS {
+        if let Err(err) = vm_page_cache_writeback_inode(inode) {
+            return err;
+        }
         sync_ext2_backing();
+        flush_ext2_backing();
         return 0;
     }
     if kind == task::USER_FD_KIND_PIPE
@@ -5721,14 +6812,13 @@ fn sys_pread64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
         let take = cmp::min(chunk.len(), len - read_total);
 
-        refresh_procfs_runtime();
-        let read_n = match fs::read(inode, pos, &mut chunk[..take]) {
+        let read_n = match read_vfs_bytes(inode, pos, &mut chunk[..take]) {
             Ok(n) => n,
             Err(err) => {
                 if read_total > 0 {
                     return read_total as i64;
                 }
-                return -fs_to_errno(err);
+                return err;
             }
         };
         if read_n == 0 {
@@ -5832,6 +6922,7 @@ fn sys_pwrite64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             break;
         }
 
+        vm_page_cache_invalidate_inode_range(inode, pos, write_res.written as u64);
         pos = write_res.new_offset;
         written += write_res.written;
     }
@@ -7224,7 +8315,12 @@ fn call_from_int80_frame(frame: &InterruptFrame) -> SyscallArgs {
 pub fn init() {
     unsafe {
         UNKNOWN_SYSCALL_LOG_COUNT = 0;
+        for idx in 0..task::MAX_TASKS {
+            TASK_VM_OWNER_PID[idx] = task::INVALID_PID;
+            TASK_VM_MAPPINGS[idx] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+        }
     }
+    vm_page_cache_reset();
 }
 
 #[no_mangle]
@@ -7442,6 +8538,7 @@ mod tests {
             Some("mprotect")
         );
         assert_eq!(lookup_syscall(SYS_MUNMAP).map(|d| d.name), Some("munmap"));
+        assert_eq!(lookup_syscall(SYS_MSYNC).map(|d| d.name), Some("msync"));
         assert_eq!(
             lookup_syscall(SYS_RT_SIGACTION).map(|d| d.name),
             Some("rt_sigaction")
@@ -7576,6 +8673,193 @@ mod tests {
     fn mmap_flag_validation_rejects_unknown_bits() {
         assert!(mmap_flags_are_supported(MAP_PRIVATE | MAP_ANONYMOUS));
         assert!(!mmap_flags_are_supported(MAP_PRIVATE | 0x8000_0000));
+    }
+
+    #[test]
+    fn mmap_parse_sharing_mode_requires_exactly_one_mode() {
+        assert_eq!(
+            mmap_parse_sharing_mode(MAP_PRIVATE).expect("private mode"),
+            (true, false)
+        );
+        assert_eq!(
+            mmap_parse_sharing_mode(MAP_SHARED).expect("shared mode"),
+            (false, true)
+        );
+        assert_eq!(mmap_parse_sharing_mode(0), Err(-EINVAL));
+        assert_eq!(
+            mmap_parse_sharing_mode(MAP_PRIVATE | MAP_SHARED),
+            Err(-EINVAL)
+        );
+    }
+
+    #[test]
+    fn mmap_regions_unmap_range_splits_middle_mapping() {
+        let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+        regions[0] = VmMapping {
+            start: 0x1000,
+            len: 0x4000,
+            file_offset: 0,
+            file_inode: task::USER_FD_NONE,
+            prot: PROT_READ,
+            map_shared: false,
+            map_shared_can_write: false,
+        };
+
+        mmap_regions_unmap_range(&mut regions, 0x2000, 0x3000).expect("unmap split should work");
+
+        let left = mmap_regions_find_mapping(&regions, 0x1000).expect("left segment");
+        let right = mmap_regions_find_mapping(&regions, 0x3000).expect("right segment");
+        assert_eq!(left.start, 0x1000);
+        assert_eq!(left.len, 0x1000);
+        assert_eq!(right.start, 0x3000);
+        assert_eq!(right.len, 0x2000);
+        assert!(mmap_regions_find_mapping(&regions, 0x2000).is_none());
+    }
+
+    #[test]
+    fn mmap_regions_protect_range_splits_and_updates_target() {
+        let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+        regions[0] = VmMapping {
+            start: 0x4000,
+            len: 0x4000,
+            file_offset: 0,
+            file_inode: task::USER_FD_NONE,
+            prot: PROT_READ,
+            map_shared: false,
+            map_shared_can_write: false,
+        };
+
+        mmap_regions_protect_range(&mut regions, 0x5000, 0x6000, PROT_READ | PROT_WRITE)
+            .expect("mprotect split should work");
+
+        let left = mmap_regions_find_mapping(&regions, 0x4000).expect("left segment");
+        let middle = mmap_regions_find_mapping(&regions, 0x5000).expect("middle segment");
+        let right = mmap_regions_find_mapping(&regions, 0x6000).expect("right segment");
+        assert_eq!(left.prot, PROT_READ);
+        assert_eq!(middle.prot, PROT_READ | PROT_WRITE);
+        assert_eq!(right.prot, PROT_READ);
+    }
+
+    #[test]
+    fn mmap_regions_protect_range_rejects_shared_write_upgrade() {
+        let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+        regions[0] = VmMapping {
+            start: 0x7000,
+            len: 0x2000,
+            file_offset: 0,
+            file_inode: 5,
+            prot: PROT_READ,
+            map_shared: true,
+            map_shared_can_write: false,
+        };
+
+        assert_eq!(
+            mmap_regions_protect_range(&mut regions, 0x7000, 0x9000, PROT_READ | PROT_WRITE),
+            Err(-EINVAL)
+        );
+    }
+
+    #[test]
+    fn mmap_region_allows_prot_accepts_shared_write_when_capable() {
+        let region = VmMapping {
+            start: 0x9000,
+            len: 0x1000,
+            file_offset: 0,
+            file_inode: task::USER_FD_NONE,
+            prot: PROT_READ,
+            map_shared: true,
+            map_shared_can_write: true,
+        };
+        assert!(mmap_region_allows_prot(&region, PROT_READ | PROT_WRITE));
+    }
+
+    #[test]
+    fn mmap_region_reclaimable_only_for_safe_file_backed_cases() {
+        let shared_file = VmMapping {
+            start: 0x1000,
+            len: PAGE_SIZE,
+            file_offset: 0,
+            file_inode: 7,
+            prot: PROT_READ | PROT_WRITE,
+            map_shared: true,
+            map_shared_can_write: true,
+        };
+        assert!(mmap_region_is_reclaimable(&shared_file));
+
+        let private_ro_file = VmMapping {
+            start: 0x2000,
+            len: PAGE_SIZE,
+            file_offset: 0,
+            file_inode: 8,
+            prot: PROT_READ,
+            map_shared: false,
+            map_shared_can_write: false,
+        };
+        assert!(mmap_region_is_reclaimable(&private_ro_file));
+    }
+
+    #[test]
+    fn mmap_region_reclaimable_rejects_unsafe_cases() {
+        let anon_shared = VmMapping {
+            start: 0x3000,
+            len: PAGE_SIZE,
+            file_offset: 0,
+            file_inode: task::USER_FD_NONE,
+            prot: PROT_READ | PROT_WRITE,
+            map_shared: true,
+            map_shared_can_write: true,
+        };
+        assert!(!mmap_region_is_reclaimable(&anon_shared));
+
+        let private_writable_file = VmMapping {
+            start: 0x4000,
+            len: PAGE_SIZE,
+            file_offset: 0,
+            file_inode: 9,
+            prot: PROT_READ | PROT_WRITE,
+            map_shared: false,
+            map_shared_can_write: false,
+        };
+        assert!(!mmap_region_is_reclaimable(&private_writable_file));
+    }
+
+    #[test]
+    fn msync_flag_validation_rejects_unknown_or_conflicting_bits() {
+        assert!(msync_flags_are_valid(0));
+        assert!(msync_flags_are_valid(MS_SYNC));
+        assert!(msync_flags_are_valid(MS_ASYNC));
+        assert!(msync_flags_are_valid(MS_SYNC | MS_INVALIDATE));
+        assert!(!msync_flags_are_valid(MS_SYNC | MS_ASYNC));
+        assert!(!msync_flags_are_valid(0x8000_0000));
+    }
+
+    #[test]
+    fn mmap_prot_fault_access_checks_expected_modes() {
+        assert!(mmap_prot_allows_fault_access(PROT_READ, 0));
+        assert!(mmap_prot_allows_fault_access(
+            PROT_WRITE,
+            PAGE_FAULT_ERROR_WRITE
+        ));
+        assert!(!mmap_prot_allows_fault_access(
+            PROT_READ,
+            PAGE_FAULT_ERROR_WRITE
+        ));
+        assert!(mmap_prot_allows_fault_access(
+            PROT_EXEC,
+            PAGE_FAULT_ERROR_INSTR
+        ));
+        assert!(!mmap_prot_allows_fault_access(
+            PROT_READ,
+            PAGE_FAULT_ERROR_INSTR
+        ));
+        assert!(!mmap_prot_allows_fault_access(PROT_NONE, 0));
+    }
+
+    #[test]
+    fn vm_page_cache_release_unknown_phys_returns_false() {
+        assert!(!vm_page_cache_release_mapped_phys(PhysAddr::new(
+            0x1234_5000
+        )));
     }
 
     #[test]

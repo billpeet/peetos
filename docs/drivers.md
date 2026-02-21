@@ -51,6 +51,7 @@ The kernel then performs:
 A minimal kernel block layer now provides:
 - device inventory/registration
 - per-device read/write callback dispatch (`block::read`, `block::write`)
+- a bounded page-sized write-back cache for block I/O (`block::write_cached`, `block::read_cached`, `block::flush_cached_device`)
 
 The registry records discovered disks from both paths:
 - transport (`ata-pio` or `ahci-dma`)
@@ -102,8 +103,8 @@ Limitations / Simplifications
 - AHCI command execution is polling-based; interrupts and async completion are not wired.
 - AHCI DMA transfer size is currently capped to one page (`4 KiB`) per command through a bounce buffer.
 - ATA (`ata-pio`) devices are inventory-only for now; read/write callbacks are currently wired for AHCI devices.
-- VFS currently consumes block I/O through an image-style ext2 bridge (read image from block at mount time + best-effort sync-back), not a native block-cache/page-cache-backed ext2 path.
-- No partition parsing (MBR/GPT) or block cache/page cache integration yet.
+- VFS now mounts ext2 through a native block backend with sparse/lazy block residency and dirty-run sync-back; it no longer preloads a full image into RAM at mount.
+- No partition parsing (MBR/GPT), and full VM/fs page-cache unification is still incomplete (notably writable shared-mmap writeback semantics).
 - MMIO window mapping is currently bounded (`AHCI_MMIO_WINDOW_LIMIT`) and boot-time only.
 - Hotplug, power management, and controller reset/error-recovery flows are minimal.
 - Keyboard input is US-layout set-1 only; extended keys and key-repeat handling are minimal.

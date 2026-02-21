@@ -11,15 +11,9 @@ const EXT2_SUPER_MAGIC_OFFSET: usize = EXT2_SUPERBLOCK_OFFSET + 56;
 const EXT2_BLOCKS_COUNT_OFFSET: usize = EXT2_SUPERBLOCK_OFFSET + 4;
 const EXT2_LOG_BLOCK_SIZE_OFFSET: usize = EXT2_SUPERBLOCK_OFFSET + 24;
 const EXT2_SUPER_MAGIC: u16 = 0xEF53;
-const EXT2_MAX_IMAGE_SIZE: usize = 16 * 1024 * 1024;
 
 const BLOCK_SECTOR_SIZE: usize = 512;
 const BLOCK_IO_CHUNK: usize = 4096;
-
-#[cfg(target_os = "none")]
-static SAMPLE_EXT2_IMG: &[u8] = &[];
-#[cfg(not(target_os = "none"))]
-static SAMPLE_EXT2_IMG: &[u8] = include_bytes!("../../user/sample_ext2.img");
 
 #[derive(Clone, Copy)]
 struct Ext2BlockBacking {
@@ -42,23 +36,8 @@ pub fn init() {
     fs::init();
     serial_println!("[VFS] Initialized (tmpfs + devfs + procfs)");
 
-    if try_mount_ext2_from_block() {
-        return;
-    }
-
-    if SAMPLE_EXT2_IMG.is_empty() {
-        serial_println!("[VFS] Embedded ext2 sample disabled in kernel build");
-        return;
-    }
-
-    match fs::mount_ext2_image(EXT2_MOUNT_POINT, SAMPLE_EXT2_IMG) {
-        Ok(()) => {
-            // Keep this as a plain literal to avoid dynamic formatting in early boot.
-            serial_println!("[VFS] Mounted ext2 sample at /mnt/ext2");
-        }
-        Err(err) => {
-            serial_println!("[VFS] WARN: failed to mount ext2 sample ({})", err);
-        }
+    if !try_mount_ext2_from_block() {
+        serial_println!("[VFS] No ext2 block-backed image detected");
     }
 }
 
@@ -68,42 +47,142 @@ pub fn sync_ext2_to_block() -> bool {
         return false;
     }
 
-    let image_ptr = heap::kmalloc(backing.image_len);
-    if image_ptr.is_null() {
+    if fs::ext2_has_journal() {
+        let flushed = match fs::flush_ext2_dirty_blocks() {
+            Ok(count) => count,
+            Err(err) => {
+                serial_println!("[VFS] WARN: ext2 journaled dirty flush failed ({})", err);
+                return false;
+            }
+        };
+        let checkpointed = match fs::checkpoint_ext2_journal() {
+            Ok(count) => count,
+            Err(err) => {
+                serial_println!("[VFS] WARN: ext2 journal checkpoint failed ({})", err);
+                return false;
+            }
+        };
+        return flushed > 0 || checkpointed > 0;
+    }
+
+    let block_size = fs::ext2_block_size() as usize;
+    if block_size == 0
+        || (block_size % BLOCK_SECTOR_SIZE) != 0
+        || block_size > BLOCK_IO_CHUNK
+        || (BLOCK_IO_CHUNK % block_size) != 0
+    {
+        serial_println!("[VFS] WARN: ext2 sync invalid block size {}", block_size);
+        return false;
+    }
+
+    let chunk_ptr = heap::kmalloc(BLOCK_IO_CHUNK);
+    if chunk_ptr.is_null() {
         serial_println!("[VFS] WARN: ext2 sync alloc failed");
         return false;
     }
 
-    let mut ok = false;
-    unsafe {
-        let image = core::slice::from_raw_parts_mut(image_ptr, backing.image_len);
-        match fs::export_ext2_image(image) {
-            Ok(exported_len) => {
-                ok = write_ext2_image_to_block(backing.device_index, &image[..exported_len]);
-                if !ok {
-                    serial_println!(
-                        "[VFS] WARN: ext2 sync to block dev{} failed",
-                        backing.device_index
-                    );
-                }
-            }
+    let blocks_per_chunk = BLOCK_IO_CHUNK / block_size;
+    let mut cursor = 0u32;
+    let mut wrote_any = false;
+    let mut ok = true;
+
+    while ok {
+        let run = match fs::ext2_next_dirty_run(cursor) {
+            Ok(Some(run)) => run,
+            Ok(None) => break,
             Err(err) => {
-                serial_println!("[VFS] WARN: ext2 export for sync failed ({})", err);
+                serial_println!("[VFS] WARN: ext2 dirty-scan failed ({})", err);
+                ok = false;
+                break;
             }
+        };
+
+        let run_start = run.start_block as usize;
+        let run_blocks = run.block_count as usize;
+        let mut done_blocks = 0usize;
+        while done_blocks < run_blocks {
+            let chunk_blocks = cmp::min(run_blocks - done_blocks, blocks_per_chunk);
+            let chunk_len = chunk_blocks * block_size;
+            let start_block = run_start + done_blocks;
+            let lba = (start_block * block_size / BLOCK_SECTOR_SIZE) as u64;
+
+            let copied = unsafe {
+                let chunk = core::slice::from_raw_parts_mut(chunk_ptr, chunk_len);
+                fs::copy_ext2_blocks(start_block as u32, chunk)
+            };
+
+            let copied = match copied {
+                Ok(v) => v,
+                Err(err) => {
+                    serial_println!("[VFS] WARN: ext2 block-copy failed ({})", err);
+                    ok = false;
+                    break;
+                }
+            };
+            if copied != chunk_len {
+                serial_println!("[VFS] WARN: ext2 block-copy short read");
+                ok = false;
+                break;
+            }
+
+            let write_res = unsafe {
+                let chunk = core::slice::from_raw_parts(chunk_ptr, chunk_len);
+                block::write_cached(backing.device_index, lba, chunk)
+            };
+            if write_res.is_err() {
+                serial_println!(
+                    "[VFS] WARN: ext2 sync cache-write failed dev{} lba{}",
+                    backing.device_index,
+                    lba
+                );
+                ok = false;
+                break;
+            }
+
+            done_blocks += chunk_blocks;
+            wrote_any = true;
+        }
+
+        cursor = run.start_block.saturating_add(run.block_count);
+    }
+
+    if ok && wrote_any {
+        if let Err(err) = fs::mark_ext2_blocks_synced() {
+            serial_println!("[VFS] WARN: ext2 sync checkpoint failed ({})", err);
+            ok = false;
         }
     }
 
-    heap::kfree(image_ptr);
-    ok
+    heap::kfree(chunk_ptr);
+    ok && wrote_any
+}
+
+pub fn flush_ext2_block_cache() -> bool {
+    let backing = unsafe { EXT2_BLOCK_BACKING };
+    if !backing.active || backing.image_len == 0 {
+        return false;
+    }
+
+    match block::flush_cached_device(backing.device_index) {
+        Ok(()) => true,
+        Err(err) => {
+            serial_println!(
+                "[VFS] WARN: ext2 cache flush failed dev{} ({})",
+                backing.device_index,
+                block::io_error_name(err)
+            );
+            false
+        }
+    }
 }
 
 fn try_mount_ext2_from_block() -> bool {
     let mut devices = [block::BlockDevice::EMPTY; block::MAX_BLOCK_DEVICES];
     let count = block::snapshot(&mut devices);
 
-    // First pass: probe each device with a small read to find the ext2 superblock.
-    // Only allocate the full image buffer once we know which device has ext2.
-    const PROBE_SIZE: usize = 2048; // enough to read the superblock (at offset 1024)
+    // Probe each device with a small read to find the ext2 superblock.
+    // If found, mount via fs backend callbacks and lazy block residency.
+    const PROBE_SIZE: usize = 4096;
 
     for (index, dev) in devices.iter().take(count).enumerate() {
         if dev.logical_block_size as usize != BLOCK_SECTOR_SIZE {
@@ -126,52 +205,96 @@ fn try_mount_ext2_from_block() -> bool {
                 ext2_len = detect_ext2_image_len(probe);
             }
         }
-        heap::kfree(probe_ptr);
-
         let image_len = match ext2_len {
-            Some(len) if len <= EXT2_MAX_IMAGE_SIZE && len <= dev_bytes => len,
-            _ => continue,
+            Some(len) if len <= dev_bytes => len,
+            _ => {
+                heap::kfree(probe_ptr);
+                continue;
+            }
         };
-
-        // Now allocate the full image and read+mount.
-        let read_len =
-            image_len + (BLOCK_SECTOR_SIZE - (image_len % BLOCK_SECTOR_SIZE)) % BLOCK_SECTOR_SIZE;
-        let image_ptr = heap::kmalloc(read_len);
-        if image_ptr.is_null() {
-            continue;
-        }
 
         let mut mounted = false;
         unsafe {
-            let image = core::slice::from_raw_parts_mut(image_ptr, read_len);
-            if read_block_image(index, image).is_ok() {
-                match fs::mount_ext2_image(EXT2_MOUNT_POINT, &image[..image_len]) {
-                    Ok(()) => {
-                        EXT2_BLOCK_BACKING = Ext2BlockBacking {
-                            active: true,
-                            device_index: index,
-                            image_len,
-                        };
-                        serial_println!(
-                            "[VFS] Mounted ext2 from block dev{} at {} ({} KiB)",
-                            index,
-                            EXT2_MOUNT_POINT,
-                            image_len / 1024
-                        );
-                        mounted = true;
-                    }
-                    Err(_) => {}
+            let backend = fs::Ext2BlockBackend {
+                ctx: index as u64,
+                read_block: ext2_block_backend_read,
+                write_block: ext2_block_backend_write,
+            };
+            if fs::set_ext2_block_backend(backend).is_ok() {
+                let probe = core::slice::from_raw_parts(probe_ptr, PROBE_SIZE);
+                if fs::mount_ext2_block_backend(EXT2_MOUNT_POINT, image_len, probe).is_ok() {
+                    EXT2_BLOCK_BACKING = Ext2BlockBacking {
+                        active: true,
+                        device_index: index,
+                        image_len,
+                    };
+                    serial_println!(
+                        "[VFS] Mounted ext2 from block dev{} at {} ({} KiB, lazy cache)",
+                        index,
+                        EXT2_MOUNT_POINT,
+                        image_len / 1024
+                    );
+                    mounted = true;
+                } else {
+                    let _ = fs::clear_ext2_block_backend();
                 }
             }
         }
 
-        heap::kfree(image_ptr);
+        heap::kfree(probe_ptr);
         if mounted {
             return true;
         }
     }
 
     false
+}
+
+fn ext2_block_backend_read(ctx: u64, block_index: u32, out: &mut [u8]) -> Result<(), i64> {
+    if out.is_empty() || (out.len() % BLOCK_SECTOR_SIZE) != 0 {
+        return Err(fs::EINVAL);
+    }
+
+    let block_bytes = out.len();
+    let byte_offset = (block_index as u64)
+        .checked_mul(block_bytes as u64)
+        .ok_or(fs::EIO)?;
+    if (byte_offset % BLOCK_SECTOR_SIZE as u64) != 0 {
+        return Err(fs::EIO);
+    }
+    let lba = byte_offset / BLOCK_SECTOR_SIZE as u64;
+    let device_index = ctx as usize;
+
+    block::read(device_index, lba, out).map_err(map_block_io_to_errno)
+}
+
+fn ext2_block_backend_write(ctx: u64, block_index: u32, data: &[u8]) -> Result<(), i64> {
+    if data.is_empty() || (data.len() % BLOCK_SECTOR_SIZE) != 0 {
+        return Err(fs::EINVAL);
+    }
+
+    let block_bytes = data.len();
+    let byte_offset = (block_index as u64)
+        .checked_mul(block_bytes as u64)
+        .ok_or(fs::EIO)?;
+    if (byte_offset % BLOCK_SECTOR_SIZE as u64) != 0 {
+        return Err(fs::EIO);
+    }
+    let lba = byte_offset / BLOCK_SECTOR_SIZE as u64;
+    let device_index = ctx as usize;
+
+    block::write_cached(device_index, lba, data).map_err(map_block_io_to_errno)
+}
+
+fn map_block_io_to_errno(err: block::BlockIoError) -> i64 {
+    match err {
+        block::BlockIoError::InvalidDevice => fs::ENOENT,
+        block::BlockIoError::Unsupported => fs::EINVAL,
+        block::BlockIoError::UnalignedBuffer => fs::EINVAL,
+        block::BlockIoError::OutOfRange => fs::EIO,
+        block::BlockIoError::InvalidRequest => fs::EINVAL,
+        block::BlockIoError::IoFault => fs::EIO,
+    }
 }
 
 fn read_block_image(device_index: usize, image: &mut [u8]) -> Result<(), block::BlockIoError> {
@@ -192,42 +315,6 @@ fn read_block_image(device_index: usize, image: &mut [u8]) -> Result<(), block::
     }
 
     Ok(())
-}
-
-fn write_ext2_image_to_block(device_index: usize, image: &[u8]) -> bool {
-    let mut offset = 0usize;
-    let mut lba = 0u64;
-
-    while offset + BLOCK_SECTOR_SIZE <= image.len() {
-        let remaining = image.len() - offset;
-        let chunk_len = cmp::min(BLOCK_IO_CHUNK, remaining - (remaining % BLOCK_SECTOR_SIZE));
-        if chunk_len == 0 {
-            break;
-        }
-
-        if block::write(device_index, lba, &image[offset..offset + chunk_len]).is_err() {
-            return false;
-        }
-
-        offset += chunk_len;
-        lba += (chunk_len / BLOCK_SECTOR_SIZE) as u64;
-    }
-
-    if offset < image.len() {
-        let mut sector = [0u8; BLOCK_SECTOR_SIZE];
-        if block::read(device_index, lba, &mut sector).is_err() {
-            return false;
-        }
-
-        let tail = image.len() - offset;
-        sector[..tail].copy_from_slice(&image[offset..]);
-
-        if block::write(device_index, lba, &sector).is_err() {
-            return false;
-        }
-    }
-
-    true
 }
 
 fn detect_ext2_image_len(image: &[u8]) -> Option<usize> {

@@ -1,6 +1,8 @@
 use core::cell::UnsafeCell;
 
 pub const MAX_BLOCK_DEVICES: usize = 16;
+const BLOCK_CACHE_ENTRY_BYTES: usize = 4096;
+const BLOCK_CACHE_ENTRIES: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -182,12 +184,157 @@ unsafe impl Sync for RegistryCell {}
 
 static BLOCK_REGISTRY: RegistryCell = RegistryCell(UnsafeCell::new(BlockRegistry::new()));
 
+#[derive(Clone, Copy)]
+struct BlockCacheLine {
+    valid: bool,
+    dirty: bool,
+    device_index: usize,
+    lba: u64,
+    len: usize,
+    data: [u8; BLOCK_CACHE_ENTRY_BYTES],
+    stamp: u64,
+}
+
+impl BlockCacheLine {
+    const EMPTY: Self = Self {
+        valid: false,
+        dirty: false,
+        device_index: 0,
+        lba: 0,
+        len: 0,
+        data: [0; BLOCK_CACHE_ENTRY_BYTES],
+        stamp: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct BlockCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub writebacks: u64,
+    pub dirty_lines: usize,
+}
+
+impl BlockCacheStats {
+    #[allow(dead_code)]
+    pub const EMPTY: Self = Self {
+        hits: 0,
+        misses: 0,
+        evictions: 0,
+        writebacks: 0,
+        dirty_lines: 0,
+    };
+}
+
+struct BlockCache {
+    lines: [BlockCacheLine; BLOCK_CACHE_ENTRIES],
+    next_stamp: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    writebacks: u64,
+}
+
+impl BlockCache {
+    const fn new() -> Self {
+        Self {
+            lines: [BlockCacheLine::EMPTY; BLOCK_CACHE_ENTRIES],
+            next_stamp: 1,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            writebacks: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lines = [BlockCacheLine::EMPTY; BLOCK_CACHE_ENTRIES];
+        self.next_stamp = 1;
+        self.hits = 0;
+        self.misses = 0;
+        self.evictions = 0;
+        self.writebacks = 0;
+    }
+
+    fn next_touch_stamp(&mut self) -> u64 {
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.wrapping_add(1);
+        stamp
+    }
+
+    fn find_exact(&self, device_index: usize, lba: u64, len: usize) -> Option<usize> {
+        let mut idx = 0usize;
+        while idx < self.lines.len() {
+            let line = &self.lines[idx];
+            if line.valid && line.device_index == device_index && line.lba == lba && line.len == len
+            {
+                return Some(idx);
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    fn pick_victim(&self) -> usize {
+        let mut idx = 0usize;
+        while idx < self.lines.len() {
+            if !self.lines[idx].valid {
+                return idx;
+            }
+            idx += 1;
+        }
+
+        let mut best = 0usize;
+        let mut best_stamp = self.lines[0].stamp;
+        idx = 1;
+        while idx < self.lines.len() {
+            let stamp = self.lines[idx].stamp;
+            if stamp < best_stamp {
+                best = idx;
+                best_stamp = stamp;
+            }
+            idx += 1;
+        }
+        best
+    }
+
+    #[allow(dead_code)]
+    fn dirty_line_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut idx = 0usize;
+        while idx < self.lines.len() {
+            if self.lines[idx].valid && self.lines[idx].dirty {
+                count += 1;
+            }
+            idx += 1;
+        }
+        count
+    }
+}
+
+struct CacheCell(UnsafeCell<BlockCache>);
+
+unsafe impl Sync for CacheCell {}
+
+static BLOCK_CACHE: CacheCell = CacheCell(UnsafeCell::new(BlockCache::new()));
+
 fn with_registry_mut<R>(f: impl FnOnce(&mut BlockRegistry) -> R) -> R {
     unsafe { f(&mut *BLOCK_REGISTRY.0.get()) }
 }
 
 fn with_registry<R>(f: impl FnOnce(&BlockRegistry) -> R) -> R {
     unsafe { f(&*BLOCK_REGISTRY.0.get()) }
+}
+
+fn with_cache_mut<R>(f: impl FnOnce(&mut BlockCache) -> R) -> R {
+    unsafe { f(&mut *BLOCK_CACHE.0.get()) }
+}
+
+#[allow(dead_code)]
+fn with_cache<R>(f: impl FnOnce(&BlockCache) -> R) -> R {
+    unsafe { f(&*BLOCK_CACHE.0.get()) }
 }
 
 pub const fn transport_name(transport: BlockTransport) -> &'static str {
@@ -199,6 +346,7 @@ pub const fn transport_name(transport: BlockTransport) -> &'static str {
 
 pub fn reset() {
     with_registry_mut(|registry| registry.clear());
+    with_cache_mut(|cache| cache.clear());
 }
 
 pub fn register(device: BlockDevice) -> Option<usize> {
@@ -217,20 +365,159 @@ pub fn inventory() -> BlockInventory {
     with_registry(|registry| registry.summary())
 }
 
+#[allow(dead_code)]
+pub fn cache_stats() -> BlockCacheStats {
+    with_cache(|cache| BlockCacheStats {
+        hits: cache.hits,
+        misses: cache.misses,
+        evictions: cache.evictions,
+        writebacks: cache.writebacks,
+        dirty_lines: cache.dirty_line_count(),
+    })
+}
+
+fn lookup_entry(index: usize) -> Result<BlockEntry, BlockIoError> {
+    with_registry(|registry| registry.get(index).ok_or(BlockIoError::InvalidDevice))
+}
+
+fn dispatch_read(entry: BlockEntry, lba: u64, out: &mut [u8]) -> Result<(), BlockIoError> {
+    let Some(read_op) = entry.ops.read else {
+        return Err(BlockIoError::Unsupported);
+    };
+    read_op(entry.ctx, &entry.device, lba, out)
+}
+
+fn dispatch_write(entry: BlockEntry, lba: u64, data: &[u8]) -> Result<(), BlockIoError> {
+    let Some(write_op) = entry.ops.write else {
+        return Err(BlockIoError::Unsupported);
+    };
+    write_op(entry.ctx, &entry.device, lba, data)
+}
+
+fn validate_cached_io(entry: BlockEntry, lba: u64, len: usize) -> Result<usize, BlockIoError> {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let logical = entry.device.logical_block_size as usize;
+    if logical == 0 {
+        return Err(BlockIoError::InvalidRequest);
+    }
+    if (len % logical) != 0 {
+        return Err(BlockIoError::UnalignedBuffer);
+    }
+
+    let sectors = len / logical;
+    let end = lba
+        .checked_add(sectors as u64)
+        .ok_or(BlockIoError::OutOfRange)?;
+    if entry.device.sectors != 0 && end > entry.device.sectors {
+        return Err(BlockIoError::OutOfRange);
+    }
+    Ok(logical)
+}
+
+fn flush_line(cache: &mut BlockCache, line_index: usize) -> Result<(), BlockIoError> {
+    let (device_index, lba, len) = {
+        let line = cache.lines[line_index];
+        if !line.valid || !line.dirty {
+            return Ok(());
+        }
+        (line.device_index, line.lba, line.len)
+    };
+
+    let entry = lookup_entry(device_index)?;
+    {
+        let line = &cache.lines[line_index];
+        dispatch_write(entry, lba, &line.data[..len])?;
+    }
+
+    cache.lines[line_index].dirty = false;
+    cache.writebacks = cache.writebacks.saturating_add(1);
+    Ok(())
+}
+
+fn cache_store_chunk(
+    cache: &mut BlockCache,
+    device_index: usize,
+    lba: u64,
+    src: &[u8],
+    dirty: bool,
+) -> Result<(), BlockIoError> {
+    let len = src.len();
+    if len == 0 || len > BLOCK_CACHE_ENTRY_BYTES {
+        return Err(BlockIoError::InvalidRequest);
+    }
+
+    if let Some(hit_idx) = cache.find_exact(device_index, lba, len) {
+        let stamp = cache.next_touch_stamp();
+        let line = &mut cache.lines[hit_idx];
+        line.data[..len].copy_from_slice(src);
+        if dirty {
+            line.dirty = true;
+        }
+        line.stamp = stamp;
+        cache.hits = cache.hits.saturating_add(1);
+        return Ok(());
+    }
+
+    cache.misses = cache.misses.saturating_add(1);
+    let victim = cache.pick_victim();
+    if cache.lines[victim].valid {
+        cache.evictions = cache.evictions.saturating_add(1);
+        flush_line(cache, victim)?;
+    }
+
+    let stamp = cache.next_touch_stamp();
+    let line = &mut cache.lines[victim];
+    line.valid = true;
+    line.dirty = dirty;
+    line.device_index = device_index;
+    line.lba = lba;
+    line.len = len;
+    line.data[..len].copy_from_slice(src);
+    if len < BLOCK_CACHE_ENTRY_BYTES {
+        line.data[len..].fill(0);
+    }
+    line.stamp = stamp;
+    Ok(())
+}
+
+pub fn flush_cached_device(index: usize) -> Result<(), BlockIoError> {
+    with_cache_mut(|cache| {
+        let mut i = 0usize;
+        while i < cache.lines.len() {
+            if cache.lines[i].valid && cache.lines[i].dirty && cache.lines[i].device_index == index
+            {
+                flush_line(cache, i)?;
+            }
+            i += 1;
+        }
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub fn flush_cached_all() -> Result<(), BlockIoError> {
+    with_cache_mut(|cache| {
+        let mut i = 0usize;
+        while i < cache.lines.len() {
+            if cache.lines[i].valid && cache.lines[i].dirty {
+                flush_line(cache, i)?;
+            }
+            i += 1;
+        }
+        Ok(())
+    })
+}
+
 pub fn read(index: usize, lba: u64, out: &mut [u8]) -> Result<(), BlockIoError> {
     if out.is_empty() {
         return Ok(());
     }
 
-    with_registry(|registry| {
-        let Some(entry) = registry.get(index) else {
-            return Err(BlockIoError::InvalidDevice);
-        };
-        let Some(read_op) = entry.ops.read else {
-            return Err(BlockIoError::Unsupported);
-        };
-        read_op(entry.ctx, &entry.device, lba, out)
-    })
+    let entry = lookup_entry(index)?;
+    dispatch_read(entry, lba, out)
 }
 
 pub fn write(index: usize, lba: u64, data: &[u8]) -> Result<(), BlockIoError> {
@@ -238,15 +525,84 @@ pub fn write(index: usize, lba: u64, data: &[u8]) -> Result<(), BlockIoError> {
         return Ok(());
     }
 
-    with_registry(|registry| {
-        let Some(entry) = registry.get(index) else {
-            return Err(BlockIoError::InvalidDevice);
-        };
-        let Some(write_op) = entry.ops.write else {
-            return Err(BlockIoError::Unsupported);
-        };
-        write_op(entry.ctx, &entry.device, lba, data)
-    })
+    let entry = lookup_entry(index)?;
+    dispatch_write(entry, lba, data)
+}
+
+#[allow(dead_code)]
+pub fn read_cached(index: usize, lba: u64, out: &mut [u8]) -> Result<(), BlockIoError> {
+    if out.is_empty() {
+        return Ok(());
+    }
+
+    let entry = lookup_entry(index)?;
+    let logical = validate_cached_io(entry, lba, out.len())?;
+
+    let mut bytes_done = 0usize;
+    let mut chunk_lba = lba;
+    while bytes_done < out.len() {
+        let remaining = out.len() - bytes_done;
+        let mut chunk_len = core::cmp::min(remaining, BLOCK_CACHE_ENTRY_BYTES);
+        chunk_len -= chunk_len % logical;
+        if chunk_len == 0 {
+            return Err(BlockIoError::InvalidRequest);
+        }
+
+        let mut hit = false;
+        with_cache_mut(|cache| {
+            if let Some(hit_idx) = cache.find_exact(index, chunk_lba, chunk_len) {
+                let stamp = cache.next_touch_stamp();
+                let line = &mut cache.lines[hit_idx];
+                out[bytes_done..bytes_done + chunk_len].copy_from_slice(&line.data[..chunk_len]);
+                line.stamp = stamp;
+                cache.hits = cache.hits.saturating_add(1);
+                hit = true;
+            } else {
+                cache.misses = cache.misses.saturating_add(1);
+            }
+        });
+
+        if !hit {
+            let dst = &mut out[bytes_done..bytes_done + chunk_len];
+            dispatch_read(entry, chunk_lba, dst)?;
+            with_cache_mut(|cache| {
+                let _ = cache_store_chunk(cache, index, chunk_lba, dst, false);
+            });
+        }
+
+        bytes_done += chunk_len;
+        chunk_lba = chunk_lba.saturating_add((chunk_len / logical) as u64);
+    }
+
+    Ok(())
+}
+
+pub fn write_cached(index: usize, lba: u64, data: &[u8]) -> Result<(), BlockIoError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let entry = lookup_entry(index)?;
+    let logical = validate_cached_io(entry, lba, data.len())?;
+
+    let mut bytes_done = 0usize;
+    let mut chunk_lba = lba;
+    while bytes_done < data.len() {
+        let remaining = data.len() - bytes_done;
+        let mut chunk_len = core::cmp::min(remaining, BLOCK_CACHE_ENTRY_BYTES);
+        chunk_len -= chunk_len % logical;
+        if chunk_len == 0 {
+            return Err(BlockIoError::InvalidRequest);
+        }
+
+        let src = &data[bytes_done..bytes_done + chunk_len];
+        with_cache_mut(|cache| cache_store_chunk(cache, index, chunk_lba, src, true))?;
+
+        bytes_done += chunk_len;
+        chunk_lba = chunk_lba.saturating_add((chunk_len / logical) as u64);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -257,6 +613,9 @@ mod tests {
 
     static LAST_READ_CTX: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_SUM: AtomicU64 = AtomicU64::new(0);
+    static CACHE_READ_CALLS: AtomicU64 = AtomicU64::new(0);
+    static CACHE_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
+    static CACHE_LAST_WRITE_LBA: AtomicU64 = AtomicU64::new(0);
 
     fn global_registry_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -282,6 +641,35 @@ mod tests {
         _lba: u64,
         data: &[u8],
     ) -> Result<(), BlockIoError> {
+        let mut sum = 0u64;
+        for byte in data {
+            sum = sum.wrapping_add(*byte as u64);
+        }
+        LAST_WRITE_SUM.store(sum, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn cache_test_read(
+        _ctx: BlockOpContext,
+        _dev: &BlockDevice,
+        lba: u64,
+        out: &mut [u8],
+    ) -> Result<(), BlockIoError> {
+        CACHE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        for byte in out.iter_mut() {
+            *byte = (lba as u8) ^ 0x5A;
+        }
+        Ok(())
+    }
+
+    fn cache_test_write(
+        _ctx: BlockOpContext,
+        _dev: &BlockDevice,
+        lba: u64,
+        data: &[u8],
+    ) -> Result<(), BlockIoError> {
+        CACHE_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+        CACHE_LAST_WRITE_LBA.store(lba, Ordering::Relaxed);
         let mut sum = 0u64;
         for byte in data {
             sum = sum.wrapping_add(*byte as u64);
@@ -389,5 +777,108 @@ mod tests {
         assert_eq!(read(index, 0, &mut out), Err(BlockIoError::Unsupported));
         assert_eq!(write(index, 0, &[1]), Err(BlockIoError::Unsupported));
         assert_eq!(read(99, 0, &mut out), Err(BlockIoError::InvalidDevice));
+    }
+
+    #[test]
+    fn cached_write_coalesces_until_flush() {
+        let _guard = global_registry_lock().lock().unwrap();
+        reset();
+        CACHE_WRITE_CALLS.store(0, Ordering::Relaxed);
+        LAST_WRITE_SUM.store(0, Ordering::Relaxed);
+        CACHE_LAST_WRITE_LBA.store(0, Ordering::Relaxed);
+
+        let index = register_with_ops(
+            BlockDevice {
+                sectors: 4096,
+                ..BlockDevice::EMPTY
+            },
+            BlockOps {
+                read: Some(cache_test_read),
+                write: Some(cache_test_write),
+            },
+            BlockOpContext::EMPTY,
+        )
+        .unwrap();
+
+        let ones = [1u8; 1024];
+        let twos = [2u8; 1024];
+
+        write_cached(index, 8, &ones).expect("cache ones");
+        write_cached(index, 8, &twos).expect("overwrite cached line");
+        assert_eq!(CACHE_WRITE_CALLS.load(Ordering::Relaxed), 0);
+
+        flush_cached_device(index).expect("flush cached writes");
+        assert_eq!(CACHE_WRITE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(CACHE_LAST_WRITE_LBA.load(Ordering::Relaxed), 8);
+        assert_eq!(LAST_WRITE_SUM.load(Ordering::Relaxed), (2u64 * 1024));
+        assert_eq!(cache_stats().dirty_lines, 0);
+    }
+
+    #[test]
+    fn cached_write_evicts_dirty_lines_with_writeback() {
+        let _guard = global_registry_lock().lock().unwrap();
+        reset();
+        CACHE_WRITE_CALLS.store(0, Ordering::Relaxed);
+        LAST_WRITE_SUM.store(0, Ordering::Relaxed);
+
+        let index = register_with_ops(
+            BlockDevice {
+                sectors: 8192,
+                ..BlockDevice::EMPTY
+            },
+            BlockOps {
+                read: Some(cache_test_read),
+                write: Some(cache_test_write),
+            },
+            BlockOpContext::EMPTY,
+        )
+        .unwrap();
+
+        let sector = [0xABu8; 512];
+        for lba in 0..BLOCK_CACHE_ENTRIES {
+            write_cached(index, lba as u64, &sector).expect("fill cache line");
+        }
+        assert_eq!(CACHE_WRITE_CALLS.load(Ordering::Relaxed), 0);
+
+        write_cached(index, BLOCK_CACHE_ENTRIES as u64, &sector).expect("evict oldest line");
+        assert_eq!(CACHE_WRITE_CALLS.load(Ordering::Relaxed), 1);
+
+        flush_cached_device(index).expect("flush remaining dirty lines");
+        assert_eq!(
+            CACHE_WRITE_CALLS.load(Ordering::Relaxed),
+            (BLOCK_CACHE_ENTRIES + 1) as u64
+        );
+        assert_eq!(cache_stats().dirty_lines, 0);
+    }
+
+    #[test]
+    fn cached_read_hits_after_first_miss() {
+        let _guard = global_registry_lock().lock().unwrap();
+        reset();
+        CACHE_READ_CALLS.store(0, Ordering::Relaxed);
+
+        let index = register_with_ops(
+            BlockDevice {
+                sectors: 1024,
+                ..BlockDevice::EMPTY
+            },
+            BlockOps {
+                read: Some(cache_test_read),
+                write: Some(cache_test_write),
+            },
+            BlockOpContext::EMPTY,
+        )
+        .unwrap();
+
+        let mut first = [0u8; 512];
+        let mut second = [0u8; 512];
+        read_cached(index, 3, &mut first).expect("first cached read");
+        read_cached(index, 3, &mut second).expect("second cached read");
+
+        assert_eq!(CACHE_READ_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(first, second);
+        let stats = cache_stats();
+        assert!(stats.hits >= 1);
+        assert!(stats.misses >= 1);
     }
 }

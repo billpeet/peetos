@@ -84,7 +84,7 @@ P0 metadata syscalls (`fchmodat`, `fchownat`, `mknodat`, `utimes`, `futimesat`)
 are now implemented; `chmod`/`chown` applets use the new handlers.
 
 Next-wave syscalls now implemented:
-- `ftruncate` (77) - done (truncate-to-zero for tmpfs/ext2; truncate-to-length for tmpfs)
+- `ftruncate` (77) - done (truncate-to-zero and truncate-to-length for tmpfs/ext2 regular files)
 - `getrandom` (318) - done (XORshift PRNG, capped at 256 bytes per call)
 - `sysinfo` (99) - done (PIT uptime, PMM memory stats)
 - `prlimit64` (302) - done (stub returning RLIM_INFINITY)
@@ -95,7 +95,7 @@ Third-wave syscalls now implemented:
 - `fchmod` (91) - done (fd-based permission-bit update for VFS/ext2)
 - `fchown` (93) - done (fd-based uid/gid update for VFS/ext2)
 - `truncate` (76) - done (path-based truncate via VFS lookup)
-- `sync` (162) - done (ext2 sync-back)
+- `sync` (162) - done (ext2 dirty-run enqueue + cache flush)
 - `pread64` (17) - done (positioned read without fd offset change)
 - `pwrite64` (18) - done (positioned write without fd offset change)
 - `readv` (19) - done (scatter/gather read via iovec entries)
@@ -472,7 +472,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
   - `utimes`/`futimesat` convert `struct timeval` tv_sec directly; microsecond precision is discarded.
   - `fchmod`/`fchown` operate on VFS fd inodes without ownership/capability checks.
   - `truncate` resolves path to VFS inode and delegates to same backend as `ftruncate`.
-  - `sync` performs a best-effort ext2 sync-back; no per-filesystem sync granularity.
+  - `sync` performs best-effort ext2 dirty-run enqueue plus block-cache flush; no per-filesystem sync granularity.
   - `pread64`/`pwrite64` operate on VFS fds only (pipes/console return `-ESPIPE`).
   - `readv` delegates to `sys_read` per iovec entry (not zero-copy).
   - `sched_getaffinity` returns a single-CPU affinity mask (no SMP awareness).

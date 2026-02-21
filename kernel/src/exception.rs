@@ -4,6 +4,20 @@ use arch_x86_64::idt;
 
 use crate::serial_println;
 
+pub fn handle(frame: &mut idt::InterruptFrame) -> bool {
+    let int_no = read_u64(ptr::addr_of!(frame.int_no)) as u8;
+    if int_no != idt::EXCEPTION_PAGE_FAULT {
+        return false;
+    }
+
+    let error_code = read_u64(ptr::addr_of!(frame.error_code));
+    let fault_addr = read_cr2();
+    if crate::syscall::try_handle_page_fault(fault_addr, error_code) {
+        return true;
+    }
+    crate::syscall::terminate_current_user_fault(error_code, fault_addr)
+}
+
 pub fn report(frame: &idt::InterruptFrame) {
     let int_no = read_u64(ptr::addr_of!(frame.int_no));
     let error_code = read_u64(ptr::addr_of!(frame.error_code));

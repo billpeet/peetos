@@ -580,10 +580,10 @@ pub fn set_absolute_position(
 ) {
     with_cursor_state(|state| {
         state.buttons = buttons;
-        let next_x =
-            map_absolute_axis(raw_x, logical_min_x, logical_max_x, state.max_x).clamp(0, state.max_x);
-        let next_y =
-            map_absolute_axis(raw_y, logical_min_y, logical_max_y, state.max_y).clamp(0, state.max_y);
+        let next_x = map_absolute_axis(raw_x, logical_min_x, logical_max_x, state.max_x)
+            .clamp(0, state.max_x);
+        let next_y = map_absolute_axis(raw_y, logical_min_y, logical_max_y, state.max_y)
+            .clamp(0, state.max_y);
 
         if state.x == next_x && state.y == next_y {
             if !state.drawn {

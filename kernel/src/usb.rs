@@ -130,10 +130,9 @@ fn parse_hid_tablet_interface(config_bytes: &[u8]) -> Option<HidTabletInterface>
                 let list_end = offset + len;
                 while cursor + 3 <= list_end {
                     let desc_type = config_bytes[cursor];
-                    let desc_len = u16::from_le_bytes([
-                        config_bytes[cursor + 1],
-                        config_bytes[cursor + 2],
-                    ]) as usize;
+                    let desc_len =
+                        u16::from_le_bytes([config_bytes[cursor + 1], config_bytes[cursor + 2]])
+                            as usize;
                     if desc_type == USB_DESCRIPTOR_REPORT {
                         hid_report_len = desc_len;
                         break;
@@ -159,8 +158,10 @@ fn parse_hid_tablet_interface(config_bytes: &[u8]) -> Option<HidTabletInterface>
         offset += len;
     }
 
-    let ((interface_number, subclass, protocol), (endpoint_address, endpoint_max_packet, poll_interval)) =
-        (active_interface?, endpoint?);
+    let (
+        (interface_number, subclass, protocol),
+        (endpoint_address, endpoint_max_packet, poll_interval),
+    ) = (active_interface?, endpoint?);
 
     Some(HidTabletInterface {
         config_value,
@@ -337,7 +338,8 @@ fn parse_hid_report_layout(descriptor: &[u8]) -> Option<TabletReportLayout> {
                             if usage.is_some() {
                                 match button_field {
                                     Some(mut field) => {
-                                        let expected = field.bit_offset as u32 + field.bit_count as u32;
+                                        let expected =
+                                            field.bit_offset as u32 + field.bit_count as u32;
                                         if field_offset == expected && field.bit_count < 8 {
                                             field.bit_count += 1;
                                             button_field = Some(field);
@@ -508,7 +510,8 @@ mod hw {
     const UHCI_TD_STATUS_CERR_3: u32 = 3 << 27;
     const UHCI_TD_STATUS_SPD: u32 = 1 << 29;
     const UHCI_TD_STATUS_NAK: u32 = 1 << 19;
-    const UHCI_TD_STATUS_ERROR_MASK: u32 = (1 << 17) | (1 << 18) | (1 << 20) | (1 << 21) | (1 << 22);
+    const UHCI_TD_STATUS_ERROR_MASK: u32 =
+        (1 << 17) | (1 << 18) | (1 << 20) | (1 << 21) | (1 << 22);
 
     const UHCI_PID_OUT: u8 = 0xE1;
     const UHCI_PID_IN: u8 = 0x69;
@@ -780,7 +783,11 @@ mod hw {
             return None;
         }
 
-        write16(io_base, port_reg, status | UHCI_PORTSC_CSC | UHCI_PORTSC_PEC);
+        write16(
+            io_base,
+            port_reg,
+            status | UHCI_PORTSC_CSC | UHCI_PORTSC_PEC,
+        );
         write16(io_base, port_reg, status | UHCI_PORTSC_PR);
         spin_delay(350_000);
 
@@ -789,7 +796,11 @@ mod hw {
         spin_delay(120_000);
 
         let mut current = read16(io_base, port_reg);
-        write16(io_base, port_reg, current | UHCI_PORTSC_CSC | UHCI_PORTSC_PEC);
+        write16(
+            io_base,
+            port_reg,
+            current | UHCI_PORTSC_CSC | UHCI_PORTSC_PEC,
+        );
         current = read16(io_base, port_reg);
 
         if (current & UHCI_PORTSC_CCS) == 0 {
@@ -901,7 +912,13 @@ mod hw {
                 UHCI_LINK_TERMINATE
             },
             status: setup_status,
-            token: build_td_token(UHCI_PID_SETUP, device_address, 0, 0, mem::size_of::<SetupPacket>()),
+            token: build_td_token(
+                UHCI_PID_SETUP,
+                device_address,
+                0,
+                0,
+                mem::size_of::<SetupPacket>(),
+            ),
             buffer: driver.setup_buf.phys,
         };
         write_td(driver, 0, setup_td);
@@ -944,11 +961,7 @@ mod hw {
             next_td += 1;
         }
 
-        let status_pid = if data_in {
-            UHCI_PID_OUT
-        } else {
-            UHCI_PID_IN
-        };
+        let status_pid = if data_in { UHCI_PID_OUT } else { UHCI_PID_IN };
         let status_td = UhciTd {
             link_ptr: UHCI_LINK_TERMINATE,
             status: UHCI_TD_STATUS_ACTIVE

@@ -4,6 +4,7 @@ use arch_x86_64::addr::{PhysAddr, VirtAddr, PAGE_SIZE};
 
 use crate::memory::pmm;
 use crate::serial_println;
+use crate::syscall;
 
 pub const VMM_ENTRIES_PER_TABLE: usize = 512;
 
@@ -856,7 +857,9 @@ pub fn clear_user_space(target_pml4: PhysAddr) {
                     }
 
                     let page_phys = pte_addr(pte);
-                    pmm::free_page(page_phys);
+                    if !syscall::vm_page_cache_release_mapped_phys(page_phys) {
+                        pmm::free_page(page_phys);
+                    }
                     unsafe { ptr::write(pt_table.add(pt_idx), 0) };
                 }
 
