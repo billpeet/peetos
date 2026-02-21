@@ -25,6 +25,26 @@ if ! grep -q 'PATH=/mnt/ext2/bin:/bin' "${LAUNCHER}"; then
   exit 1
 fi
 
+if grep -q 'launching interactive toybox sh' "${LAUNCHER}"; then
+  echo "musl ext2 launcher should not print a startup banner" >&2
+  exit 1
+fi
+
+if ! grep -q 'PS1=' "${LAUNCHER}"; then
+  echo "musl ext2 launcher is missing PS1 prompt override" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'PS1=\x1b[32m\\w $ \x1b[0m' "${LAUNCHER}"; then
+  echo "musl ext2 launcher PS1 is missing cwd + dollar prompt format" >&2
+  exit 1
+fi
+
+if ! grep -Fq '\x1b[32m' "${LAUNCHER}"; then
+  echo "musl ext2 launcher PS1 is missing green ANSI color" >&2
+  exit 1
+fi
+
 if ! grep -q 'build_toybox_core.sh' "${EXT2_BUILDER}"; then
   echo "ext2 builder is not using core toybox staging" >&2
   exit 1

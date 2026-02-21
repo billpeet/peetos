@@ -21,11 +21,10 @@ int main(void) {
     char *const envp[] = {
         (char *)"PATH=/mnt/ext2/bin:/bin",
         (char *)"TERM=peetos",
+        (char *)"PS1=\x1b[32m\\w $ \x1b[0m",
         0,
     };
 
-    static const char launch_msg[] = "[musl-ext2-exec] launching interactive toybox sh\n";
-    write_all(1, launch_msg, sizeof(launch_msg) - 1);
     chdir("/mnt/ext2");
     execve(target, argv, envp);
 

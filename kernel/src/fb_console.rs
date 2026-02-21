@@ -14,6 +14,14 @@ const PANEL_BORDER: usize = 2;
 const PANEL_PADDING_X: usize = 12;
 const PANEL_PADDING_Y: usize = 12;
 const PANEL_TITLE_BAR_HEIGHT: usize = 20;
+const DESKTOP_HEADER_HEIGHT: usize = 24;
+const DESKTOP_HEADER_GAP: usize = 10;
+const STATUS_TEXT_PAD_X: usize = 6;
+const STATUS_SEG_GAP_X: usize = 4;
+const STATUS_POLL_TICKS: u8 = 20;
+const STATUS_PATH_MAX_DEPTH: usize = 32;
+const DESKTOP_HEADER_LABEL: &[u8] = b"PeetOS";
+const STATUS_TITLE_LABEL: &[u8] = b"Terminal";
 
 const ANSI_MAX_PARAMS: usize = 4;
 
@@ -200,6 +208,9 @@ struct FbConsoleState {
     ansi_params: [u16; ANSI_MAX_PARAMS],
     ansi_param_count: u8,
     ansi_current_param: u16,
+    status_poll_ticks: u8,
+    status_cwd_len: usize,
+    status_cwd: [u8; fs::VFS_MAX_PATH],
 }
 
 impl FbConsoleState {
@@ -235,6 +246,9 @@ impl FbConsoleState {
             ansi_params: [0; ANSI_MAX_PARAMS],
             ansi_param_count: 0,
             ansi_current_param: 0,
+            status_poll_ticks: 0,
+            status_cwd_len: 0,
+            status_cwd: [0; fs::VFS_MAX_PATH],
         }
     }
 }
@@ -396,7 +410,54 @@ fn clear_screen(state: &FbConsoleState) {
         state.fb.height as usize,
         state.desktop_bg,
     );
+    draw_desktop_header(state);
     draw_panel(state);
+    draw_status_line(state);
+}
+
+fn draw_desktop_header(state: &FbConsoleState) {
+    if !state.chrome_enabled {
+        return;
+    }
+
+    let header_h = core::cmp::min(DESKTOP_HEADER_HEIGHT, state.fb.height as usize);
+    let header_bg = palette_color(state, 2);
+    let header_fg = palette_color(state, 15);
+    fill_rect(
+        state.fb,
+        0,
+        0,
+        state.fb.width as usize,
+        header_h,
+        header_bg,
+    );
+    if header_h > 0 {
+        fill_rect(
+            state.fb,
+            0,
+            header_h.saturating_sub(1),
+            state.fb.width as usize,
+            1,
+            palette_color(state, 8),
+        );
+    }
+
+    if header_h < GLYPH_HEIGHT {
+        return;
+    }
+    let label_w = DESKTOP_HEADER_LABEL.len().saturating_mul(GLYPH_WIDTH);
+    let max_x = (state.fb.width as usize).saturating_sub(label_w);
+    let text_x = max_x / 2;
+    let text_y = (header_h.saturating_sub(GLYPH_HEIGHT)) / 2;
+    let _ = draw_text_raw(
+        state,
+        text_x,
+        text_y,
+        DESKTOP_HEADER_LABEL,
+        header_fg,
+        header_bg,
+        DESKTOP_HEADER_LABEL.len(),
+    );
 }
 
 fn draw_glyph(state: &FbConsoleState, col: usize, row: usize, byte: u8) {
@@ -417,6 +478,281 @@ fn draw_glyph(state: &FbConsoleState, col: usize, row: usize, byte: u8) {
             put_pixel(state.fb, x0 + gx, y0 + gy, color);
         }
     }
+}
+
+fn draw_glyph_raw(state: &FbConsoleState, x0: usize, y0: usize, byte: u8, fg: u32, bg: u32) {
+    let glyph_idx = if (0x20..=0x7E).contains(&byte) {
+        byte
+    } else {
+        b'?'
+    };
+    let glyph = &FONT8X16_VGA[glyph_idx as usize];
+
+    for (gy, bits) in glyph.iter().copied().enumerate() {
+        for gx in 0..8 {
+            let on = (bits & (0x80 >> gx)) != 0;
+            let color = if on { fg } else { bg };
+            put_pixel(state.fb, x0 + gx, y0 + gy, color);
+        }
+    }
+}
+
+fn draw_text_raw(
+    state: &FbConsoleState,
+    x0: usize,
+    y0: usize,
+    text: &[u8],
+    fg: u32,
+    bg: u32,
+    max_chars: usize,
+) -> usize {
+    let count = core::cmp::min(text.len(), max_chars);
+    let mut idx = 0usize;
+    while idx < count {
+        let x = x0.saturating_add(idx.saturating_mul(GLYPH_WIDTH));
+        draw_glyph_raw(state, x, y0, text[idx], fg, bg);
+        idx += 1;
+    }
+    count
+}
+
+#[inline]
+fn status_component_is_dot(name: &[u8]) -> bool {
+    name.len() == 1 && name[0] == b'.'
+}
+
+#[inline]
+fn status_component_is_dotdot(name: &[u8]) -> bool {
+    name.len() == 2 && name[0] == b'.' && name[1] == b'.'
+}
+
+fn find_inode_path_for_status(
+    dir_inode: u16,
+    target_inode: u16,
+    current_len: usize,
+    depth: usize,
+    path_buf: &mut [u8; fs::VFS_MAX_PATH],
+) -> Option<usize> {
+    if dir_inode == target_inode {
+        return Some(current_len);
+    }
+    if depth >= STATUS_PATH_MAX_DEPTH {
+        return None;
+    }
+
+    let mut offset = 0u64;
+    loop {
+        let entry = match fs::readdir(dir_inode, offset) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => return None,
+        };
+        offset = entry.next_offset;
+        if entry.name_len == 0 {
+            continue;
+        }
+        let name = &entry.name[..entry.name_len];
+        if status_component_is_dot(name) || status_component_is_dotdot(name) {
+            continue;
+        }
+        let name_str = match core::str::from_utf8(name) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let child_inode = match fs::lookupat(dir_inode, name_str) {
+            Ok(inode) => inode,
+            Err(_) => continue,
+        };
+
+        let next_len;
+        if current_len == 0 {
+            if 1 + name.len() >= path_buf.len() {
+                continue;
+            }
+            path_buf[0] = b'/';
+            path_buf[1..1 + name.len()].copy_from_slice(name);
+            next_len = 1 + name.len();
+        } else {
+            if current_len + 1 + name.len() >= path_buf.len() {
+                continue;
+            }
+            path_buf[current_len] = b'/';
+            path_buf[current_len + 1..current_len + 1 + name.len()].copy_from_slice(name);
+            next_len = current_len + 1 + name.len();
+        }
+
+        if child_inode == target_inode {
+            return Some(next_len);
+        }
+
+        if matches!(fs::inode_is_dir(child_inode), Ok(true)) {
+            if let Some(found_len) = find_inode_path_for_status(
+                child_inode,
+                target_inode,
+                next_len,
+                depth + 1,
+                path_buf,
+            ) {
+                return Some(found_len);
+            }
+        }
+    }
+
+    None
+}
+
+fn query_current_cwd_path(path_buf: &mut [u8; fs::VFS_MAX_PATH]) -> usize {
+    let task_ptr = crate::task::current();
+    if task_ptr.is_null() {
+        path_buf[0] = b'/';
+        return 1;
+    }
+
+    let cwd = unsafe { (*task_ptr).user_cwd_inode };
+    if cwd == fs::root_inode() {
+        path_buf[0] = b'/';
+        return 1;
+    }
+
+    match find_inode_path_for_status(fs::root_inode(), cwd, 0, 0, path_buf) {
+        Some(len) if len > 0 => len,
+        _ => {
+            path_buf[0] = b'?';
+            1
+        }
+    }
+}
+
+fn format_status_path(
+    path: &[u8],
+    max_chars: usize,
+    out: &mut [u8; fs::VFS_MAX_PATH],
+) -> usize {
+    let sanitize = |byte: u8| {
+        if (0x20..=0x7E).contains(&byte) {
+            byte
+        } else {
+            b'?'
+        }
+    };
+
+    if max_chars == 0 {
+        return 0;
+    }
+
+    let path_len = core::cmp::min(path.len(), out.len());
+    if path_len <= max_chars {
+        let mut idx = 0usize;
+        while idx < path_len {
+            out[idx] = sanitize(path[idx]);
+            idx += 1;
+        }
+        return path_len;
+    }
+
+    if max_chars <= 3 {
+        let mut idx = 0usize;
+        while idx < max_chars {
+            out[idx] = b'.';
+            idx += 1;
+        }
+        return max_chars;
+    }
+
+    out[0] = b'.';
+    out[1] = b'.';
+    out[2] = b'.';
+    let tail_len = max_chars - 3;
+    let tail_start = path_len - tail_len;
+    let mut idx = 0usize;
+    while idx < tail_len {
+        out[3 + idx] = sanitize(path[tail_start + idx]);
+        idx += 1;
+    }
+    max_chars
+}
+
+fn refresh_status_path_cache(state: &mut FbConsoleState, force: bool) -> bool {
+    if !force {
+        if state.status_poll_ticks < STATUS_POLL_TICKS {
+            state.status_poll_ticks = state.status_poll_ticks.saturating_add(1);
+            return false;
+        }
+    }
+
+    state.status_poll_ticks = 0;
+
+    let mut latest = [0u8; fs::VFS_MAX_PATH];
+    let latest_len = query_current_cwd_path(&mut latest);
+    if latest_len == state.status_cwd_len && state.status_cwd[..latest_len] == latest[..latest_len] {
+        return false;
+    }
+
+    state.status_cwd[..latest_len].copy_from_slice(&latest[..latest_len]);
+    if latest_len < state.status_cwd_len {
+        state.status_cwd[latest_len..state.status_cwd_len].fill(0);
+    }
+    state.status_cwd_len = latest_len;
+    true
+}
+
+fn draw_status_segment(
+    state: &FbConsoleState,
+    x: usize,
+    y: usize,
+    text: &[u8],
+    fg: u32,
+    bg: u32,
+) -> usize {
+    let text_width = text.len().saturating_mul(GLYPH_WIDTH);
+    let seg_width = text_width.saturating_add(STATUS_TEXT_PAD_X.saturating_mul(2));
+    fill_rect(state.fb, x, y, seg_width, GLYPH_HEIGHT, bg);
+    let text_x = x.saturating_add(STATUS_TEXT_PAD_X);
+    let _ = draw_text_raw(state, text_x, y, text, fg, bg, text.len());
+    x.saturating_add(seg_width)
+}
+
+fn draw_status_line(state: &FbConsoleState) {
+    if !state.chrome_enabled {
+        return;
+    }
+
+    let title_x = state.panel_x.saturating_add(PANEL_BORDER);
+    let title_y = state.panel_y.saturating_add(PANEL_BORDER);
+    let title_w = state.panel_width.saturating_sub(PANEL_BORDER.saturating_mul(2));
+    fill_rect(state.fb, title_x, title_y, title_w, PANEL_TITLE_BAR_HEIGHT, state.panel_title);
+
+    let text_y = title_y.saturating_add(PANEL_TITLE_BAR_HEIGHT.saturating_sub(GLYPH_HEIGHT) / 2);
+    let mut x = title_x.saturating_add(STATUS_TEXT_PAD_X);
+
+    let title_bg = palette_color(state, 4);
+    let title_fg = palette_color(state, 15);
+    let cwd_bg = palette_color(state, 0);
+    let cwd_fg = palette_color(state, 14);
+
+    x = draw_status_segment(state, x, text_y, STATUS_TITLE_LABEL, title_fg, title_bg);
+    x = x.saturating_add(STATUS_SEG_GAP_X);
+
+    let title_right = title_x.saturating_add(title_w);
+    let right_pad = STATUS_TEXT_PAD_X;
+    if x.saturating_add(right_pad) >= title_right {
+        return;
+    }
+
+    let cwd_width = title_right.saturating_sub(x.saturating_add(right_pad));
+    fill_rect(state.fb, x, text_y, cwd_width, GLYPH_HEIGHT, cwd_bg);
+    let cwd_chars = cwd_width / GLYPH_WIDTH;
+    if cwd_chars == 0 {
+        return;
+    }
+
+    let mut rendered = [0u8; fs::VFS_MAX_PATH];
+    let rendered_len = format_status_path(
+        &state.status_cwd[..state.status_cwd_len],
+        cwd_chars,
+        &mut rendered,
+    );
+    let _ = draw_text_raw(state, x, text_y, &rendered[..rendered_len], cwd_fg, cwd_bg, cwd_chars);
 }
 
 fn clear_cell(state: &FbConsoleState, col: usize, row: usize) {
@@ -772,8 +1108,12 @@ pub fn init() {
     let mut chrome_enabled = false;
 
     let chrome_w = PANEL_MARGIN_X * 2 + PANEL_BORDER * 2 + PANEL_PADDING_X * 2;
-    let chrome_h =
-        PANEL_MARGIN_Y * 2 + PANEL_BORDER * 2 + PANEL_PADDING_Y * 2 + PANEL_TITLE_BAR_HEIGHT;
+    let chrome_h = PANEL_MARGIN_Y * 2
+        + PANEL_BORDER * 2
+        + PANEL_PADDING_Y * 2
+        + PANEL_TITLE_BAR_HEIGHT
+        + DESKTOP_HEADER_HEIGHT
+        + DESKTOP_HEADER_GAP;
 
     if (fb.width as usize) > chrome_w && (fb.height as usize) > chrome_h {
         let max_text_width = (fb.width as usize).saturating_sub(chrome_w);
@@ -793,7 +1133,9 @@ pub fn init() {
             panel_width = inner_width.saturating_add(PANEL_BORDER * 2);
             panel_height = inner_height.saturating_add(PANEL_BORDER * 2);
             panel_x = (fb.width as usize).saturating_sub(panel_width) / 2;
-            panel_y = (fb.height as usize).saturating_sub(panel_height) / 2;
+            let top_reserved = DESKTOP_HEADER_HEIGHT.saturating_add(DESKTOP_HEADER_GAP);
+            let usable_height = (fb.height as usize).saturating_sub(top_reserved);
+            panel_y = top_reserved.saturating_add(usable_height.saturating_sub(panel_height) / 2);
             text_origin_x = panel_x.saturating_add(PANEL_BORDER + PANEL_PADDING_X);
             text_origin_y =
                 panel_y.saturating_add(PANEL_BORDER + PANEL_TITLE_BAR_HEIGHT + PANEL_PADDING_Y);
@@ -821,7 +1163,12 @@ pub fn init() {
     state.cursor_row = 0;
     state.cursor_drawn = false;
     state.blink_ticks = 0;
+    state.status_poll_ticks = STATUS_POLL_TICKS;
+    state.status_cwd.fill(0);
+    state.status_cwd[0] = b'/';
+    state.status_cwd_len = 1;
     ansi_reset(&mut state);
+    let _ = refresh_status_path_cache(&mut state, true);
     clear_screen(&state);
     sync_cursor(&mut state);
 }
@@ -848,6 +1195,9 @@ pub fn tick() {
     if !state.initialized {
         return;
     }
+    if refresh_status_path_cache(&mut state, false) {
+        draw_status_line(&state);
+    }
     state.blink_ticks = state.blink_ticks.saturating_add(1);
     sync_cursor(&mut state);
 }
@@ -862,6 +1212,7 @@ pub fn set_theme(preset: ThemePreset) {
     apply_theme(&mut state, preset);
     state.cursor_col = 0;
     state.cursor_row = 0;
+    let _ = refresh_status_path_cache(&mut state, true);
     ansi_reset(&mut state);
     clear_screen(&state);
     sync_cursor(&mut state);
@@ -1054,5 +1405,32 @@ mod tests {
         apply_theme(&mut state, ThemePreset::Green);
         state.fg_index = 2;
         assert_eq!(current_fg_color(&state), THEME_GREEN.palette[2]);
+    }
+
+    #[test]
+    fn status_path_format_keeps_short_paths() {
+        let mut out = [0u8; fs::VFS_MAX_PATH];
+        let len = format_status_path(b"/mnt/ext2", 32, &mut out);
+        assert_eq!(&out[..len], b"/mnt/ext2");
+    }
+
+    #[test]
+    fn status_path_format_uses_ellipsis_for_long_paths() {
+        let mut out = [0u8; fs::VFS_MAX_PATH];
+        let len = format_status_path(b"/very/long/path", 8, &mut out);
+        assert_eq!(&out[..len], b".../path");
+    }
+
+    #[test]
+    fn status_path_format_handles_tiny_width() {
+        let mut out = [0u8; fs::VFS_MAX_PATH];
+        let len = format_status_path(b"/very/long/path", 3, &mut out);
+        assert_eq!(&out[..len], b"...");
+    }
+
+    #[test]
+    fn chrome_labels_match_terminal_ui() {
+        assert_eq!(DESKTOP_HEADER_LABEL, b"PeetOS");
+        assert_eq!(STATUS_TITLE_LABEL, b"Terminal");
     }
 }
