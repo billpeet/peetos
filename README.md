@@ -46,8 +46,9 @@ Key references in the C project:
 - Phase-7 PCI enumeration is active in `crates/drivers` (config mechanism #1, bus/device/function scan, bounded boot-time serial inventory output), and ATA/AHCI bring-up now includes AHCI command-engine setup/teardown, AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write commands behind the kernel block API, ATA PIO `IDENTIFY`, and a minimal in-kernel block-device inventory.
 - Baseline keyboard/TTY input is now wired in-kernel: PS/2 IRQ1 set-1 scancode decode feeds a canonical line-buffered console input path used by user `read` on stdio.
 - Baseline pointer input is now wired in-kernel: PS/2 IRQ12 packet decode drives relative cursor movement by default, and an optional `usb-tablet` kernel feature enables UHCI USB HID-tablet polling for absolute framebuffer cursor positioning.
-- Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, basic pixel/clear primitives, and a styled framebuffer terminal mirror with 8x16 VGA-compatible bitmap glyphs, baseline ANSI color handling, cursor blink, preset themes, and a movable mouse cursor overlay.
+- Baseline framebuffer setup is now wired in-kernel: VESA boot handoff parsing (`status` + `mode` blocks), higher-half framebuffer window validation, basic pixel/clear primitives, and a styled framebuffer terminal mirror with 8x16 VGA-compatible bitmap glyphs, baseline ANSI color handling, cursor blink, preset themes, a top `PeetOS` desktop header, a `Terminal` title bar, and a movable mouse cursor overlay.
 - Stage-9 userspace bootstrap plumbing is now present: musl source/sysroot build (`make musl-fetch`, `make musl-configure`, `make musl`) and toybox staging (`make toybox-fetch`, `make toybox`) with a shell-core Toybox set (`sh`, `echo`, `cat`, `ls`, `mkdir`, `rm`, `pwd`, `cp`, `mv`, `ln`, `touch`) integrated into the ext2 `execve` smoke path.
+- In `musl-ext2-exec` interactive shell mode, launcher `PS1` now shows cwd directly in the prompt line and renders that prompt in green.
 - QuickJS userspace staging is now wired (`make quickjs-fetch`, `make quickjs`) with ext2 smoke coverage via `make run-quickjs-smoke` (`KERNEL_FEATURES=musl-ext2-quickjs-smoke`) that executes staged JS scripts with `/bin/qjs`.
 - MicroPython userspace staging is now wired (`make micropython-fetch`, `make micropython`) with ext2 smoke coverage via `make run-micropython-smoke` (`KERNEL_FEATURES=musl-ext2-micropython-smoke`) that executes staged Python scripts with `/bin/micropython`.
 - Dropbear userspace staging is now wired (`make dropbear-fetch`, `make dropbear`) with ext2 smoke coverage via `make run-dropbear-smoke` (`KERNEL_FEATURES=musl-ext2-dropbear-smoke`) that validates staged `/bin/dropbear` + `/bin/dropbearkey` bring-up, staged host-key usage, and daemonization startup marker.
@@ -195,11 +196,12 @@ make run-micropython-smoke
 make run-dropbear-smoke
 ```
 
-Expected serial output includes `[musl-ext2-exec] launching interactive toybox sh` when the ext2 handoff succeeds.
+Expected shell startup now opens directly at the prompt without a launcher banner line.
+Interactive shell prompt is configured as a green cwd prompt (for example, `/mnt/ext2 $ `).
 Keyboard input is captured from the QEMU display window and surfaced through the kernel TTY.
 Mouse input is captured from the QEMU display window and drives the on-screen software cursor when framebuffer mode is active.
 Use `make run-tablet` to launch QEMU with `-usb -device usb-tablet` for absolute pointer input tests.
-When framebuffer mode is active, console output is mirrored into the QEMU display via a styled 8x16 text renderer with baseline ANSI 16-color support, cursor blink, preset themes, and the software mouse cursor overlay.
+When framebuffer mode is active, console output is mirrored into the QEMU display via a styled 8x16 text renderer with baseline ANSI 16-color support, cursor blink, preset themes, a top `PeetOS` header, a `Terminal` title bar, and the software mouse cursor overlay.
 Note: kernel size is no longer bounded by the stage2 low-memory chunk buffer; image builds are now constrained by disk image capacity and the current 16-bit sector-count metadata field.
 
 ## Testing

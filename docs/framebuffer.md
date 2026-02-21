@@ -48,7 +48,7 @@ If validation fails, framebuffer is marked unavailable and kernel continues with
 - `clear(color)` - full-screen fill (including pitch padding)
 
 `kernel/src/fb_console.rs` exposes:
-- `init()` - initialize a styled framebuffer terminal with an 8x16 bitmap text grid
+- `init()` - initialize a styled framebuffer terminal with an 8x16 bitmap text grid, a top `PeetOS` desktop header, and a `Terminal` title bar
 - `write_bytes(bytes)` - mirror console/serial output into the framebuffer text grid
 - `tick()` - advance cursor blink timing and refresh cursor visibility
 - `set_theme(preset)` - switch between built-in terminal theme presets (`Midnight`, `Amber`, `Green`, `Solarized`)
@@ -70,10 +70,11 @@ Color values are treated as 32-bit packed pixels (current baseline assumes 32-bp
 Limitations / Simplifications
 - Only bootloader-provided VESA mode is supported; kernel-side mode discovery/switching is not implemented.
 - Pixel format is treated as packed 32-bpp without decoding VBE channel masks.
-- Text rendering is still baseline: fixed 8x16 VGA-compatible bitmap glyphs, static panel chrome, a blinking underline cursor, and partial ANSI CSI support (`H`/`f`, `A`/`B`/`C`/`D`, `J`, `K`, `m`) with SGR limited to 16-color fg/bg + bold/default resets.
+- Text rendering is still baseline: fixed 8x16 VGA-compatible bitmap glyphs, static panel chrome, a top desktop header, a `Terminal` title bar with cwd path rendering, a blinking underline cursor, and partial ANSI CSI support (`H`/`f`, `A`/`B`/`C`/`D`, `J`, `K`, `m`) with SGR limited to 16-color fg/bg + bold/default resets.
 - Mouse cursor rendering is software-only over the same framebuffer; it relies on save/restore and can still show artifacts if non-console code draws directly into cursor-covered pixels without using cursor hide/show hooks.
 - USB absolute cursor mapping currently assumes a single directly attached HID tablet on UHCI and maps reported logical X/Y ranges linearly to cursor coordinates.
 - Full VT terminal semantics are not implemented (no scrollback buffer, no DEC private modes, and no 256-color/truecolor SGR).
+- Title-bar cwd uses bounded in-kernel traversal from the active task inode and is polled periodically rather than event-driven, so updates are near-real-time but not instantaneous on every internal cwd mutation.
 - No double buffering, dirty-region tracking, or acceleration path exists.
 - Mapping is boot-time fixed-size (`16 MiB`) and not dynamically expanded/remapped.
 - Kernel bring-up does not clear the full framebuffer during early boot; only probe/logging is done at init.
