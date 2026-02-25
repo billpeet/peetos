@@ -72,6 +72,7 @@ On initialization, the kernel creates:
   - Mount import is rollback-safe: on parse/import failure, partially imported nodes are removed.
   - Ext2 mount now includes ext3 internal journal parsing and mount-time replay of committed transactions when recovery is required, then clears recover markers before exposing the mount.
   - For journaled mounts, dirty-block flushes now emit runtime journal descriptor/data/commit records before checkpointing home blocks.
+  - Journal replay revoke precedence now uses wrap-safe transaction ID ordering so replay remains correct across `u32` sequence rollover.
   - Block-backed ext2 now uses sparse per-block residency and dirty tracking: blocks are loaded into cache on first access, and uncached blocks are never allocated in RAM up front.
   - Block cache residency is bounded by a configurable block cap, with CLOCK eviction and dirty-block write-back on dirty victim eviction.
   - Dirty-pressure flushing runs opportunistically when dirty/cached ratio crosses the configured threshold, reducing write burst size at sync points.
@@ -110,7 +111,7 @@ Limitations / Simplifications
 - Symbolic links are baseline-implemented (`symlinkat` + `readlinkat` target reads), but general symlink-follow path resolution is not implemented yet.
 - Console input path is baseline-only: canonical line mode with basic backspace editing and newline commit; no `termios`, raw mode, job control, or pty support.
 - ext2 importer is intentionally minimal: regular files/directories only, and imported file size is still capped by `TMPFS_MAX_FILE_SIZE`.
-- Journal bring-up is still incomplete: mount-time recovery replay is wired for internal journals, runtime dirty-block flushes are journaled with multi-block transaction batching, runtime transaction placement rotates through the journal ring with wrap support, and committed transactions now use deferred checkpointing with runtime revoke-block emission before home-block writeback. Full JBD parity (for example richer transaction state/credit handling and complete ext3 mode semantics) remains pending.
+- Journal bring-up is still incomplete: mount-time recovery replay is wired for internal journals, replay/revoke ordering now handles wrapped transaction IDs, runtime dirty-block flushes are journaled with multi-block transaction batching, runtime transaction placement rotates through the journal ring with wrap support, and committed transactions now use deferred checkpointing with runtime revoke-block emission before home-block writeback. Full JBD parity (for example richer transaction state/credit handling and complete ext3 mode semantics) remains pending.
 - Block-backed ext2 sync is currently best-effort and uses a page-sized block write-back cache (dirty block runs are enqueued on mutating syscalls, then flushed on `sync`/`fsync`), without full end-to-end durability guarantees until block-cache flush completion.
 - Dirty-pressure flush is opportunistic in filesystem paths (no dedicated background flusher thread yet).
 - Ext2 still uses its own sparse block cache for on-disk block residency/dirty tracking, but syscall-level file reads and file-backed `MAP_SHARED` faults now share a kernel VM inode-page cache path. Full fs-wide VM page-cache integration (including writable shared mmap writeback and unified reclaim policy) remains pending.

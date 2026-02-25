@@ -5236,6 +5236,129 @@ mod tests {
         (image, target_block, payload)
     }
 
+    fn build_internal_journal_wrapped_revoke_replay_image(
+    ) -> (std::vec::Vec<u8>, u32, std::vec::Vec<u8>, u32, std::vec::Vec<u8>) {
+        let mut image = std::vec::Vec::from(SAMPLE_EXT2);
+        let meta = ext2_parse_meta_with_len(&image, image.len(), true).expect("parse sample ext2");
+        let block_size = meta.block_size;
+
+        let compat_off = EXT2_SUPERBLOCK_OFFSET + 92;
+        let compat = read_u32_le(&image, compat_off).expect("read compat");
+        write_u32_le(
+            &mut image,
+            compat_off,
+            compat | EXT2_FEATURE_COMPAT_HAS_JOURNAL,
+        )
+        .expect("set has_journal");
+
+        let incompat_off = EXT2_SUPERBLOCK_OFFSET + 96;
+        let incompat = read_u32_le(&image, incompat_off).expect("read incompat");
+        write_u32_le(
+            &mut image,
+            incompat_off,
+            incompat | EXT2_FEATURE_INCOMPAT_RECOVER,
+        )
+        .expect("set recover");
+
+        write_u32_le(&mut image, EXT2_SUPERBLOCK_OFFSET + 224, 8).expect("set journal inode");
+        write_u32_le(&mut image, EXT2_SUPERBLOCK_OFFSET + 228, 0).expect("set journal dev");
+
+        let journal_blocks = [40u32, 41, 42, 43, 44, 45, 46, 47, 48];
+        let mut journal_inode = Ext2Inode {
+            mode: EXT2_S_IFREG | 0o600,
+            uid: 0,
+            size: (journal_blocks.len() * block_size) as u32,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            links_count: 1,
+            gid: 0,
+            block_count_512: ((journal_blocks.len() * block_size) / 512) as u32,
+            blocks: [0; 15],
+        };
+        for (idx, block) in journal_blocks.iter().enumerate() {
+            journal_inode.blocks[idx] = *block;
+        }
+        ext2_write_inode(&mut image, &meta, 8, &journal_inode).expect("write journal inode");
+
+        let tx_sequence_first = u32::MAX;
+        let tx_sequence_second = 0u32;
+        let revoked_target_block = 70u32;
+        let surviving_target_block = 71u32;
+        let revoked_payload = std::vec::Vec::from(&b"revoked payload"[..]);
+        let surviving_payload = std::vec::Vec::from(&b"surviving payload"[..]);
+
+        let journal_super_off = (journal_blocks[0] as usize) * block_size;
+        write_u32_be(&mut image, journal_super_off, 0xC03B_3998);
+        write_u32_be(&mut image, journal_super_off + 4, 3);
+        write_u32_be(&mut image, journal_super_off + 8, 0);
+        write_u32_be(&mut image, journal_super_off + 12, block_size as u32);
+        write_u32_be(
+            &mut image,
+            journal_super_off + 16,
+            journal_blocks.len() as u32,
+        );
+        write_u32_be(&mut image, journal_super_off + 20, 1);
+        write_u32_be(&mut image, journal_super_off + 24, tx_sequence_first);
+        write_u32_be(&mut image, journal_super_off + 28, 1);
+
+        let descriptor_first_off = (journal_blocks[1] as usize) * block_size;
+        write_u32_be(&mut image, descriptor_first_off, 0xC03B_3998);
+        write_u32_be(&mut image, descriptor_first_off + 4, 1);
+        write_u32_be(&mut image, descriptor_first_off + 8, tx_sequence_first);
+        write_u32_be(&mut image, descriptor_first_off + 12, revoked_target_block);
+        write_u32_be(&mut image, descriptor_first_off + 16, 0x0000_0008);
+        image[descriptor_first_off + 20..descriptor_first_off + 36].fill(0);
+
+        let data_first_off = (journal_blocks[2] as usize) * block_size;
+        image[data_first_off..data_first_off + block_size].fill(0);
+        image[data_first_off..data_first_off + revoked_payload.len()]
+            .copy_from_slice(revoked_payload.as_slice());
+
+        let commit_first_off = (journal_blocks[3] as usize) * block_size;
+        write_u32_be(&mut image, commit_first_off, 0xC03B_3998);
+        write_u32_be(&mut image, commit_first_off + 4, 2);
+        write_u32_be(&mut image, commit_first_off + 8, tx_sequence_first);
+
+        let descriptor_second_off = (journal_blocks[4] as usize) * block_size;
+        write_u32_be(&mut image, descriptor_second_off, 0xC03B_3998);
+        write_u32_be(&mut image, descriptor_second_off + 4, 1);
+        write_u32_be(&mut image, descriptor_second_off + 8, tx_sequence_second);
+        write_u32_be(&mut image, descriptor_second_off + 12, surviving_target_block);
+        write_u32_be(&mut image, descriptor_second_off + 16, 0x0000_0008);
+        image[descriptor_second_off + 20..descriptor_second_off + 36].fill(0);
+
+        let data_second_off = (journal_blocks[5] as usize) * block_size;
+        image[data_second_off..data_second_off + block_size].fill(0);
+        image[data_second_off..data_second_off + surviving_payload.len()]
+            .copy_from_slice(surviving_payload.as_slice());
+
+        let revoke_off = (journal_blocks[6] as usize) * block_size;
+        write_u32_be(&mut image, revoke_off, 0xC03B_3998);
+        write_u32_be(&mut image, revoke_off + 4, 5);
+        write_u32_be(&mut image, revoke_off + 8, tx_sequence_second);
+        write_u32_be(&mut image, revoke_off + 12, 20);
+        write_u32_be(&mut image, revoke_off + 16, revoked_target_block);
+
+        let commit_second_off = (journal_blocks[7] as usize) * block_size;
+        write_u32_be(&mut image, commit_second_off, 0xC03B_3998);
+        write_u32_be(&mut image, commit_second_off + 4, 2);
+        write_u32_be(&mut image, commit_second_off + 8, tx_sequence_second);
+
+        let revoked_target_off = (revoked_target_block as usize) * block_size;
+        image[revoked_target_off..revoked_target_off + revoked_payload.len()].fill(b's');
+        let surviving_target_off = (surviving_target_block as usize) * block_size;
+        image[surviving_target_off..surviving_target_off + surviving_payload.len()].fill(b'k');
+
+        (
+            image,
+            revoked_target_block,
+            revoked_payload,
+            surviving_target_block,
+            surviving_payload,
+        )
+    }
+
     #[test]
     fn open_create_write_read_roundtrip() {
         let _guard = TEST_LOCK.lock().expect("lock should work");
@@ -5666,6 +5789,43 @@ mod tests {
             assert_eq!(state.ext2_journal.inode, 8);
             assert_eq!(state.ext2_journal.start, 0);
             assert_eq!(state.ext2_journal.sequence, 56);
+        });
+    }
+
+    #[test]
+    fn ext2_mount_replay_revoke_handles_wrapped_transaction_sequences() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, revoked_block, revoked_payload, surviving_block, surviving_payload) =
+            build_internal_journal_wrapped_revoke_replay_image();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+
+        let block_size = 1024usize;
+        let revoked_off = (revoked_block as usize) * block_size;
+        let surviving_off = (surviving_block as usize) * block_size;
+
+        assert!(
+            ctx.image[revoked_off..revoked_off + revoked_payload.len()]
+                .iter()
+                .all(|byte| *byte == b's')
+        );
+        assert_eq!(
+            &ctx.image[surviving_off..surviving_off + surviving_payload.len()],
+            surviving_payload.as_slice()
+        );
+
+        let incompat = read_u32_le(&ctx.image, EXT2_SUPERBLOCK_OFFSET + 96).expect("read incompat");
+        assert_eq!(incompat & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+
+        let journal_super_off = 40usize * block_size;
+        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 1);
+        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 28), 0);
+
+        with_state(|state| {
+            assert!(state.ext2_journal.present);
+            assert_eq!(state.ext2_journal.start, 0);
+            assert_eq!(state.ext2_journal.sequence, 1);
         });
     }
 
