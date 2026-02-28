@@ -1,6 +1,6 @@
 # quickjs Bootstrap
 
-This document tracks the Rust-port Stage 9 quickjs bootstrap setup.
+This document tracks the quickjs userspace bootstrap setup.
 
 ## Scope
 

@@ -1,6 +1,8 @@
 # AGENTS.md
 
-This repo is the Rust reimplementation of the PeetOS C kernel (source of truth lives in `../peetos_c`). The goal is parity with the C kernel stages 1–9 before any stage 10 optimizations.
+This repo is the primary Rust implementation of the PeetOS kernel.
+`../peetos_c` is now a historical reference for behavior comparisons, not the
+main project target.
 
 **Basics**
 - Target: `x86_64` bare metal, higher-half kernel.
@@ -23,11 +25,10 @@ This repo is the Rust reimplementation of the PeetOS C kernel (source of truth l
   - Add/extend QEMU smoke or integration tests as needed.
 - Always update docs for new features:
   - `README.md` for user-facing behavior and how to run things.
-  - `docs/PORTING_PLAN.md` for phase/status tracking.
+  - `docs/PORTING_PLAN.md` for status and roadmap tracking.
 - Keep subsystem docs in `docs/` up to date. Each section must include a "Limitations / Simplifications" subsection describing known gaps, shortcuts, or future hardening needs.
 - Keep the default build clean and minimal; gate test-only behavior behind features.
 - Preserve the existing boot flow and linker setup unless there is a strong reason to change it.
 
-**Parity Targets**
-- Current feature scope is in `../peetos_c/docs/ROADMAP.md`.
-- Kernel source reference: `../peetos_c/kernel/src`.
+**Historical Reference**
+- `../peetos_c/docs/ROADMAP.md` and `../peetos_c/kernel/src` can still be used to compare legacy behavior when useful.

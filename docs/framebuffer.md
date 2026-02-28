@@ -1,6 +1,6 @@
 # Framebuffer Bring-Up
 
-This document describes the phase-7 framebuffer initialization path currently wired into the Rust kernel.
+This document describes the framebuffer initialization path currently wired into the Rust kernel.
 
 **Where It Lives**
 - `kernel/src/framebuffer.rs`

@@ -1,4 +1,4 @@
-# MicroPython Setup for PeetOS (Rust Port)
+# MicroPython Setup for PeetOS
 
 This directory bootstraps MicroPython source and builds a static `micropython`
 interpreter for PeetOS userspace staging.

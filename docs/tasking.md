@@ -1,6 +1,6 @@
 # Tasking and Scheduler
 
-This document describes the baseline tasking and scheduler implementation introduced in Phase 4. It supports kernel threads and a minimal user-mode task, with preemptive round-robin scheduling driven by the PIT.
+This document describes the baseline tasking and scheduler implementation. It supports kernel threads and a minimal user-mode task, with preemptive round-robin scheduling driven by the PIT.
 
 **Where It Lives**
 - `kernel/src/task.rs`

@@ -1,6 +1,6 @@
 # IPC and Synchronization
 
-This document describes the phase-6 baseline IPC/synchronization implementation currently wired into the kernel.
+This document describes the current baseline IPC/synchronization implementation wired into the kernel.
 
 **Where It Lives**
 - `kernel/src/sync.rs`

@@ -3,9 +3,9 @@ use alloc::vec::Vec;
 use super::{
     ext2_backend, ext2_backend_read_block, ext2_block_slice_mut_state, ext2_cache_find,
     ext2_cache_flush_block, ext2_data_block_for_logical_index_state, ext2_mark_dirty_block,
-    ext2_read_inode_from_state, ext2_unmark_dirty_block, ext2_write_u32_state,
-    Ext2Inode, Ext2JournalCommittedTx, Ext2JournalCommittedUpdate, Ext2JournalState, VfsState,
-    EINVAL, EIO, ENOSPC, EXT2_FEATURE_COMPAT_HAS_JOURNAL, EXT2_FEATURE_INCOMPAT_JOURNAL_DEV,
+    ext2_read_inode_from_state, ext2_unmark_dirty_block, ext2_write_u32_state, Ext2Inode,
+    Ext2JournalCommittedTx, Ext2JournalCommittedUpdate, Ext2JournalState, VfsState, EINVAL, EIO,
+    ENOSPC, EXT2_FEATURE_COMPAT_HAS_JOURNAL, EXT2_FEATURE_INCOMPAT_JOURNAL_DEV,
     EXT2_FEATURE_INCOMPAT_RECOVER, EXT2_SUPERBLOCK_OFFSET,
 };
 
@@ -138,6 +138,41 @@ fn tx_sequence_after_or_eq(left: u32, right: u32) -> bool {
     left == right || tx_sequence_after(left, right)
 }
 
+fn journal_abort_errno(state: &VfsState) -> i64 {
+    if state.ext2_journal.abort_errno == 0 {
+        EIO
+    } else {
+        state.ext2_journal.abort_errno
+    }
+}
+
+fn ensure_journal_not_aborted(state: &VfsState) -> Result<(), i64> {
+    if state.ext2_journal.aborted {
+        return Err(journal_abort_errno(state));
+    }
+    Ok(())
+}
+
+fn mark_journal_aborted(state: &mut VfsState, err: i64) {
+    if !state.ext2_journal.present || state.ext2_journal.replaying || state.ext2_journal.aborted {
+        return;
+    }
+    state.ext2_journal.aborted = true;
+    state.ext2_journal.abort_errno = if err == 0 { EIO } else { err };
+}
+
+fn abort_on_runtime_io_error<T>(state: &mut VfsState, result: Result<T, i64>) -> Result<T, i64> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            if err == EIO {
+                mark_journal_aborted(state, err);
+            }
+            Err(err)
+        }
+    }
+}
+
 fn backend_write_block_raw(state: &mut VfsState, block: u32, data: &[u8]) -> Result<(), i64> {
     let backend = match state.ext2_backend {
         ext2_backend::Ext2Backend::None => return Err(EIO),
@@ -262,11 +297,7 @@ fn runtime_tx_layout(
         .ext2_journal
         .max_len
         .saturating_sub(state.ext2_journal.first) as usize;
-    if data_blocks
-        .saturating_add(revoke_blocks)
-        .saturating_add(2)
-        > journal_window
-    {
+    if data_blocks.saturating_add(revoke_blocks).saturating_add(2) > journal_window {
         return Err(EIO);
     }
 
@@ -304,7 +335,12 @@ fn runtime_tx_layout(
     ) {
         return Err(ENOSPC);
     }
-    Ok((descriptor_jblock, data_jblocks, revoke_jblocks, commit_jblock))
+    Ok((
+        descriptor_jblock,
+        data_jblocks,
+        revoke_jblocks,
+        commit_jblock,
+    ))
 }
 
 fn write_journal_super_fields(state: &mut VfsState, sequence: u32, start: u32) -> Result<(), i64> {
@@ -332,7 +368,11 @@ fn insert_revoked(revoked: &mut Vec<u32>, block: u32) -> Result<(), i64> {
 }
 
 fn revoke_entries_per_block(state: &VfsState) -> usize {
-    state.ext2_meta.block_size.saturating_sub(16).saturating_div(4)
+    state
+        .ext2_meta
+        .block_size
+        .saturating_sub(16)
+        .saturating_div(4)
 }
 
 fn remove_sorted_u32(values: &mut Vec<u32>, value: u32) -> bool {
@@ -345,7 +385,11 @@ fn remove_sorted_u32(values: &mut Vec<u32>, value: u32) -> bool {
     }
 }
 
-fn tx_uses_journal_block(superblock: &JournalSuper, tx: &Ext2JournalCommittedTx, jblock: u32) -> bool {
+fn tx_uses_journal_block(
+    superblock: &JournalSuper,
+    tx: &Ext2JournalCommittedTx,
+    jblock: u32,
+) -> bool {
     let mut cursor = tx.descriptor_jblock;
     let mut remaining = tx.log_block_count;
     while remaining > 0 {
@@ -403,6 +447,7 @@ pub(super) fn note_revoke(state: &mut VfsState, block: u32) -> Result<(), i64> {
     if !state.ext2_journal.present || state.ext2_journal.replaying {
         return Ok(());
     }
+    ensure_journal_not_aborted(state)?;
     insert_revoked(&mut state.ext2_journal_pending_revokes, block)
 }
 
@@ -528,7 +573,8 @@ fn apply_committed_transaction(
     let mut idx = 0usize;
     while idx < pending.len() {
         let entry = pending[idx];
-        let revoked = match revoke_map.binary_search_by_key(&entry.home_block, |(block, _)| *block) {
+        let revoked = match revoke_map.binary_search_by_key(&entry.home_block, |(block, _)| *block)
+        {
             Ok(map_idx) => tx_sequence_after_or_eq(revoke_map[map_idx].1, sequence),
             Err(_) => false,
         };
@@ -562,280 +608,296 @@ fn flush_tx_blocks(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
     if !state.ext2_journal.present || state.ext2_journal.replaying {
         return Err(EINVAL);
     }
+    ensure_journal_not_aborted(state)?;
 
-    let block_size = state.ext2_meta.block_size;
-    let sequence = state.ext2_journal.sequence;
-    let revoke_capacity = revoke_entries_per_block(state);
-    if revoke_capacity == 0 {
-        return Err(EIO);
-    }
-
-    let mut escaped = Vec::new();
-    escaped
-        .try_reserve_exact(blocks.len())
-        .map_err(|_| ENOSPC)?;
-    let mut idx = 0usize;
-    while idx < blocks.len() {
-        let block = blocks[idx];
-        let cache_idx = match ext2_cache_find(state, block) {
-            Ok(v) => v,
-            Err(_) => return Err(EIO),
-        };
-        if !state.ext2_cached_blocks[cache_idx].dirty {
+    let result = (|| -> Result<usize, i64> {
+        let block_size = state.ext2_meta.block_size;
+        let sequence = state.ext2_journal.sequence;
+        let revoke_capacity = revoke_entries_per_block(state);
+        if revoke_capacity == 0 {
             return Err(EIO);
         }
-        escaped.push(
-            state.ext2_cached_blocks[cache_idx].data.len() >= 4
-                && state.ext2_cached_blocks[cache_idx].data[..4] == JBD_MAGIC.to_be_bytes(),
-        );
-        idx += 1;
-    }
 
-    let journal_window = state
-        .ext2_journal
-        .max_len
-        .saturating_sub(state.ext2_journal.first) as usize;
-    let max_payload_blocks = journal_window.saturating_sub(2);
-    if blocks.len() > max_payload_blocks {
-        return Err(EIO);
-    }
-
-    let mut revoke_candidates = Vec::new();
-    revoke_candidates
-        .try_reserve_exact(state.ext2_journal_pending_revokes.len())
-        .map_err(|_| ENOSPC)?;
-    idx = 0;
-    while idx < state.ext2_journal_pending_revokes.len() {
-        let revoke = state.ext2_journal_pending_revokes[idx];
-        if !blocks.contains(&revoke) {
-            revoke_candidates.push(revoke);
-        }
-        idx += 1;
-    }
-    let max_revoke_blocks = max_payload_blocks.saturating_sub(blocks.len());
-    let max_revoke_entries = max_revoke_blocks.saturating_mul(revoke_capacity);
-    let emitted_revoke_count = core::cmp::min(revoke_candidates.len(), max_revoke_entries);
-    let revoke_block_count = if emitted_revoke_count == 0 {
-        0
-    } else {
-        emitted_revoke_count
-            .saturating_add(revoke_capacity.saturating_sub(1))
-            .saturating_div(revoke_capacity)
-    };
-
-    let (descriptor_jblock, data_jblocks, revoke_jblocks, commit_jblock) = loop {
-        match runtime_tx_layout(state, blocks.len(), revoke_block_count) {
-            Ok(layout) => break layout,
-            Err(ENOSPC) if !state.ext2_journal_committed_txs.is_empty() => {
-                checkpoint_committed(state, 1)?;
+        let mut escaped = Vec::new();
+        escaped
+            .try_reserve_exact(blocks.len())
+            .map_err(|_| ENOSPC)?;
+        let mut idx = 0usize;
+        while idx < blocks.len() {
+            let block = blocks[idx];
+            let cache_idx = match ext2_cache_find(state, block) {
+                Ok(v) => v,
+                Err(_) => return Err(EIO),
+            };
+            if !state.ext2_cached_blocks[cache_idx].dirty {
+                return Err(EIO);
             }
-            Err(err) => return Err(err),
+            escaped.push(
+                state.ext2_cached_blocks[cache_idx].data.len() >= 4
+                    && state.ext2_cached_blocks[cache_idx].data[..4] == JBD_MAGIC.to_be_bytes(),
+            );
+            idx += 1;
         }
-    };
 
-    let descriptor_fs_block = journal_block_to_fs_from_state(state, descriptor_jblock)?;
-    let commit_fs_block = journal_block_to_fs_from_state(state, commit_jblock)?;
-    let first_data_jblock = data_jblocks[0];
-    let first_data_fs_block = journal_block_to_fs_from_state(state, first_data_jblock)?;
-
-    state.ext2_journal.tx_descriptor_jblock = descriptor_jblock;
-    state.ext2_journal.tx_data_jblock = first_data_jblock;
-    state.ext2_journal.tx_commit_jblock = commit_jblock;
-    state.ext2_journal.tx_descriptor_fs_block = descriptor_fs_block;
-    state.ext2_journal.tx_data_fs_block = first_data_fs_block;
-    state.ext2_journal.tx_commit_fs_block = commit_fs_block;
-
-    let mut descriptor = Vec::new();
-    descriptor
-        .try_reserve_exact(block_size)
-        .map_err(|_| ENOSPC)?;
-    descriptor.resize(block_size, 0);
-    write_u32_be(&mut descriptor, 0, JBD_MAGIC)?;
-    write_u32_be(&mut descriptor, 4, JBD_DESCRIPTOR_BLOCK)?;
-    write_u32_be(&mut descriptor, 8, sequence)?;
-    let mut desc_off = 12usize;
-    idx = 0;
-    while idx < blocks.len() {
-        write_u32_be(&mut descriptor, desc_off, blocks[idx])?;
-        let mut flags = JBD_FLAG_SAME_UUID;
-        if escaped[idx] {
-            flags |= JBD_FLAG_ESCAPE;
+        let journal_window = state
+            .ext2_journal
+            .max_len
+            .saturating_sub(state.ext2_journal.first) as usize;
+        let max_payload_blocks = journal_window.saturating_sub(2);
+        if blocks.len() > max_payload_blocks {
+            return Err(EIO);
         }
-        if idx + 1 == blocks.len() {
-            flags |= JBD_FLAG_LAST_TAG;
+
+        let mut revoke_candidates = Vec::new();
+        revoke_candidates
+            .try_reserve_exact(state.ext2_journal_pending_revokes.len())
+            .map_err(|_| ENOSPC)?;
+        idx = 0;
+        while idx < state.ext2_journal_pending_revokes.len() {
+            let revoke = state.ext2_journal_pending_revokes[idx];
+            if !blocks.contains(&revoke) {
+                revoke_candidates.push(revoke);
+            }
+            idx += 1;
         }
-        write_u32_be(&mut descriptor, desc_off + 4, flags)?;
-        desc_off = desc_off.saturating_add(8);
-        idx += 1;
-    }
+        let max_revoke_blocks = max_payload_blocks.saturating_sub(blocks.len());
+        let max_revoke_entries = max_revoke_blocks.saturating_mul(revoke_capacity);
+        let emitted_revoke_count = core::cmp::min(revoke_candidates.len(), max_revoke_entries);
+        let revoke_block_count = if emitted_revoke_count == 0 {
+            0
+        } else {
+            emitted_revoke_count
+                .saturating_add(revoke_capacity.saturating_sub(1))
+                .saturating_div(revoke_capacity)
+        };
 
-    let mut commit = Vec::new();
-    commit.try_reserve_exact(block_size).map_err(|_| ENOSPC)?;
-    commit.resize(block_size, 0);
-    write_u32_be(&mut commit, 0, JBD_MAGIC)?;
-    write_u32_be(&mut commit, 4, JBD_COMMIT_BLOCK)?;
-    write_u32_be(&mut commit, 8, sequence)?;
+        let (descriptor_jblock, data_jblocks, revoke_jblocks, commit_jblock) = loop {
+            match runtime_tx_layout(state, blocks.len(), revoke_block_count) {
+                Ok(layout) => break layout,
+                Err(ENOSPC) if !state.ext2_journal_committed_txs.is_empty() => {
+                    checkpoint_committed(state, 1)?;
+                }
+                Err(err) => return Err(err),
+            }
+        };
 
-    let start_before_commit = if state.ext2_journal_committed_txs.is_empty() {
-        descriptor_jblock
-    } else {
-        state.ext2_journal_committed_txs[0].descriptor_jblock
-    };
-    write_journal_super_fields(state, sequence, start_before_commit)?;
-    write_backend_and_refresh_cache(state, descriptor_fs_block, descriptor.as_slice())?;
+        let descriptor_fs_block = journal_block_to_fs_from_state(state, descriptor_jblock)?;
+        let commit_fs_block = journal_block_to_fs_from_state(state, commit_jblock)?;
+        let first_data_jblock = data_jblocks[0];
+        let first_data_fs_block = journal_block_to_fs_from_state(state, first_data_jblock)?;
 
-    idx = 0;
-    while idx < blocks.len() {
-        let mut journal_data = Vec::new();
-        journal_data
+        state.ext2_journal.tx_descriptor_jblock = descriptor_jblock;
+        state.ext2_journal.tx_data_jblock = first_data_jblock;
+        state.ext2_journal.tx_commit_jblock = commit_jblock;
+        state.ext2_journal.tx_descriptor_fs_block = descriptor_fs_block;
+        state.ext2_journal.tx_data_fs_block = first_data_fs_block;
+        state.ext2_journal.tx_commit_fs_block = commit_fs_block;
+
+        let mut descriptor = Vec::new();
+        descriptor
             .try_reserve_exact(block_size)
             .map_err(|_| ENOSPC)?;
-        journal_data.resize(block_size, 0);
-        let cache_idx = ext2_cache_find(state, blocks[idx]).map_err(|_| EIO)?;
-        journal_data.copy_from_slice(state.ext2_cached_blocks[cache_idx].data.as_slice());
-        if escaped[idx] {
-            journal_data[..4].fill(0);
+        descriptor.resize(block_size, 0);
+        write_u32_be(&mut descriptor, 0, JBD_MAGIC)?;
+        write_u32_be(&mut descriptor, 4, JBD_DESCRIPTOR_BLOCK)?;
+        write_u32_be(&mut descriptor, 8, sequence)?;
+        let mut desc_off = 12usize;
+        idx = 0;
+        while idx < blocks.len() {
+            write_u32_be(&mut descriptor, desc_off, blocks[idx])?;
+            let mut flags = JBD_FLAG_SAME_UUID;
+            if escaped[idx] {
+                flags |= JBD_FLAG_ESCAPE;
+            }
+            if idx + 1 == blocks.len() {
+                flags |= JBD_FLAG_LAST_TAG;
+            }
+            write_u32_be(&mut descriptor, desc_off + 4, flags)?;
+            desc_off = desc_off.saturating_add(8);
+            idx += 1;
         }
-        let jblock = data_jblocks[idx];
-        let fs_block = journal_block_to_fs_from_state(state, jblock)?;
-        write_backend_and_refresh_cache(state, fs_block, journal_data.as_slice())?;
-        idx += 1;
-    }
 
-    idx = 0;
-    let mut revoke_written = 0usize;
-    while idx < revoke_jblocks.len() {
-        let remaining = emitted_revoke_count.saturating_sub(revoke_written);
-        let chunk = core::cmp::min(remaining, revoke_capacity);
-        let mut revoke_block = Vec::new();
-        revoke_block
-            .try_reserve_exact(block_size)
+        let mut commit = Vec::new();
+        commit.try_reserve_exact(block_size).map_err(|_| ENOSPC)?;
+        commit.resize(block_size, 0);
+        write_u32_be(&mut commit, 0, JBD_MAGIC)?;
+        write_u32_be(&mut commit, 4, JBD_COMMIT_BLOCK)?;
+        write_u32_be(&mut commit, 8, sequence)?;
+
+        let start_before_commit = if state.ext2_journal_committed_txs.is_empty() {
+            descriptor_jblock
+        } else {
+            state.ext2_journal_committed_txs[0].descriptor_jblock
+        };
+        write_journal_super_fields(state, sequence, start_before_commit)?;
+        write_backend_and_refresh_cache(state, descriptor_fs_block, descriptor.as_slice())?;
+
+        idx = 0;
+        while idx < blocks.len() {
+            let mut journal_data = Vec::new();
+            journal_data
+                .try_reserve_exact(block_size)
+                .map_err(|_| ENOSPC)?;
+            journal_data.resize(block_size, 0);
+            let cache_idx = ext2_cache_find(state, blocks[idx]).map_err(|_| EIO)?;
+            journal_data.copy_from_slice(state.ext2_cached_blocks[cache_idx].data.as_slice());
+            if escaped[idx] {
+                journal_data[..4].fill(0);
+            }
+            let jblock = data_jblocks[idx];
+            let fs_block = journal_block_to_fs_from_state(state, jblock)?;
+            write_backend_and_refresh_cache(state, fs_block, journal_data.as_slice())?;
+            idx += 1;
+        }
+
+        idx = 0;
+        let mut revoke_written = 0usize;
+        while idx < revoke_jblocks.len() {
+            let remaining = emitted_revoke_count.saturating_sub(revoke_written);
+            let chunk = core::cmp::min(remaining, revoke_capacity);
+            let mut revoke_block = Vec::new();
+            revoke_block
+                .try_reserve_exact(block_size)
+                .map_err(|_| ENOSPC)?;
+            revoke_block.resize(block_size, 0);
+            write_u32_be(&mut revoke_block, 0, JBD_MAGIC)?;
+            write_u32_be(&mut revoke_block, 4, JBD_REVOKE_BLOCK)?;
+            write_u32_be(&mut revoke_block, 8, sequence)?;
+            let used_bytes = 16usize.saturating_add(chunk.saturating_mul(4));
+            write_u32_be(&mut revoke_block, 12, used_bytes as u32)?;
+            let mut revoke_off = 16usize;
+            let mut chunk_idx = 0usize;
+            while chunk_idx < chunk {
+                write_u32_be(
+                    &mut revoke_block,
+                    revoke_off,
+                    revoke_candidates[revoke_written + chunk_idx],
+                )?;
+                revoke_off = revoke_off.saturating_add(4);
+                chunk_idx += 1;
+            }
+            let revoke_fs_block = journal_block_to_fs_from_state(state, revoke_jblocks[idx])?;
+            write_backend_and_refresh_cache(state, revoke_fs_block, revoke_block.as_slice())?;
+            revoke_written = revoke_written.saturating_add(chunk);
+            idx += 1;
+        }
+
+        write_backend_and_refresh_cache(state, commit_fs_block, commit.as_slice())?;
+
+        idx = 0;
+        while idx < emitted_revoke_count {
+            let _ = remove_sorted_u32(
+                &mut state.ext2_journal_pending_revokes,
+                revoke_candidates[idx],
+            );
+            idx += 1;
+        }
+        idx = 0;
+        while idx < blocks.len() {
+            let _ = remove_sorted_u32(&mut state.ext2_journal_pending_revokes, blocks[idx]);
+            idx += 1;
+        }
+
+        let mut committed_updates = Vec::new();
+        committed_updates
+            .try_reserve_exact(blocks.len())
             .map_err(|_| ENOSPC)?;
-        revoke_block.resize(block_size, 0);
-        write_u32_be(&mut revoke_block, 0, JBD_MAGIC)?;
-        write_u32_be(&mut revoke_block, 4, JBD_REVOKE_BLOCK)?;
-        write_u32_be(&mut revoke_block, 8, sequence)?;
-        let used_bytes = 16usize.saturating_add(chunk.saturating_mul(4));
-        write_u32_be(&mut revoke_block, 12, used_bytes as u32)?;
-        let mut revoke_off = 16usize;
-        let mut chunk_idx = 0usize;
-        while chunk_idx < chunk {
-            write_u32_be(
-                &mut revoke_block,
-                revoke_off,
-                revoke_candidates[revoke_written + chunk_idx],
-            )?;
-            revoke_off = revoke_off.saturating_add(4);
-            chunk_idx += 1;
+        idx = 0;
+        while idx < blocks.len() {
+            let block = blocks[idx];
+            committed_updates.push(Ext2JournalCommittedUpdate {
+                home_block: block,
+                journal_block: data_jblocks[idx],
+                escaped: escaped[idx],
+            });
+            if let Ok(cache_idx) = ext2_cache_find(state, block) {
+                state.ext2_cached_blocks[cache_idx].dirty = false;
+                state.ext2_cached_blocks[cache_idx].referenced = true;
+            }
+            ext2_unmark_dirty_block(state, block);
+            idx += 1;
         }
-        let revoke_fs_block = journal_block_to_fs_from_state(state, revoke_jblocks[idx])?;
-        write_backend_and_refresh_cache(state, revoke_fs_block, revoke_block.as_slice())?;
-        revoke_written = revoke_written.saturating_add(chunk);
-        idx += 1;
-    }
 
-    write_backend_and_refresh_cache(state, commit_fs_block, commit.as_slice())?;
+        state
+            .ext2_journal_committed_txs
+            .try_reserve(1)
+            .map_err(|_| ENOSPC)?;
+        state
+            .ext2_journal_committed_txs
+            .push(Ext2JournalCommittedTx {
+                sequence,
+                descriptor_jblock,
+                log_block_count: blocks
+                    .len()
+                    .saturating_add(revoke_jblocks.len())
+                    .saturating_add(2) as u32,
+                updates: committed_updates,
+            });
 
-    idx = 0;
-    while idx < emitted_revoke_count {
-        let _ = remove_sorted_u32(&mut state.ext2_journal_pending_revokes, revoke_candidates[idx]);
-        idx += 1;
-    }
-    idx = 0;
-    while idx < blocks.len() {
-        let _ = remove_sorted_u32(&mut state.ext2_journal_pending_revokes, blocks[idx]);
-        idx += 1;
-    }
+        let next_start = if state.ext2_journal_committed_txs.is_empty() {
+            0
+        } else {
+            state.ext2_journal_committed_txs[0].descriptor_jblock
+        };
+        write_journal_super_fields(state, sequence.wrapping_add(1), next_start)?;
+        state.ext2_journal.sequence = sequence.wrapping_add(1);
+        state.ext2_journal.start = next_start;
+        let journal_super = runtime_journal_super(state);
+        state.ext2_journal.runtime_head_jblock = journal_next_block(&journal_super, commit_jblock)?;
+        Ok(blocks.len())
+    })();
 
-    let mut committed_updates = Vec::new();
-    committed_updates
-        .try_reserve_exact(blocks.len())
-        .map_err(|_| ENOSPC)?;
-    idx = 0;
-    while idx < blocks.len() {
-        let block = blocks[idx];
-        committed_updates.push(Ext2JournalCommittedUpdate {
-            home_block: block,
-            journal_block: data_jblocks[idx],
-            escaped: escaped[idx],
-        });
-        if let Ok(cache_idx) = ext2_cache_find(state, block) {
-            state.ext2_cached_blocks[cache_idx].dirty = false;
-            state.ext2_cached_blocks[cache_idx].referenced = true;
-        }
-        ext2_unmark_dirty_block(state, block);
-        idx += 1;
-    }
-
-    state
-        .ext2_journal_committed_txs
-        .try_reserve(1)
-        .map_err(|_| ENOSPC)?;
-    state.ext2_journal_committed_txs.push(Ext2JournalCommittedTx {
-        sequence,
-        descriptor_jblock,
-        log_block_count: blocks
-            .len()
-            .saturating_add(revoke_jblocks.len())
-            .saturating_add(2) as u32,
-        updates: committed_updates,
-    });
-
-    let next_start = if state.ext2_journal_committed_txs.is_empty() {
-        0
-    } else {
-        state.ext2_journal_committed_txs[0].descriptor_jblock
-    };
-    write_journal_super_fields(state, sequence.wrapping_add(1), next_start)?;
-    state.ext2_journal.sequence = sequence.wrapping_add(1);
-    state.ext2_journal.start = next_start;
-    let journal_super = runtime_journal_super(state);
-    state.ext2_journal.runtime_head_jblock = journal_next_block(&journal_super, commit_jblock)?;
-    Ok(blocks.len())
+    abort_on_runtime_io_error(state, result)
 }
 
 fn checkpoint_committed(state: &mut VfsState, max_txs: usize) -> Result<usize, i64> {
     if max_txs == 0 || state.ext2_journal_committed_txs.is_empty() {
         return Ok(0);
     }
+    ensure_journal_not_aborted(state)?;
 
-    let block_size = state.ext2_meta.block_size;
-    let mut scratch = Vec::new();
-    scratch.try_reserve_exact(block_size).map_err(|_| ENOSPC)?;
-    scratch.resize(block_size, 0);
-    let magic = JBD_MAGIC.to_be_bytes();
+    let result = (|| -> Result<usize, i64> {
+        let block_size = state.ext2_meta.block_size;
+        let mut scratch = Vec::new();
+        scratch.try_reserve_exact(block_size).map_err(|_| ENOSPC)?;
+        scratch.resize(block_size, 0);
+        let magic = JBD_MAGIC.to_be_bytes();
 
-    let mut completed_txs = 0usize;
-    let mut checkpointed_blocks = 0usize;
-    while !state.ext2_journal_committed_txs.is_empty() && completed_txs < max_txs {
-        let tx = state.ext2_journal_committed_txs.remove(0);
-        let _sequence = tx.sequence;
-        let mut idx = 0usize;
-        while idx < tx.updates.len() {
-            let update = tx.updates[idx];
-            let journal_fs_block = journal_block_to_fs_from_state(state, update.journal_block)?;
-            ext2_backend_read_block(state, journal_fs_block, &mut scratch)?;
-            if update.escaped {
-                if scratch.len() < 4 {
-                    return Err(EIO);
+        let mut completed_txs = 0usize;
+        let mut checkpointed_blocks = 0usize;
+        while !state.ext2_journal_committed_txs.is_empty() && completed_txs < max_txs {
+            let _sequence = state.ext2_journal_committed_txs[0].sequence;
+            let updates_len = state.ext2_journal_committed_txs[0].updates.len();
+            let mut idx = 0usize;
+            while idx < updates_len {
+                let update = state.ext2_journal_committed_txs[0].updates[idx];
+                let journal_fs_block = journal_block_to_fs_from_state(state, update.journal_block)?;
+                ext2_backend_read_block(state, journal_fs_block, &mut scratch)?;
+                if update.escaped {
+                    if scratch.len() < 4 {
+                        return Err(EIO);
+                    }
+                    scratch[..4].copy_from_slice(&magic);
                 }
-                scratch[..4].copy_from_slice(&magic);
+                write_checkpoint_home_block(state, update.home_block, scratch.as_slice())?;
+                checkpointed_blocks = checkpointed_blocks.saturating_add(1);
+                idx += 1;
             }
-            write_checkpoint_home_block(state, update.home_block, scratch.as_slice())?;
-            checkpointed_blocks = checkpointed_blocks.saturating_add(1);
-            idx += 1;
+            state.ext2_journal_committed_txs.remove(0);
+            completed_txs = completed_txs.saturating_add(1);
         }
-        completed_txs = completed_txs.saturating_add(1);
-    }
 
-    let start = if state.ext2_journal_committed_txs.is_empty() {
-        0
-    } else {
-        state.ext2_journal_committed_txs[0].descriptor_jblock
-    };
-    write_journal_super_fields(state, state.ext2_journal.sequence, start)?;
-    state.ext2_journal.start = start;
-    Ok(checkpointed_blocks)
+        let start = if state.ext2_journal_committed_txs.is_empty() {
+            0
+        } else {
+            state.ext2_journal_committed_txs[0].descriptor_jblock
+        };
+        write_journal_super_fields(state, state.ext2_journal.sequence, start)?;
+        state.ext2_journal.start = start;
+        Ok(checkpointed_blocks)
+    })();
+
+    abort_on_runtime_io_error(state, result)
 }
 
 pub(super) fn checkpoint_all_committed(state: &mut VfsState) -> Result<usize, i64> {
@@ -1080,6 +1142,8 @@ pub(super) fn prepare_mount(state: &mut VfsState) -> Result<(), i64> {
     state.ext2_journal = Ext2JournalState {
         present: true,
         replaying: false,
+        aborted: false,
+        abort_errno: 0,
         inode: journal_inode_num,
         inode_blocks: journal_inode.blocks,
         superblock_block: journal_sb_fs_block,

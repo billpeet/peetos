@@ -7,7 +7,7 @@ User images embedded by the kernel:
 - `user/ld-peetos.so`: minimal interpreter stub that reads `AT_ENTRY` from `auxv` and jumps to the program entry point.
 - `user/sample_ext2.img`: sample ext2 image (built from `user/ext2_root/`) mounted at `/mnt/ext2` with ext2-backed read/write/create/mkdir/truncate behavior that mutates inode/data metadata in the mounted image.
 
-Related Stage-9 userspace bootstrap artifacts live outside this directory:
+Related userspace bootstrap artifacts live outside this directory:
 
 - `musl/musl-src`: upstream musl source (fetched via `make musl-fetch`).
 - `musl/sysroot`: headers/libraries for PeetOS-oriented user-space cross-compilation (built via `make musl`).

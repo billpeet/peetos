@@ -1,6 +1,6 @@
 # ELF Loading
 
-This document describes the ELF loader used for the Phase 4 user-mode bring-up. The loader accepts an embedded ELF64 image and maps its loadable segments into a fresh user address space.
+This document describes the ELF loader used for user-mode bring-up. The loader accepts an embedded ELF64 image and maps its loadable segments into a fresh user address space.
 
 **Where It Lives**
 - `kernel/src/elf.rs`

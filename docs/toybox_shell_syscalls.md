@@ -1,8 +1,8 @@
 # Toybox Shell Syscall Focus
 
-Last reviewed: 2026-02-13
+Last reviewed: 2026-02-28
 
-This document narrows syscall bring-up specifically for Toybox `sh` (`toysh`) so we can use the shell as a realistic runtime test harness.
+This document narrows syscall tracking specifically for Toybox `sh` (`toysh`) so we can use the shell as a realistic runtime test harness.
 
 ## Scope
 
@@ -82,12 +82,12 @@ Status in PeetOS:
 - `ioctl` semantics are intentionally shallow (static/default termios + fixed winsize), so advanced terminal behavior may not match Linux.
 - `clone`/`vfork` coverage is limited to fork-compatible semantics; full Linux clone-flag behavior is not yet implemented.
 
-## Recommended Bring-Up Order (Shell-First)
+## Recommended Hardening Order (Shell-First)
 
 1. Land baseline process/tty primitives (done):
    - `fork`, `wait4`, and minimal tty `ioctl` subset.
 2. Keep hardening process-group/session behavior:
-   - `setpgid`, `setsid`, `getsid` edge-case parity + job-control interactions.
+   - `setpgid`, `setsid`, `getsid` edge-case handling + job-control interactions.
 3. Harden process-creation compatibility:
    - expand beyond fork-compatible `clone`/`vfork` subset as required by selected musl/toolchain configuration.
 4. Optional hardening:
@@ -104,8 +104,8 @@ Status in PeetOS:
 
 ## Limitations / Simplifications
 
-- This is a shell-focused syscall subset, not full Toybox parity.
-- Toybox `sh` still has internal TODOs for complete job control semantics; kernel parity alone does not guarantee full bash-equivalent behavior.
+- This is a shell-focused syscall subset, not full Toybox coverage.
+- Toybox `sh` still has internal TODOs for complete job-control semantics; kernel support alone does not guarantee full bash-equivalent behavior.
 - musl/toolchain variants may route process creation through different syscalls (`fork` vs `clone`), so implementation should match the selected ABI/runtime path in this repo.
 - `wait4` is currently minimal (`WNOHANG` only, `rusage` not yet supported).
 - `clone`/`vfork` are currently compatibility-focused and do not provide full Linux shared-VM/thread semantics.

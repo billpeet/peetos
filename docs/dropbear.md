@@ -1,6 +1,6 @@
 # Dropbear Bootstrap
 
-This document tracks the Rust-port Stage 9 Dropbear bootstrap setup.
+This document tracks the Dropbear userspace bootstrap setup on the current Rust kernel.
 
 ## Scope
 

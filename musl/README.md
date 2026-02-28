@@ -1,4 +1,4 @@
-# musl Setup for PeetOS (Rust Port)
+# musl Setup for PeetOS
 
 This directory bootstraps musl source and a sysroot for PeetOS user-space cross-compilation work.
 
@@ -32,7 +32,7 @@ make musl CC=clang AR=llvm-ar RANLIB=llvm-ranlib
 
 - Current default target is `x86_64-linux-musl` because PeetOS currently tracks Linux syscall ABI numbering/behavior for userspace compatibility work.
 - `CROSS_PREFIX=x86_64-peetos-` is supported for downstream packages that expect prefixed cross tools.
-- Dynamic-linker/runtime compatibility is still in-progress in the kernel and loader paths; this setup is build-system scaffolding for Stage 9.
+- Dynamic-linker/runtime compatibility is still in-progress in the kernel and loader paths; this setup is build-system scaffolding for userspace runtime bring-up.
 
 ## Limitations / Simplifications
 

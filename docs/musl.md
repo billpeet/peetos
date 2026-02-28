@@ -1,6 +1,6 @@
 # musl Bootstrap
 
-This document tracks the Rust-port Stage 9 musl bootstrap setup.
+This document tracks the musl userspace bootstrap setup.
 
 ## Scope
 

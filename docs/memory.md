@@ -1,6 +1,6 @@
 # Memory Management
 
-This document summarizes the Phase 3 memory management implementation: typed addresses, PMM, VMM, and the kernel heap.
+This document summarizes the current memory management implementation: typed addresses, PMM, VMM, and the kernel heap.
 
 **Where It Lives**
 - `crates/arch_x86_64/src/addr.rs`

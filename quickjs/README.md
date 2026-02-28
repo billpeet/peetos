@@ -1,4 +1,4 @@
-# QuickJS Setup for PeetOS (Rust Port)
+# QuickJS Setup for PeetOS
 
 This directory bootstraps QuickJS source and builds a static `qjs` binary for
 PeetOS userspace staging.

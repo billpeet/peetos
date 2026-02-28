@@ -68,6 +68,8 @@ const ROOT_INODE: u16 = 0;
 const PROCFS_BUFFER_MAX: usize = 512;
 const PROC_TICK_HZ: u64 = 100;
 const MOUNT_MAX: usize = 8;
+const LEGACY_EXT2_MOUNT_PREFIX: &str = "/mnt/ext2";
+const ROOT_PSEUDO_MOUNT_NAMES: [&[u8]; 4] = [b"dev", b"proc", b"temp", b"boot"];
 
 const STAT_S_IFMT: u32 = 0xF000;
 const STAT_S_IFDIR: u32 = 0x4000;
@@ -306,6 +308,8 @@ struct Ext2CachedBlock {
 struct Ext2JournalState {
     present: bool,
     replaying: bool,
+    aborted: bool,
+    abort_errno: i64,
     inode: u32,
     inode_blocks: [u32; 15],
     superblock_block: u32,
@@ -328,6 +332,8 @@ impl Ext2JournalState {
         Self {
             present: false,
             replaying: false,
+            aborted: false,
+            abort_errno: 0,
             inode: 0,
             inode_blocks: [0; 15],
             superblock_block: 0,
@@ -708,6 +714,8 @@ fn ensure_init(state: &mut VfsState) {
     state.initialized = true;
 
     let _ = mkdir_inner(state, "/tmp");
+    let _ = mkdir_inner(state, "/temp");
+    let _ = mkdir_inner(state, "/boot");
     let _ = mkdir_inner(state, "/etc");
 
     let _ = mkdir_virtual_inner(state, "/dev");
@@ -740,6 +748,12 @@ fn ensure_init(state: &mut VfsState) {
     let _ = create_virtual_file_inner(state, "/proc/version", NodeBackend::ProcVersion);
 
     let _ = mount_table_set(state, ROOT_INODE, "/", "tmpfs", false);
+    if let Ok(temp_inode) = lookup_path_inner(state, "/temp") {
+        let _ = mount_table_set(state, temp_inode, "/temp", "tmpfs", false);
+    }
+    if let Ok(boot_inode) = lookup_path_inner(state, "/boot") {
+        let _ = mount_table_set(state, boot_inode, "/boot", "bootfs", false);
+    }
     if let Ok(dev_inode) = lookup_path_inner(state, "/dev") {
         let _ = mount_table_set(state, dev_inode, "/dev", "devfs", false);
     }
@@ -753,6 +767,12 @@ fn name_eq(inode: &Inode, name: &[u8]) -> bool {
         return false;
     }
     inode.name[..name.len()] == *name
+}
+
+fn is_root_pseudo_mount_name(name: &[u8]) -> bool {
+    ROOT_PSEUDO_MOUNT_NAMES
+        .iter()
+        .any(|candidate| *candidate == name)
 }
 
 fn find_child(state: &VfsState, dir: u16, name: &[u8]) -> Option<u16> {
@@ -917,7 +937,24 @@ fn has_remaining_component(path: &[u8], mut cursor: usize) -> bool {
     false
 }
 
+fn remap_legacy_ext2_root_path<'a>(state: &VfsState, path: &'a str) -> &'a str {
+    if !state.ext2_mounted || state.ext2_mount_inode != ROOT_INODE {
+        return path;
+    }
+    if !path.starts_with(LEGACY_EXT2_MOUNT_PREFIX) {
+        return path;
+    }
+    if path.len() == LEGACY_EXT2_MOUNT_PREFIX.len() {
+        return "/";
+    }
+    if path.as_bytes()[LEGACY_EXT2_MOUNT_PREFIX.len()] != b'/' {
+        return path;
+    }
+    &path[LEGACY_EXT2_MOUNT_PREFIX.len()..]
+}
+
 fn lookup_path_from_inner(state: &mut VfsState, start: u16, path: &str) -> Result<u16, i64> {
+    let path = remap_legacy_ext2_root_path(state, path);
     if path.is_empty() {
         return Err(EINVAL);
     }
@@ -975,6 +1012,7 @@ fn resolve_parent_from_inner(
     path: &str,
     out_name: &mut [u8; VFS_MAX_NAME],
 ) -> Result<(u16, usize), i64> {
+    let path = remap_legacy_ext2_root_path(state, path);
     if path.is_empty() || path == "/" {
         return Err(EINVAL);
     }
@@ -3609,6 +3647,42 @@ fn clear_inode_subtree(state: &mut VfsState, inode: u16) {
     clear_inode(&mut state.inodes[inode as usize]);
 }
 
+fn prune_root_overlays_after_ext2_mount(state: &mut VfsState) {
+    let mut children = [0u16; VFS_MAX_CHILDREN];
+    let child_count = state.inodes[ROOT_INODE as usize].child_count as usize;
+
+    let mut idx = 0usize;
+    while idx < child_count {
+        children[idx] = state.inodes[ROOT_INODE as usize].children[idx];
+        idx += 1;
+    }
+
+    idx = 0;
+    while idx < child_count {
+        let child = children[idx];
+        if (child as usize) >= VFS_MAX_INODES {
+            idx += 1;
+            continue;
+        }
+        let node = state.inodes[child as usize];
+        if !node.used {
+            idx += 1;
+            continue;
+        }
+        let name_len = node.name_len as usize;
+        let keep = node.file_type == FileType::Directory
+            && is_root_pseudo_mount_name(&node.name[..name_len]);
+        if keep {
+            idx += 1;
+            continue;
+        }
+        let _ = remove_child(state, ROOT_INODE, child);
+        mount_table_remove_by_inode(state, child);
+        clear_inode_subtree(state, child);
+        idx += 1;
+    }
+}
+
 fn rollback_ext2_mount_import(state: &mut VfsState, mount_inode: u16) {
     let mut children = [0u16; VFS_MAX_CHILDREN];
     let child_count = state.inodes[mount_inode as usize].child_count as usize;
@@ -5061,6 +5135,7 @@ mod tests {
         image: std::vec::Vec<u8>,
         reads: usize,
         writes: usize,
+        fail_write_after: Option<usize>,
     }
 
     fn test_ext2_backend_read(ctx: u64, block_index: u32, out: &mut [u8]) -> Result<(), i64> {
@@ -5083,6 +5158,9 @@ mod tests {
             return Err(EIO);
         }
         let ctx = unsafe { &mut *(ctx as *mut TestBackendCtx) };
+        if matches!(ctx.fail_write_after, Some(limit) if ctx.writes >= limit) {
+            return Err(EIO);
+        }
         let start = (block_index as usize).checked_mul(data.len()).ok_or(EIO)?;
         let end = start.checked_add(data.len()).ok_or(EIO)?;
         if end > ctx.image.len() {
@@ -5093,11 +5171,16 @@ mod tests {
         Ok(())
     }
 
-    fn mount_ext2_backend_image(image: &[u8], head_len: usize) -> std::boxed::Box<TestBackendCtx> {
+    fn mount_ext2_backend_image_at(
+        mount_path: &str,
+        image: &[u8],
+        head_len: usize,
+    ) -> std::boxed::Box<TestBackendCtx> {
         let mut ctx = std::boxed::Box::new(TestBackendCtx {
             image: std::vec::Vec::from(image),
             reads: 0,
             writes: 0,
+            fail_write_after: None,
         });
         let backend = Ext2BlockBackend {
             ctx: (&mut *ctx as *mut TestBackendCtx) as u64,
@@ -5106,9 +5189,13 @@ mod tests {
         };
         set_ext2_block_backend(backend).expect("set block backend");
         let head_len = core::cmp::min(head_len, image.len());
-        mount_ext2_block_backend("/mnt/ext2", image.len(), &image[..head_len])
+        mount_ext2_block_backend(mount_path, image.len(), &image[..head_len])
             .expect("mount ext2 backend");
         ctx
+    }
+
+    fn mount_ext2_backend_image(image: &[u8], head_len: usize) -> std::boxed::Box<TestBackendCtx> {
+        mount_ext2_backend_image_at("/mnt/ext2", image, head_len)
     }
 
     fn mount_ext2_backend_image_expect_err(image: &[u8], head_len: usize) -> i64 {
@@ -5116,6 +5203,7 @@ mod tests {
             image: std::vec::Vec::from(image),
             reads: 0,
             writes: 0,
+            fail_write_after: None,
         });
         let backend = Ext2BlockBackend {
             ctx: (&mut *ctx as *mut TestBackendCtx) as u64,
@@ -5236,8 +5324,13 @@ mod tests {
         (image, target_block, payload)
     }
 
-    fn build_internal_journal_wrapped_revoke_replay_image(
-    ) -> (std::vec::Vec<u8>, u32, std::vec::Vec<u8>, u32, std::vec::Vec<u8>) {
+    fn build_internal_journal_wrapped_revoke_replay_image() -> (
+        std::vec::Vec<u8>,
+        u32,
+        std::vec::Vec<u8>,
+        u32,
+        std::vec::Vec<u8>,
+    ) {
         let mut image = std::vec::Vec::from(SAMPLE_EXT2);
         let meta = ext2_parse_meta_with_len(&image, image.len(), true).expect("parse sample ext2");
         let block_size = meta.block_size;
@@ -5324,7 +5417,11 @@ mod tests {
         write_u32_be(&mut image, descriptor_second_off, 0xC03B_3998);
         write_u32_be(&mut image, descriptor_second_off + 4, 1);
         write_u32_be(&mut image, descriptor_second_off + 8, tx_sequence_second);
-        write_u32_be(&mut image, descriptor_second_off + 12, surviving_target_block);
+        write_u32_be(
+            &mut image,
+            descriptor_second_off + 12,
+            surviving_target_block,
+        );
         write_u32_be(&mut image, descriptor_second_off + 16, 0x0000_0008);
         image[descriptor_second_off + 20..descriptor_second_off + 36].fill(0);
 
@@ -5634,6 +5731,54 @@ mod tests {
     }
 
     #[test]
+    fn ext2_root_mount_supports_legacy_mnt_ext2_prefix() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let _ctx = mount_ext2_backend_image_at("/", SAMPLE_EXT2, 4096);
+
+        let direct = open("/hello.txt", O_RDONLY, 0).expect("open root path");
+        let compat = open("/mnt/ext2/hello.txt", O_RDONLY, 0).expect("open legacy path");
+
+        let mut direct_buf = [0u8; 96];
+        let direct_n = read(direct.inode, 0, &mut direct_buf).expect("read root file");
+        let mut compat_buf = [0u8; 96];
+        let compat_n = read(compat.inode, 0, &mut compat_buf).expect("read legacy file");
+
+        assert_eq!(&direct_buf[..direct_n], &compat_buf[..compat_n]);
+
+        let mounts = open("/proc/mounts", O_RDONLY, 0).expect("open /proc/mounts");
+        let mut mounts_buf = [0u8; 256];
+        let mounts_n = read(mounts.inode, 0, &mut mounts_buf).expect("read mounts");
+        let mounts_text = core::str::from_utf8(&mounts_buf[..mounts_n]).expect("utf8");
+        assert!(mounts_text.contains("ext2 / ext2 rw"));
+    }
+
+    #[test]
+    fn ext2_root_mount_prunes_tmp_overlay_but_keeps_pseudo_mounts() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let shadow = open("/tmp/pre_mount.txt", O_CREAT | O_RDWR, 0).expect("create /tmp shadow");
+        let _ = write(shadow.inode, 0, b"shadow", false).expect("write /tmp shadow");
+
+        let temp = open("/temp/keep.txt", O_CREAT | O_RDWR, 0).expect("create /temp file");
+        let _ = write(temp.inode, 0, b"temp", false).expect("write /temp file");
+
+        let _ctx = mount_ext2_backend_image_at("/", SAMPLE_EXT2, 4096);
+
+        assert_eq!(open("/tmp/pre_mount.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+
+        let kept = open("/temp/keep.txt", O_RDONLY, 0).expect("open kept /temp file");
+        let mut kept_buf = [0u8; 8];
+        let kept_n = read(kept.inode, 0, &mut kept_buf).expect("read kept /temp file");
+        assert_eq!(&kept_buf[..kept_n], b"temp");
+
+        let _ = open("/dev/null", O_RDWR, 0).expect("open /dev/null after root mount");
+        let _ = open("/proc/mounts", O_RDONLY, 0).expect("open /proc/mounts after root mount");
+    }
+
+    #[test]
     fn ext2_logical_block_lookup_handles_indirect_levels() {
         let _guard = TEST_LOCK.lock().expect("lock should work");
 
@@ -5811,11 +5956,9 @@ mod tests {
         let revoked_off = (revoked_block as usize) * block_size;
         let surviving_off = (surviving_block as usize) * block_size;
 
-        assert!(
-            ctx.image[revoked_off..revoked_off + revoked_payload.len()]
-                .iter()
-                .all(|byte| *byte == b's')
-        );
+        assert!(ctx.image[revoked_off..revoked_off + revoked_payload.len()]
+            .iter()
+            .all(|byte| *byte == b's'));
         assert_eq!(
             &ctx.image[surviving_off..surviving_off + surviving_payload.len()],
             surviving_payload.as_slice()
@@ -6028,8 +6171,14 @@ mod tests {
         assert_eq!(read_u32_be(&ctx.image, second_descriptor_off), 0xC03B_3998);
         assert_eq!(read_u32_be(&ctx.image, second_descriptor_off + 4), 1);
         assert_eq!(read_u32_be(&ctx.image, second_descriptor_off + 8), 57);
-        assert_eq!(read_u32_be(&ctx.image, second_descriptor_off + 12), target_block);
-        assert_eq!(read_u32_be(&ctx.image, second_descriptor_off + 16), 0x0000_000A);
+        assert_eq!(
+            read_u32_be(&ctx.image, second_descriptor_off + 12),
+            target_block
+        );
+        assert_eq!(
+            read_u32_be(&ctx.image, second_descriptor_off + 16),
+            0x0000_000A
+        );
 
         assert_eq!(
             &ctx.image[second_data_off..second_data_off + 4],
@@ -6183,6 +6332,87 @@ mod tests {
         assert_eq!(read_u32_be(&ctx.image, revoke_off + 8), 56);
         assert_eq!(read_u32_be(&ctx.image, revoke_off + 12), 20);
         assert_eq!(read_u32_be(&ctx.image, revoke_off + 16), target_block + 9);
+    }
+
+    #[test]
+    fn ext2_journal_runtime_io_error_aborts_and_blocks_future_flushes() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, target_block, _payload) = build_internal_journal_replay_image();
+        let mut ctx = mount_ext2_backend_image(&image, 4096);
+        ctx.fail_write_after = Some(ctx.writes.saturating_add(2));
+
+        with_state(|state| {
+            {
+                let block =
+                    ext2_block_slice_mut_state(state, target_block).expect("target block mut");
+                block[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+            }
+            ext2_mark_dirty_block(state, target_block).expect("mark dirty");
+
+            assert_eq!(ext2_sync::flush_all_dirty(state).unwrap_err(), EIO);
+            assert!(state.ext2_journal.aborted);
+            assert_eq!(state.ext2_journal.abort_errno, EIO);
+            assert!(state.ext2_dirty_blocks.contains(&target_block));
+        });
+
+        let writes_after_abort = ctx.writes;
+        ctx.fail_write_after = None;
+
+        with_state(|state| {
+            assert_eq!(ext2_sync::flush_all_dirty(state).unwrap_err(), EIO);
+            assert!(state.ext2_journal.aborted);
+            assert!(state.ext2_dirty_blocks.contains(&target_block));
+        });
+
+        assert_eq!(ctx.writes, writes_after_abort);
+    }
+
+    #[test]
+    fn ext2_journal_checkpoint_io_error_keeps_committed_tx_and_aborts() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, target_block, _payload) = build_internal_journal_replay_image();
+        let mut ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            {
+                let block =
+                    ext2_block_slice_mut_state(state, target_block).expect("target block mut");
+                block[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+            }
+            ext2_mark_dirty_block(state, target_block).expect("mark dirty");
+            ext2_sync::flush_all_dirty(state).expect("flush all dirty");
+            assert_eq!(state.ext2_journal_committed_txs.len(), 1);
+        });
+
+        ctx.fail_write_after = Some(ctx.writes);
+
+        with_state(|state| {
+            assert_eq!(
+                ext2_journal::checkpoint_all_committed(state).unwrap_err(),
+                EIO
+            );
+            assert!(state.ext2_journal.aborted);
+            assert_eq!(state.ext2_journal.abort_errno, EIO);
+            assert_eq!(state.ext2_journal_committed_txs.len(), 1);
+        });
+
+        let writes_after_abort = ctx.writes;
+        ctx.fail_write_after = None;
+
+        with_state(|state| {
+            assert_eq!(
+                ext2_journal::checkpoint_all_committed(state).unwrap_err(),
+                EIO
+            );
+            assert!(state.ext2_journal.aborted);
+            assert_eq!(state.ext2_journal_committed_txs.len(), 1);
+        });
+
+        assert_eq!(ctx.writes, writes_after_abort);
     }
 
     #[test]

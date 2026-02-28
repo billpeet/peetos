@@ -1,6 +1,6 @@
 # toybox Bootstrap
 
-This document tracks Stage-9 toybox staging for PeetOS userspace bring-up.
+This document tracks toybox staging for PeetOS userspace bring-up.
 
 Shell-focused syscall requirements and priorities are tracked separately in
 `docs/toybox_shell_syscalls.md`.

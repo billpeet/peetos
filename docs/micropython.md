@@ -1,6 +1,6 @@
 # micropython Bootstrap
 
-This document tracks the Rust-port Stage 9 micropython bootstrap setup.
+This document tracks the micropython userspace bootstrap setup.
 
 ## Scope
 

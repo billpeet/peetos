@@ -1,4 +1,4 @@
-# Dropbear Setup for PeetOS (Rust Port)
+# Dropbear Setup for PeetOS
 
 This directory bootstraps Dropbear source and builds static Dropbear tools for
 PeetOS userspace staging.
@@ -26,7 +26,7 @@ make dropbear
 ## Limitations / Simplifications
 
 - Initial staged integration focuses on baseline daemon/key tooling bring-up,
-  not full SSH feature parity.
+  not full SSH feature coverage.
 - Password auth and forwarding features are disabled in `localoptions.h` to keep
   dependencies aligned with current kernel/runtime support.
 - Smoke validation is intentionally narrow and does not yet prove complete

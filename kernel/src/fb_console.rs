@@ -423,14 +423,7 @@ fn draw_desktop_header(state: &FbConsoleState) {
     let header_h = core::cmp::min(DESKTOP_HEADER_HEIGHT, state.fb.height as usize);
     let header_bg = palette_color(state, 2);
     let header_fg = palette_color(state, 15);
-    fill_rect(
-        state.fb,
-        0,
-        0,
-        state.fb.width as usize,
-        header_h,
-        header_bg,
-    );
+    fill_rect(state.fb, 0, 0, state.fb.width as usize, header_h, header_bg);
     if header_h > 0 {
         fill_rect(
             state.fb,
@@ -586,13 +579,9 @@ fn find_inode_path_for_status(
         }
 
         if matches!(fs::inode_is_dir(child_inode), Ok(true)) {
-            if let Some(found_len) = find_inode_path_for_status(
-                child_inode,
-                target_inode,
-                next_len,
-                depth + 1,
-                path_buf,
-            ) {
+            if let Some(found_len) =
+                find_inode_path_for_status(child_inode, target_inode, next_len, depth + 1, path_buf)
+            {
                 return Some(found_len);
             }
         }
@@ -623,11 +612,7 @@ fn query_current_cwd_path(path_buf: &mut [u8; fs::VFS_MAX_PATH]) -> usize {
     }
 }
 
-fn format_status_path(
-    path: &[u8],
-    max_chars: usize,
-    out: &mut [u8; fs::VFS_MAX_PATH],
-) -> usize {
+fn format_status_path(path: &[u8], max_chars: usize, out: &mut [u8; fs::VFS_MAX_PATH]) -> usize {
     let sanitize = |byte: u8| {
         if (0x20..=0x7E).contains(&byte) {
             byte
@@ -684,7 +669,8 @@ fn refresh_status_path_cache(state: &mut FbConsoleState, force: bool) -> bool {
 
     let mut latest = [0u8; fs::VFS_MAX_PATH];
     let latest_len = query_current_cwd_path(&mut latest);
-    if latest_len == state.status_cwd_len && state.status_cwd[..latest_len] == latest[..latest_len] {
+    if latest_len == state.status_cwd_len && state.status_cwd[..latest_len] == latest[..latest_len]
+    {
         return false;
     }
 
@@ -719,8 +705,17 @@ fn draw_status_line(state: &FbConsoleState) {
 
     let title_x = state.panel_x.saturating_add(PANEL_BORDER);
     let title_y = state.panel_y.saturating_add(PANEL_BORDER);
-    let title_w = state.panel_width.saturating_sub(PANEL_BORDER.saturating_mul(2));
-    fill_rect(state.fb, title_x, title_y, title_w, PANEL_TITLE_BAR_HEIGHT, state.panel_title);
+    let title_w = state
+        .panel_width
+        .saturating_sub(PANEL_BORDER.saturating_mul(2));
+    fill_rect(
+        state.fb,
+        title_x,
+        title_y,
+        title_w,
+        PANEL_TITLE_BAR_HEIGHT,
+        state.panel_title,
+    );
 
     let text_y = title_y.saturating_add(PANEL_TITLE_BAR_HEIGHT.saturating_sub(GLYPH_HEIGHT) / 2);
     let mut x = title_x.saturating_add(STATUS_TEXT_PAD_X);
@@ -752,7 +747,15 @@ fn draw_status_line(state: &FbConsoleState) {
         cwd_chars,
         &mut rendered,
     );
-    let _ = draw_text_raw(state, x, text_y, &rendered[..rendered_len], cwd_fg, cwd_bg, cwd_chars);
+    let _ = draw_text_raw(
+        state,
+        x,
+        text_y,
+        &rendered[..rendered_len],
+        cwd_fg,
+        cwd_bg,
+        cwd_chars,
+    );
 }
 
 fn clear_cell(state: &FbConsoleState, col: usize, row: usize) {

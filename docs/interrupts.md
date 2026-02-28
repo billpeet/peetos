@@ -1,6 +1,6 @@
 # Interrupts and CPU Setup
 
-This document summarizes the interrupt-related infrastructure in the Rust port, including GDT/IDT setup, PIC/PIT handling, and interrupt masking helpers.
+This document summarizes interrupt-related infrastructure in the current kernel, including GDT/IDT setup, PIC/PIT handling, and interrupt masking helpers.
 
 **Where It Lives**
 - `crates/arch_x86_64/src/port.rs`
@@ -107,6 +107,6 @@ Limitations / Simplifications
 - Sleep is coarse (tick-based) and busy-waits with `hlt`.
 
 **Status Notes**
-- The PIC/PIT infrastructure is in place, but no device IRQ handlers are registered yet.
+- The PIC/PIT infrastructure is in place and now has active device IRQ users (timer, keyboard, mouse).
 - Exception reporting is serial-only. VGA integration is not implemented.
 - No APIC or SMP support yet.

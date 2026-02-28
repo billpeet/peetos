@@ -10,7 +10,7 @@ This document describes the early boot path into the Rust kernel and the high-le
 **Bootloader Assumptions**
 - The bootloader enters 64-bit long mode and jumps to `_start`.
 - The first 2 MB are identity-mapped, and the kernel is also mapped in the higher-half.
-- Page tables are located at fixed physical addresses reused from the C kernel.
+- Page tables are located at fixed physical addresses shared with the legacy boot layout.
 
 **Entry Flow (`entry.asm`)**
 1. Disable maskable interrupts (`cli`) and clear DF to satisfy SysV ABI expectations.

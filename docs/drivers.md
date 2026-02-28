@@ -1,6 +1,6 @@
-# Device Drivers (Phase 7 Progress)
+# Device Drivers
 
-This document covers current Phase-7 driver work: PCI enumeration plus ATA/AHCI bring-up through AHCI command-engine `IDENTIFY`, AHCI LBA48 DMA read/write commands, baseline block-device API integration, keyboard/mouse input wiring, UHCI USB HID-tablet polling, and framebuffer setup.
+This document covers current driver work: PCI enumeration, ATA/AHCI bring-up through AHCI command-engine `IDENTIFY` and LBA48 DMA read/write commands, block-device API integration, keyboard/mouse input wiring, UHCI USB HID-tablet polling, and framebuffer setup.
 
 **Where It Lives**
 - `crates/drivers/src/pci.rs`

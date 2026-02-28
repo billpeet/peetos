@@ -18,7 +18,7 @@ Limitations / Simplifications
 - No serial RX input path, flow control, or log levels.
 - No locking for concurrent writers.
 
-Keyboard-backed console input is now provided separately via the phase-7 PS/2 + TTY path (`kernel/src/keyboard.rs` + `kernel/src/tty.rs`), with typed bytes echoed through the same serial path (and therefore mirrored to framebuffer when available).
+Keyboard-backed console input is now provided separately via the PS/2 + TTY path (`kernel/src/keyboard.rs` + `kernel/src/tty.rs`), with typed bytes echoed through the same serial path (and therefore mirrored to framebuffer when available).
 
 **Exception Reporting**
 `kernel/src/exception.rs` prints a register dump and decodes page fault error codes. For page faults, it reads CR2 and prints the access type, privilege level, and present/reserved bits. Optional VGA printing exists behind the `vga` feature.

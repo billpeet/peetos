@@ -1,11 +1,11 @@
-# Ext3 Feature Parity Audit (2026-02-28)
+# Ext3 Journal Status Audit (2026-02-28)
 
 ## Scope
 
 This audit covers ext3-style journaling behavior in the Rust kernel (`/home/bill/source/peetos`) and compares it against:
 
 - The current Rust implementation goals and behavior.
-- Stage 1-9 parity source of truth in `/home/bill/source/peetos_c` (which is ext2-focused and does not implement ext3/JBD).
+- Historical implementation context in `/home/bill/source/peetos_c` (which is ext2-focused and does not implement ext3/JBD).
 
 ## Current Status
 
@@ -17,6 +17,7 @@ Rust currently implements a partial ext3-compatible path on top of the ext2 moun
 4. Deferred checkpointing of committed transactions to home blocks.
 5. Revoke parsing/emission, including wrapped transaction sequence ordering.
 6. Mount-table/runtime labeling of journaled mounts as `ext3`.
+7. Runtime journal abort state on I/O fault with fail-fast behavior.
 
 Key code paths:
 
@@ -34,6 +35,8 @@ Representative tests:
 - `ext2_journaled_flush_rotates_runtime_head_between_transactions`
 - `ext2_journaled_flush_wraps_runtime_transaction_layout`
 - `ext2_journaled_flush_emits_revoke_block_from_pending_revoke_set`
+- `ext2_journal_runtime_io_error_aborts_and_blocks_future_flushes`
+- `ext2_journal_checkpoint_io_error_keeps_committed_tx_and_aborts`
 
 All of the above are in `crates/fs/src/lib.rs` test module.
 
@@ -65,11 +68,20 @@ All of the above are in `crates/fs/src/lib.rs` test module.
 - Revoke blocks can be emitted in runtime transactions.
 - Replay honors revoke precedence with wrapped sequence comparisons.
 
+### 5. Runtime abort semantics (baseline)
+
+- Runtime journal write/checkpoint paths now track an aborted state after journal
+  I/O failure (`EIO`).
+- Once aborted, subsequent runtime journal flush/checkpoint/revoke-note paths
+  fail fast with the recorded abort errno.
+- Checkpoint failure no longer drops queued committed transactions from
+  in-memory state before a successful checkpoint pass.
+
 ## Gaps
 
-### 1. Not full ext3/JBD parity
+### 1. Not full ext3/JBD compatibility
 
-- No full JBD transaction-handle model (credits, richer transaction state, abort semantics).
+- No full JBD transaction-handle model (credits, richer transaction lifecycle/state).
 - No ext3 mount option semantics (for example data mode selection).
 - No separate ext3 driver/API surface; behavior is still ext2 + optional internal journal handling (journaled mounts are currently surfaced as `ext3` in mount metadata).
 
@@ -85,17 +97,18 @@ All of the above are in `crates/fs/src/lib.rs` test module.
 
 ### 4. Broader filesystem integration still incomplete
 
-- Current docs already note this is not complete ext3 mode parity.
+- Current docs already note this is not complete ext3 mode behavior.
 - Full fs-wide VM page-cache integration and broader hardening are still pending.
 
-## Parity Against `peetos_c` (Stage 1-9 Source of Truth)
+## Historical Comparison (`peetos_c`)
 
 - `peetos_c` roadmap and kernel code are ext2-focused; no ext3 journal implementation exists there.
-- Therefore ext3/journaling is currently a Rust-only extension rather than a required stage 1-9 parity item.
-- Practical implication: Rust is ahead of C baseline for this area, but still below full ext3/JBD behavior.
+- Therefore ext3/journaling is currently a Rust-only extension rather than a legacy compatibility requirement.
+- Practical implication: Rust currently includes this capability, but it is still below full ext3/JBD behavior.
 
 ## Limitations / Simplifications
 
 - Single in-kernel implementation path with global VFS state; no full Linux-like journaling architecture.
 - Focused on crash-recovery essentials and baseline durability, not full ext3 compatibility matrix.
+- Abort handling is a baseline runtime guard (`EIO`-driven state transition) rather than a full ext3 remount-ro + operator-policy model.
 - Test coverage is currently strong at unit level for replay/flush/checkpoint/revoke mechanics, but there is no dedicated QEMU integration suite focused on ext3 crash scenarios yet.

@@ -3,9 +3,9 @@ use super::{
     ext2_clear_dirty_tracking, ext2_journal, ext2_mark_resident_range, ext2_parse_meta_with_len,
     ext2_read_inode_from_state, ext2_reset_dirty_tracking,
     ext2_set_cache_policy as ext2_set_cache_policy_state, ext2_set_image_len, ext2_sync,
-    mount_table_set, rollback_ext2_mount_import, with_state, Ext2BackendKind, Ext2BlockBackend,
-    Ext2DirtyRun, FileType, NodeBackend, EBUSY, EEXIST, EINVAL, EIO, ENOENT, ENOSPC, ENOTDIR,
-    EXT2_ROOT_INODE,
+    mount_table_set, prune_root_overlays_after_ext2_mount, rollback_ext2_mount_import, with_state,
+    Ext2BackendKind, Ext2BlockBackend, Ext2DirtyRun, FileType, NodeBackend, EBUSY, EEXIST, EINVAL,
+    EIO, ENOENT, ENOSPC, ENOTDIR, EXT2_ROOT_INODE, ROOT_INODE,
 };
 
 pub fn mount_ext2_block_backend(
@@ -21,7 +21,7 @@ pub fn mount_ext2_block_backend(
             return Err(ENOTDIR);
         }
 
-        if state.inodes[mount_inode as usize].child_count != 0 {
+        if mount_inode != ROOT_INODE && state.inodes[mount_inode as usize].child_count != 0 {
             return Err(EEXIST);
         }
 
@@ -103,6 +103,9 @@ pub fn mount_ext2_block_backend(
         if let Err(err) = mount_table_set(state, mount_inode, mount_path, fs_name, false) {
             rollback_ext2_mount_import(state, mount_inode);
             return Err(err);
+        }
+        if mount_inode == ROOT_INODE {
+            prune_root_overlays_after_ext2_mount(state);
         }
         Ok(())
     })

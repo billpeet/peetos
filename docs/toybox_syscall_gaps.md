@@ -1,8 +1,8 @@
 # Toybox Syscall Gaps
 
-Last reviewed: 2026-02-18
+Last reviewed: 2026-02-28
 
-This document tracks missing Linux syscalls needed to bring up Toybox utilities on PeetOS in a staged way.
+This document tracks remaining Linux syscalls needed for broader Toybox utility coverage on PeetOS.
 
 For shell-specific bring-up priorities, see `docs/toybox_shell_syscalls.md`.
 
@@ -15,7 +15,7 @@ For shell-specific bring-up priorities, see `docs/toybox_shell_syscalls.md`.
 - Dropbear runtime smoke is staged through the same ext2 launcher path (`musl-ext2-dropbear-smoke`) to validate SSH daemon/key tool userspace execution on top of the current toybox/musl baseline.
 - Use `kernel/src/syscall.rs` as current implemented surface.
 
-## Current Kernel Syscalls (Baseline)
+## Current Kernel Syscalls
 
 Currently implemented in `kernel/src/syscall.rs`:
 
@@ -445,7 +445,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
 
 ## Limitations / Simplifications
 
-- This is a staged gap list, not full Linux parity.
+- This is a staged gap list, not full Linux behavior coverage.
 - Some Toybox applets live under `toys/pending/`; those may need extra work unrelated to syscalls.
 - Syscall implementation alone is not sufficient for deferred areas (networking, mount namespaces, full tty/pty, multi-process job control).
 - `ping` smoke currently asserts only the QEMU user-mode NAT gateway path (`10.0.2.2`); broader ICMP interoperability is not yet a pass criterion in this document.
@@ -457,7 +457,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
   - `linkat` currently supports regular-file links only; tmpfs path is a pragmatic clone-style fallback.
   - `symlinkat` creates baseline symlink inodes but general symlink-follow path resolution is not implemented yet.
   - `readlinkat` supports baseline VFS symlink targets plus synthetic `/proc/self/exe`.
-  - `utimensat` currently updates inode timestamps in VFS/ext2 metadata without full permission/ownership policy parity.
+  - `utimensat` currently updates inode timestamps in VFS/ext2 metadata without full permission/ownership policy compatibility.
   - `copy_file_range` is currently implemented as a buffered read/write copy for VFS fds (not a zero-copy filesystem-optimized path).
   - time syscalls are PIT tick-derived monotonic values (no RTC or true wall clock).
   - `getcwd` path lookup is bounded and depends on current VFS traversal behavior.
@@ -465,7 +465,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
   - `clone`/`vfork` currently map to a narrow fork-compatible subset (no full Linux thread/shared-VM semantics).
   - `wait4` currently supports `WNOHANG`; `rusage` output is unimplemented.
   - `ioctl` currently supports a minimal console tty subset with static/default behavior.
-  - process-group/session syscalls are baseline and still need hardening for full job-control parity.
+  - process-group/session syscalls are baseline and still need hardening for complete job-control behavior.
   - `fchmodat` updates permission bits without full ownership/capability permission checks.
   - `fchownat` truncates uid/gid to u16 to match current VFS inode field width; no privilege checks.
   - `mknodat` only supports `S_IFREG` regular file creation; character/block/fifo device nodes are unsupported.

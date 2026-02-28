@@ -1,6 +1,6 @@
 # Syscall Entry
 
-This document describes the current syscall entry implementation. It is a minimal baseline meant to unblock later user-mode work in Phase 4.
+This document describes the current syscall entry implementation and dispatcher behavior.
 
 **Where It Lives**
 - `crates/arch_x86_64/src/syscall.rs`
@@ -38,7 +38,7 @@ Limitations / Simplifications
 For initial user-mode bring-up, a user-accessible `int 0x80` gate is installed in the IDT. The handler uses the `InterruptFrame` to extract syscall arguments and write the return value to `RAX`.
 
 Limitations / Simplifications
-- The `int 0x80` path currently shares the same Linux-numbered dispatcher as the SYSCALL path and supports a baseline subset:
+- The `int 0x80` path shares the same Linux-numbered dispatcher as the SYSCALL path and supports the current baseline subset:
   - `SYS_OPEN`, `SYS_OPENAT`, `SYS_MKDIRAT`, `SYS_CLOSE`, `SYS_READ`, `SYS_WRITE`, `SYS_LSEEK`
   - `SYS_WRITEV`
   - `SYS_IOCTL` (console fd baseline: `TIOCGWINSZ`, `TCGETS`, `TCSETS*`, `TIOCGPGRP`, `TIOCSPGRP`)
@@ -66,7 +66,7 @@ Limitations / Simplifications
   - `SYS_SETPGID`, `SYS_SETSID`, `SYS_GETSID`
   - `SYS_SET_TID_ADDRESS` (stores per-task clear-tid pointer)
   - `SYS_BRK`
-- The int 0x80 path is temporary and will be replaced by a full SYSCALL/SYSRET flow with stack switching.
+- `int 0x80` is retained as a compatibility path for current userspace bring-up and tooling.
 
 **Syscall Handler**
 `kernel/src/syscall.rs` now implements a table-driven dispatcher shared by both the SYSCALL and int 0x80 paths. Arguments are normalized into a small `SyscallArgs` struct, syscall entries carry mode metadata (any task vs user task), unknown syscall logs are rate-limited, and return values use Linux-style negative errno.
@@ -133,5 +133,5 @@ Limitations / Simplifications
 `kernel/src/main.rs` calls `arch_syscall::init()` (MSR setup) and `syscall::init()` (dispatcher state init) during early boot.
 
 **Status Notes**
-- This is a baseline user-mode syscall path with staged Linux compatibility, not full parity.
+- This is a baseline user-mode syscall path with staged Linux compatibility, not full Linux behavior coverage.
 - The syscall fast path now uses per-task kernel stacks (`TSS.rsp0`) and `swapgs`.

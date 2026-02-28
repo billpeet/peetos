@@ -1,6 +1,6 @@
 # VFS and Filesystems
 
-This document describes the phase-5 VFS/filesystem implementation currently wired into the Rust kernel.
+This document describes the current VFS/filesystem implementation wired into the Rust kernel.
 
 **Where It Lives**
 - `crates/fs/src/lib.rs`
@@ -30,7 +30,7 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
   - `ext2_backend_kind()`, `set_ext2_block_backend(...)`, `clear_ext2_block_backend()`, and `set_ext2_cache_policy(max_blocks, dirty_high_watermark_percent)` are available as block-backed ext2 staging hooks.
   - Kernel init mounts ext2 only from discovered block devices (`kernel/src/block.rs`).
   - Host-side fs tests use `user/sample_ext2.img` through in-memory block-backend callbacks.
-  - Runtime shell/smoke flows (`musl-ext2-exec`, `musl-ext2-cmd-smoke`, `musl-ext2-ping-smoke`, `musl-ext2-quickjs-smoke`, `musl-ext2-micropython-smoke`, `musl-ext2-dropbear-smoke`) use `user/sample_ext2_musl.img` as a second block-backed ext2 payload so Toybox `sh`/staged userspace tools can be launched via `/mnt/ext2/bin/...`.
+  - Runtime shell/smoke flows (`musl-ext2-exec`, `musl-ext2-cmd-smoke`, `musl-ext2-ping-smoke`, `musl-ext2-quickjs-smoke`, `musl-ext2-micropython-smoke`, `musl-ext2-dropbear-smoke`) use `user/sample_ext2_musl.img` as a second block-backed ext2 payload so Toybox `sh`/staged userspace tools can be launched via `/bin/...` on root ext2 (with transitional `/mnt/ext2/...` compatibility remap when root ext2 is active).
 - File operations:
   - `open`/`openat` with `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`
   - `mkdir`/`mkdirat`
@@ -45,10 +45,13 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
 
 **Default Filesystem Layout**
 On initialization, the kernel creates:
-- tmpfs: `/`, `/tmp`, `/etc`
+- block-backed ext2/ext3 root mount at `/` when a compatible block-backed image is detected
+- runtime `/etc/fstab` with root declared as `block:auto / ext3 rw 0 1`
+- tmpfs mountpoints: `/temp` (runtime scratch) and `/boot` (boot-drive placeholder mountpoint)
+- tmpfs bootstrap paths: `/tmp`, `/etc` (transitional bootstrap before/without root ext2)
 - devfs nodes under `/dev`
 - procfs nodes under `/proc`
-- ext2 mount under `/mnt/ext2` when a block-backed image is detected
+- legacy compatibility path remap from `/mnt/ext2/...` to `/...` only when ext2 is mounted at `/`
 
 **Behavior Highlights**
 - tmpfs files are mutable and support offset-based reads/writes with sparse-zero fill on gaps.
@@ -58,7 +61,7 @@ On initialization, the kernel creates:
   - `/dev/console`: opened as a console descriptor; kernel routes writes to serial (mirrored to framebuffer text when available) and reads through canonical line-buffered TTY input
 - `procfs` behavior:
   - `/proc/uptime` and `/proc/meminfo` are generated from runtime kernel stats
-  - `/proc/mounts` is generated from the mount table and reflects mounted ext2 entries (journaled mounts are surfaced as ext3)
+  - `/proc/mounts` is generated from the mount table and reflects mounted ext2 entries (journaled mounts are surfaced as ext3), plus pseudo mounts such as `/boot`, `/temp`, `/dev`, and `/proc`
   - proc files are read-only (`-EROFS` on write)
 - ext2 behavior:
   - Imported files/directories support baseline mutable regular-file and directory operations (`read`, `write`, `truncate`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`) through the existing VFS file APIs.
@@ -68,11 +71,12 @@ On initialization, the kernel creates:
   - ext2 directory entry growth now allocates additional directory data blocks through direct/indirect mappings.
   - `create`/`mkdir` allocate ext2 inodes/blocks, update inode/block bitmaps and free counters, and insert directory entries in parent directories.
   - inode metadata (`mode`, `uid`, `gid`, link count, basic timestamps) is tracked and surfaced via `stat` paths.
-  - `/proc/mounts` reports non-journaled mounts as `ext2 rw` and journaled mounts as `ext3 rw`.
+  - `/proc/mounts` reports non-journaled root mounts as `ext2 / ext2 rw` and journaled root mounts as `ext3 / ext3 rw`.
   - Mount import is rollback-safe: on parse/import failure, partially imported nodes are removed.
   - Ext2 mount now includes ext3 internal journal parsing and mount-time replay of committed transactions when recovery is required, then clears recover markers before exposing the mount.
   - For journaled mounts, dirty-block flushes now emit runtime journal descriptor/data/commit records before checkpointing home blocks.
   - Journal replay revoke precedence now uses wrap-safe transaction ID ordering so replay remains correct across `u32` sequence rollover.
+  - Runtime journal paths now enter an aborted state on journal I/O faults and fail fast on later flush/checkpoint attempts.
   - Block-backed ext2 now uses sparse per-block residency and dirty tracking: blocks are loaded into cache on first access, and uncached blocks are never allocated in RAM up front.
   - Block cache residency is bounded by a configurable block cap, with CLOCK eviction and dirty-block write-back on dirty victim eviction.
   - Dirty-pressure flushing runs opportunistically when dirty/cached ratio crosses the configured threshold, reducing write burst size at sync points.
@@ -111,10 +115,11 @@ Limitations / Simplifications
 - Symbolic links are baseline-implemented (`symlinkat` + `readlinkat` target reads), but general symlink-follow path resolution is not implemented yet.
 - Console input path is baseline-only: canonical line mode with basic backspace editing and newline commit; no `termios`, raw mode, job control, or pty support.
 - ext2 importer is intentionally minimal: regular files/directories only, and imported file size is still capped by `TMPFS_MAX_FILE_SIZE`.
-- Journal bring-up is still incomplete: mount-time recovery replay is wired for internal journals, replay/revoke ordering now handles wrapped transaction IDs, runtime dirty-block flushes are journaled with multi-block transaction batching, runtime transaction placement rotates through the journal ring with wrap support, and committed transactions now use deferred checkpointing with runtime revoke-block emission before home-block writeback. Full JBD parity (for example richer transaction state/credit handling and complete ext3 mode semantics) remains pending.
+- Journal bring-up is still incomplete: mount-time recovery replay is wired for internal journals, replay/revoke ordering now handles wrapped transaction IDs, runtime dirty-block flushes are journaled with multi-block transaction batching, runtime transaction placement rotates through the journal ring with wrap support, committed transactions now use deferred checkpointing with runtime revoke-block emission before home-block writeback, and runtime journal I/O faults now trigger fail-fast aborted state. Fuller JBD compatibility (for example richer transaction state/credit handling and complete ext3 mode semantics) remains pending.
 - Block-backed ext2 sync is currently best-effort and uses a page-sized block write-back cache (dirty block runs are enqueued on mutating syscalls, then flushed on `sync`/`fsync`), without full end-to-end durability guarantees until block-cache flush completion.
 - Dirty-pressure flush is opportunistic in filesystem paths (no dedicated background flusher thread yet).
 - Ext2 still uses its own sparse block cache for on-disk block residency/dirty tracking, but syscall-level file reads and file-backed `MAP_SHARED` faults now share a kernel VM inode-page cache path. Full fs-wide VM page-cache integration (including writable shared mmap writeback and unified reclaim policy) remains pending.
 - ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.
+- `/boot` is currently a mountpoint placeholder (`bootfs` in `/proc/mounts`); there is no dedicated boot-filesystem backend yet.
 - Bare-metal kernel builds currently skip embedding the sample ext2 fallback image to keep the default kernel/image lean.
 - Runtime shell/smoke flows currently require attaching `user/sample_ext2_musl.img` as a second AHCI disk in QEMU.
