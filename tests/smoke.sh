@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${ROOT_DIR}/build/peetos.img"
 LOG_FILE="$(mktemp)"
 
+source "${ROOT_DIR}/tests/rust_build_compat_env.bash"
+setup_rust_build_compat "${ROOT_DIR}"
+
 cleanup() {
   rm -f "${LOG_FILE}"
 }
