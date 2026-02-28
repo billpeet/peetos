@@ -1,4 +1,4 @@
-# Ext3 Feature Parity Audit (2026-02-25)
+# Ext3 Feature Parity Audit (2026-02-28)
 
 ## Scope
 
@@ -16,6 +16,7 @@ Rust currently implements a partial ext3-compatible path on top of the ext2 moun
 3. Runtime journal transaction emission for dirty block flushes.
 4. Deferred checkpointing of committed transactions to home blocks.
 5. Revoke parsing/emission, including wrapped transaction sequence ordering.
+6. Mount-table/runtime labeling of journaled mounts as `ext3`.
 
 Key code paths:
 
@@ -70,7 +71,7 @@ All of the above are in `crates/fs/src/lib.rs` test module.
 
 - No full JBD transaction-handle model (credits, richer transaction state, abort semantics).
 - No ext3 mount option semantics (for example data mode selection).
-- No separate ext3 filesystem type; behavior is ext2 + optional internal journal handling.
+- No separate ext3 driver/API surface; behavior is still ext2 + optional internal journal handling (journaled mounts are currently surfaced as `ext3` in mount metadata).
 
 ### 2. Journal topology limits
 

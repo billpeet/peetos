@@ -21,7 +21,7 @@ This document describes the phase-5 VFS/filesystem implementation currently wire
 - Virtual filesystems backed by dedicated node behavior:
   - `devfs`: `/dev/null`, `/dev/zero`, `/dev/console`
   - `procfs`: `/proc/uptime`, `/proc/meminfo`, `/proc/mounts`, `/proc/version`
-- Mount table abstraction used by `/proc/mounts` (tmpfs/devfs/procfs baseline entries plus dynamic ext2 entry when mounted).
+- Mount table abstraction used by `/proc/mounts` (tmpfs/devfs/procfs baseline entries plus dynamic ext2/ext3 entry when mounted).
 - ext2 baseline importer:
   - `mount_ext2_block_backend(path, image_len, head)` mounts from a block backend without pre-reading or preallocating the full device image.
   - Block-backed ext2 uses a sparse per-block cache: blocks are loaded on first access and tracked as dirty by block index.
@@ -58,7 +58,7 @@ On initialization, the kernel creates:
   - `/dev/console`: opened as a console descriptor; kernel routes writes to serial (mirrored to framebuffer text when available) and reads through canonical line-buffered TTY input
 - `procfs` behavior:
   - `/proc/uptime` and `/proc/meminfo` are generated from runtime kernel stats
-  - `/proc/mounts` is generated from the mount table and reflects mounted ext2 entries
+  - `/proc/mounts` is generated from the mount table and reflects mounted ext2 entries (journaled mounts are surfaced as ext3)
   - proc files are read-only (`-EROFS` on write)
 - ext2 behavior:
   - Imported files/directories support baseline mutable regular-file and directory operations (`read`, `write`, `truncate`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`) through the existing VFS file APIs.
@@ -68,7 +68,7 @@ On initialization, the kernel creates:
   - ext2 directory entry growth now allocates additional directory data blocks through direct/indirect mappings.
   - `create`/`mkdir` allocate ext2 inodes/blocks, update inode/block bitmaps and free counters, and insert directory entries in parent directories.
   - inode metadata (`mode`, `uid`, `gid`, link count, basic timestamps) is tracked and surfaced via `stat` paths.
-  - `/proc/mounts` reports ext2 as `rw` when mounted.
+  - `/proc/mounts` reports non-journaled mounts as `ext2 rw` and journaled mounts as `ext3 rw`.
   - Mount import is rollback-safe: on parse/import failure, partially imported nodes are removed.
   - Ext2 mount now includes ext3 internal journal parsing and mount-time replay of committed transactions when recovery is required, then clears recover markers before exposing the mount.
   - For journaled mounts, dirty-block flushes now emit runtime journal descriptor/data/commit records before checkpointing home blocks.

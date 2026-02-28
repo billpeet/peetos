@@ -5784,6 +5784,12 @@ mod tests {
         assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 56);
         assert_eq!(read_u32_be(&ctx.image, journal_super_off + 28), 0);
 
+        let mounts = open("/proc/mounts", O_RDONLY, 0).expect("open /proc/mounts");
+        let mut mounts_buf = [0u8; 256];
+        let mounts_n = read(mounts.inode, 0, &mut mounts_buf).expect("read mounts");
+        let mounts_text = core::str::from_utf8(&mounts_buf[..mounts_n]).expect("utf8");
+        assert!(mounts_text.contains("ext3 /mnt/ext2 ext3 rw"));
+
         with_state(|state| {
             assert!(state.ext2_journal.present);
             assert_eq!(state.ext2_journal.inode, 8);

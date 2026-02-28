@@ -223,13 +223,15 @@ fn try_mount_ext2_from_block() -> bool {
             if fs::set_ext2_block_backend(backend).is_ok() {
                 let probe = core::slice::from_raw_parts(probe_ptr, PROBE_SIZE);
                 if fs::mount_ext2_block_backend(EXT2_MOUNT_POINT, image_len, probe).is_ok() {
+                    let fs_name = if fs::ext2_has_journal() { "ext3" } else { "ext2" };
                     EXT2_BLOCK_BACKING = Ext2BlockBacking {
                         active: true,
                         device_index: index,
                         image_len,
                     };
                     serial_println!(
-                        "[VFS] Mounted ext2 from block dev{} at {} ({} KiB, lazy cache)",
+                        "[VFS] Mounted {} from block dev{} at {} ({} KiB, lazy cache)",
+                        fs_name,
                         index,
                         EXT2_MOUNT_POINT,
                         image_len / 1024

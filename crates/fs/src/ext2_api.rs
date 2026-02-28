@@ -95,7 +95,12 @@ pub fn mount_ext2_block_backend(
         mount.atime = root.atime as u64;
         mount.mtime = root.mtime as u64;
         mount.ctime = root.ctime as u64;
-        if let Err(err) = mount_table_set(state, mount_inode, mount_path, "ext2", false) {
+        let fs_name = if state.ext2_journal.present {
+            "ext3"
+        } else {
+            "ext2"
+        };
+        if let Err(err) = mount_table_set(state, mount_inode, mount_path, fs_name, false) {
             rollback_ext2_mount_import(state, mount_inode);
             return Err(err);
         }
