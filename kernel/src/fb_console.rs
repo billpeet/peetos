@@ -256,6 +256,11 @@ impl FbConsoleState {
 static FB_CONSOLE: SpinLock<FbConsoleState> = SpinLock::new(FbConsoleState::unavailable());
 
 #[inline]
+fn console_active() -> bool {
+    crate::display_mode::console_active()
+}
+
+#[inline]
 fn tab_spaces(col: usize) -> usize {
     TAB_WIDTH - (col % TAB_WIDTH)
 }
@@ -1172,12 +1177,14 @@ pub fn init() {
     state.status_cwd_len = 1;
     ansi_reset(&mut state);
     let _ = refresh_status_path_cache(&mut state, true);
-    clear_screen(&state);
-    sync_cursor(&mut state);
+    if console_active() {
+        clear_screen(&state);
+        sync_cursor(&mut state);
+    }
 }
 
 pub fn write_bytes(bytes: &[u8]) {
-    if bytes.is_empty() {
+    if bytes.is_empty() || !console_active() {
         return;
     }
 
@@ -1194,6 +1201,9 @@ pub fn write_bytes(bytes: &[u8]) {
 }
 
 pub fn tick() {
+    if !console_active() {
+        return;
+    }
     let mut state = FB_CONSOLE.lock();
     if !state.initialized {
         return;
@@ -1217,7 +1227,30 @@ pub fn set_theme(preset: ThemePreset) {
     state.cursor_row = 0;
     let _ = refresh_status_path_cache(&mut state, true);
     ansi_reset(&mut state);
-    clear_screen(&state);
+    if console_active() {
+        clear_screen(&state);
+        sync_cursor(&mut state);
+    } else {
+        state.cursor_drawn = false;
+    }
+}
+
+pub fn set_active(active: bool, redraw: bool) {
+    let mut state = FB_CONSOLE.lock();
+    if !state.initialized {
+        return;
+    }
+
+    hide_cursor(&mut state);
+    state.cursor_drawn = false;
+    if !active {
+        return;
+    }
+
+    let _ = refresh_status_path_cache(&mut state, true);
+    if redraw {
+        clear_screen(&state);
+    }
     sync_cursor(&mut state);
 }
 

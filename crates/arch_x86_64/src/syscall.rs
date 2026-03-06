@@ -15,6 +15,12 @@ pub const RFLAGS_DF: u64 = 1 << 10;
 
 #[repr(C)]
 pub struct SyscallFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbp: u64,
+    pub rbx: u64,
     pub r9: u64,
     pub r8: u64,
     pub r10: u64,
@@ -108,21 +114,33 @@ syscall_entry:
     push r10
     push r8
     push r9
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
 
     mov rdi, rsp
     call syscall_handler
 
-    mov [rsp + 48], rax
-    mov r9, [rsp + 0]
-    mov r8, [rsp + 8]
-    mov r10, [rsp + 16]
-    mov rdx, [rsp + 24]
-    mov rsi, [rsp + 32]
-    mov rdi, [rsp + 40]
-    mov rax, [rsp + 48]
-    mov r11, [rsp + 56]
-    mov rcx, [rsp + 64]
-    mov rsp, [rsp + 72]
+    mov [rsp + 96], rax
+    mov r15, [rsp + 0]
+    mov r14, [rsp + 8]
+    mov r13, [rsp + 16]
+    mov r12, [rsp + 24]
+    mov rbp, [rsp + 32]
+    mov rbx, [rsp + 40]
+    mov r9, [rsp + 48]
+    mov r8, [rsp + 56]
+    mov r10, [rsp + 64]
+    mov rdx, [rsp + 72]
+    mov rsi, [rsp + 80]
+    mov rdi, [rsp + 88]
+    mov rax, [rsp + 96]
+    mov r11, [rsp + 104]
+    mov rcx, [rsp + 112]
+    mov rsp, [rsp + 120]
     swapgs
     sysretq
 
@@ -137,6 +155,6 @@ mod tests {
 
     #[test]
     fn syscall_frame_size() {
-        assert_eq!(size_of::<SyscallFrame>(), 80);
+        assert_eq!(size_of::<SyscallFrame>(), 128);
     }
 }

@@ -31,6 +31,7 @@ pub const USER_FD_KIND_PIPE: u8 = 3;
 pub const USER_FD_KIND_SOCKET: u8 = 4;
 pub const USER_FD_KIND_PTY_MASTER: u8 = 5;
 pub const USER_FD_KIND_PTY_SLAVE: u8 = 6;
+pub const USER_FD_KIND_EPOLL: u8 = 7;
 pub const USER_FD_NONE: u16 = u16::MAX;
 
 pub const CTTY_NONE: u8 = 0;
@@ -545,6 +546,31 @@ impl Task {
             sleep_until: 0,
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
+        }
+    }
+
+    pub(crate) fn install_for_test(slot: usize, task: *mut Task) {
+        assert!(slot < MAX_TASKS);
+        unsafe {
+            let was_empty = TASK_TABLE[slot].is_null();
+            TASK_TABLE[slot] = task;
+            if was_empty && !task.is_null() {
+                TASK_COUNT = TASK_COUNT.saturating_add(1);
+            } else if !was_empty && task.is_null() {
+                TASK_COUNT = TASK_COUNT.saturating_sub(1);
+            }
+            TASK_INITIALIZED = true;
+        }
+    }
+
+    pub(crate) fn reset_registry_for_test() {
+        unsafe {
+            for slot in TASK_TABLE.iter_mut() {
+                *slot = ptr::null_mut();
+            }
+            TASK_COUNT = 0;
+            NEXT_PID = 1;
+            TASK_INITIALIZED = true;
         }
     }
 }

@@ -160,6 +160,8 @@ enum NodeBackend {
     DevTty = 10,
     DevPtmx = 11,
     DevPtsSlave = 12,
+    DevFramebuffer = 13,
+    DevInputEvent = 14,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +172,7 @@ pub struct OpenResult {
     pub is_tty: bool,
     pub is_ptmx: bool,
     pub is_pts_slave: bool,
+    pub is_framebuffer: bool,
     pub pts_id: u16,
 }
 
@@ -235,6 +238,7 @@ struct Inode {
     children: [u16; VFS_MAX_CHILDREN],
     data: [u8; TMPFS_MAX_FILE_SIZE],
     ext2_ino: u32,
+    dev_id: u16,
     ext2_children_loaded: bool,
     mode: u16,
     uid: u16,
@@ -259,6 +263,7 @@ impl Inode {
             children: [0; VFS_MAX_CHILDREN],
             data: [0; TMPFS_MAX_FILE_SIZE],
             ext2_ino: 0,
+            dev_id: 0,
             ext2_children_loaded: false,
             mode: 0,
             uid: 0,
@@ -641,6 +646,7 @@ fn clear_inode(inode: &mut Inode) {
     inode.children.fill(0);
     inode.data.fill(0);
     inode.ext2_ino = 0;
+    inode.dev_id = 0;
     inode.ext2_children_loaded = false;
     inode.mode = 0;
     inode.uid = 0;
@@ -725,6 +731,18 @@ fn ensure_init(state: &mut VfsState) {
     let _ = create_virtual_file_inner(state, "/dev/urandom", NodeBackend::DevUrandom);
     let _ = create_virtual_file_inner(state, "/dev/tty", NodeBackend::DevTty);
     let _ = create_virtual_file_inner(state, "/dev/ptmx", NodeBackend::DevPtmx);
+    let _ = create_virtual_file_inner(state, "/dev/fb0", NodeBackend::DevFramebuffer);
+    let _ = mkdir_virtual_inner(state, "/dev/input");
+    if let Ok(inode) =
+        create_virtual_file_inner(state, "/dev/input/event0", NodeBackend::DevInputEvent)
+    {
+        state.inodes[inode as usize].dev_id = 0;
+    }
+    if let Ok(inode) =
+        create_virtual_file_inner(state, "/dev/input/event1", NodeBackend::DevInputEvent)
+    {
+        state.inodes[inode as usize].dev_id = 1;
+    }
 
     let _ = mkdir_virtual_inner(state, "/dev/pts");
     {
@@ -735,7 +753,7 @@ fn ensure_init(state: &mut VfsState) {
             // Safety: path_buf contains only ASCII digits prefixed by /dev/pts/
             let path = unsafe { core::str::from_utf8_unchecked(&path_buf[..path_len]) };
             if let Ok(inode) = create_virtual_file_inner(state, path, NodeBackend::DevPtsSlave) {
-                state.inodes[inode as usize].ext2_ino = pty_idx as u32;
+                state.inodes[inode as usize].dev_id = pty_idx;
             }
             pty_idx += 1;
         }
@@ -860,6 +878,7 @@ fn alloc_inode(
             inode.parent = parent;
             inode.name_len = name.len() as u8;
             inode.name[..name.len()].copy_from_slice(name);
+            inode.dev_id = 0;
             inode.ext2_children_loaded =
                 !(backend == NodeBackend::Ext2 && file_type == FileType::Directory);
             inode.mode = match file_type {
@@ -1243,7 +1262,9 @@ fn create_virtual_file_inner(
             | NodeBackend::DevUrandom
             | NodeBackend::DevTty
             | NodeBackend::DevPtmx
-            | NodeBackend::DevPtsSlave => (STAT_S_IFREG | 0o666) as u16,
+            | NodeBackend::DevPtsSlave
+            | NodeBackend::DevFramebuffer => (STAT_S_IFREG | 0o666) as u16,
+            NodeBackend::DevInputEvent => (STAT_S_IFREG | 0o444) as u16,
             _ => node.mode,
         };
     }
@@ -3779,7 +3800,9 @@ fn open_at_inner(
                 | NodeBackend::DevUrandom
                 | NodeBackend::DevTty
                 | NodeBackend::DevPtmx
-                | NodeBackend::DevPtsSlave => {}
+                | NodeBackend::DevPtsSlave
+                | NodeBackend::DevFramebuffer
+                | NodeBackend::DevInputEvent => {}
                 _ => return Err(EROFS),
             }
         }
@@ -3802,7 +3825,7 @@ fn open_at_inner(
     }
 
     let pts_id = if inode_backend == NodeBackend::DevPtsSlave {
-        state.inodes[inode_idx as usize].ext2_ino as u16
+        state.inodes[inode_idx as usize].dev_id
     } else {
         0
     };
@@ -3814,6 +3837,7 @@ fn open_at_inner(
         is_tty: inode_backend == NodeBackend::DevTty,
         is_ptmx: inode_backend == NodeBackend::DevPtmx,
         is_pts_slave: inode_backend == NodeBackend::DevPtsSlave,
+        is_framebuffer: inode_backend == NodeBackend::DevFramebuffer,
         pts_id,
     })
 }
@@ -4759,7 +4783,11 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
                 | NodeBackend::ProcMeminfo
                 | NodeBackend::ProcMounts
                 | NodeBackend::ProcVersion => read_proc(node, state, offset, dst)?,
-                NodeBackend::DevTty | NodeBackend::DevPtmx | NodeBackend::DevPtsSlave => 0,
+                NodeBackend::DevTty
+                | NodeBackend::DevPtmx
+                | NodeBackend::DevPtsSlave
+                | NodeBackend::DevFramebuffer
+                | NodeBackend::DevInputEvent => 0,
             }
         };
         touch_inode_metadata(state, inode, true, false, false);
@@ -4851,7 +4879,9 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
             | NodeBackend::DevUrandom
             | NodeBackend::DevTty
             | NodeBackend::DevPtmx
-            | NodeBackend::DevPtsSlave => {
+            | NodeBackend::DevPtsSlave
+            | NodeBackend::DevFramebuffer
+            | NodeBackend::DevInputEvent => {
                 let next = offset.saturating_add(src.len() as u64);
                 WriteResult {
                     written: src.len(),
@@ -4901,7 +4931,9 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
             | NodeBackend::DevUrandom
             | NodeBackend::DevTty
             | NodeBackend::DevPtmx
-            | NodeBackend::DevPtsSlave => current,
+            | NodeBackend::DevPtsSlave
+            | NodeBackend::DevFramebuffer
+            | NodeBackend::DevInputEvent => current,
         };
 
         let base = match whence {
@@ -4942,7 +4974,9 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
             | NodeBackend::DevUrandom
             | NodeBackend::DevTty
             | NodeBackend::DevPtmx
-            | NodeBackend::DevPtsSlave => {
+            | NodeBackend::DevPtsSlave
+            | NodeBackend::DevFramebuffer
+            | NodeBackend::DevInputEvent => {
                 if target > u64::MAX as i128 {
                     return Err(EINVAL);
                 }
@@ -4987,7 +5021,9 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
             | NodeBackend::DevUrandom
             | NodeBackend::DevTty
             | NodeBackend::DevPtmx
-            | NodeBackend::DevPtsSlave => 0,
+            | NodeBackend::DevPtsSlave
+            | NodeBackend::DevFramebuffer
+            | NodeBackend::DevInputEvent => 0,
         };
 
         Ok(size)
@@ -5096,6 +5132,32 @@ pub fn inode_backend_is_ext2(inode: u16) -> bool {
             return false;
         }
         state.inodes[inode as usize].backend == NodeBackend::Ext2
+    })
+}
+
+pub fn inode_is_framebuffer(inode: u16) -> bool {
+    with_state(|state| {
+        ensure_init(state);
+        if inode as usize >= VFS_MAX_INODES {
+            return false;
+        }
+        let node = &state.inodes[inode as usize];
+        node.used && node.backend == NodeBackend::DevFramebuffer
+    })
+}
+
+pub fn inode_input_device_id(inode: u16) -> Option<u16> {
+    with_state(|state| {
+        ensure_init(state);
+        if inode as usize >= VFS_MAX_INODES {
+            return None;
+        }
+        let node = &state.inodes[inode as usize];
+        if node.used && node.backend == NodeBackend::DevInputEvent {
+            Some(node.dev_id)
+        } else {
+            None
+        }
     })
 }
 
@@ -5633,6 +5695,37 @@ mod tests {
 
         let console = open("/dev/console", O_RDWR, 0).expect("open /dev/console");
         assert!(console.is_console);
+    }
+
+    #[test]
+    fn dev_fb0_reports_framebuffer_open_and_mode() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let fb = open("/dev/fb0", O_RDWR, 0).expect("open /dev/fb0");
+        assert!(fb.is_framebuffer);
+        assert!(!fb.is_console);
+        assert!(inode_is_framebuffer(fb.inode));
+
+        let st = stat(fb.inode).expect("stat /dev/fb0");
+        assert_eq!(st.mode & STAT_S_IFMT, STAT_S_IFREG);
+        assert_eq!(st.mode & 0o666, 0o666);
+    }
+
+    #[test]
+    fn dev_input_events_are_present_with_stable_ids() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let kbd = open("/dev/input/event0", O_RDONLY, 0).expect("open event0");
+        let ptr = open("/dev/input/event1", O_RDONLY, 0).expect("open event1");
+
+        assert_eq!(inode_input_device_id(kbd.inode), Some(0));
+        assert_eq!(inode_input_device_id(ptr.inode), Some(1));
+
+        let st = stat(kbd.inode).expect("stat event0");
+        assert_eq!(st.mode & STAT_S_IFMT, STAT_S_IFREG);
+        assert_eq!(st.mode & 0o444, 0o444);
     }
 
     #[test]

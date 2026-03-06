@@ -63,6 +63,8 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
 **Keyboard + TTY Input Baseline**
 - Keyboard IRQ1 is registered in the IDT and unmasked on the PIC during bring-up.
 - PS/2 set-1 scancodes are decoded with basic modifier handling (left/right shift, caps lock, printable keys, backspace, enter).
+- The same decode path now also feeds `/dev/input/event0` with evdev-style
+  `EV_KEY` records plus `SYN_REPORT`.
 - Decoded bytes are fed into a kernel TTY line buffer:
   - canonical mode only (input is committed on newline)
   - basic backspace editing in the pending line
@@ -76,9 +78,15 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
   - button state bits (left/right/middle)
   - signed relative motion (`dx`/`dy`)
   - overflow rejection and first-byte sync-bit resynchronization
+- Decoded pointer activity now also feeds `/dev/input/event1`:
+  - PS/2 packets emit `EV_REL` (`REL_X`, `REL_Y`) plus `EV_KEY` button changes
+  - USB tablet absolute updates emit `EV_ABS` (`ABS_X`, `ABS_Y`) plus button changes
+  - each packet/report ends with `SYN_REPORT`
+  - queue overflow is reported with `SYN_DROPPED` on the next successfully queued packet
 - Motion deltas are accumulated in IRQ context and applied in the main loop to a software framebuffer cursor.
 - Cursor rendering uses save/restore of covered pixels and clamps movement to screen bounds.
 - Framebuffer console writes/ticks temporarily hide the cursor and redraw it after updates so text rendering and cursor overlay stay coherent.
+- `KERNEL_FEATURES=compositor-first` disables kernel cursor composition and framebuffer-console updates so userspace can own the display without kernel redraw interference; fatal panic/exception paths and init-launch failure reactivate the kernel console fallback.
 
 **USB UHCI Tablet Baseline**
 - Feature-gated behind `KERNEL_FEATURES=usb-tablet` so default builds stay minimal and the optional UHCI path remains opt-in.
@@ -87,6 +95,19 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
 - HID configuration parsing selects an interrupt-IN endpoint and a report descriptor parser extracts absolute X/Y + button fields when possible.
 - On successful enumeration, USB interrupt-IN polling drives `mouse::set_absolute_position(...)` for absolute framebuffer cursor updates.
 - Relative PS/2 cursor motion is disabled while USB tablet mode is active to avoid mixed-input drift.
+
+**Userspace Input Device ABI**
+- `devfs` now exposes:
+  - `/dev/input/event0` for keyboard
+  - `/dev/input/event1` for pointer
+- Records use a fixed 24-byte layout:
+  - `tv_sec: i64`
+  - `tv_usec: i64`
+  - `type: u16`
+  - `code: u16`
+  - `value: i32`
+- Timestamps are sourced from monotonic PIT uptime.
+- `read` is packet-preserving at event-record granularity, nonblocking empty reads return `-EAGAIN`, and readiness is wired through `poll`/`select`/`epoll` as `POLLIN`.
 
 **Framebuffer Baseline**
 - Bootloader-provided VESA handoff structures are consumed from fixed higher-half addresses:
@@ -109,7 +130,11 @@ Limitations / Simplifications
 - Hotplug, power management, and controller reset/error-recovery flows are minimal.
 - Keyboard input is US-layout set-1 only; extended keys and key-repeat handling are minimal.
 - Mouse support is baseline PS/2 packet mode plus a minimal UHCI USB HID-tablet absolute-input path; there is no generic USB hub stack, transfer scheduler, or broad HID-class coverage yet.
+- Input-event ABI coverage is intentionally narrow: fixed `event0`/`event1`
+  numbering, no `EVIOC*` capability ioctls, no hotplug, and no multi-seat or
+  focus-routing policy yet.
 - Cursor composition is software-only over the shared framebuffer; there is no true hardware cursor plane, alpha blending, or z-order compositor yet.
+- Display ownership is still coarse-grained: the current model is console-or-compositor with a kernel-internal mode switch, not a runtime userspace lock/lease ABI.
 - TTY is canonical-line buffered only; no `termios`, ptys, or virtual terminal switching yet.
 - Framebuffer currently assumes packed 32-bpp layout and does not yet decode VBE color masks.
 - Framebuffer text rendering is still baseline: serial output is mirrored into a fixed 8x16 bitmap text grid with terminal panel styling, preset themes, a blinking cursor, and partial ANSI/SGR handling (16-color fg/bg + bold/default), but full VT emulation is not implemented.

@@ -9,12 +9,14 @@ use core::panic::PanicInfo;
 
 mod arp;
 mod block;
+mod display_mode;
 mod e1000;
 mod elf;
 mod ethernet;
 mod exception;
 mod framebuffer;
 mod icmp;
+mod input;
 mod ipc;
 mod ipv4;
 mod keyboard;
@@ -46,6 +48,7 @@ mod fb_console;
 #[cfg(feature = "test-exit")]
 mod fb_console {
     pub fn init() {}
+    pub fn set_active(_active: bool, _redraw: bool) {}
     pub fn tick() {}
     pub fn write_bytes(_bytes: &[u8]) {}
 }
@@ -66,11 +69,20 @@ pub extern "C" fn kmain() -> ! {
     serial_println!("PeetOS Rust kernel: serial online");
 
     framebuffer::init();
+    let display_owner = display_mode::init(framebuffer::is_available());
     fb_console::init();
     if framebuffer::is_available() {
         serial_println!("[FB] Active");
     } else {
         serial_println!("[FB] Unavailable (VGA fallback)");
+    }
+    match display_owner {
+        display_mode::DisplayOwner::Console => {
+            serial_println!("[GUI] Display owner: console");
+        }
+        display_mode::DisplayOwner::Compositor => {
+            serial_println!("[GUI] Display owner: compositor-first");
+        }
     }
 
     gdt::init();
@@ -92,6 +104,9 @@ pub extern "C" fn kmain() -> ! {
 
     pit::init();
     serial_println!("[PIT] Initialized");
+
+    input::init();
+    serial_println!("[INPUT] Initialized");
 
     tty::init();
     serial_println!("[TTY] Initialized");
@@ -166,7 +181,15 @@ pub extern "C" fn kmain() -> ! {
     idt::set_post_handler_hook(sched::isr_hook);
 
     #[cfg(not(feature = "test-exit"))]
-    user::spawn_init();
+    let init_started = user::spawn_init();
+    #[cfg(feature = "test-exit")]
+    let init_started = true;
+    if !init_started && display_mode::compositor_active() {
+        display_mode::activate_console();
+        fb_console::set_active(true, true);
+        mouse::sync_display_owner();
+        serial_println!("[GUI] Init launch failed; framebuffer ownership returned to console");
+    }
 
     arch_syscall::init();
     syscall::init();
@@ -195,6 +218,9 @@ pub extern "C" fn kmain() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial::init();
+    display_mode::activate_console();
+    fb_console::set_active(true, true);
+    mouse::sync_display_owner();
     serial_println!("KERNEL PANIC: {}", info);
 
     loop {
@@ -209,6 +235,9 @@ extern "C" fn default_exception_handler(frame: &mut idt::InterruptFrame) {
     if exception::handle(frame) {
         return;
     }
+    display_mode::activate_console();
+    fb_console::set_active(true, true);
+    mouse::sync_display_owner();
     exception::report(frame);
 
     loop {

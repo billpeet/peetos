@@ -25,7 +25,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `docs/PORTING_PLAN.md` Current status and forward roadmap.
 - `docs/` Subsystem documentation.
 
-## Current Status (Last reviewed: 2026-02-28)
+## Current Status (Last reviewed: 2026-03-07)
 
 - Boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a `hlt` loop.
 - Panic handler prints over serial, then halts with `cli; hlt`.
@@ -36,12 +36,19 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - ELF loading is hardened (header/segment validation, malformed `PT_INTERP` rejection, RWX rejection, entrypoint checks) with NXE enabled.
 - User bootstrap supports a minimal `PT_INTERP` flow (`AT_ENTRY`/`AT_BASE`) and Linux-style initial stack (`argc`/`argv`/`envp`/`auxv`).
 - Syscall dispatch is table-driven and shared by SYSCALL/int80 paths. Implemented syscalls include file/VFS operations, process control (`fork`/`clone`/`vfork`/`wait4`), VM mapping (`mmap`/`mprotect`/`munmap`), IPC (`pipe`/`futex`/`shm*`), signals (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`kill`), and core identity/time/process-group calls.
+- Shared-buffer primitive baseline now includes `memfd_create` (tmpfs-backed internal namespace objects with `MFD_CLOEXEC`; sealing flags currently return `-ENOSYS`).
+- Event-loop primitive baseline now includes level-triggered `epoll_create1`/`epoll_ctl`/`epoll_wait` (`EPOLL_CLOEXEC`, `ADD`/`MOD`/`DEL`, timeout wait, `-EINTR` interruption path).
+- Socket coverage includes `AF_INET` networking plus baseline `AF_UNIX` local stream support (`socket`, `socketpair`, pathname `bind`/`connect`/`listen`/`accept`), with `SCM_RIGHTS` fd passing in `sendmsg`/`recvmsg`.
+- AF_UNIX/SCM_RIGHTS now has a dedicated QEMU smoke target (`run-unix-rights-smoke`) covering cross-process fd transfer and key negative paths.
 - File-backed `MAP_SHARED` mappings support dirty tracking and writeback via `msync`/`sync`/`fsync`; user-page allocation includes a best-effort reclaim pass for reclaim-safe file-backed pages.
 - VFS now mounts block-backed ext2/ext3 at `/` (root) with Linux-like mountpoints (`/boot`, `/temp`, `/dev`, `/proc`), with `/etc/fstab` declaring the root block mount as `ext3` and preserving a `/mnt/ext2` compatibility path alias when root ext2 is active.
 - ext2 includes mutable file/dir operations, direct+indirect block mapping (single/double/triple), truncate growth/shrink, lazy directory population, sparse block cache with CLOCK eviction, and block-cache sync/flush integration.
 - Journaled ext mounts are surfaced as `ext3` and include internal-journal parse/replay + runtime descriptor/data/commit/revoke emission with wrap-aware sequencing, plus baseline runtime abort-on-I/O-fault handling.
 - PCI enumeration is active in `crates/drivers`; storage bring-up includes AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write, ATA PIO `IDENTIFY`, and block-device inventory.
 - Keyboard/TTY input, PS/2 mouse cursor movement, optional UHCI USB tablet absolute input, and framebuffer text mirroring are wired.
+- Phase 3 GUI bring-up has started with a baseline display device ABI: `devfs` now exposes `/dev/fb0`, `ioctl(FBIOGETINFO)` (`0x5001`) returns framebuffer geometry/format metadata (`width`, `height`, `pitch`, `bpp`, `format`, `map_size`), and userspace can `mmap` the framebuffer with direct shared visibility for compositor-style redraw loops.
+- Phase 3 input ABI is now present: `devfs` exposes `/dev/input/event0` (keyboard) and `/dev/input/event1` (pointer) with 24-byte evdev-style records, nonblocking `read`, `poll`/`select`/`epoll` readiness, and `SYN_DROPPED` overflow signalling.
+- Phase 3 display ownership gating is now explicit: default boots stay console-first, while `KERNEL_FEATURES=compositor-first` suppresses kernel framebuffer console/cursor composition so a userspace compositor can own `/dev/fb0`; init-launch failure and fatal panic/exception paths reactivate a visible kernel console fallback.
 - Userspace bootstrap is active via musl + toybox, with runtime smoke paths for shell, ping, QuickJS, MicroPython, and Dropbear.
 
 ## Documentation
@@ -56,6 +63,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `docs/ipc.md` Synchronization primitives and IPC baseline (`pipe`/`futex`/`shm*`/`signal`).
 - `docs/drivers.md` PCI/storage/input/framebuffer driver status.
 - `docs/framebuffer.md` Framebuffer handoff, mapping model, console rendering, and cursor path.
+- `docs/gui_wayland_plan.md` Living GUI roadmap and staged plan toward Wayland compatibility.
 - `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.
 - `docs/subsystems.md` Subsystem crate status and intended usage.
 - `docs/musl.md` musl bootstrap workflow and current limitations.
@@ -104,6 +112,7 @@ Notes:
 - AHCI disk0 is `build/peetos.img`; AHCI disk1 is `user/sample_ext2_musl.img`.
 - Use `make run-current` to boot the current image without rebuilding.
 - Use `make run-image` to force rebuild then boot.
+- `KERNEL_FEATURES=compositor-first` is an explicit Phase 3 display-ownership profile. It only changes kernel framebuffer ownership/handoff today, so pair it with a userspace framebuffer client or compositor-oriented init profile rather than the default shell profile.
 
 Regenerate the sample ext2 image used by host-side fs tests:
 
@@ -130,6 +139,7 @@ scripts/build_toybox_sh.sh
 scripts/build_toybox_core.sh
 scripts/run_toybox_next_smoke.sh
 scripts/run_toybox_ping_smoke.sh
+scripts/run_toybox_unix_rights_smoke.sh
 ```
 
 quickjs:
@@ -163,6 +173,7 @@ make run-shell
 make run-shell-smoke
 make run-tablet
 make run-ping-smoke
+make run-unix-rights-smoke
 make run-quickjs-smoke
 make run-micropython-smoke
 make run-dropbear-smoke

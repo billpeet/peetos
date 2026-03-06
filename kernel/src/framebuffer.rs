@@ -1,3 +1,5 @@
+use arch_x86_64::addr::PAGE_SIZE;
+
 use crate::sync::SpinLock;
 
 const VESA_MODE_INFO_ADDR: usize = 0xFFFF_FFFF_8000_0A00;
@@ -39,6 +41,19 @@ impl FramebufferInfo {
             buffer_virt: 0,
         }
     }
+}
+
+pub const FBDEV_FORMAT_XRGB8888: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FramebufferDeviceInfo {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u32,
+    pub format: u32,
+    pub map_size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -99,6 +114,55 @@ fn framebuffer_geometry_valid(pitch: u16, width: u16, height: u16, bpp: u8) -> b
 
 fn framebuffer_bytes_required(pitch: u16, height: u16) -> Option<u64> {
     (pitch as u64).checked_mul(height as u64)
+}
+
+fn framebuffer_device_info_from(info: FramebufferInfo) -> Option<FramebufferDeviceInfo> {
+    if !info.available {
+        return None;
+    }
+    let map_size = framebuffer_bytes_required(info.pitch, info.height)?;
+    if map_size == 0 {
+        return None;
+    }
+    Some(FramebufferDeviceInfo {
+        width: info.width as u32,
+        height: info.height as u32,
+        pitch: info.pitch as u32,
+        bpp: info.bpp as u32,
+        format: FBDEV_FORMAT_XRGB8888,
+        map_size,
+    })
+}
+
+fn framebuffer_mappable_size_from(info: FramebufferInfo) -> Option<u64> {
+    if !info.available {
+        return None;
+    }
+    let map_size = framebuffer_bytes_required(info.pitch, info.height)?;
+    let page_mask = PAGE_SIZE - 1;
+    map_size.checked_add(page_mask).map(|v| v & !page_mask)
+}
+
+fn framebuffer_mmap_range_valid(info: FramebufferInfo, offset: u64, len: u64) -> bool {
+    if (offset & (PAGE_SIZE - 1)) != 0 || len == 0 {
+        return false;
+    }
+    let map_end = match framebuffer_mappable_size_from(info) {
+        Some(v) => v,
+        None => return false,
+    };
+    let end = match offset.checked_add(len) {
+        Some(v) => v,
+        None => return false,
+    };
+    end <= map_end
+}
+
+fn framebuffer_mmap_phys_page_from(info: FramebufferInfo, offset: u64) -> Option<u64> {
+    if !framebuffer_mmap_range_valid(info, offset, PAGE_SIZE) {
+        return None;
+    }
+    (info.phys_addr as u64).checked_add(offset)
 }
 
 fn mapping_fits_window(phys_addr: u32, bytes_required: u64) -> bool {
@@ -180,6 +244,22 @@ pub fn info() -> FramebufferInfo {
 
 pub fn is_available() -> bool {
     info().available
+}
+
+pub fn device_info() -> Option<FramebufferDeviceInfo> {
+    framebuffer_device_info_from(info())
+}
+
+pub fn mmap_size() -> Option<u64> {
+    framebuffer_mappable_size_from(info())
+}
+
+pub fn mmap_range_valid(offset: u64, len: u64) -> bool {
+    framebuffer_mmap_range_valid(info(), offset, len)
+}
+
+pub fn mmap_phys_page(offset: u64) -> Option<u64> {
+    framebuffer_mmap_phys_page_from(info(), offset)
 }
 
 pub fn set_pixel(x: u32, y: u32, color: u32) -> bool {
@@ -296,5 +376,90 @@ mod tests {
         assert!(!framebuffer_geometry_valid(5116, 1280, 1024, 32));
         assert!(!framebuffer_geometry_valid(5120, 1280, 1024, 24));
         assert!(!framebuffer_geometry_valid(4096, 4096, 9000, 32));
+    }
+
+    #[test]
+    fn device_info_maps_probe_geometry() {
+        let info = FramebufferInfo {
+            available: true,
+            mode: 0x118,
+            phys_addr: 0xFD00_0000,
+            width: 1280,
+            height: 1024,
+            pitch: 5120,
+            bpp: 32,
+            buffer_virt: 0xFFFF_FFFF_8800_0000,
+        };
+        let exported = framebuffer_device_info_from(info).expect("exported info");
+        assert_eq!(exported.width, 1280);
+        assert_eq!(exported.height, 1024);
+        assert_eq!(exported.pitch, 5120);
+        assert_eq!(exported.bpp, 32);
+        assert_eq!(exported.format, FBDEV_FORMAT_XRGB8888);
+        assert_eq!(exported.map_size, 5_242_880);
+    }
+
+    #[test]
+    fn device_info_rejects_unavailable_probe() {
+        assert!(framebuffer_device_info_from(FramebufferInfo::unavailable()).is_none());
+    }
+
+    #[test]
+    fn mmap_size_rounds_up_to_full_pages() {
+        let info = FramebufferInfo {
+            available: true,
+            mode: 0x118,
+            phys_addr: 0xFD00_0000,
+            width: 100,
+            height: 10,
+            pitch: 400,
+            bpp: 32,
+            buffer_virt: 0xFFFF_FFFF_8800_0000,
+        };
+        assert_eq!(
+            framebuffer_bytes_required(info.pitch, info.height),
+            Some(4_000)
+        );
+        assert_eq!(framebuffer_mappable_size_from(info), Some(PAGE_SIZE));
+    }
+
+    #[test]
+    fn mmap_range_validation_enforces_page_alignment_and_bounds() {
+        let info = FramebufferInfo {
+            available: true,
+            mode: 0x118,
+            phys_addr: 0xFD00_0000,
+            width: 100,
+            height: 10,
+            pitch: 400,
+            bpp: 32,
+            buffer_virt: 0xFFFF_FFFF_8800_0000,
+        };
+
+        assert!(framebuffer_mmap_range_valid(info, 0, PAGE_SIZE));
+        assert!(!framebuffer_mmap_range_valid(info, 1, PAGE_SIZE));
+        assert!(!framebuffer_mmap_range_valid(info, 0, 0));
+        assert!(!framebuffer_mmap_range_valid(info, PAGE_SIZE, PAGE_SIZE));
+    }
+
+    #[test]
+    fn mmap_phys_page_tracks_page_aligned_offsets() {
+        let info = FramebufferInfo {
+            available: true,
+            mode: 0x118,
+            phys_addr: 0xFD00_0000,
+            width: 1280,
+            height: 1024,
+            pitch: 5120,
+            bpp: 32,
+            buffer_virt: 0xFFFF_FFFF_8800_0000,
+        };
+
+        assert_eq!(framebuffer_mmap_phys_page_from(info, 0), Some(0xFD00_0000));
+        assert_eq!(
+            framebuffer_mmap_phys_page_from(info, PAGE_SIZE),
+            Some(0xFD00_1000)
+        );
+        assert_eq!(framebuffer_mmap_phys_page_from(info, 123), None);
     }
 }

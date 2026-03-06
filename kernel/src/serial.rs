@@ -5,6 +5,9 @@ use core::fmt::Write;
 
 use arch_x86_64::port::{inb, outb};
 
+#[cfg(test)]
+use std::io::{self, Write as _};
+
 const COM1_BASE: u16 = 0x3F8;
 
 fn write_str_with_crlf<F: FnMut(u8)>(s: &str, mut write: F) {
@@ -80,10 +83,17 @@ pub fn init() {
     unsafe { SERIAL1.init() };
 }
 
+#[cfg(not(test))]
 pub fn _print(args: fmt::Arguments) {
     unsafe {
         let _ = SERIAL1.write_fmt(args);
     }
+}
+
+#[cfg(test)]
+pub fn _print(args: fmt::Arguments) {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_fmt(args);
 }
 
 /// ANSI escape stripping state for serial output.
@@ -124,6 +134,7 @@ fn ansi_filter(state: &mut AnsiFilterState, byte: u8) -> bool {
     }
 }
 
+#[cfg(not(test))]
 pub fn write_bytes(bytes: &[u8]) {
     // Send raw bytes to framebuffer console (ANSI-aware rendering)
     crate::mouse::begin_framebuffer_update();
@@ -143,6 +154,12 @@ pub fn write_bytes(bytes: &[u8]) {
             SERIAL1.write_byte(byte);
         }
     }
+}
+
+#[cfg(test)]
+pub fn write_bytes(bytes: &[u8]) {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(bytes);
 }
 
 #[macro_export]

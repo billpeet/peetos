@@ -94,3 +94,9 @@ This order is enforced in `kernel/src/main.rs`.
 **Status Notes**
 - PMM and VMM are functional but still conservative about large pages.
 - Heap is suitable for early kernel allocations; there is no slab/buddy layer yet.
+- Shared-buffer bring-up now includes `memfd_create` tmpfs-backed fd objects for
+  userspace sharing workflows, plus baseline writable shared `mmap`
+  reliability for compositor/client buffer exchange; per-task VMA mapping
+  coverage now has an explicit hardening cap (currently 8192 pages / 32 MiB
+  virtual range) while broader VM policy work remains tracked separately in the
+  GUI roadmap.

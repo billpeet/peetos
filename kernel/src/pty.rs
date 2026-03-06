@@ -12,7 +12,6 @@ const PTY_WAKE_BATCH: usize = 8;
 const EAGAIN: i64 = 11;
 const ENOSPC: i64 = 28;
 const EIO: i64 = 5;
-const EINVAL: i64 = 22;
 
 #[derive(Clone, Copy)]
 struct Waiter {
@@ -182,7 +181,12 @@ fn valid_pty(state: &PtyState, id: u16) -> bool {
     (id as usize) < PTY_MAX && state.entries[id as usize].in_use
 }
 
-pub fn master_read(task: *mut Task, pty_id: u16, out: &mut [u8]) -> Result<usize, i64> {
+pub fn master_read(
+    task: *mut Task,
+    pty_id: u16,
+    out: &mut [u8],
+    nonblocking: bool,
+) -> Result<usize, i64> {
     if out.is_empty() {
         return Ok(0);
     }
@@ -205,6 +209,10 @@ pub fn master_read(task: *mut Task, pty_id: u16, out: &mut [u8]) -> Result<usize
                 return Ok(0);
             }
 
+            if nonblocking {
+                return Err(EAGAIN);
+            }
+
             if !can_block(task) {
                 return Ok(0);
             }
@@ -220,7 +228,12 @@ pub fn master_read(task: *mut Task, pty_id: u16, out: &mut [u8]) -> Result<usize
     }
 }
 
-pub fn master_write(_task: *mut Task, pty_id: u16, data: &[u8]) -> Result<usize, i64> {
+pub fn master_write(
+    _task: *mut Task,
+    pty_id: u16,
+    data: &[u8],
+    _nonblocking: bool,
+) -> Result<usize, i64> {
     if data.is_empty() {
         return Ok(0);
     }
@@ -327,7 +340,12 @@ pub fn slave_open(pty_id: u16) -> Result<(), i64> {
     Ok(())
 }
 
-pub fn slave_read(task: *mut Task, pty_id: u16, out: &mut [u8]) -> Result<usize, i64> {
+pub fn slave_read(
+    task: *mut Task,
+    pty_id: u16,
+    out: &mut [u8],
+    nonblocking: bool,
+) -> Result<usize, i64> {
     if out.is_empty() {
         return Ok(0);
     }
@@ -356,6 +374,10 @@ pub fn slave_read(task: *mut Task, pty_id: u16, out: &mut [u8]) -> Result<usize,
                 return Ok(0);
             }
 
+            if nonblocking {
+                return Err(EAGAIN);
+            }
+
             if !can_block(task) {
                 return Ok(0);
             }
@@ -371,12 +393,18 @@ pub fn slave_read(task: *mut Task, pty_id: u16, out: &mut [u8]) -> Result<usize,
     }
 }
 
-pub fn slave_write(task: *mut Task, pty_id: u16, data: &[u8]) -> Result<usize, i64> {
+pub fn slave_write(
+    task: *mut Task,
+    pty_id: u16,
+    data: &[u8],
+    nonblocking: bool,
+) -> Result<usize, i64> {
     let _ = task;
     if data.is_empty() {
         return Ok(0);
     }
 
+    let mut written = 0usize;
     let mut wake_master = false;
 
     {
@@ -392,8 +420,15 @@ pub fn slave_write(task: *mut Task, pty_id: u16, data: &[u8]) -> Result<usize, i
 
         for &byte in data {
             if !entry.master_buf_push_byte(byte) {
+                if nonblocking {
+                    if written == 0 {
+                        return Err(EAGAIN);
+                    }
+                    break;
+                }
                 break;
             }
+            written += 1;
             wake_master = true;
         }
     }
@@ -402,7 +437,7 @@ pub fn slave_write(task: *mut Task, pty_id: u16, data: &[u8]) -> Result<usize, i
         wake_master_waiters(pty_id);
     }
 
-    Ok(data.len())
+    Ok(written)
 }
 
 pub fn slave_close(pty_id: u16) {
@@ -650,10 +685,10 @@ mod tests {
         slave_open(id).expect("slave open");
 
         // Master writes "hello\n" → line discipline processes → slave reads
-        master_write(ptr::null_mut(), id, b"hello\n").expect("master write");
+        master_write(ptr::null_mut(), id, b"hello\n", false).expect("master write");
 
         let mut out = [0u8; 32];
-        let n = slave_read(ptr::null_mut(), id, &mut out).expect("slave read");
+        let n = slave_read(ptr::null_mut(), id, &mut out, false).expect("slave read");
         assert_eq!(&out[..n], b"hello\n");
 
         slave_close(id);
@@ -670,10 +705,10 @@ mod tests {
         slave_open(id).expect("slave open");
 
         // Slave writes directly to master_buf
-        slave_write(ptr::null_mut(), id, b"output data").expect("slave write");
+        slave_write(ptr::null_mut(), id, b"output data", false).expect("slave write");
 
         let mut out = [0u8; 32];
-        let n = master_read(ptr::null_mut(), id, &mut out).expect("master read");
+        let n = master_read(ptr::null_mut(), id, &mut out, false).expect("master read");
         assert_eq!(&out[..n], b"output data");
 
         slave_close(id);
@@ -690,10 +725,10 @@ mod tests {
         slave_open(id).expect("slave open");
 
         // Master writes "a" → echo 'a' goes to master_buf
-        master_write(ptr::null_mut(), id, b"a").expect("master write");
+        master_write(ptr::null_mut(), id, b"a", false).expect("master write");
 
         let mut out = [0u8; 32];
-        let n = master_read(ptr::null_mut(), id, &mut out).expect("master read");
+        let n = master_read(ptr::null_mut(), id, &mut out, false).expect("master read");
         assert_eq!(&out[..n], b"a"); // echo of 'a'
 
         slave_close(id);
@@ -710,16 +745,16 @@ mod tests {
         slave_open(id).expect("slave open");
 
         // Type some chars then Ctrl-C
-        master_write(ptr::null_mut(), id, b"abc").expect("write");
-        master_write(ptr::null_mut(), id, &[0x03]).expect("ctrl-c");
+        master_write(ptr::null_mut(), id, b"abc", false).expect("write");
+        master_write(ptr::null_mut(), id, &[0x03], false).expect("ctrl-c");
 
         // Slave should have no data (line was discarded)
         let mut out = [0u8; 32];
-        let n = slave_read(ptr::null_mut(), id, &mut out).expect("read");
+        let n = slave_read(ptr::null_mut(), id, &mut out, false).expect("read");
         assert_eq!(n, 0);
 
         // Master should see echo: "abc^C\r\n"
-        let n = master_read(ptr::null_mut(), id, &mut out).expect("master read");
+        let n = master_read(ptr::null_mut(), id, &mut out, false).expect("master read");
         assert_eq!(&out[..n], b"abc^C\r\n");
 
         slave_close(id);
@@ -739,7 +774,7 @@ mod tests {
 
         // Slave read should return 0 (EOF)
         let mut out = [0u8; 32];
-        let n = slave_read(ptr::null_mut(), id, &mut out).expect("read");
+        let n = slave_read(ptr::null_mut(), id, &mut out, false).expect("read");
         assert_eq!(n, 0);
 
         slave_close(id);
@@ -765,5 +800,59 @@ mod tests {
         assert!(is_in_use(id)); // slave still holds
         slave_close(id); // slave_refs=0, both zero → freed
         assert!(!is_in_use(id));
+    }
+
+    #[test]
+    fn nonblocking_master_read_returns_eagain_when_empty() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+
+        let id = pty_alloc().expect("alloc");
+        unlock(id);
+        slave_open(id).expect("slave open");
+
+        let mut out = [0u8; 8];
+        let err = master_read(ptr::null_mut(), id, &mut out, true).unwrap_err();
+        assert_eq!(err, EAGAIN);
+
+        slave_close(id);
+        master_close(id);
+    }
+
+    #[test]
+    fn nonblocking_slave_read_returns_eagain_when_empty() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+
+        let id = pty_alloc().expect("alloc");
+        unlock(id);
+        slave_open(id).expect("slave open");
+
+        let mut out = [0u8; 8];
+        let err = slave_read(ptr::null_mut(), id, &mut out, true).unwrap_err();
+        assert_eq!(err, EAGAIN);
+
+        slave_close(id);
+        master_close(id);
+    }
+
+    #[test]
+    fn nonblocking_slave_write_returns_eagain_when_master_buf_full() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+
+        let id = pty_alloc().expect("alloc");
+        unlock(id);
+        slave_open(id).expect("slave open");
+
+        let fill = [0xCDu8; PTY_BUF_SIZE];
+        let n = slave_write(ptr::null_mut(), id, &fill, false).expect("fill");
+        assert_eq!(n, PTY_BUF_SIZE);
+
+        let err = slave_write(ptr::null_mut(), id, b"x", true).unwrap_err();
+        assert_eq!(err, EAGAIN);
+
+        slave_close(id);
+        master_close(id);
     }
 }

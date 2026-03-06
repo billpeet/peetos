@@ -187,6 +187,12 @@ static RELATIVE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 #[cfg(target_os = "none")]
 #[inline]
+fn cursor_compositing_enabled() -> bool {
+    crate::display_mode::console_active()
+}
+
+#[cfg(target_os = "none")]
+#[inline]
 fn pixel_offset(fb: framebuffer::FramebufferInfo, x: usize, y: usize) -> Option<usize> {
     if x >= fb.width as usize || y >= fb.height as usize {
         return None;
@@ -431,7 +437,9 @@ fn initialize_cursor() {
         state.max_x = max_x;
         state.max_y = max_y;
         state.buttons = 0;
-        draw_cursor(&mut state);
+        if cursor_compositing_enabled() {
+            draw_cursor(&mut state);
+        }
     });
 }
 
@@ -440,6 +448,7 @@ fn queue_packet(packet: MousePacket) {
     PENDING_DX.fetch_add(packet.dx as i32, Ordering::Relaxed);
     PENDING_DY.fetch_add(packet.dy as i32, Ordering::Relaxed);
     BUTTON_STATE.store(packet.buttons, Ordering::Relaxed);
+    crate::input::push_pointer_relative(packet.dx, packet.dy, packet.buttons);
 }
 
 #[cfg(target_os = "none")]
@@ -503,6 +512,9 @@ pub fn init() {}
 
 #[cfg(target_os = "none")]
 pub fn begin_framebuffer_update() {
+    if !cursor_compositing_enabled() {
+        return;
+    }
     with_cursor_state(hide_cursor);
 }
 
@@ -511,6 +523,9 @@ pub fn begin_framebuffer_update() {}
 
 #[cfg(target_os = "none")]
 pub fn end_framebuffer_update() {
+    if !cursor_compositing_enabled() {
+        return;
+    }
     with_cursor_state(draw_cursor);
 }
 
@@ -527,10 +542,24 @@ pub fn tick() {
     let dx = PENDING_DX.swap(0, Ordering::AcqRel);
     let dy = PENDING_DY.swap(0, Ordering::AcqRel);
     let buttons = BUTTON_STATE.load(Ordering::Acquire);
+    let compositing_enabled = cursor_compositing_enabled();
 
     with_cursor_state(|state| {
         state.buttons = buttons;
-        if !relative_enabled || (dx == 0 && dy == 0) {
+        if !relative_enabled {
+            if !compositing_enabled {
+                hide_cursor(state);
+            } else if !state.drawn {
+                draw_cursor(state);
+            }
+            return;
+        }
+        if dx == 0 && dy == 0 {
+            if !compositing_enabled {
+                hide_cursor(state);
+            } else if !state.drawn {
+                draw_cursor(state);
+            }
             return;
         }
 
@@ -538,7 +567,9 @@ pub fn tick() {
         let (next_x, next_y) = apply_motion(state.x, state.y, dx, dy, state.max_x, state.max_y);
         state.x = next_x;
         state.y = next_y;
-        draw_cursor(state);
+        if compositing_enabled {
+            draw_cursor(state);
+        }
     });
 }
 
@@ -559,6 +590,23 @@ pub fn set_relative_enabled(enabled: bool) {
 #[cfg(not(target_os = "none"))]
 pub fn set_relative_enabled(_enabled: bool) {}
 
+#[cfg(target_os = "none")]
+pub fn sync_display_owner() {
+    let compositing_enabled = cursor_compositing_enabled();
+    with_cursor_state(|state| {
+        if compositing_enabled {
+            if !state.drawn {
+                draw_cursor(state);
+            }
+        } else {
+            hide_cursor(state);
+        }
+    });
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sync_display_owner() {}
+
 fn map_absolute_axis(raw: i32, logical_min: i32, logical_max: i32, screen_max: i32) -> i32 {
     if screen_max <= 0 || logical_max <= logical_min {
         return 0;
@@ -578,16 +626,20 @@ pub fn set_absolute_position(
     logical_max_y: i32,
     buttons: u8,
 ) {
+    let mut abs_event = None;
     with_cursor_state(|state| {
         state.buttons = buttons;
         let next_x = map_absolute_axis(raw_x, logical_min_x, logical_max_x, state.max_x)
             .clamp(0, state.max_x);
         let next_y = map_absolute_axis(raw_y, logical_min_y, logical_max_y, state.max_y)
             .clamp(0, state.max_y);
+        abs_event = Some((next_x, next_y, buttons));
 
         if state.x == next_x && state.y == next_y {
-            if !state.drawn {
+            if cursor_compositing_enabled() && !state.drawn {
                 draw_cursor(state);
+            } else if !cursor_compositing_enabled() {
+                hide_cursor(state);
             }
             return;
         }
@@ -595,8 +647,13 @@ pub fn set_absolute_position(
         hide_cursor(state);
         state.x = next_x;
         state.y = next_y;
-        draw_cursor(state);
+        if cursor_compositing_enabled() {
+            draw_cursor(state);
+        }
     });
+    if let Some((x, y, buttons)) = abs_event {
+        crate::input::push_pointer_absolute(x, y, buttons);
+    }
 }
 
 #[cfg(not(target_os = "none"))]

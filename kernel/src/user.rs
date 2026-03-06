@@ -28,6 +28,9 @@ const EXEC_MAX_INTERP_IMAGE: usize = 2 * 1024 * 1024;
     feature = "musl-ext2-exec",
     feature = "musl-ext2-cmd-smoke",
     feature = "musl-ext2-ping-smoke",
+    feature = "musl-ext2-unix-rights-smoke",
+    feature = "musl-ext2-epoll-smoke",
+    feature = "musl-ext2-shared-buffer-smoke",
     feature = "musl-ext2-quickjs-smoke",
     feature = "musl-ext2-micropython-smoke",
     feature = "musl-ext2-dropbear-smoke"
@@ -37,6 +40,9 @@ const INIT_ARGV0: &[u8] = b"/init-ext2\0";
     not(feature = "musl-ext2-exec"),
     not(feature = "musl-ext2-cmd-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-unix-rights-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
@@ -47,6 +53,9 @@ const INIT_ARGV0: &[u8] = b"/bin/echo\0";
     not(feature = "musl-ext2-exec"),
     not(feature = "musl-ext2-cmd-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-unix-rights-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
@@ -104,6 +113,36 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_ping_smoke.
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    feature = "musl-ext2-shared-buffer-smoke"
+))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_shared_buffer_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-dropbear-smoke"),
+    not(feature = "musl-ext2-micropython-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
+    not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
+    feature = "musl-ext2-epoll-smoke"
+))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_epoll_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-dropbear-smoke"),
+    not(feature = "musl-ext2-micropython-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
+    not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    feature = "musl-ext2-unix-rights-smoke"
+))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_unix_rights_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-dropbear-smoke"),
+    not(feature = "musl-ext2-micropython-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
+    not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-unix-rights-smoke"),
     feature = "musl-ext2-cmd-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_smoke.elf");
@@ -112,6 +151,9 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_smoke.elf")
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-unix-rights-smoke"),
     not(feature = "musl-ext2-cmd-smoke"),
     feature = "musl-ext2-exec"
 ))]
@@ -120,6 +162,9 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2.elf");
     not(feature = "musl-ext2-exec"),
     not(feature = "musl-ext2-cmd-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-unix-rights-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
@@ -130,6 +175,9 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
     not(feature = "musl-ext2-exec"),
     not(feature = "musl-ext2-cmd-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-unix-rights-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
@@ -760,7 +808,7 @@ fn populate_user_stack<const ARGC: usize, const ENVC: usize, const AUXC: usize>(
     Some(plan)
 }
 
-pub fn spawn_init() {
+pub fn spawn_init() -> bool {
     serial_println!("[USER] Setting up initial user task...");
     if cfg!(feature = "musl-ext2-dropbear-smoke") {
         serial_println!("[USER] musl-ext2-dropbear-smoke init image selected");
@@ -770,6 +818,12 @@ pub fn spawn_init() {
         serial_println!("[USER] musl-ext2-quickjs-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-ping-smoke") {
         serial_println!("[USER] musl-ext2-ping-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-shared-buffer-smoke") {
+        serial_println!("[USER] musl-ext2-shared-buffer-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-epoll-smoke") {
+        serial_println!("[USER] musl-ext2-epoll-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-unix-rights-smoke") {
+        serial_println!("[USER] musl-ext2-unix-rights-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-cmd-smoke") {
         serial_println!("[USER] musl-ext2-cmd-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-exec") {
@@ -781,7 +835,7 @@ pub fn spawn_init() {
     let pml4 = vmm::create_address_space();
     if pml4.as_u64() == 0 {
         serial_println!("[USER] ERROR: failed to create address space");
-        return;
+        return false;
     }
 
     let mut elf_result = if elf::is_dynamic(INIT_ELF) {
@@ -792,7 +846,7 @@ pub fn spawn_init() {
     if !elf_result.success {
         serial_println!("[USER] ERROR: failed to load init ELF");
         free_address_space(pml4);
-        return;
+        return false;
     }
 
     let mut entry_rip = elf_result.entry_point;
@@ -803,7 +857,7 @@ pub fn spawn_init() {
             None => {
                 serial_println!("[USER] ERROR: unsupported PT_INTERP path");
                 free_address_space(pml4);
-                return;
+                return false;
             }
         };
 
@@ -811,7 +865,7 @@ pub fn spawn_init() {
         if !interp_result.success {
             serial_println!("[USER] ERROR: failed to load PT_INTERP image");
             free_address_space(pml4);
-            return;
+            return false;
         }
 
         interp_base = interp_result.base_addr;
@@ -824,7 +878,7 @@ pub fn spawn_init() {
         None => {
             serial_println!("[USER] ERROR: failed to allocate/map user stack");
             free_address_space(pml4);
-            return;
+            return false;
         }
     };
 
@@ -850,6 +904,9 @@ pub fn spawn_init() {
         not(feature = "musl-ext2-exec"),
         not(feature = "musl-ext2-cmd-smoke"),
         not(feature = "musl-ext2-ping-smoke"),
+        not(feature = "musl-ext2-unix-rights-smoke"),
+        not(feature = "musl-ext2-epoll-smoke"),
+        not(feature = "musl-ext2-shared-buffer-smoke"),
         not(feature = "musl-ext2-quickjs-smoke"),
         not(feature = "musl-ext2-micropython-smoke"),
         not(feature = "musl-ext2-dropbear-smoke")
@@ -866,13 +923,16 @@ pub fn spawn_init() {
         None => {
             serial_println!("[USER] ERROR: failed to build user stack");
             free_address_space(pml4);
-            return;
+            return false;
         }
     };
     #[cfg(any(
         feature = "musl-ext2-exec",
         feature = "musl-ext2-cmd-smoke",
         feature = "musl-ext2-ping-smoke",
+        feature = "musl-ext2-unix-rights-smoke",
+        feature = "musl-ext2-epoll-smoke",
+        feature = "musl-ext2-shared-buffer-smoke",
         feature = "musl-ext2-quickjs-smoke",
         feature = "musl-ext2-micropython-smoke",
         feature = "musl-ext2-dropbear-smoke",
@@ -890,7 +950,7 @@ pub fn spawn_init() {
         None => {
             serial_println!("[USER] ERROR: failed to build user stack");
             free_address_space(pml4);
-            return;
+            return false;
         }
     };
     if !install_auxv_runtime_data(
@@ -904,14 +964,14 @@ pub fn spawn_init() {
     ) {
         serial_println!("[USER] ERROR: failed to finalize user auxv");
         free_address_space(pml4);
-        return;
+        return false;
     }
 
     let task_ptr = task::task_alloc("init", TASK_FLAG_USER);
     if task_ptr.is_null() {
         serial_println!("[USER] ERROR: failed to allocate task");
         free_address_space(pml4);
-        return;
+        return false;
     }
 
     unsafe {
@@ -965,6 +1025,7 @@ pub fn spawn_init() {
         entry_rip,
         stack_plan.initial_rsp
     );
+    true
 }
 
 pub fn exec_current_image(

@@ -10,7 +10,7 @@ current Rust kernel implementation and forward roadmap.
 - Stage 1-9 parity goals are largely complete; remaining work focuses on
   hardening, completeness, and new capability.
 
-## Status Snapshot (Last reviewed: 2026-02-28)
+## Status Snapshot (Last reviewed: 2026-03-07)
 
 ### Kernel Foundation
 
@@ -27,6 +27,14 @@ current Rust kernel implementation and forward roadmap.
 - Implemented syscall families now cover core file I/O, process control,
   memory mapping, IPC/signal baseline, metadata/time/identity calls, and
   socket-based networking APIs used by current userspace.
+- Shared-buffer syscall baseline now includes `memfd_create` with tmpfs-backed
+  internal objects (`MFD_CLOEXEC` support; sealing deferred with `-ENOSYS`).
+- Descriptor flag semantics now include `fcntl(F_SETFL)` runtime `O_NONBLOCK`
+  updates for sockets/pipes/PTYs, plus stricter `accept4`/`socket`/`socketpair`
+  flag validation paths for event-loop bring-up.
+- Phase 2 hardening now enforces per-task caps for shared-buffer objects,
+  mapped VMA pages, and epoll watch ownership, with explicit teardown cleanup
+  for epoll owner watches and user address-space mappings on task exit.
 
 ### Storage and Filesystems
 
@@ -52,12 +60,31 @@ current Rust kernel implementation and forward roadmap.
 - PS/2 mouse plus optional UHCI USB-tablet absolute input are active.
 - Framebuffer handoff, text mirroring, cursor rendering, and basic ANSI color
   handling are active.
+- Baseline Phase 3 display ABI is now present: `/dev/fb0` exists in `devfs`,
+  with `ioctl(FBIOGETINFO)` metadata query support plus direct shared userspace
+  `mmap` support.
+- Baseline Phase 3 input ABI is now present: `/dev/input/event0` (keyboard)
+  and `/dev/input/event1` (pointer) expose evdev-style timestamped records with
+  nonblocking `read`, `poll`/`select`/`epoll` readiness, and `SYN_DROPPED`
+  overflow signalling.
+- Phase 3 display ownership is now explicitly gated: default boots remain
+  console-first, while the `compositor-first` kernel feature suppresses kernel
+  framebuffer console/cursor composition, keeps panic/oops fallback readable,
+  and restores a visible console if init launch fails before userspace takes
+  over the display.
 
 ### Networking
 
 - E1000 driver, Ethernet, ARP, IPv4, ICMP, UDP, TCP, and BSD socket syscall
   layers are implemented for current userspace workloads.
-- `select`/`poll`/`ppoll` + `recvmsg` are implemented.
+- `select`/`poll`/`ppoll` plus baseline `epoll_create1`/`epoll_ctl`/`epoll_wait`
+  and baseline `sendmsg`/`recvmsg` paths are implemented, including
+  `SCM_RIGHTS` fd passing for Unix-domain streams.
+- Local socket baseline now includes `AF_UNIX` stream `socket()`/`socketpair()`
+  plus pathname `bind`/`connect`/`listen`/`accept`, with pathname conflict
+  handling tied to VFS namespace entries.
+- Dedicated AF_UNIX/SCM_RIGHTS QEMU smoke coverage now validates cross-process
+  fd transfer plus malformed ancillary/error-path behavior.
 
 ### Userspace Runtime Bring-Up
 
@@ -79,8 +106,9 @@ current Rust kernel implementation and forward roadmap.
 ### 2. VM and Memory Policy
 
 - Improve reclaim policy beyond current best-effort file-backed reclaim.
-- Add stronger mmap/fork sharing semantics and continue page-cache unification.
-- Add hardening around user-pointer fault recovery and broader VM accounting.
+- Continue page-cache unification and add broader mmap/shared-buffer stress coverage.
+- Add hardening around user-pointer fault recovery and broader VM accounting
+  beyond current per-task mapping caps.
 
 ### 3. Filesystem and Block Stack
 
@@ -94,11 +122,14 @@ current Rust kernel implementation and forward roadmap.
 - Move more polling paths to interrupt-driven completion where appropriate
   (storage/network paths still contain polling-heavy flows).
 - Broaden USB/input/device coverage beyond the current focused baseline.
-- Continue framebuffer/terminal work toward fuller VT and pty semantics.
+- Continue framebuffer/terminal work toward fuller VT and pty semantics,
+  including runtime compositor/console ownership negotiation, compositor-exit
+  fallback after successful launch, and richer input semantics.
 
 ### 5. Networking Completeness
 
-- Fill remaining socket API gaps (`epoll`, fuller `sendmsg`, Unix-domain sockets).
+- Fill remaining socket API gaps (fuller ancillary semantics beyond current
+  `SCM_RIGHTS`, Unix abstract-namespace semantics, and advanced epoll variants).
 - Continue protocol hardening (congestion behavior, out-of-order handling,
   robustness under load).
 
@@ -107,6 +138,8 @@ current Rust kernel implementation and forward roadmap.
 - Expand staged userspace utility and runtime coverage.
 - Replace targeted smoke checks with broader integration suites as syscall and
   runtime behavior stabilize.
+- Keep the dedicated AF_UNIX/SCM_RIGHTS smoke (`run-unix-rights-smoke`) in the
+  regression workflow and add dedicated epoll compositor-loop smokes for Phase 2.
 
 ## Tracking Conventions
 

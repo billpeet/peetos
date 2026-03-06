@@ -288,7 +288,12 @@ pub fn pipe_close(pipe_id: u16, close_read: bool, close_write: bool) -> Result<(
     Ok(())
 }
 
-pub fn pipe_read(task: *mut Task, pipe_id: u16, out: &mut [u8]) -> Result<usize, i64> {
+pub fn pipe_read(
+    task: *mut Task,
+    pipe_id: u16,
+    out: &mut [u8],
+    nonblocking: bool,
+) -> Result<usize, i64> {
     if out.is_empty() {
         return Ok(0);
     }
@@ -319,6 +324,8 @@ pub fn pipe_read(task: *mut Task, pipe_id: u16, out: &mut [u8]) -> Result<usize,
                 read_n = count;
             } else if pipe.write_ends == 0 {
                 eof = true;
+            } else if nonblocking {
+                return Err(EAGAIN);
             } else {
                 register_waiter_locked(&mut state, read_key, task)?;
                 should_block = true;
@@ -340,7 +347,12 @@ pub fn pipe_read(task: *mut Task, pipe_id: u16, out: &mut [u8]) -> Result<usize,
     }
 }
 
-pub fn pipe_write(task: *mut Task, pipe_id: u16, src: &[u8]) -> Result<usize, i64> {
+pub fn pipe_write(
+    task: *mut Task,
+    pipe_id: u16,
+    src: &[u8],
+    nonblocking: bool,
+) -> Result<usize, i64> {
     if src.is_empty() {
         return Ok(0);
     }
@@ -369,6 +381,11 @@ pub fn pipe_write(task: *mut Task, pipe_id: u16, src: &[u8]) -> Result<usize, i6
                     pipe.len += 1;
                     wrote_now += 1;
                 }
+            } else if nonblocking {
+                if written > 0 {
+                    return Ok(written);
+                }
+                return Err(EAGAIN);
             } else {
                 register_waiter_locked(&mut state, write_key, task)?;
                 should_block = true;
@@ -456,15 +473,15 @@ mod tests {
         init();
         let pipe = pipe_open().expect("pipe alloc");
 
-        let wrote = pipe_write(ptr::null_mut(), pipe, b"abc").expect("pipe write");
+        let wrote = pipe_write(ptr::null_mut(), pipe, b"abc", false).expect("pipe write");
         assert_eq!(wrote, 3);
 
         let mut buf = [0u8; 8];
-        let read_n = pipe_read(ptr::null_mut(), pipe, &mut buf).expect("pipe read");
+        let read_n = pipe_read(ptr::null_mut(), pipe, &mut buf, false).expect("pipe read");
         assert_eq!(&buf[..read_n], b"abc");
 
         pipe_close(pipe, false, true).expect("close writer");
-        let eof_n = pipe_read(ptr::null_mut(), pipe, &mut buf).expect("eof read");
+        let eof_n = pipe_read(ptr::null_mut(), pipe, &mut buf, false).expect("eof read");
         assert_eq!(eof_n, 0);
     }
 
@@ -474,7 +491,7 @@ mod tests {
         init();
         let pipe = pipe_open().expect("pipe alloc");
         pipe_close(pipe, true, false).expect("close readers");
-        let err = pipe_write(ptr::null_mut(), pipe, b"x").unwrap_err();
+        let err = pipe_write(ptr::null_mut(), pipe, b"x", false).unwrap_err();
         assert_eq!(err, EPIPE);
     }
 
@@ -488,8 +505,32 @@ mod tests {
         pipe_close(pipe, true, false).expect("close one read end");
         pipe_close(pipe, true, false).expect("close second read end");
 
-        let err = pipe_write(ptr::null_mut(), pipe, b"x").unwrap_err();
+        let err = pipe_write(ptr::null_mut(), pipe, b"x", false).unwrap_err();
         assert_eq!(err, EPIPE);
+    }
+
+    #[test]
+    fn pipe_nonblocking_empty_read_returns_eagain() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let pipe = pipe_open().expect("pipe alloc");
+        let mut buf = [0u8; 8];
+        let err = pipe_read(ptr::null_mut(), pipe, &mut buf, true).unwrap_err();
+        assert_eq!(err, EAGAIN);
+    }
+
+    #[test]
+    fn pipe_nonblocking_full_write_returns_partial_then_eagain() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let pipe = pipe_open().expect("pipe alloc");
+
+        let fill = [0xABu8; PIPE_CAPACITY];
+        let wrote = pipe_write(ptr::null_mut(), pipe, &fill, true).expect("fill");
+        assert_eq!(wrote, PIPE_CAPACITY);
+
+        let err = pipe_write(ptr::null_mut(), pipe, b"x", true).unwrap_err();
+        assert_eq!(err, EAGAIN);
     }
 
     #[test]
