@@ -10,7 +10,7 @@ current Rust kernel implementation and forward roadmap.
 - Stage 1-9 parity goals are largely complete; remaining work focuses on
   hardening, completeness, and new capability.
 
-## Status Snapshot (Last reviewed: 2026-03-07)
+## Status Snapshot (Last reviewed: 2026-04-12)
 
 ### Kernel Foundation
 
@@ -44,6 +44,11 @@ current Rust kernel implementation and forward roadmap.
 - Internal ext journal handling (surfaced as ext3 mounts) supports mount-time
   replay plus runtime journal transaction emission with deferred checkpointing
   and revoke handling, with baseline runtime journal abort-on-I/O-fault state.
+- ext2/ext3 feature acceptance is intentionally conservative: mounts currently
+  allow `HAS_JOURNAL` in compat bits, `FILETYPE`/`RECOVER`/`JOURNAL_DEV` in
+  incompat bits, and `SPARSE_SUPER` in ro-compat bits. Images carrying
+  `EXT_ATTR`, `DIR_INDEX`, `RESIZE_INO`, `IMAGIC_INODES`, `DIR_PREALLOC`, or
+  `LARGE_FILE` are rejected until the corresponding behavior exists.
 - Block cache residency is bounded with CLOCK eviction and dirty-pressure flush.
 
 ### IPC and Signals
@@ -72,6 +77,29 @@ current Rust kernel implementation and forward roadmap.
   framebuffer console/cursor composition, keeps panic/oops fallback readable,
   and restores a visible console if init launch fails before userspace takes
   over the display.
+- Phase 3 userspace bring-up now includes a compositor-first ext2 smoke profile:
+  `musl-ext2-gui-smoke` launches an ext2-hosted helper that validates exported
+  framebuffer/input environment variables, opens `/dev/fb0` and
+  `/dev/input/event{0,1}`, maps and writes the framebuffer, and confirms
+  injected keyboard/pointer events arrive through the userspace input-device
+  path under `compositor-first`.
+- Phase 3 compositor fallback policy now extends past init-launch failure:
+  when the compositor-owned initial userspace task exits or crashes after
+  successful takeover, the kernel restores framebuffer ownership to the console,
+  redraws the fallback UI, and exposes that transition through a dedicated QEMU
+  smoke target.
+- Phase 3 console-first smoke coverage is now explicit: a dedicated shell smoke
+  runner asserts the kernel keeps display ownership in console mode while the
+  scripted Toybox workload completes under the default profile.
+- The repository test harness is green again with current Phase 3 coverage:
+  `make test` now includes the default `test-exit` QEMU smoke alongside the
+  dedicated console-first/compositor-first/fallback smoke scripts and host
+  unit suites without known red paths.
+- Phase 4 bring-up has started with a compositor-core smoke profile:
+  `musl-ext2-peet-gui-smoke` boots a compositor-first userspace helper that
+  renders two independent surfaces to `/dev/fb0`, updates visible focus state,
+  and routes injected keyboard/pointer activity through the initial compositor
+  event loop. Real multi-process `peet-gui` transport is still pending.
 
 ### Networking
 
@@ -124,7 +152,8 @@ current Rust kernel implementation and forward roadmap.
 - Broaden USB/input/device coverage beyond the current focused baseline.
 - Continue framebuffer/terminal work toward fuller VT and pty semantics,
   including runtime compositor/console ownership negotiation, compositor-exit
-  fallback after successful launch, and richer input semantics.
+  policy hardening beyond the current init-owned handoff, and richer input
+  semantics.
 
 ### 5. Networking Completeness
 

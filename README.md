@@ -25,7 +25,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `docs/PORTING_PLAN.md` Current status and forward roadmap.
 - `docs/` Subsystem documentation.
 
-## Current Status (Last reviewed: 2026-03-07)
+## Current Status (Last reviewed: 2026-04-12)
 
 - Boots to Rust `kmain()`, initializes serial output, prints a banner, and halts in a `hlt` loop.
 - Panic handler prints over serial, then halts with `cli; hlt`.
@@ -44,11 +44,15 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - VFS now mounts block-backed ext2/ext3 at `/` (root) with Linux-like mountpoints (`/boot`, `/temp`, `/dev`, `/proc`), with `/etc/fstab` declaring the root block mount as `ext3` and preserving a `/mnt/ext2` compatibility path alias when root ext2 is active.
 - ext2 includes mutable file/dir operations, direct+indirect block mapping (single/double/triple), truncate growth/shrink, lazy directory population, sparse block cache with CLOCK eviction, and block-cache sync/flush integration.
 - Journaled ext mounts are surfaced as `ext3` and include internal-journal parse/replay + runtime descriptor/data/commit/revoke emission with wrap-aware sequencing, plus baseline runtime abort-on-I/O-fault handling.
+- ext2/ext3 feature acceptance is intentionally narrow: the mount path currently allows `HAS_JOURNAL` in compat bits, `FILETYPE`/`RECOVER`/`JOURNAL_DEV` in incompat bits, and `SPARSE_SUPER` in ro-compat bits. Images carrying `EXT_ATTR`, `DIR_INDEX`, `RESIZE_INO`, `IMAGIC_INODES`, `DIR_PREALLOC`, or `LARGE_FILE` are currently rejected until their semantics are implemented.
 - PCI enumeration is active in `crates/drivers`; storage bring-up includes AHCI DMA `IDENTIFY`, AHCI LBA48 DMA read/write, ATA PIO `IDENTIFY`, and block-device inventory.
 - Keyboard/TTY input, PS/2 mouse cursor movement, optional UHCI USB tablet absolute input, and framebuffer text mirroring are wired.
 - Phase 3 GUI bring-up has started with a baseline display device ABI: `devfs` now exposes `/dev/fb0`, `ioctl(FBIOGETINFO)` (`0x5001`) returns framebuffer geometry/format metadata (`width`, `height`, `pitch`, `bpp`, `format`, `map_size`), and userspace can `mmap` the framebuffer with direct shared visibility for compositor-style redraw loops.
 - Phase 3 input ABI is now present: `devfs` exposes `/dev/input/event0` (keyboard) and `/dev/input/event1` (pointer) with 24-byte evdev-style records, nonblocking `read`, `poll`/`select`/`epoll` readiness, and `SYN_DROPPED` overflow signalling.
 - Phase 3 display ownership gating is now explicit: default boots stay console-first, while `KERNEL_FEATURES=compositor-first` suppresses kernel framebuffer console/cursor composition so a userspace compositor can own `/dev/fb0`; init-launch failure and fatal panic/exception paths reactivate a visible kernel console fallback.
+- Phase 3 userspace compositor-first wiring now includes a dedicated ext2 smoke profile (`KERNEL_FEATURES="compositor-first musl-ext2-gui-smoke"`): init launches `/mnt/ext2/bin/gui_smoke.sh`, exports explicit framebuffer/input environment variables, opens `/dev/fb0` plus `/dev/input/event{0,1}`, maps and writes the framebuffer, and confirms injected keyboard/pointer events reach userspace through the event-device path.
+- Phase 3 compositor fallback now covers successful takeover as well: if the compositor-owned initial userspace task exits or crashes, the kernel reactivates console ownership, redraws the fallback framebuffer UI, and exposes that path through a dedicated QEMU smoke target.
+- Phase 4 compositor MVP work has started with an initial compositor-core smoke (`KERNEL_FEATURES="compositor-first musl-ext2-peet-gui-smoke"`): a userspace compositor helper renders two independent surfaces, highlights focus, and routes injected keyboard/pointer events through the compositor-first loop.
 - Userspace bootstrap is active via musl + toybox, with runtime smoke paths for shell, ping, QuickJS, MicroPython, and Dropbear.
 
 ## Documentation
@@ -113,6 +117,10 @@ Notes:
 - Use `make run-current` to boot the current image without rebuilding.
 - Use `make run-image` to force rebuild then boot.
 - `KERNEL_FEATURES=compositor-first` is an explicit Phase 3 display-ownership profile. It only changes kernel framebuffer ownership/handoff today, so pair it with a userspace framebuffer client or compositor-oriented init profile rather than the default shell profile.
+- `make run-gui-smoke` boots the compositor-first smoke profile and validates framebuffer rendering plus injected keyboard/pointer delivery over serial logs.
+- `make run-gui-fallback-smoke` boots the compositor-first smoke profile, lets the compositor-owned init complete, and asserts the kernel returns framebuffer ownership to the console afterward.
+- `make run-peet-gui-smoke` boots the initial Phase 4 compositor-core smoke and validates two-surface composition plus focus/input routing.
+- `make run-console-first-smoke` boots the dedicated console-first smoke profile (`KERNEL_FEATURES=musl-ext2-console-first-smoke`) and asserts the kernel stays in console ownership while a minimal shell workload completes.
 
 Regenerate the sample ext2 image used by host-side fs tests:
 
@@ -172,8 +180,12 @@ Shell shortcut targets:
 make run-shell
 make run-shell-smoke
 make run-tablet
+make run-console-first-smoke
+make run-gui-fallback-smoke
+make run-peet-gui-smoke
 make run-ping-smoke
 make run-unix-rights-smoke
+make run-gui-smoke
 make run-quickjs-smoke
 make run-micropython-smoke
 make run-dropbear-smoke
@@ -187,7 +199,7 @@ Run the repository test harness:
 make test
 ```
 
-`make test` runs host unit tests (`arch_x86_64`, `drivers`, `fs`, `kernel`) and then boots QEMU with `isa-debug-exit` so the VM exits automatically after the serial smoke path.
+`make test` runs the full `tests/*.sh` harness: host unit tests (`arch_x86_64`, `drivers`, `fs`, `kernel`), setup checks for staged runtime components, the default `isa-debug-exit` QEMU smoke, and the dedicated GUI/console/userspace smoke scripts currently tracked in `tests/`.
 
 ## Historical Reference
 

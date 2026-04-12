@@ -104,6 +104,14 @@ if [[ -x "${ROOT_DIR}/user/shared_buffer_rights_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/shared_buffer_rights_smoke.elf" "${STAGE_ROOT}/bin/shared_buffer_rights_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/shared_buffer_rights_smoke"
 fi
+if [[ -x "${ROOT_DIR}/user/gui_compositor_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/gui_compositor_smoke.elf" "${STAGE_ROOT}/bin/gui_compositor_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/gui_compositor_smoke"
+fi
+if [[ -x "${ROOT_DIR}/user/peet_gui_compositor_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/peet_gui_compositor_smoke.elf" "${STAGE_ROOT}/bin/peet_gui_compositor_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/peet_gui_compositor_smoke"
+fi
 
 # Applets are invoked as `toybox <applet>` to keep the smoke image compact.
 cat > "${STAGE_ROOT}/bin/next_smoke.sh" <<'EOS'
@@ -469,6 +477,85 @@ fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/shared_buffer_smoke.sh"
 
+cat > "${STAGE_ROOT}/bin/console_first_smoke.sh" <<'EOS'
+fail=0
+if [ "${PEETOS_DISPLAY_MODE}" != "console-first" ]; then
+  echo [musl-ext2-console-first-smoke] unexpected-display-mode "${PEETOS_DISPLAY_MODE}"
+  fail=1
+fi
+pwd || fail=1
+toybox ls /bin >/dev/null || fail=1
+echo console-first >/tmp/console_first || fail=1
+toybox cat /tmp/console_first || fail=1
+toybox uname || fail=1
+toybox rm -f /tmp/console_first || fail=1
+
+echo [musl-ext2-console-first-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-console-first-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/console_first_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/gui_smoke.sh" <<'EOS'
+fail=0
+if [ "${PEETOS_DISPLAY_MODE}" != "compositor-first" ]; then
+  echo [musl-ext2-gui-smoke] unexpected-display-mode "${PEETOS_DISPLAY_MODE}"
+  fail=1
+fi
+if [ "${PEETOS_FB}" != "/dev/fb0" ]; then
+  echo [musl-ext2-gui-smoke] unexpected-fb "${PEETOS_FB}"
+  fail=1
+fi
+if [ "${PEETOS_INPUT_KEYBOARD}" != "/dev/input/event0" ]; then
+  echo [musl-ext2-gui-smoke] unexpected-kbd "${PEETOS_INPUT_KEYBOARD}"
+  fail=1
+fi
+if [ "${PEETOS_INPUT_POINTER}" != "/dev/input/event1" ]; then
+  echo [musl-ext2-gui-smoke] unexpected-ptr "${PEETOS_INPUT_POINTER}"
+  fail=1
+fi
+/bin/gui_compositor_smoke || fail=1
+
+echo [musl-ext2-gui-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-gui-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/gui_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/peet_gui_smoke.sh" <<'EOS'
+fail=0
+if [ "${PEETOS_DISPLAY_MODE}" != "compositor-first" ]; then
+  echo [musl-ext2-peet-gui-smoke] unexpected-display-mode "${PEETOS_DISPLAY_MODE}"
+  fail=1
+fi
+if [ "${PEETOS_FB}" != "/dev/fb0" ]; then
+  echo [musl-ext2-peet-gui-smoke] unexpected-fb "${PEETOS_FB}"
+  fail=1
+fi
+if [ "${PEETOS_INPUT_KEYBOARD}" != "/dev/input/event0" ]; then
+  echo [musl-ext2-peet-gui-smoke] unexpected-kbd "${PEETOS_INPUT_KEYBOARD}"
+  fail=1
+fi
+if [ "${PEETOS_INPUT_POINTER}" != "/dev/input/event1" ]; then
+  echo [musl-ext2-peet-gui-smoke] unexpected-ptr "${PEETOS_INPUT_POINTER}"
+  fail=1
+fi
+if [ ! -x bin/peet_gui_compositor_smoke ]; then
+  echo [musl-ext2-peet-gui-smoke] missing bin/peet_gui_compositor_smoke
+  fail=1
+else
+  /bin/peet_gui_compositor_smoke || fail=1
+fi
+
+echo [musl-ext2-peet-gui-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-peet-gui-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/peet_gui_smoke.sh"
+
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact but size it from staged payload so larger binaries
 # (for example QuickJS qjs) do not overflow ext2 population.
@@ -478,7 +565,9 @@ img_kib=$((payload_kib + 1024))
 if [[ "${img_kib}" -lt 3072 ]]; then
   img_kib=3072
 fi
-mke2fs -q -t ext2 -F -b 1024 -I 256 -N 384 -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" "${img_kib}"
+mke2fs -q -t ext2 -F -b 1024 -I 256 -N 384 \
+  -O ^dir_index,^resize_inode,^ext_attr,^large_file \
+  -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" "${img_kib}"
 
 mv "${TMP_IMG}" "${OUT_IMG}"
 chmod 0644 "${OUT_IMG}"

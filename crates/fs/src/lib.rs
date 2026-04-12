@@ -98,18 +98,21 @@ const EXT2_INODE_DIRECT_COUNT: usize = 12;
 const EXT2_CACHE_MAX_BLOCKS_DEFAULT: usize = 2048;
 const EXT2_CACHE_DIRTY_HIGH_WATERMARK_PERCENT_DEFAULT: u8 = 30;
 
-const EXT2_FEATURE_COMPAT_DIR_PREALLOC: u32 = 0x0001;
-const EXT2_FEATURE_COMPAT_IMAGIC_INODES: u32 = 0x0002;
 const EXT2_FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+#[cfg(test)]
+const EXT2_FEATURE_COMPAT_DIR_PREALLOC: u32 = 0x0001;
+#[cfg(test)]
+const EXT2_FEATURE_COMPAT_IMAGIC_INODES: u32 = 0x0002;
+#[cfg(test)]
 const EXT2_FEATURE_COMPAT_EXT_ATTR: u32 = 0x0008;
+#[cfg(test)]
 const EXT2_FEATURE_COMPAT_RESIZE_INO: u32 = 0x0010;
+#[cfg(test)]
 const EXT2_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
-const EXT2_FEATURE_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_COMPAT_DIR_PREALLOC
-    | EXT2_FEATURE_COMPAT_IMAGIC_INODES
-    | EXT2_FEATURE_COMPAT_HAS_JOURNAL
-    | EXT2_FEATURE_COMPAT_EXT_ATTR
-    | EXT2_FEATURE_COMPAT_RESIZE_INO
-    | EXT2_FEATURE_COMPAT_DIR_INDEX;
+// Keep the compat allowlist intentionally narrow. Other ext2/ext3-era compat
+// bits are still parsed for tests and explicit rejection, but the runtime code
+// does not implement their operational semantics yet.
+const EXT2_FEATURE_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_COMPAT_HAS_JOURNAL;
 
 const EXT2_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const EXT2_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
@@ -119,9 +122,9 @@ const EXT2_FEATURE_INCOMPAT_SUPPORTED: u32 = EXT2_FEATURE_INCOMPAT_FILETYPE
     | EXT2_FEATURE_INCOMPAT_JOURNAL_DEV;
 
 const EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+#[cfg(test)]
 const EXT2_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
-const EXT2_FEATURE_RO_COMPAT_SUPPORTED: u32 =
-    EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT2_FEATURE_RO_COMPAT_LARGE_FILE;
+const EXT2_FEATURE_RO_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER;
 
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
@@ -6517,6 +6520,49 @@ mod tests {
         let incompat_off = EXT2_SUPERBLOCK_OFFSET + 96;
         let incompat = read_u32_le(&bad, incompat_off).expect("read feature incompat");
         write_u32_le(&mut bad, incompat_off, incompat | 0x40).expect("set unsupported incompat");
+
+        let err = mount_ext2_backend_image_expect_err(&bad, 4096);
+        assert_eq!(err, EINVAL);
+    }
+
+    #[test]
+    fn ext2_mount_rejects_unimplemented_compat_features() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let unsupported_compat = [
+            EXT2_FEATURE_COMPAT_DIR_PREALLOC,
+            EXT2_FEATURE_COMPAT_IMAGIC_INODES,
+            EXT2_FEATURE_COMPAT_EXT_ATTR,
+            EXT2_FEATURE_COMPAT_RESIZE_INO,
+            EXT2_FEATURE_COMPAT_DIR_INDEX,
+        ];
+
+        for feature in unsupported_compat {
+            let mut bad = std::vec::Vec::from(SAMPLE_EXT2);
+            let compat_off = EXT2_SUPERBLOCK_OFFSET + 92;
+            let compat = read_u32_le(&bad, compat_off).expect("read feature compat");
+            write_u32_le(&mut bad, compat_off, compat | feature).expect("set unsupported compat");
+
+            let err = mount_ext2_backend_image_expect_err(&bad, 4096);
+            assert_eq!(err, EINVAL);
+        }
+    }
+
+    #[test]
+    fn ext2_mount_rejects_unimplemented_ro_compat_features() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let mut bad = std::vec::Vec::from(SAMPLE_EXT2);
+        let ro_compat_off = EXT2_SUPERBLOCK_OFFSET + 100;
+        let ro_compat = read_u32_le(&bad, ro_compat_off).expect("read feature ro compat");
+        write_u32_le(
+            &mut bad,
+            ro_compat_off,
+            ro_compat | EXT2_FEATURE_RO_COMPAT_LARGE_FILE,
+        )
+        .expect("set unsupported ro compat");
 
         let err = mount_ext2_backend_image_expect_err(&bad, 4096);
         assert_eq!(err, EINVAL);

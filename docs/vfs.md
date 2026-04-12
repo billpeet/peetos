@@ -74,6 +74,7 @@ On initialization, the kernel creates:
   - `/proc/mounts` reports non-journaled root mounts as `ext2 / ext2 rw` and journaled root mounts as `ext3 / ext3 rw`.
   - Mount import is rollback-safe: on parse/import failure, partially imported nodes are removed.
   - Ext2 mount now includes ext3 internal journal parsing and mount-time replay of committed transactions when recovery is required, then clears recover markers before exposing the mount.
+  - Feature acceptance is intentionally conservative: mounts currently allow `HAS_JOURNAL` in compat bits, `FILETYPE`/`RECOVER`/`JOURNAL_DEV` in incompat bits, and `SPARSE_SUPER` in ro-compat bits; other ext2/ext3-era feature bits are rejected until implemented.
   - For journaled mounts, dirty-block flushes now emit runtime journal descriptor/data/commit records before checkpointing home blocks.
   - Journal replay revoke precedence now uses wrap-safe transaction ID ordering so replay remains correct across `u32` sequence rollover.
   - Runtime journal paths now enter an aborted state on journal I/O faults and fail fast on later flush/checkpoint attempts.
