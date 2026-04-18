@@ -6919,6 +6919,7 @@ fn sys_exit_common(ctx: &SyscallContext, code: i32) -> i64 {
         (*ctx.current).exit_code = code;
         (*ctx.current).state = TaskState::Zombie;
     }
+    crate::user::maybe_restore_console_after_init_exit(ctx.current, code);
     crate::sched::request_preempt();
     0
 }

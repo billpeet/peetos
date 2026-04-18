@@ -2,9 +2,9 @@ use super::{
     ext2_block_slice_mut_state, ext2_data_block_for_logical_index_state, ext2_ensure_data_block,
     ext2_for_each_dir_entry_state, ext2_logical_blocks_for_size, ext2_mark_dirty_block,
     ext2_max_addressable_file_size, ext2_mode_to_filetype, ext2_read_inode_from_state,
-    ext2_recalc_inode_block_count_512_state, ext2_write_inode_to_state, read_u16_le, read_u32_le,
-    write_u16_le, write_u32_le, FileType, VfsState, EINVAL, EIO, ENAMETOOLONG, ENOENT, ENOSPC,
-    ENOTDIR, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK,
+    ext2_recalc_inode_block_count_512_state, ext2_write_inode_to_state, read_u16_le,
+    read_u32_le, write_u16_le, write_u32_le, Ext2JournalHandle, FileType, VfsState, EINVAL, EIO,
+    ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK,
 };
 
 fn ext2_dirent_file_type(file_type: FileType) -> u8 {
@@ -55,6 +55,7 @@ pub(super) fn ext2_write_dirent(
 
 pub(super) fn ext2_add_dir_entry(
     state: &mut VfsState,
+    journal_handle: Option<Ext2JournalHandle>,
     parent_ino: u32,
     child_ino: u32,
     name: &[u8],
@@ -84,7 +85,12 @@ pub(super) fn ext2_add_dir_entry(
     while idx < max_blocks {
         let block_no = ext2_data_block_for_logical_index_state(state, &parent, idx)?;
         if block_no == 0 {
-            let new_block = ext2_ensure_data_block(state, &mut parent, idx)?;
+            let new_block = ext2_ensure_data_block(
+                state,
+                journal_handle,
+                &mut parent,
+                idx,
+            )?;
 
             {
                 let blk = ext2_block_slice_mut_state(state, new_block)?;
@@ -151,6 +157,7 @@ pub(super) fn ext2_add_dir_entry(
 
 pub(super) fn ext2_remove_dir_entry(
     state: &mut VfsState,
+    _journal_handle: Option<Ext2JournalHandle>,
     parent_ino: u32,
     name: &[u8],
 ) -> Result<u32, i64> {

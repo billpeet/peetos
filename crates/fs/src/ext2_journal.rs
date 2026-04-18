@@ -4,9 +4,9 @@ use super::{
     ext2_backend, ext2_backend_read_block, ext2_block_slice_mut_state, ext2_cache_find,
     ext2_cache_flush_block, ext2_data_block_for_logical_index_state, ext2_mark_dirty_block,
     ext2_read_inode_from_state, ext2_unmark_dirty_block, ext2_write_u32_state, Ext2Inode,
-    Ext2JournalCommittedTx, Ext2JournalCommittedUpdate, Ext2JournalState, VfsState, EINVAL, EIO,
-    ENOSPC, EXT2_FEATURE_COMPAT_HAS_JOURNAL, EXT2_FEATURE_INCOMPAT_JOURNAL_DEV,
-    EXT2_FEATURE_INCOMPAT_RECOVER, EXT2_SUPERBLOCK_OFFSET,
+    Ext2JournalCommittedTx, Ext2JournalCommittedUpdate, Ext2JournalMode, Ext2JournalState,
+    VfsState, EINVAL, EIO, ENOSPC, EXT2_FEATURE_COMPAT_HAS_JOURNAL,
+    EXT2_FEATURE_INCOMPAT_JOURNAL_DEV, EXT2_FEATURE_INCOMPAT_RECOVER, EXT2_SUPERBLOCK_OFFSET,
 };
 
 const JBD_MAGIC: u32 = 0xC03B_3998;
@@ -385,6 +385,541 @@ fn remove_sorted_u32(values: &mut Vec<u32>, value: u32) -> bool {
     }
 }
 
+fn insert_sorted_unique_u32(values: &mut Vec<u32>, value: u32) -> Result<(), i64> {
+    match values.binary_search(&value) {
+        Ok(_) => Ok(()),
+        Err(insert_at) => {
+            values.try_reserve(1).map_err(|_| ENOSPC)?;
+            values.insert(insert_at, value);
+            Ok(())
+        }
+    }
+}
+
+fn reserve_running_tx_credits(state: &mut VfsState, credits: usize) -> Result<(), i64> {
+    if credits == 0 {
+        return Ok(());
+    }
+    state.ext2_journal_running_tx.reserved_credits = state
+        .ext2_journal_running_tx
+        .reserved_credits
+        .checked_add(credits)
+        .ok_or(ENOSPC)?;
+    Ok(())
+}
+
+fn next_journal_tx_id(state: &mut VfsState) -> u64 {
+    let tx_id = state.ext2_journal_next_tx_id;
+    state.ext2_journal_next_tx_id = state.ext2_journal_next_tx_id.saturating_add(1);
+    tx_id
+}
+
+fn populate_pending_from_running_tx(
+    state: &mut VfsState,
+    pending: &mut super::Ext2JournalPendingTx,
+) -> Result<(), i64> {
+    pending.op_id = state.ext2_journal_running_tx.op_id;
+    pending.tx_id = state.ext2_journal_running_tx.tx_id;
+    pending.segment_index = state.ext2_journal_running_tx.segment_index;
+    pending.phase_entries = state.ext2_journal_running_tx.phase_entries;
+    pending.last_phase_kind = state.ext2_journal_running_tx.last_phase_kind;
+    pending.restart_count = state.ext2_journal_running_tx.restart_count;
+    pending.reserved_credits = state.ext2_journal_running_tx.reserved_credits;
+    pending.used_credits = state.ext2_journal_running_tx.used_credits;
+    pending
+        .metadata_blocks
+        .try_reserve_exact(state.ext2_journal_running_tx.tracked_blocks.len())
+        .map_err(|_| ENOSPC)?;
+    pending
+        .metadata_snapshots
+        .try_reserve_exact(state.ext2_journal_running_tx.tracked_blocks.len())
+        .map_err(|_| ENOSPC)?;
+    pending
+        .data_blocks
+        .try_reserve_exact(state.ext2_journal_running_tx.data_blocks.len())
+        .map_err(|_| ENOSPC)?;
+    pending
+        .data_snapshots
+        .try_reserve_exact(state.ext2_journal_running_tx.data_blocks.len())
+        .map_err(|_| ENOSPC)?;
+    pending
+        .revoke_blocks
+        .try_reserve_exact(state.ext2_journal_running_tx.revoke_blocks.len())
+        .map_err(|_| ENOSPC)?;
+
+    let mut idx = 0usize;
+    while idx < state.ext2_journal_running_tx.tracked_blocks.len() {
+        let block = state.ext2_journal_running_tx.tracked_blocks[idx];
+        if !running_tx_marks_data(state, block) {
+            pending.metadata_blocks.push(block);
+            snapshot_tx_block(state, &mut pending.metadata_snapshots, block)?;
+        }
+        idx += 1;
+    }
+    idx = 0;
+    while idx < state.ext2_journal_running_tx.data_blocks.len() {
+        let block = state.ext2_journal_running_tx.data_blocks[idx];
+        pending.data_blocks.push(block);
+        snapshot_tx_block(state, &mut pending.data_snapshots, block)?;
+        idx += 1;
+    }
+    pending
+        .revoke_blocks
+        .extend_from_slice(state.ext2_journal_running_tx.revoke_blocks.as_slice());
+    Ok(())
+}
+
+fn seal_running_tx_into_pending(state: &mut VfsState) -> Result<bool, i64> {
+    if !state.ext2_journal_running_tx.active {
+        return Ok(false);
+    }
+    let mut pending = super::Ext2JournalPendingTx::empty();
+    populate_pending_from_running_tx(state, &mut pending)?;
+    state.ext2_journal_pending_txs.try_reserve(1).map_err(|_| ENOSPC)?;
+    state.ext2_journal_pending_txs.push(pending);
+    Ok(true)
+}
+
+fn restart_running_tx_segment(state: &mut VfsState) -> Result<(), i64> {
+    if !state.ext2_journal_running_tx.restartable {
+        return Err(ENOSPC);
+    }
+    let growth = core::cmp::max(1usize, state.ext2_journal_running_tx.credit_growth_chunk);
+    let op_id = state.ext2_journal_running_tx.op_id;
+    let next_segment_index = state.ext2_journal_running_tx.segment_index.saturating_add(1);
+    let scope_depth = state.ext2_journal_running_tx.scope_depth;
+    let handle_count = state.ext2_journal_running_tx.handle_count;
+    let restart_count = state.ext2_journal_running_tx.restart_count.saturating_add(1);
+    seal_running_tx_into_pending(state)?;
+    clear_running_tx_tracking(state);
+    state.ext2_journal_running_tx.op_id = op_id;
+    state.ext2_journal_running_tx.tx_id = next_journal_tx_id(state);
+    state.ext2_journal_running_tx.segment_index = next_segment_index;
+    state.ext2_journal_running_tx.phase_entries = 0;
+    state.ext2_journal_running_tx.last_phase_kind = super::Ext2JournalPhaseKind::None;
+    state.ext2_journal_running_tx.active = false;
+    state.ext2_journal_running_tx.scope_depth = scope_depth;
+    state.ext2_journal_running_tx.handle_count = handle_count;
+    state.ext2_journal_running_tx.restartable = true;
+    state.ext2_journal_running_tx.credit_growth_chunk = growth;
+    state.ext2_journal_running_tx.restart_count = restart_count;
+    state.ext2_journal_running_tx.reserved_credits = 0;
+    state.ext2_journal_running_tx.used_credits = 0;
+    reserve_running_tx_credits(state, growth)?;
+    Ok(())
+}
+
+fn consume_running_tx_credit(state: &mut VfsState) -> Result<(), i64> {
+    if state.ext2_journal_running_tx.reserved_credits == 0 {
+        state.ext2_journal_running_tx.used_credits = state
+            .ext2_journal_running_tx
+            .used_credits
+            .saturating_add(1);
+        return Ok(());
+    }
+    if state.ext2_journal_running_tx.used_credits >= state.ext2_journal_running_tx.reserved_credits {
+        restart_running_tx_segment(state)?;
+    }
+    state.ext2_journal_running_tx.used_credits += 1;
+    Ok(())
+}
+
+pub(super) fn prepare_running_tx_credits(
+    state: &mut VfsState,
+    needed_credits: usize,
+) -> Result<(), i64> {
+    if needed_credits == 0
+        || !state.ext2_journal.present
+        || state.ext2_journal.replaying
+        || state.ext2_journal.aborted
+        || !state.ext2_journal_running_tx.restartable
+        || state.ext2_journal_running_tx.scope_depth == 0
+        || !state.ext2_journal_running_tx.active
+        || state.ext2_journal_running_tx.reserved_credits == 0
+    {
+        return Ok(());
+    }
+    if state
+        .ext2_journal_running_tx
+        .used_credits
+        .saturating_add(needed_credits)
+        > state.ext2_journal_running_tx.reserved_credits
+    {
+        restart_running_tx_segment(state)?;
+    }
+    Ok(())
+}
+
+pub(super) fn begin_restartable_phase(
+    state: &mut VfsState,
+    phase_kind: super::Ext2JournalPhaseKind,
+    needed_credits: usize,
+) -> Result<(), i64> {
+    prepare_running_tx_credits(state, needed_credits)?;
+    if phase_kind == super::Ext2JournalPhaseKind::None
+        || !state.ext2_journal.present
+        || state.ext2_journal.replaying
+        || state.ext2_journal.aborted
+        || state.ext2_journal_running_tx.scope_depth == 0
+    {
+        return Ok(());
+    }
+    if state.ext2_journal_running_tx.last_phase_kind != phase_kind {
+        state.ext2_journal_running_tx.phase_entries =
+            state.ext2_journal_running_tx.phase_entries.saturating_add(1);
+        state.ext2_journal_running_tx.last_phase_kind = phase_kind;
+    }
+    Ok(())
+}
+
+pub(super) fn with_restartable_phase<R>(
+    state: &mut VfsState,
+    phase_kind: super::Ext2JournalPhaseKind,
+    needed_credits: usize,
+    f: impl FnOnce(&mut VfsState) -> Result<R, i64>,
+) -> Result<R, i64> {
+    begin_restartable_phase(state, phase_kind, needed_credits)?;
+    f(state)
+}
+
+pub(super) fn current_handle(state: &VfsState) -> Option<super::Ext2JournalHandle> {
+    if !state.ext2_journal.present
+        || state.ext2_journal.replaying
+        || state.ext2_journal.aborted
+        || state.ext2_journal_running_tx.scope_depth == 0
+        || state.ext2_journal_running_tx.op_id == 0
+    {
+        return None;
+    }
+    Some(super::Ext2JournalHandle {
+        op_id: state.ext2_journal_running_tx.op_id,
+    })
+}
+
+fn handle_matches_running_tx(state: &VfsState, handle: super::Ext2JournalHandle) -> bool {
+    state.ext2_journal_running_tx.scope_depth > 0
+        && state.ext2_journal_running_tx.op_id != 0
+        && state.ext2_journal_running_tx.op_id == handle.op_id
+}
+
+pub(super) fn with_handle_restartable_phase<R>(
+    state: &mut VfsState,
+    handle: Option<super::Ext2JournalHandle>,
+    phase_kind: super::Ext2JournalPhaseKind,
+    needed_credits: usize,
+    f: impl FnOnce(&mut VfsState) -> Result<R, i64>,
+) -> Result<R, i64> {
+    if let Some(handle) = handle {
+        if !handle_matches_running_tx(state, handle) {
+            return Err(EINVAL);
+        }
+    }
+    with_restartable_phase(state, phase_kind, needed_credits, f)
+}
+
+fn note_running_tx_block(state: &mut VfsState, block: u32, is_data: bool) -> Result<(), i64> {
+    if !state.ext2_journal.present || state.ext2_journal.replaying || state.ext2_journal.aborted {
+        return Ok(());
+    }
+    if state.ext2_journal_running_tx.scope_depth == 0 {
+        return Ok(());
+    }
+    state.ext2_journal_running_tx.active = true;
+    let tracked_new = state
+        .ext2_journal_running_tx
+        .tracked_blocks
+        .binary_search(&block)
+        .is_err();
+    let data_new = is_data
+        && state
+            .ext2_journal_running_tx
+            .data_blocks
+            .binary_search(&block)
+            .is_err();
+    if tracked_new || data_new {
+        consume_running_tx_credit(state)?;
+    }
+    insert_sorted_unique_u32(&mut state.ext2_journal_running_tx.tracked_blocks, block)?;
+    if is_data {
+        insert_sorted_unique_u32(&mut state.ext2_journal_running_tx.data_blocks, block)?;
+    }
+    Ok(())
+}
+
+fn note_running_tx_revoke(state: &mut VfsState, block: u32) -> Result<(), i64> {
+    if !state.ext2_journal.present || state.ext2_journal.replaying || state.ext2_journal.aborted {
+        return Ok(());
+    }
+    if state.ext2_journal_running_tx.scope_depth == 0 {
+        return Ok(());
+    }
+    state.ext2_journal_running_tx.active = true;
+    if state
+        .ext2_journal_running_tx
+        .revoke_blocks
+        .binary_search(&block)
+        .is_err()
+    {
+        consume_running_tx_credit(state)?;
+    }
+    insert_sorted_unique_u32(&mut state.ext2_journal_running_tx.revoke_blocks, block)
+}
+
+pub(super) fn note_metadata_block(state: &mut VfsState, block: u32) -> Result<(), i64> {
+    note_running_tx_block(state, block, false)
+}
+
+pub(super) fn note_data_block(state: &mut VfsState, block: u32) -> Result<(), i64> {
+    note_running_tx_block(state, block, true)
+}
+
+pub(super) fn begin_mutation_scope_with_credits_options(
+    state: &mut VfsState,
+    credits: usize,
+    restartable: bool,
+    credit_growth_chunk: usize,
+) -> Result<u64, i64> {
+    if !state.ext2_journal.present || state.ext2_journal.replaying {
+        return Ok(0);
+    }
+    ensure_journal_not_aborted(state)?;
+    let opening_new_tx = state.ext2_journal_running_tx.handle_count == 0;
+    if opening_new_tx {
+        let tx_id = next_journal_tx_id(state);
+        state.ext2_journal_running_tx.op_id = tx_id;
+        state.ext2_journal_running_tx.tx_id = tx_id;
+        state.ext2_journal_running_tx.segment_index = 0;
+        state.ext2_journal_running_tx.phase_entries = 0;
+        state.ext2_journal_running_tx.last_phase_kind = super::Ext2JournalPhaseKind::None;
+        state.ext2_journal_running_tx.restartable = restartable;
+        state.ext2_journal_running_tx.credit_growth_chunk = credit_growth_chunk;
+        state.ext2_journal_running_tx.restart_count = 0;
+        state.ext2_journal_running_tx.reserved_credits = 0;
+        state.ext2_journal_running_tx.used_credits = 0;
+    } else if restartable {
+        state.ext2_journal_running_tx.restartable = true;
+        state.ext2_journal_running_tx.credit_growth_chunk = core::cmp::max(
+            state.ext2_journal_running_tx.credit_growth_chunk,
+            credit_growth_chunk,
+        );
+    }
+    if let Err(err) = reserve_running_tx_credits(state, credits) {
+        if opening_new_tx {
+            state.ext2_journal_running_tx.op_id = 0;
+            state.ext2_journal_running_tx.tx_id = 0;
+            state.ext2_journal_running_tx.segment_index = 0;
+            state.ext2_journal_running_tx.phase_entries = 0;
+            state.ext2_journal_running_tx.last_phase_kind = super::Ext2JournalPhaseKind::None;
+            state.ext2_journal_running_tx.restartable = false;
+            state.ext2_journal_running_tx.credit_growth_chunk = 0;
+            state.ext2_journal_running_tx.restart_count = 0;
+            state.ext2_journal_running_tx.reserved_credits = 0;
+            state.ext2_journal_running_tx.used_credits = 0;
+            state.ext2_journal_next_tx_id = state.ext2_journal_next_tx_id.saturating_sub(1);
+        }
+        return Err(err);
+    }
+    state.ext2_journal_running_tx.handle_count =
+        state.ext2_journal_running_tx.handle_count.saturating_add(1);
+    state.ext2_journal_running_tx.scope_depth =
+        state.ext2_journal_running_tx.scope_depth.saturating_add(1);
+    Ok(state.ext2_journal_running_tx.tx_id)
+}
+
+#[cfg(test)]
+pub(super) fn begin_mutation_scope_with_credits(
+    state: &mut VfsState,
+    credits: usize,
+) -> Result<u64, i64> {
+    begin_mutation_scope_with_credits_options(state, credits, false, 0)
+}
+
+pub(super) fn end_mutation_scope(state: &mut VfsState) -> Result<(), i64> {
+    if !state.ext2_journal.present || state.ext2_journal.replaying {
+        return Ok(());
+    }
+    if state.ext2_journal_running_tx.scope_depth == 0 {
+        return Err(EINVAL);
+    }
+    state.ext2_journal_running_tx.scope_depth -= 1;
+    if state.ext2_journal_running_tx.handle_count > 0 {
+        state.ext2_journal_running_tx.handle_count -= 1;
+    }
+    if state.ext2_journal_running_tx.scope_depth == 0 && state.ext2_journal_running_tx.active {
+        seal_running_tx_into_pending(state)?;
+        clear_running_tx_tracking(state);
+    } else if state.ext2_journal_running_tx.scope_depth == 0 {
+        clear_running_tx_tracking(state);
+    }
+    Ok(())
+}
+
+fn clear_running_tx_tracking(state: &mut VfsState) {
+    state.ext2_journal_running_tx.op_id = 0;
+    state.ext2_journal_running_tx.tx_id = 0;
+    state.ext2_journal_running_tx.segment_index = 0;
+    state.ext2_journal_running_tx.phase_entries = 0;
+    state.ext2_journal_running_tx.last_phase_kind = super::Ext2JournalPhaseKind::None;
+    state.ext2_journal_running_tx.active = false;
+    state.ext2_journal_running_tx.scope_depth = 0;
+    state.ext2_journal_running_tx.handle_count = 0;
+    state.ext2_journal_running_tx.restartable = false;
+    state.ext2_journal_running_tx.credit_growth_chunk = 0;
+    state.ext2_journal_running_tx.restart_count = 0;
+    state.ext2_journal_running_tx.reserved_credits = 0;
+    state.ext2_journal_running_tx.used_credits = 0;
+    state.ext2_journal_running_tx.tracked_blocks.clear();
+    state.ext2_journal_running_tx.data_blocks.clear();
+    state.ext2_journal_running_tx.revoke_blocks.clear();
+}
+
+fn snapshot_tx_block(
+    state: &mut VfsState,
+    snapshots: &mut Vec<super::Ext2JournalBlockSnapshot>,
+    block: u32,
+) -> Result<(), i64> {
+    let cache_idx = ext2_cache_find(state, block).map_err(|_| EIO)?;
+    let cache = &state.ext2_cached_blocks[cache_idx];
+    let mut data = Vec::new();
+    data.try_reserve_exact(cache.data.len()).map_err(|_| ENOSPC)?;
+    data.extend_from_slice(cache.data.as_slice());
+    snapshots.try_reserve(1).map_err(|_| ENOSPC)?;
+    snapshots.push(super::Ext2JournalBlockSnapshot {
+        home_block: block,
+        escaped: data.len() >= 4 && data[..4] == JBD_MAGIC.to_be_bytes(),
+        data,
+    });
+    Ok(())
+}
+
+fn pending_tx_snapshot_for_block(
+    snapshots: &[super::Ext2JournalBlockSnapshot],
+    block: u32,
+) -> Option<&super::Ext2JournalBlockSnapshot> {
+    let mut idx = 0usize;
+    while idx < snapshots.len() {
+        if snapshots[idx].home_block == block {
+            return Some(&snapshots[idx]);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn pending_tx_contains_all_metadata_blocks(
+    tx: &super::Ext2JournalPendingTx,
+    blocks: &[u32],
+) -> bool {
+    let mut idx = 0usize;
+    while idx < blocks.len() {
+        if tx.metadata_blocks.binary_search(&blocks[idx]).is_err() {
+            return false;
+        }
+        idx += 1;
+    }
+    true
+}
+
+fn pending_tx_owns_block(tx: &super::Ext2JournalPendingTx, block: u32) -> bool {
+    tx.metadata_blocks.binary_search(&block).is_ok() || tx.data_blocks.binary_search(&block).is_ok()
+}
+
+fn pending_tx_owner_index(state: &VfsState, block: u32) -> Option<usize> {
+    let mut idx = 0usize;
+    while idx < state.ext2_journal_pending_txs.len() {
+        if pending_tx_owns_block(&state.ext2_journal_pending_txs[idx], block) {
+            return Some(idx);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn remove_pending_tx_snapshot(
+    snapshots: &mut Vec<super::Ext2JournalBlockSnapshot>,
+    block: u32,
+) {
+    let mut idx = 0usize;
+    while idx < snapshots.len() {
+        if snapshots[idx].home_block == block {
+            snapshots.remove(idx);
+            return;
+        }
+        idx += 1;
+    }
+}
+
+fn block_has_newer_ordered_owner(state: &VfsState, block: u32) -> bool {
+    let mut tx_idx = 1usize;
+    while tx_idx < state.ext2_journal_pending_txs.len() {
+        let tx = &state.ext2_journal_pending_txs[tx_idx];
+        if tx.metadata_blocks.binary_search(&block).is_ok() || tx.data_blocks.binary_search(&block).is_ok()
+        {
+            return true;
+        }
+        tx_idx += 1;
+    }
+    state
+        .ext2_journal_running_tx
+        .tracked_blocks
+        .binary_search(&block)
+        .is_ok()
+}
+
+fn clear_cache_if_snapshot_matches(
+    state: &mut VfsState,
+    block: u32,
+    snapshot: &[u8],
+) -> Result<(), i64> {
+    if block_has_newer_ordered_owner(state, block) {
+        return Ok(());
+    }
+    if let Ok(cache_idx) = ext2_cache_find(state, block) {
+        let cache = &mut state.ext2_cached_blocks[cache_idx];
+        if cache.dirty && cache.data.as_slice() == snapshot {
+            cache.dirty = false;
+            cache.referenced = true;
+            let _ = ext2_unmark_dirty_block(state, block);
+        }
+    }
+    Ok(())
+}
+
+fn drop_running_tx_blocks(state: &mut VfsState, blocks: &[u32]) {
+    let mut idx = 0usize;
+    while idx < blocks.len() {
+        let block = blocks[idx];
+        let _ = remove_sorted_u32(&mut state.ext2_journal_running_tx.tracked_blocks, block);
+        let _ = remove_sorted_u32(&mut state.ext2_journal_running_tx.data_blocks, block);
+        idx += 1;
+    }
+    state.ext2_journal_running_tx.active = !state.ext2_journal_running_tx.tracked_blocks.is_empty();
+}
+
+fn drop_pending_tx_blocks(state: &mut VfsState, blocks: &[u32]) {
+    let mut tx_idx = 0usize;
+    while tx_idx < state.ext2_journal_pending_txs.len() {
+        let tx = &mut state.ext2_journal_pending_txs[tx_idx];
+        let mut idx = 0usize;
+        while idx < blocks.len() {
+            let block = blocks[idx];
+            let _ = remove_sorted_u32(&mut tx.metadata_blocks, block);
+            let _ = remove_sorted_u32(&mut tx.data_blocks, block);
+            remove_pending_tx_snapshot(&mut tx.metadata_snapshots, block);
+            remove_pending_tx_snapshot(&mut tx.data_snapshots, block);
+            idx += 1;
+        }
+        tx_idx += 1;
+    }
+    state.ext2_journal_pending_txs.retain(|tx| {
+        !tx.metadata_blocks.is_empty()
+            || !tx.metadata_snapshots.is_empty()
+            || !tx.data_blocks.is_empty()
+            || !tx.data_snapshots.is_empty()
+            || !tx.revoke_blocks.is_empty()
+    });
+}
+
 fn tx_uses_journal_block(
     superblock: &JournalSuper,
     tx: &Ext2JournalCommittedTx,
@@ -443,11 +978,135 @@ fn pending_tx_conflicts(
     false
 }
 
+fn running_tx_marks_data(state: &VfsState, block: u32) -> bool {
+    state
+        .ext2_journal_running_tx
+        .data_blocks
+        .binary_search(&block)
+        .is_ok()
+}
+
+fn collect_dirty_running_data_blocks(state: &mut VfsState) -> Result<Vec<u32>, i64> {
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(state.ext2_journal_running_tx.data_blocks.len())
+        .map_err(|_| ENOSPC)?;
+    let mut idx = 0usize;
+    while idx < state.ext2_journal_running_tx.data_blocks.len() {
+        let block = state.ext2_journal_running_tx.data_blocks[idx];
+        if block != state.ext2_journal.superblock_block {
+            if let Ok(cache_idx) = ext2_cache_find(state, block) {
+                if state.ext2_cached_blocks[cache_idx].dirty {
+                    blocks.push(block);
+                }
+            }
+        }
+        idx += 1;
+    }
+    Ok(blocks)
+}
+
+fn collect_dirty_pending_data_blocks(state: &mut VfsState) -> Result<Vec<u32>, i64> {
+    if state.ext2_journal_pending_txs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = &state.ext2_journal_pending_txs[0];
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(tx.data_blocks.len())
+        .map_err(|_| ENOSPC)?;
+    blocks.extend_from_slice(tx.data_blocks.as_slice());
+    Ok(blocks)
+}
+
+fn collect_dirty_running_metadata_blocks(state: &mut VfsState) -> Result<Vec<u32>, i64> {
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(state.ext2_journal_running_tx.tracked_blocks.len())
+        .map_err(|_| ENOSPC)?;
+    let mut idx = 0usize;
+    while idx < state.ext2_journal_running_tx.tracked_blocks.len() {
+        let block = state.ext2_journal_running_tx.tracked_blocks[idx];
+        if block != state.ext2_journal.superblock_block && !running_tx_marks_data(state, block) {
+            if let Ok(cache_idx) = ext2_cache_find(state, block) {
+                if state.ext2_cached_blocks[cache_idx].dirty {
+                    blocks.push(block);
+                }
+            }
+        }
+        idx += 1;
+    }
+    Ok(blocks)
+}
+
+fn collect_dirty_pending_metadata_blocks(state: &mut VfsState) -> Result<Vec<u32>, i64> {
+    if state.ext2_journal_pending_txs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = &state.ext2_journal_pending_txs[0];
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(tx.metadata_blocks.len())
+        .map_err(|_| ENOSPC)?;
+    blocks.extend_from_slice(tx.metadata_blocks.as_slice());
+    Ok(blocks)
+}
+
+fn collect_pending_revoke_blocks(state: &VfsState) -> Result<Vec<u32>, i64> {
+    let mut blocks = Vec::new();
+    if !state.ext2_journal_pending_txs.is_empty() {
+        let tx = &state.ext2_journal_pending_txs[0];
+        blocks
+            .try_reserve_exact(tx.revoke_blocks.len())
+            .map_err(|_| ENOSPC)?;
+        blocks.extend_from_slice(tx.revoke_blocks.as_slice());
+        return Ok(blocks);
+    }
+    blocks
+        .try_reserve_exact(state.ext2_journal_pending_revokes.len())
+        .map_err(|_| ENOSPC)?;
+    blocks.extend_from_slice(state.ext2_journal_pending_revokes.as_slice());
+    Ok(blocks)
+}
+
+fn flush_ordered_data_home(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
+    let mut idx = 0usize;
+    while idx < blocks.len() {
+        let block = blocks[idx];
+        let mut snapshot: Option<Vec<u8>> = None;
+        if !state.ext2_journal_pending_txs.is_empty() {
+            if let Some(entry) = pending_tx_snapshot_for_block(
+                state.ext2_journal_pending_txs[0].data_snapshots.as_slice(),
+                block,
+            ) {
+                snapshot = Some(entry.data.clone());
+            }
+        }
+        let data = match snapshot {
+            Some(data) => data,
+            None => {
+                let cache_idx = ext2_cache_find(state, block).map_err(|_| EIO)?;
+                state.ext2_cached_blocks[cache_idx].data.clone()
+            }
+        };
+        write_checkpoint_home_block(state, block, data.as_slice())?;
+        clear_cache_if_snapshot_matches(state, block, data.as_slice())?;
+        idx += 1;
+    }
+    drop_running_tx_blocks(state, blocks);
+    drop_pending_tx_blocks(state, blocks);
+    Ok(blocks.len())
+}
+
 pub(super) fn note_revoke(state: &mut VfsState, block: u32) -> Result<(), i64> {
     if !state.ext2_journal.present || state.ext2_journal.replaying {
         return Ok(());
     }
     ensure_journal_not_aborted(state)?;
+    if state.ext2_journal.mode == Ext2JournalMode::Ordered && state.ext2_journal_running_tx.scope_depth > 0
+    {
+        return note_running_tx_revoke(state, block);
+    }
     insert_revoked(&mut state.ext2_journal_pending_revokes, block)
 }
 
@@ -617,6 +1276,9 @@ fn flush_tx_blocks(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
         if revoke_capacity == 0 {
             return Err(EIO);
         }
+        let using_pending_tx = state.ext2_journal.mode == Ext2JournalMode::Ordered
+            && !state.ext2_journal_pending_txs.is_empty()
+            && pending_tx_contains_all_metadata_blocks(&state.ext2_journal_pending_txs[0], blocks);
 
         let mut escaped = Vec::new();
         escaped
@@ -625,6 +1287,16 @@ fn flush_tx_blocks(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
         let mut idx = 0usize;
         while idx < blocks.len() {
             let block = blocks[idx];
+            if using_pending_tx {
+                let snapshot = pending_tx_snapshot_for_block(
+                    state.ext2_journal_pending_txs[0].metadata_snapshots.as_slice(),
+                    block,
+                )
+                .ok_or(EIO)?;
+                escaped.push(snapshot.escaped);
+                idx += 1;
+                continue;
+            }
             let cache_idx = match ext2_cache_find(state, block) {
                 Ok(v) => v,
                 Err(_) => return Err(EIO),
@@ -638,6 +1310,15 @@ fn flush_tx_blocks(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
             );
             idx += 1;
         }
+        let ordered_data_blocks = if state.ext2_journal.mode == Ext2JournalMode::Ordered {
+            if using_pending_tx {
+                collect_dirty_pending_data_blocks(state)?
+            } else {
+                collect_dirty_running_data_blocks(state)?
+            }
+        } else {
+            Vec::new()
+        };
 
         let journal_window = state
             .ext2_journal
@@ -648,13 +1329,23 @@ fn flush_tx_blocks(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
             return Err(EIO);
         }
 
+        let revoke_source = if using_pending_tx {
+            collect_pending_revoke_blocks(state)?
+        } else {
+            let mut blocks = Vec::new();
+            blocks
+                .try_reserve_exact(state.ext2_journal_pending_revokes.len())
+                .map_err(|_| ENOSPC)?;
+            blocks.extend_from_slice(state.ext2_journal_pending_revokes.as_slice());
+            blocks
+        };
         let mut revoke_candidates = Vec::new();
         revoke_candidates
-            .try_reserve_exact(state.ext2_journal_pending_revokes.len())
+            .try_reserve_exact(revoke_source.len())
             .map_err(|_| ENOSPC)?;
         idx = 0;
-        while idx < state.ext2_journal_pending_revokes.len() {
-            let revoke = state.ext2_journal_pending_revokes[idx];
+        while idx < revoke_source.len() {
+            let revoke = revoke_source[idx];
             if !blocks.contains(&revoke) {
                 revoke_candidates.push(revoke);
             }
@@ -739,8 +1430,18 @@ fn flush_tx_blocks(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
                 .try_reserve_exact(block_size)
                 .map_err(|_| ENOSPC)?;
             journal_data.resize(block_size, 0);
-            let cache_idx = ext2_cache_find(state, blocks[idx]).map_err(|_| EIO)?;
-            journal_data.copy_from_slice(state.ext2_cached_blocks[cache_idx].data.as_slice());
+            let block = blocks[idx];
+            if using_pending_tx {
+                let snapshot = pending_tx_snapshot_for_block(
+                    state.ext2_journal_pending_txs[0].metadata_snapshots.as_slice(),
+                    block,
+                )
+                .ok_or(EIO)?;
+                journal_data.copy_from_slice(snapshot.data.as_slice());
+            } else {
+                let cache_idx = ext2_cache_find(state, block).map_err(|_| EIO)?;
+                journal_data.copy_from_slice(state.ext2_cached_blocks[cache_idx].data.as_slice());
+            }
             if escaped[idx] {
                 journal_data[..4].fill(0);
             }
@@ -782,20 +1483,40 @@ fn flush_tx_blocks(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
             idx += 1;
         }
 
+        if !ordered_data_blocks.is_empty() {
+            flush_ordered_data_home(state, ordered_data_blocks.as_slice())?;
+        }
+
         write_backend_and_refresh_cache(state, commit_fs_block, commit.as_slice())?;
 
         idx = 0;
         while idx < emitted_revoke_count {
-            let _ = remove_sorted_u32(
-                &mut state.ext2_journal_pending_revokes,
-                revoke_candidates[idx],
-            );
+            if using_pending_tx {
+                let _ = remove_sorted_u32(
+                    &mut state.ext2_journal_pending_txs[0].revoke_blocks,
+                    revoke_candidates[idx],
+                );
+            } else {
+                let _ = remove_sorted_u32(
+                    &mut state.ext2_journal_pending_revokes,
+                    revoke_candidates[idx],
+                );
+            }
             idx += 1;
         }
         idx = 0;
         while idx < blocks.len() {
             let _ = remove_sorted_u32(&mut state.ext2_journal_pending_revokes, blocks[idx]);
             idx += 1;
+        }
+        if using_pending_tx {
+            state.ext2_journal_pending_txs.retain(|tx| {
+                !tx.metadata_blocks.is_empty()
+                    || !tx.metadata_snapshots.is_empty()
+                    || !tx.data_blocks.is_empty()
+                    || !tx.data_snapshots.is_empty()
+                    || !tx.revoke_blocks.is_empty()
+            });
         }
 
         let mut committed_updates = Vec::new();
@@ -805,17 +1526,34 @@ fn flush_tx_blocks(state: &mut VfsState, blocks: &[u32]) -> Result<usize, i64> {
         idx = 0;
         while idx < blocks.len() {
             let block = blocks[idx];
+            let snapshot_data = if using_pending_tx {
+                pending_tx_snapshot_for_block(
+                    state.ext2_journal_pending_txs[0].metadata_snapshots.as_slice(),
+                    block,
+                )
+                .map(|entry| entry.data.clone())
+            } else {
+                None
+            };
             committed_updates.push(Ext2JournalCommittedUpdate {
                 home_block: block,
                 journal_block: data_jblocks[idx],
                 escaped: escaped[idx],
             });
-            if let Ok(cache_idx) = ext2_cache_find(state, block) {
-                state.ext2_cached_blocks[cache_idx].dirty = false;
-                state.ext2_cached_blocks[cache_idx].referenced = true;
+            if let Some(snapshot_data) = snapshot_data {
+                clear_cache_if_snapshot_matches(state, block, snapshot_data.as_slice())?;
+            } else {
+                if let Ok(cache_idx) = ext2_cache_find(state, block) {
+                    state.ext2_cached_blocks[cache_idx].dirty = false;
+                    state.ext2_cached_blocks[cache_idx].referenced = true;
+                }
+                let _ = ext2_unmark_dirty_block(state, block);
             }
-            ext2_unmark_dirty_block(state, block);
             idx += 1;
+        }
+        drop_running_tx_blocks(state, blocks);
+        if using_pending_tx {
+            drop_pending_tx_blocks(state, blocks);
         }
 
         state
@@ -904,7 +1642,49 @@ pub(super) fn checkpoint_all_committed(state: &mut VfsState) -> Result<usize, i6
     checkpoint_committed(state, usize::MAX)
 }
 
+pub(super) fn flush_oldest_ordered_pending_tx(
+    state: &mut VfsState,
+    max_blocks: usize,
+) -> Result<usize, i64> {
+    if max_blocks == 0 {
+        return Ok(0);
+    }
+    if state.ext2_journal.mode != Ext2JournalMode::Ordered || state.ext2_journal_pending_txs.is_empty()
+    {
+        return Ok(0);
+    }
+    let tx_capacity = runtime_tx_data_capacity(state);
+    if tx_capacity == 0 {
+        return Err(EIO);
+    }
+    let batch_cap = core::cmp::min(max_blocks, tx_capacity);
+    let metadata_blocks = collect_dirty_pending_metadata_blocks(state)?;
+    if !metadata_blocks.is_empty() {
+        let take = core::cmp::min(batch_cap, metadata_blocks.len());
+        return flush_tx_blocks(state, &metadata_blocks[..take]);
+    }
+
+    let ordered_data_blocks = collect_dirty_pending_data_blocks(state)?;
+    if !ordered_data_blocks.is_empty() {
+        let count = core::cmp::min(batch_cap, ordered_data_blocks.len());
+        return flush_ordered_data_home(state, &ordered_data_blocks[..count]);
+    }
+    Ok(0)
+}
+
 pub(super) fn flush_dirty_block(state: &mut VfsState, block: u32) -> Result<(), i64> {
+    if state.ext2_journal.mode == Ext2JournalMode::Ordered {
+        let tx_capacity = runtime_tx_data_capacity(state);
+        if tx_capacity == 0 {
+            return Err(EIO);
+        }
+        while pending_tx_owner_index(state, block).is_some() {
+            let flushed = flush_oldest_ordered_pending_tx(state, tx_capacity)?;
+            if flushed == 0 {
+                return Err(EIO);
+            }
+        }
+    }
     let cache_idx = match ext2_cache_find(state, block) {
         Ok(idx) => idx,
         Err(_) => {
@@ -935,21 +1715,48 @@ pub(super) fn flush_dirty_batch(state: &mut VfsState, max_blocks: usize) -> Resu
     let mut picked = Vec::new();
     picked.try_reserve_exact(batch_cap).map_err(|_| ENOSPC)?;
 
-    let mut idx = 0usize;
-    while idx < state.ext2_dirty_blocks.len() && picked.len() < batch_cap {
-        let block = state.ext2_dirty_blocks[idx];
-        if block == state.ext2_journal.superblock_block {
-            idx += 1;
-            continue;
-        }
-        if let Ok(cache_idx) = ext2_cache_find(state, block) {
-            if state.ext2_cached_blocks[cache_idx].dirty {
-                picked.push(block);
+    if state.ext2_journal.mode == Ext2JournalMode::Ordered && !state.ext2_journal_pending_txs.is_empty() {
+        return flush_oldest_ordered_pending_tx(state, batch_cap);
+    } else if state.ext2_journal.mode == Ext2JournalMode::Ordered
+        && state.ext2_journal_running_tx.active
+    {
+        let metadata_blocks = collect_dirty_running_metadata_blocks(state)?;
+        let take = core::cmp::min(batch_cap, metadata_blocks.len());
+        picked.extend_from_slice(&metadata_blocks[..take]);
+    }
+
+    if picked.is_empty() {
+        let mut idx = 0usize;
+        while idx < state.ext2_dirty_blocks.len() && picked.len() < batch_cap {
+            let block = state.ext2_dirty_blocks[idx];
+            if block == state.ext2_journal.superblock_block {
+                idx += 1;
+                continue;
             }
+            if state.ext2_journal.mode == Ext2JournalMode::Ordered && running_tx_marks_data(state, block) {
+                idx += 1;
+                continue;
+            }
+            if let Ok(cache_idx) = ext2_cache_find(state, block) {
+                if state.ext2_cached_blocks[cache_idx].dirty {
+                    picked.push(block);
+                }
+            }
+            idx += 1;
         }
-        idx += 1;
     }
     if picked.is_empty() {
+        if state.ext2_journal.mode == Ext2JournalMode::Ordered {
+            let ordered_data_blocks = if !state.ext2_journal_pending_txs.is_empty() {
+                collect_dirty_pending_data_blocks(state)?
+            } else {
+                collect_dirty_running_data_blocks(state)?
+            };
+            if !ordered_data_blocks.is_empty() {
+                let count = core::cmp::min(batch_cap, ordered_data_blocks.len());
+                return flush_ordered_data_home(state, &ordered_data_blocks[..count]);
+            }
+        }
         return Ok(0);
     }
     flush_tx_blocks(state, picked.as_slice())
@@ -1105,8 +1912,11 @@ fn clear_recovery_state(state: &mut VfsState, next_sequence: u32) -> Result<(), 
 
 pub(super) fn prepare_mount(state: &mut VfsState) -> Result<(), i64> {
     state.ext2_journal = Ext2JournalState::empty();
+    clear_running_tx_tracking(state);
+    state.ext2_journal_pending_txs.clear();
     state.ext2_journal_committed_txs.clear();
     state.ext2_journal_pending_revokes.clear();
+    state.ext2_journal_next_tx_id = 1;
 
     if (state.ext2_meta.feature_compat & EXT2_FEATURE_COMPAT_HAS_JOURNAL) == 0 {
         return Ok(());
@@ -1144,6 +1954,7 @@ pub(super) fn prepare_mount(state: &mut VfsState) -> Result<(), i64> {
         replaying: false,
         aborted: false,
         abort_errno: 0,
+        mode: Ext2JournalMode::Ordered,
         inode: journal_inode_num,
         inode_blocks: journal_inode.blocks,
         superblock_block: journal_sb_fs_block,

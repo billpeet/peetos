@@ -44,6 +44,20 @@ current Rust kernel implementation and forward roadmap.
 - Internal ext journal handling (surfaced as ext3 mounts) supports mount-time
   replay plus runtime journal transaction emission with deferred checkpointing
   and revoke handling, with baseline runtime journal abort-on-I/O-fault state.
+- Ordered-mode journaling now uses bounded credits for most mutators, plans
+  variable-size paths around capped per-segment reservations, rotates those
+  restartable scopes at block-walking loop boundaries and final inode closeout,
+  now uses indirection-aware allocation/free step estimates instead of a flat
+  loop heuristic, lets allocator/free helpers request restart headroom for
+  their own metadata phases, now splits allocation helpers into bookkeeping
+  versus initialization/link phases, gives truncate-side detach/free work
+  explicit unlink-table versus free/revoke restart boundaries, records restart
+  points as named journal phases on sealed ordered segments, now groups the
+  actual metadata work for those phases through closure-scoped restart-phase
+  helpers, now threads a lightweight internal journal-handle token through the
+  main ordered write/truncate/alloc/free paths and the fixed-shape directory
+  metadata mutators, and can split mutations into multiple sealed ordered
+  transaction segments when they outgrow an initial credit reservation.
 - ext2/ext3 feature acceptance is intentionally conservative: mounts currently
   allow `HAS_JOURNAL` in compat bits, `FILETYPE`/`RECOVER`/`JOURNAL_DEV` in
   incompat bits, and `SPARSE_SUPER` in ro-compat bits. Images carrying
@@ -97,9 +111,20 @@ current Rust kernel implementation and forward roadmap.
   unit suites without known red paths.
 - Phase 4 bring-up has started with a compositor-core smoke profile:
   `musl-ext2-peet-gui-smoke` boots a compositor-first userspace helper that
-  renders two independent surfaces to `/dev/fb0`, updates visible focus state,
-  and routes injected keyboard/pointer activity through the initial compositor
-  event loop. Real multi-process `peet-gui` transport is still pending.
+  renders two overlapping surfaces to `/dev/fb0`, validates initial z-order
+  plus raise-on-focus behavior, routes injected keyboard/pointer activity
+  through the initial compositor event loop, validates a damage-limited
+  partial redraw/commit path, and verifies that one client can detach cleanly
+  without destabilizing the compositor-owned session. Real multi-process
+  `peet-gui` transport is still pending.
+- A separate `musl-ext2-peet-shell-demo` profile now scaffolds a more realistic
+  visual shell on the same compositor-first device ABI: top bar, launcher,
+  terminal/files/inspector panels, pointer cursor, focus switching, theme
+  cycling, and terminal-style command feedback are rendered through an internal
+  compositor path where each panel has its own surface buffer and focus raises
+  the active panel in z-order. The `FILES` panel now runs as a separate forked
+  userspace client over an `AF_UNIX socketpair` control channel, giving GUI
+  work a more realistic visual target before full buffer handoff is finished.
 
 ### Networking
 

@@ -112,6 +112,10 @@ if [[ -x "${ROOT_DIR}/user/peet_gui_compositor_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/peet_gui_compositor_smoke.elf" "${STAGE_ROOT}/bin/peet_gui_compositor_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/peet_gui_compositor_smoke"
 fi
+if [[ -x "${ROOT_DIR}/user/peet_shell_demo.elf" ]]; then
+  cp "${ROOT_DIR}/user/peet_shell_demo.elf" "${STAGE_ROOT}/bin/peet_shell_demo"
+  chmod 0755 "${STAGE_ROOT}/bin/peet_shell_demo"
+fi
 
 # Applets are invoked as `toybox <applet>` to keep the smoke image compact.
 cat > "${STAGE_ROOT}/bin/next_smoke.sh" <<'EOS'
@@ -555,6 +559,38 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/peet_gui_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/peet_shell_demo.sh" <<'EOS'
+fail=0
+if [ "${PEETOS_DISPLAY_MODE}" != "compositor-first" ]; then
+  echo [musl-ext2-peet-shell-demo] unexpected-display-mode "${PEETOS_DISPLAY_MODE}"
+  fail=1
+fi
+if [ "${PEETOS_FB}" != "/dev/fb0" ]; then
+  echo [musl-ext2-peet-shell-demo] unexpected-fb "${PEETOS_FB}"
+  fail=1
+fi
+if [ "${PEETOS_INPUT_KEYBOARD}" != "/dev/input/event0" ]; then
+  echo [musl-ext2-peet-shell-demo] unexpected-kbd "${PEETOS_INPUT_KEYBOARD}"
+  fail=1
+fi
+if [ "${PEETOS_INPUT_POINTER}" != "/dev/input/event1" ]; then
+  echo [musl-ext2-peet-shell-demo] unexpected-ptr "${PEETOS_INPUT_POINTER}"
+  fail=1
+fi
+if [ ! -x bin/peet_shell_demo ]; then
+  echo [musl-ext2-peet-shell-demo] missing bin/peet_shell_demo
+  fail=1
+else
+  /bin/peet_shell_demo || fail=1
+fi
+
+echo [musl-ext2-peet-shell-demo] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-peet-shell-demo] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/peet_shell_demo.sh"
 
 TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact but size it from staged payload so larger binaries

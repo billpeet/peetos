@@ -318,6 +318,7 @@ struct Ext2JournalState {
     replaying: bool,
     aborted: bool,
     abort_errno: i64,
+    mode: Ext2JournalMode,
     inode: u32,
     inode_blocks: [u32; 15],
     superblock_block: u32,
@@ -335,6 +336,12 @@ struct Ext2JournalState {
     tx_commit_fs_block: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ext2JournalMode {
+    Disabled,
+    Ordered,
+}
+
 impl Ext2JournalState {
     const fn empty() -> Self {
         Self {
@@ -342,6 +349,7 @@ impl Ext2JournalState {
             replaying: false,
             aborted: false,
             abort_errno: 0,
+            mode: Ext2JournalMode::Disabled,
             inode: 0,
             inode_blocks: [0; 15],
             superblock_block: 0,
@@ -359,6 +367,113 @@ impl Ext2JournalState {
             tx_commit_fs_block: 0,
         }
     }
+}
+
+struct Ext2JournalRunningTx {
+    op_id: u64,
+    tx_id: u64,
+    segment_index: usize,
+    phase_entries: usize,
+    last_phase_kind: Ext2JournalPhaseKind,
+    active: bool,
+    scope_depth: usize,
+    handle_count: usize,
+    restartable: bool,
+    credit_growth_chunk: usize,
+    restart_count: usize,
+    reserved_credits: usize,
+    used_credits: usize,
+    tracked_blocks: Vec<u32>,
+    data_blocks: Vec<u32>,
+    revoke_blocks: Vec<u32>,
+}
+
+impl Ext2JournalRunningTx {
+    const fn empty() -> Self {
+        Self {
+            op_id: 0,
+            tx_id: 0,
+            segment_index: 0,
+            phase_entries: 0,
+            last_phase_kind: Ext2JournalPhaseKind::None,
+            active: false,
+            scope_depth: 0,
+            handle_count: 0,
+            restartable: false,
+            credit_growth_chunk: 0,
+            restart_count: 0,
+            reserved_credits: 0,
+            used_credits: 0,
+            tracked_blocks: Vec::new(),
+            data_blocks: Vec::new(),
+            revoke_blocks: Vec::new(),
+        }
+    }
+}
+
+struct Ext2JournalBlockSnapshot {
+    home_block: u32,
+    data: Vec<u8>,
+    escaped: bool,
+}
+
+struct Ext2JournalPendingTx {
+    op_id: u64,
+    tx_id: u64,
+    segment_index: usize,
+    phase_entries: usize,
+    last_phase_kind: Ext2JournalPhaseKind,
+    restart_count: usize,
+    reserved_credits: usize,
+    used_credits: usize,
+    metadata_blocks: Vec<u32>,
+    metadata_snapshots: Vec<Ext2JournalBlockSnapshot>,
+    data_blocks: Vec<u32>,
+    data_snapshots: Vec<Ext2JournalBlockSnapshot>,
+    revoke_blocks: Vec<u32>,
+}
+
+impl Ext2JournalPendingTx {
+    const fn empty() -> Self {
+        Self {
+            op_id: 0,
+            tx_id: 0,
+            segment_index: 0,
+            phase_entries: 0,
+            last_phase_kind: Ext2JournalPhaseKind::None,
+            restart_count: 0,
+            reserved_credits: 0,
+            used_credits: 0,
+            metadata_blocks: Vec::new(),
+            metadata_snapshots: Vec::new(),
+            data_blocks: Vec::new(),
+            data_snapshots: Vec::new(),
+            revoke_blocks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Ext2JournalHandle {
+    op_id: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ext2JournalPhaseKind {
+    None,
+    DataWrite,
+    DataZero,
+    InodeCloseout,
+    AllocBlockBookkeeping,
+    AllocBlockInit,
+    FreeBlockBookkeeping,
+    FreeBlockRevoke,
+    AllocInodeBookkeeping,
+    AllocInodeInit,
+    FreeInodeBookkeeping,
+    FreeInodeClear,
+    IndirectLink,
+    IndirectUnlink,
 }
 
 #[derive(Clone, Copy)]
@@ -397,8 +512,11 @@ struct VfsState {
     ext2_cache_clock_hand: usize,
     ext2_cache_dirty_high_watermark_percent: u8,
     ext2_journal: Ext2JournalState,
+    ext2_journal_running_tx: Ext2JournalRunningTx,
+    ext2_journal_pending_txs: Vec<Ext2JournalPendingTx>,
     ext2_journal_committed_txs: Vec<Ext2JournalCommittedTx>,
     ext2_journal_pending_revokes: Vec<u32>,
+    ext2_journal_next_tx_id: u64,
     prng_state: u64,
 }
 
@@ -427,8 +545,11 @@ impl VfsState {
             ext2_cache_dirty_high_watermark_percent:
                 EXT2_CACHE_DIRTY_HIGH_WATERMARK_PERCENT_DEFAULT,
             ext2_journal: Ext2JournalState::empty(),
+            ext2_journal_running_tx: Ext2JournalRunningTx::empty(),
+            ext2_journal_pending_txs: Vec::new(),
             ext2_journal_committed_txs: Vec::new(),
             ext2_journal_pending_revokes: Vec::new(),
+            ext2_journal_next_tx_id: 1,
             prng_state: 0,
         }
     }
@@ -674,6 +795,8 @@ fn reset(state: &mut VfsState) {
     state.ext2_mount_inode = ROOT_INODE;
     state.ext2_meta = Ext2Meta::empty();
     state.ext2_journal = Ext2JournalState::empty();
+    state.ext2_journal_running_tx = Ext2JournalRunningTx::empty();
+    state.ext2_journal_pending_txs.clear();
     state.ext2_image_len = 0;
     state.ext2_image.clear();
     state.ext2_backend = ext2_backend::Ext2Backend::none();
@@ -1113,36 +1236,39 @@ fn create_regular_at_inner(state: &mut VfsState, start: u16, path: &str) -> Resu
     }
 
     if parent_backend == NodeBackend::Ext2 {
-        if state.inodes[parent as usize].ext2_ino == 0 {
-            return Err(EIO);
-        }
-        if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
-            return Err(ENOSPC);
-        }
-        if !has_free_vfs_inode(state) {
-            return Err(ENOSPC);
-        }
+        return with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_CREATE, |state| {
+            if state.inodes[parent as usize].ext2_ino == 0 {
+                return Err(EIO);
+            }
+            if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
+                return Err(ENOSPC);
+            }
+            if !has_free_vfs_inode(state) {
+                return Err(ENOSPC);
+            }
 
-        let (ext2_ino, ext2_size) = ext2_create_child_on_disk(
-            state,
-            state.inodes[parent as usize].ext2_ino,
-            &name[..name_len],
-            FileType::Regular,
-        )?;
+            let (ext2_ino, ext2_size) = ext2_create_child_on_disk(
+                state,
+                ext2_journal::current_handle(state),
+                state.inodes[parent as usize].ext2_ino,
+                &name[..name_len],
+                FileType::Regular,
+            )?;
 
-        let inode = alloc_inode(
-            state,
-            FileType::Regular,
-            NodeBackend::Ext2,
-            parent,
-            &name[..name_len],
-        )?;
-        let node = &mut state.inodes[inode as usize];
-        node.ext2_ino = ext2_ino;
-        node.size = ext2_size;
-        add_child(state, parent, inode)?;
-        touch_inode_metadata(state, parent, true, true, true);
-        return Ok(inode);
+            let inode = alloc_inode(
+                state,
+                FileType::Regular,
+                NodeBackend::Ext2,
+                parent,
+                &name[..name_len],
+            )?;
+            let node = &mut state.inodes[inode as usize];
+            node.ext2_ino = ext2_ino;
+            node.size = ext2_size;
+            add_child(state, parent, inode)?;
+            touch_inode_metadata(state, parent, true, true, true);
+            Ok(inode)
+        });
     }
 
     let inode = alloc_inode(
@@ -1171,37 +1297,40 @@ fn mkdir_at_inner(state: &mut VfsState, start: u16, path: &str) -> Result<(), i6
     }
 
     if parent_backend == NodeBackend::Ext2 {
-        if state.inodes[parent as usize].ext2_ino == 0 {
-            return Err(EIO);
-        }
-        if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
-            return Err(ENOSPC);
-        }
-        if !has_free_vfs_inode(state) {
-            return Err(ENOSPC);
-        }
+        return with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_MKDIR, |state| {
+            if state.inodes[parent as usize].ext2_ino == 0 {
+                return Err(EIO);
+            }
+            if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
+                return Err(ENOSPC);
+            }
+            if !has_free_vfs_inode(state) {
+                return Err(ENOSPC);
+            }
 
-        let (ext2_ino, ext2_size) = ext2_create_child_on_disk(
-            state,
-            state.inodes[parent as usize].ext2_ino,
-            &name[..name_len],
-            FileType::Directory,
-        )?;
+            let (ext2_ino, ext2_size) = ext2_create_child_on_disk(
+                state,
+                ext2_journal::current_handle(state),
+                state.inodes[parent as usize].ext2_ino,
+                &name[..name_len],
+                FileType::Directory,
+            )?;
 
-        let inode = alloc_inode(
-            state,
-            FileType::Directory,
-            NodeBackend::Ext2,
-            parent,
-            &name[..name_len],
-        )?;
-        let node = &mut state.inodes[inode as usize];
-        node.ext2_ino = ext2_ino;
-        node.size = ext2_size;
-        node.ext2_children_loaded = true;
-        add_child(state, parent, inode)?;
-        touch_inode_metadata(state, parent, true, true, true);
-        return Ok(());
+            let inode = alloc_inode(
+                state,
+                FileType::Directory,
+                NodeBackend::Ext2,
+                parent,
+                &name[..name_len],
+            )?;
+            let node = &mut state.inodes[inode as usize];
+            node.ext2_ino = ext2_ino;
+            node.size = ext2_size;
+            node.ext2_children_loaded = true;
+            add_child(state, parent, inode)?;
+            touch_inode_metadata(state, parent, true, true, true);
+            Ok(())
+        });
     }
 
     let inode = alloc_inode(
@@ -1638,7 +1767,13 @@ fn ext2_cache_evict_one_clock(state: &mut VfsState) -> Result<(), i64> {
         return Ok(());
     }
 
+    let max_attempts = core::cmp::max(1usize, state.ext2_cached_blocks.len().saturating_mul(2));
+    let mut attempts = 0usize;
     loop {
+        if attempts >= max_attempts {
+            return Err(ENOSPC);
+        }
+        attempts += 1;
         if state.ext2_cache_clock_hand >= state.ext2_cached_blocks.len() {
             state.ext2_cache_clock_hand = 0;
         }
@@ -1651,6 +1786,31 @@ fn ext2_cache_evict_one_clock(state: &mut VfsState) -> Result<(), i64> {
 
         let block = state.ext2_cached_blocks[idx].block_index;
         if state.ext2_cached_blocks[idx].dirty {
+            if state.ext2_journal.present
+                && !state.ext2_journal.replaying
+                && state.ext2_journal.mode == Ext2JournalMode::Ordered
+                && state.ext2_journal_running_tx.scope_depth > 0
+                && state
+                    .ext2_journal_running_tx
+                    .tracked_blocks
+                    .binary_search(&block)
+                    .is_ok()
+            {
+                state.ext2_cache_clock_hand =
+                    (idx.saturating_add(1)) % state.ext2_cached_blocks.len();
+                continue;
+            }
+            if state.ext2_journal.present
+                && !state.ext2_journal.replaying
+                && state.ext2_journal.mode == Ext2JournalMode::Ordered
+                && !state.ext2_journal_pending_txs.is_empty()
+            {
+                let flushed = ext2_journal::flush_oldest_ordered_pending_tx(state, 64)?;
+                if flushed == 0 {
+                    return Err(EIO);
+                }
+                continue;
+            }
             ext2_cache_flush_block(state, block)?;
         }
 
@@ -1741,6 +1901,14 @@ fn ext2_cache_maybe_flush_dirty_pressure(state: &mut VfsState) -> Result<(), i64
     if !ext2_cache_dirty_pressure_exceeded(state) {
         return Ok(());
     }
+    if state.ext2_journal.present
+        && !state.ext2_journal.replaying
+        && state.ext2_journal.mode == Ext2JournalMode::Ordered
+        && state.ext2_journal_running_tx.scope_depth > 0
+        && state.ext2_journal_pending_txs.is_empty()
+    {
+        return Ok(());
+    }
     let target_dirty = state
         .ext2_cached_blocks
         .len()
@@ -1751,6 +1919,18 @@ fn ext2_cache_maybe_flush_dirty_pressure(state: &mut VfsState) -> Result<(), i64
         && state.ext2_dirty_blocks.len() > target_dirty
         && budget > 0
     {
+        if state.ext2_journal.present
+            && !state.ext2_journal.replaying
+            && state.ext2_journal.mode == Ext2JournalMode::Ordered
+            && !state.ext2_journal_pending_txs.is_empty()
+        {
+            let flushed = ext2_journal::flush_oldest_ordered_pending_tx(state, budget)?;
+            if flushed == 0 {
+                break;
+            }
+            budget = budget.saturating_sub(core::cmp::max(1, flushed));
+            continue;
+        }
         let block = state.ext2_dirty_blocks[0];
         if !ext2_cache_has_block(state, block) {
             ext2_unmark_dirty_block(state, block);
@@ -1767,8 +1947,11 @@ fn ext2_clear_dirty_tracking(state: &mut VfsState) {
     state.ext2_dirty_blocks.clear();
     state.ext2_cached_blocks.clear();
     state.ext2_cache_clock_hand = 0;
+    state.ext2_journal_running_tx = Ext2JournalRunningTx::empty();
+    state.ext2_journal_pending_txs.clear();
     state.ext2_journal_committed_txs.clear();
     state.ext2_journal_pending_revokes.clear();
+    state.ext2_journal_next_tx_id = 1;
 }
 
 fn ext2_reset_dirty_tracking(state: &mut VfsState) -> Result<(), i64> {
@@ -1780,8 +1963,11 @@ fn ext2_reset_dirty_tracking(state: &mut VfsState) -> Result<(), i64> {
     state.ext2_dirty_blocks.clear();
     state.ext2_cached_blocks.clear();
     state.ext2_cache_clock_hand = 0;
+    state.ext2_journal_running_tx = Ext2JournalRunningTx::empty();
+    state.ext2_journal_pending_txs.clear();
     state.ext2_journal_committed_txs.clear();
     state.ext2_journal_pending_revokes.clear();
+    state.ext2_journal_next_tx_id = 1;
     Ok(())
 }
 
@@ -1885,6 +2071,7 @@ fn ext2_mark_dirty_block(state: &mut VfsState, block: u32) -> Result<(), i64> {
         state.ext2_cached_blocks[cache_idx].dirty = true;
         state.ext2_cached_blocks[cache_idx].referenced = true;
     }
+    ext2_journal::note_metadata_block(state, block)?;
     ext2_cache_maybe_flush_dirty_pressure(state)?;
     Ok(())
 }
@@ -2897,6 +3084,7 @@ fn ext2_table_has_nonzero_entries_state(
 
 fn ext2_detach_data_block(
     state: &mut VfsState,
+    journal_handle: Option<Ext2JournalHandle>,
     inode: &mut Ext2Inode,
     block_idx: usize,
 ) -> Result<u32, i64> {
@@ -2921,10 +3109,16 @@ fn ext2_detach_data_block(
             return Ok(0);
         }
 
-        ext2_write_indirect_entry_from_state(state, table, remaining, 0)?;
+        ext2_journal::with_handle_restartable_phase(
+            state,
+            journal_handle,
+            Ext2JournalPhaseKind::IndirectUnlink,
+            EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_UNLINK,
+            |state| ext2_write_indirect_entry_from_state(state, table, remaining, 0),
+        )?;
         let table_has_entries = ext2_table_has_nonzero_entries_state(state, table)?;
         if !table_has_entries {
-            ext2_free_block(state, table)?;
+            ext2_free_block(state, journal_handle, table)?;
             inode.blocks[12] = 0;
         }
         return Ok(current);
@@ -2949,16 +3143,28 @@ fn ext2_detach_data_block(
             return Ok(0);
         }
 
-        ext2_write_indirect_entry_from_state(state, l1, second, 0)?;
+        ext2_journal::with_handle_restartable_phase(
+            state,
+            journal_handle,
+            Ext2JournalPhaseKind::IndirectUnlink,
+            EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_UNLINK,
+            |state| ext2_write_indirect_entry_from_state(state, l1, second, 0),
+        )?;
         let l1_has_entries = ext2_table_has_nonzero_entries_state(state, l1)?;
         if !l1_has_entries {
-            ext2_free_block(state, l1)?;
-            ext2_write_indirect_entry_from_state(state, table, first, 0)?;
+            ext2_free_block(state, journal_handle, l1)?;
+            ext2_journal::with_handle_restartable_phase(
+                state,
+                journal_handle,
+                Ext2JournalPhaseKind::IndirectUnlink,
+                EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_UNLINK,
+                |state| ext2_write_indirect_entry_from_state(state, table, first, 0),
+            )?;
         }
 
         let table_has_entries = ext2_table_has_nonzero_entries_state(state, table)?;
         if !table_has_entries {
-            ext2_free_block(state, table)?;
+            ext2_free_block(state, journal_handle, table)?;
             inode.blocks[13] = 0;
         }
         return Ok(current);
@@ -2989,22 +3195,40 @@ fn ext2_detach_data_block(
             return Ok(0);
         }
 
-        ext2_write_indirect_entry_from_state(state, l2, third, 0)?;
+        ext2_journal::with_handle_restartable_phase(
+            state,
+            journal_handle,
+            Ext2JournalPhaseKind::IndirectUnlink,
+            EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_UNLINK,
+            |state| ext2_write_indirect_entry_from_state(state, l2, third, 0),
+        )?;
         let l2_has_entries = ext2_table_has_nonzero_entries_state(state, l2)?;
         if !l2_has_entries {
-            ext2_free_block(state, l2)?;
-            ext2_write_indirect_entry_from_state(state, l1, second, 0)?;
+            ext2_free_block(state, journal_handle, l2)?;
+            ext2_journal::with_handle_restartable_phase(
+                state,
+                journal_handle,
+                Ext2JournalPhaseKind::IndirectUnlink,
+                EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_UNLINK,
+                |state| ext2_write_indirect_entry_from_state(state, l1, second, 0),
+            )?;
         }
 
         let l1_has_entries = ext2_table_has_nonzero_entries_state(state, l1)?;
         if !l1_has_entries {
-            ext2_free_block(state, l1)?;
-            ext2_write_indirect_entry_from_state(state, table, first, 0)?;
+            ext2_free_block(state, journal_handle, l1)?;
+            ext2_journal::with_handle_restartable_phase(
+                state,
+                journal_handle,
+                Ext2JournalPhaseKind::IndirectUnlink,
+                EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_UNLINK,
+                |state| ext2_write_indirect_entry_from_state(state, table, first, 0),
+            )?;
         }
 
         let table_has_entries = ext2_table_has_nonzero_entries_state(state, table)?;
         if !table_has_entries {
-            ext2_free_block(state, table)?;
+            ext2_free_block(state, journal_handle, table)?;
             inode.blocks[14] = 0;
         }
         return Ok(current);
@@ -3065,6 +3289,7 @@ fn ext2_write_file(
 ) -> Result<WriteResult, i64> {
     let meta = state.ext2_meta;
     let max_size = ext2_effective_max_file_size(&meta)?;
+    let journal_handle = ext2_journal::current_handle(state);
 
     let mut inode = ext2_read_inode_from_state(state, ino)?;
     let start = if append {
@@ -3086,7 +3311,7 @@ fn ext2_write_file(
 
     let old_size = inode.size as usize;
     if start > old_size {
-        ext2_write_zero_range(state, &mut inode, old_size, start)?;
+        ext2_write_zero_range(state, journal_handle, &mut inode, old_size, start)?;
     }
 
     let room = max_size - start;
@@ -3099,15 +3324,28 @@ fn ext2_write_file(
     let mut pos = start;
     while copied < count {
         let block_idx = pos / meta.block_size;
-        let block_off = pos % meta.block_size;
-        let chunk = core::cmp::min(count - copied, meta.block_size - block_off);
-        let block_no = ext2_ensure_data_block(state, &mut inode, block_idx)?;
+        let step_credits = ext2_estimate_data_write_step_credits(state, &inode, block_idx)?;
+        let chunk = ext2_journal::with_handle_restartable_phase(
+            state,
+            journal_handle,
+            Ext2JournalPhaseKind::DataWrite,
+            step_credits,
+            |state| {
+                let block_off = pos % meta.block_size;
+                let chunk = core::cmp::min(count - copied, meta.block_size - block_off);
+                let block_no =
+                    ext2_ensure_data_block(state, journal_handle, &mut inode, block_idx)?;
 
-        {
-            let blk = ext2_block_slice_mut_state(state, block_no)?;
-            blk[block_off..block_off + chunk].copy_from_slice(&src[copied..copied + chunk]);
-        }
-        ext2_mark_dirty_block(state, block_no)?;
+                {
+                    let blk = ext2_block_slice_mut_state(state, block_no)?;
+                    blk[block_off..block_off + chunk]
+                        .copy_from_slice(&src[copied..copied + chunk]);
+                }
+                ext2_journal::note_data_block(state, block_no)?;
+                ext2_mark_dirty_block(state, block_no)?;
+                Ok(chunk)
+            },
+        )?;
 
         copied += chunk;
         pos += chunk;
@@ -3122,7 +3360,13 @@ fn ext2_write_file(
     inode.ctime = now;
     inode.atime = now;
     inode.block_count_512 = ext2_recalc_inode_block_count_512_state(state, &inode)?;
-    ext2_write_inode_to_state(state, ino, &inode)?;
+    ext2_journal::with_handle_restartable_phase(
+        state,
+        journal_handle,
+        Ext2JournalPhaseKind::InodeCloseout,
+        EXT2_JOURNAL_CREDITS_STEP_INODE_CLOSEOUT,
+        |state| ext2_write_inode_to_state(state, ino, &inode),
+    )?;
     ext2_refresh_alias_nodes(state, ino, &inode);
 
     Ok(WriteResult {
@@ -3133,6 +3377,7 @@ fn ext2_write_file(
 
 fn ext2_free_indirect_tree_blocks(
     state: &mut VfsState,
+    journal_handle: Option<Ext2JournalHandle>,
     table_block: u32,
     depth: u8,
 ) -> Result<(), i64> {
@@ -3149,41 +3394,69 @@ fn ext2_free_indirect_tree_blocks(
     while idx < entries {
         let child = ext2_read_indirect_entry_from_state(state, table_block, idx)?;
         if child != 0 {
-            if depth == 1 {
-                ext2_free_block(state, child)?;
-            } else {
-                ext2_free_indirect_tree_blocks(state, child, depth - 1)?;
-            }
+            let step_credits = match depth {
+                1 => EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT,
+                2 => {
+                    EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_ENTRY
+                        + EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT
+                }
+                3 => {
+                    EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_ENTRY * 2
+                        + EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT
+                        + EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_BLOCK
+                }
+                _ => EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT,
+            };
+            ext2_journal::with_handle_restartable_phase(
+                state,
+                journal_handle,
+                Ext2JournalPhaseKind::FreeBlockBookkeeping,
+                step_credits,
+                |state| {
+                    if depth == 1 {
+                        ext2_free_block(state, journal_handle, child)
+                    } else {
+                        ext2_free_indirect_tree_blocks(state, journal_handle, child, depth - 1)
+                    }
+                },
+            )?;
         }
         idx += 1;
     }
 
-    ext2_free_block(state, table_block)
+    ext2_free_block(state, journal_handle, table_block)
 }
 
 fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
     let mut inode = ext2_read_inode_from_state(state, ino)?;
+    let journal_handle = ext2_journal::current_handle(state);
 
     let mut i = 0usize;
     while i < EXT2_INODE_DIRECT_COUNT {
         let block = inode.blocks[i];
         if block != 0 {
-            ext2_free_block(state, block)?;
+            ext2_journal::with_handle_restartable_phase(
+                state,
+                journal_handle,
+                Ext2JournalPhaseKind::FreeBlockBookkeeping,
+                EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT,
+                |state| ext2_free_block(state, journal_handle, block),
+            )?;
             inode.blocks[i] = 0;
         }
         i += 1;
     }
 
     if inode.blocks[12] != 0 {
-        ext2_free_indirect_tree_blocks(state, inode.blocks[12], 1)?;
+        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[12], 1)?;
         inode.blocks[12] = 0;
     }
     if inode.blocks[13] != 0 {
-        ext2_free_indirect_tree_blocks(state, inode.blocks[13], 2)?;
+        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[13], 2)?;
         inode.blocks[13] = 0;
     }
     if inode.blocks[14] != 0 {
-        ext2_free_indirect_tree_blocks(state, inode.blocks[14], 3)?;
+        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[14], 3)?;
         inode.blocks[14] = 0;
     }
 
@@ -3193,7 +3466,13 @@ fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
     inode.mtime = now;
     inode.ctime = now;
     inode.atime = now;
-    ext2_write_inode_to_state(state, ino, &inode)?;
+    ext2_journal::with_handle_restartable_phase(
+        state,
+        journal_handle,
+        Ext2JournalPhaseKind::InodeCloseout,
+        EXT2_JOURNAL_CREDITS_STEP_INODE_CLOSEOUT,
+        |state| ext2_write_inode_to_state(state, ino, &inode),
+    )?;
     ext2_refresh_alias_nodes(state, ino, &inode);
     Ok(())
 }
@@ -3206,10 +3485,11 @@ fn ext2_truncate_to_length(state: &mut VfsState, ino: u32, length: usize) -> Res
     }
 
     let mut inode = ext2_read_inode_from_state(state, ino)?;
+    let journal_handle = ext2_journal::current_handle(state);
     let old_size = inode.size as usize;
 
     if length > old_size {
-        ext2_write_zero_range(state, &mut inode, old_size, length)?;
+        ext2_write_zero_range(state, journal_handle, &mut inode, old_size, length)?;
     } else if length < old_size {
         let old_blocks = ext2_logical_blocks_for_size(&meta, old_size)?;
         let new_blocks = ext2_logical_blocks_for_size(&meta, length)?;
@@ -3219,20 +3499,39 @@ fn ext2_truncate_to_length(state: &mut VfsState, ino: u32, length: usize) -> Res
             let block_off = length % meta.block_size;
             let block_no = ext2_data_block_for_logical_index_state(state, &inode, block_idx)?;
             if block_no != 0 {
-                {
-                    let blk = ext2_block_slice_mut_state(state, block_no)?;
-                    blk[block_off..].fill(0);
-                }
-                ext2_mark_dirty_block(state, block_no)?;
+                ext2_journal::with_handle_restartable_phase(
+                    state,
+                    journal_handle,
+                    Ext2JournalPhaseKind::DataZero,
+                    EXT2_JOURNAL_CREDITS_STEP_EXISTING_DATA,
+                    |state| {
+                        {
+                            let blk = ext2_block_slice_mut_state(state, block_no)?;
+                            blk[block_off..].fill(0);
+                        }
+                        ext2_journal::note_data_block(state, block_no)?;
+                        ext2_mark_dirty_block(state, block_no)
+                    },
+                )?;
             }
         }
 
         let mut idx = new_blocks;
         while idx < old_blocks {
-            let removed = ext2_detach_data_block(state, &mut inode, idx)?;
-            if removed != 0 {
-                ext2_free_block(state, removed)?;
-            }
+            let step_credits = ext2_estimate_detach_step_credits(state, &inode, idx)?;
+            ext2_journal::with_handle_restartable_phase(
+                state,
+                journal_handle,
+                Ext2JournalPhaseKind::IndirectUnlink,
+                step_credits,
+                |state| {
+                    let removed = ext2_detach_data_block(state, journal_handle, &mut inode, idx)?;
+                    if removed != 0 {
+                        ext2_free_block(state, journal_handle, removed)?;
+                    }
+                    Ok(())
+                },
+            )?;
             idx += 1;
         }
     }
@@ -3243,7 +3542,13 @@ fn ext2_truncate_to_length(state: &mut VfsState, ino: u32, length: usize) -> Res
     inode.ctime = now;
     inode.atime = now;
     inode.block_count_512 = ext2_recalc_inode_block_count_512_state(state, &inode)?;
-    ext2_write_inode_to_state(state, ino, &inode)?;
+    ext2_journal::with_handle_restartable_phase(
+        state,
+        journal_handle,
+        Ext2JournalPhaseKind::InodeCloseout,
+        EXT2_JOURNAL_CREDITS_STEP_INODE_CLOSEOUT,
+        |state| ext2_write_inode_to_state(state, ino, &inode),
+    )?;
     ext2_refresh_alias_nodes(state, ino, &inode);
     Ok(())
 }
@@ -3296,28 +3601,29 @@ where
 }
 
 fn ext2_free_inode_blocks(state: &mut VfsState, inode: &mut Ext2Inode) -> Result<(), i64> {
+    let journal_handle = ext2_journal::current_handle(state);
     let mut idx = 0usize;
     while idx < EXT2_INODE_DIRECT_COUNT {
         let block = inode.blocks[idx];
         if block != 0 {
-            ext2_free_block(state, block)?;
+            ext2_free_block(state, journal_handle, block)?;
             inode.blocks[idx] = 0;
         }
         idx += 1;
     }
 
     if inode.blocks[12] != 0 {
-        ext2_free_indirect_tree_blocks(state, inode.blocks[12], 1)?;
+        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[12], 1)?;
         inode.blocks[12] = 0;
     }
 
     if inode.blocks[13] != 0 {
-        ext2_free_indirect_tree_blocks(state, inode.blocks[13], 2)?;
+        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[13], 2)?;
         inode.blocks[13] = 0;
     }
 
     if inode.blocks[14] != 0 {
-        ext2_free_indirect_tree_blocks(state, inode.blocks[14], 3)?;
+        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[14], 3)?;
         inode.blocks[14] = 0;
     }
 
@@ -3326,7 +3632,12 @@ fn ext2_free_inode_blocks(state: &mut VfsState, inode: &mut Ext2Inode) -> Result
     Ok(())
 }
 
-fn ext2_patch_dotdot(state: &mut VfsState, dir_ino: u32, parent_ino: u32) -> Result<(), i64> {
+fn ext2_patch_dotdot(
+    state: &mut VfsState,
+    _journal_handle: Option<Ext2JournalHandle>,
+    dir_ino: u32,
+    parent_ino: u32,
+) -> Result<(), i64> {
     let inode = ext2_read_inode_from_state(state, dir_ino)?;
     if ext2_mode_to_filetype(inode.mode) != Some(FileType::Directory) {
         return Err(ENOTDIR);
@@ -3367,12 +3678,13 @@ fn ext2_patch_dotdot(state: &mut VfsState, dir_ino: u32, parent_ino: u32) -> Res
 
 fn ext2_create_child_on_disk(
     state: &mut VfsState,
+    journal_handle: Option<Ext2JournalHandle>,
     parent_ino: u32,
     name: &[u8],
     file_type: FileType,
 ) -> Result<(u32, u32), i64> {
     let is_dir = file_type == FileType::Directory;
-    let ino = ext2_alloc_inode(state, is_dir)?;
+    let ino = ext2_alloc_inode(state, journal_handle, is_dir)?;
     let meta = state.ext2_meta;
     let now = fs_time_tick(state) as u32;
 
@@ -3395,10 +3707,10 @@ fn ext2_create_child_on_disk(
     };
 
     if is_dir {
-        let block = match ext2_alloc_block(state) {
+        let block = match ext2_alloc_block(state, journal_handle) {
             Ok(v) => v,
             Err(err) => {
-                let _ = ext2_free_inode(state, ino, true);
+                let _ = ext2_free_inode(state, journal_handle, ino, true);
                 return Err(err);
             }
         };
@@ -3424,17 +3736,17 @@ fn ext2_create_child_on_disk(
 
     if let Err(err) = ext2_write_inode_to_state(state, ino, &inode) {
         if inode.blocks[0] != 0 {
-            let _ = ext2_free_block(state, inode.blocks[0]);
+            let _ = ext2_free_block(state, journal_handle, inode.blocks[0]);
         }
-        let _ = ext2_free_inode(state, ino, is_dir);
+        let _ = ext2_free_inode(state, journal_handle, ino, is_dir);
         return Err(err);
     }
 
-    if let Err(err) = ext2_add_dir_entry(state, parent_ino, ino, name, file_type) {
+    if let Err(err) = ext2_add_dir_entry(state, journal_handle, parent_ino, ino, name, file_type) {
         if inode.blocks[0] != 0 {
-            let _ = ext2_free_block(state, inode.blocks[0]);
+            let _ = ext2_free_block(state, journal_handle, inode.blocks[0]);
         }
-        let _ = ext2_free_inode(state, ino, is_dir);
+        let _ = ext2_free_inode(state, journal_handle, ino, is_dir);
         return Err(err);
     }
 
@@ -3740,6 +4052,8 @@ fn rollback_ext2_mount_import(state: &mut VfsState, mount_inode: u16) {
     state.ext2_mount_inode = ROOT_INODE;
     state.ext2_meta = Ext2Meta::empty();
     state.ext2_journal = Ext2JournalState::empty();
+    state.ext2_journal_running_tx = Ext2JournalRunningTx::empty();
+    state.ext2_journal_pending_txs.clear();
     state.ext2_image_len = 0;
     state.ext2_image.clear();
     state.ext2_backend = ext2_backend::Ext2Backend::none();
@@ -3756,6 +4070,274 @@ fn inode_number(node: &Inode, inode_idx: u16) -> u64 {
 
 fn backend_mutable(backend: NodeBackend) -> bool {
     matches!(backend, NodeBackend::Tmpfs | NodeBackend::Ext2)
+}
+
+const EXT2_JOURNAL_CREDITS_CREATE: usize = 32;
+const EXT2_JOURNAL_CREDITS_MKDIR: usize = 40;
+const EXT2_JOURNAL_CREDITS_UNLINK: usize = 32;
+const EXT2_JOURNAL_CREDITS_RENAME: usize = 48;
+const EXT2_JOURNAL_CREDITS_LINK: usize = 24;
+const EXT2_JOURNAL_CREDITS_SYMLINK: usize = 40;
+const EXT2_JOURNAL_CREDITS_METADATA_UPDATE: usize = 8;
+const EXT2_JOURNAL_CREDITS_VARIABLE_BASE: usize = 32;
+const EXT2_JOURNAL_CREDITS_VARIABLE_SEGMENT_MAX: usize = 16;
+const EXT2_JOURNAL_CREDITS_STEP_EXISTING_DATA: usize = 1;
+const EXT2_JOURNAL_CREDITS_STEP_ALLOC_DIRECT: usize = 5;
+const EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY: usize = 6;
+const EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ROOT: usize = 4;
+const EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT: usize = 4;
+const EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_ENTRY: usize = 5;
+const EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_BLOCK: usize = 4;
+const EXT2_JOURNAL_CREDITS_STEP_INODE_CLOSEOUT: usize = 1;
+const EXT2_JOURNAL_CREDITS_HELPER_ALLOC_BLOCK_BOOKKEEPING: usize = 3;
+const EXT2_JOURNAL_CREDITS_HELPER_ALLOC_BLOCK_INIT: usize = 1;
+const EXT2_JOURNAL_CREDITS_HELPER_FREE_BLOCK_BOOKKEEPING: usize = 3;
+const EXT2_JOURNAL_CREDITS_HELPER_FREE_BLOCK_REVOKE: usize = 1;
+const EXT2_JOURNAL_CREDITS_HELPER_ALLOC_INODE_BOOKKEEPING: usize = 3;
+const EXT2_JOURNAL_CREDITS_HELPER_ALLOC_INODE_INIT: usize = 1;
+const EXT2_JOURNAL_CREDITS_HELPER_FREE_INODE_BOOKKEEPING: usize = 3;
+const EXT2_JOURNAL_CREDITS_HELPER_FREE_INODE_CLEAR: usize = 1;
+const EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_LINK: usize = 1;
+const EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_UNLINK: usize = 1;
+
+struct Ext2JournalCreditPlan {
+    initial_credits: usize,
+    growth_chunk: usize,
+}
+
+fn ext2_plan_variable_journal_credits(total_estimate: usize) -> Ext2JournalCreditPlan {
+    let segment = core::cmp::min(total_estimate, EXT2_JOURNAL_CREDITS_VARIABLE_SEGMENT_MAX);
+    Ext2JournalCreditPlan {
+        initial_credits: segment,
+        growth_chunk: segment,
+    }
+}
+
+fn ext2_logical_block_indirection_depth(meta: &Ext2Meta, block_idx: usize) -> Result<u8, i64> {
+    if block_idx < EXT2_INODE_DIRECT_COUNT {
+        return Ok(0);
+    }
+    let entries = ext2_indirect_entries_per_block(meta)?;
+    let mut remaining = block_idx - EXT2_INODE_DIRECT_COUNT;
+    if remaining < entries {
+        return Ok(1);
+    }
+    remaining -= entries;
+    let double_span = entries.checked_mul(entries).ok_or(EIO)?;
+    if remaining < double_span {
+        return Ok(2);
+    }
+    remaining -= double_span;
+    let triple_span = double_span.checked_mul(entries).ok_or(EIO)?;
+    if remaining < triple_span {
+        return Ok(3);
+    }
+    Err(EIO)
+}
+
+fn ext2_estimate_data_write_step_credits(
+    state: &mut VfsState,
+    inode: &Ext2Inode,
+    block_idx: usize,
+) -> Result<usize, i64> {
+    if ext2_data_block_for_logical_index_state(state, inode, block_idx)? != 0 {
+        return Ok(EXT2_JOURNAL_CREDITS_STEP_EXISTING_DATA);
+    }
+    let meta = state.ext2_meta;
+    match ext2_logical_block_indirection_depth(&meta, block_idx)? {
+        0 => Ok(EXT2_JOURNAL_CREDITS_STEP_ALLOC_DIRECT),
+        1 => Ok(
+            EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY
+                + if inode.blocks[12] == 0 {
+                    EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ROOT
+                } else {
+                    0
+                },
+        ),
+        2 => {
+            let entries = ext2_indirect_entries_per_block(&meta)?;
+            let remaining = block_idx - EXT2_INODE_DIRECT_COUNT - entries;
+            let l1_idx = remaining / entries;
+            let mut credits = EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY;
+            if inode.blocks[13] == 0 {
+                credits += EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ROOT;
+                credits += EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY;
+            } else if ext2_read_indirect_entry_from_state(state, inode.blocks[13], l1_idx)? == 0 {
+                credits += EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY;
+            }
+            Ok(credits)
+        }
+        3 => {
+            let entries = ext2_indirect_entries_per_block(&meta)?;
+            let double_span = entries.checked_mul(entries).ok_or(EIO)?;
+            let remaining = block_idx - EXT2_INODE_DIRECT_COUNT - entries - double_span;
+            let l1_idx = remaining / double_span;
+            let l2_idx = (remaining % double_span) / entries;
+            let mut credits = EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY;
+            if inode.blocks[14] == 0 {
+                credits += EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ROOT;
+                credits += EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY * 2;
+            } else {
+                let l1 = ext2_read_indirect_entry_from_state(state, inode.blocks[14], l1_idx)?;
+                if l1 == 0 {
+                    credits += EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY * 2;
+                } else if ext2_read_indirect_entry_from_state(state, l1, l2_idx)? == 0 {
+                    credits += EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY;
+                }
+            }
+            Ok(credits)
+        }
+        _ => Err(EIO),
+    }
+}
+
+fn ext2_estimate_detach_step_credits(
+    state: &mut VfsState,
+    inode: &Ext2Inode,
+    block_idx: usize,
+) -> Result<usize, i64> {
+    if ext2_data_block_for_logical_index_state(state, inode, block_idx)? == 0 {
+        return Ok(0);
+    }
+    let meta = state.ext2_meta;
+    match ext2_logical_block_indirection_depth(&meta, block_idx)? {
+        0 => Ok(EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT),
+        1 => Ok(
+            EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_ENTRY + EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT,
+        ),
+        2 => Ok(
+            EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_ENTRY * 2
+                + EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT
+                + EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_BLOCK,
+        ),
+        3 => Ok(
+            EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_ENTRY * 3
+                + EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT
+                + EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_BLOCK * 2,
+        ),
+        _ => Err(EIO),
+    }
+}
+
+fn ext2_count_blocks_in_byte_range(block_size: usize, start: usize, end: usize) -> Result<usize, i64> {
+    if block_size == 0 {
+        return Err(EIO);
+    }
+    if end <= start {
+        return Ok(0);
+    }
+    let first = start / block_size;
+    let last = (end - 1) / block_size;
+    Ok(last.saturating_sub(first).saturating_add(1))
+}
+
+fn ext2_allocated_block_count_from_inode(meta: &Ext2Meta, inode: &Ext2Inode) -> Result<usize, i64> {
+    let sectors_per_block = meta.block_size / 512;
+    if sectors_per_block == 0 {
+        return Err(EIO);
+    }
+    Ok((inode.block_count_512 as usize) / sectors_per_block)
+}
+
+fn ext2_estimate_write_credits(
+    state: &mut VfsState,
+    ino: u32,
+    offset: u64,
+    src_len: usize,
+    append: bool,
+) -> Result<usize, i64> {
+    let meta = state.ext2_meta;
+    let inode = ext2_read_inode_from_state(state, ino)?;
+    let max_size = ext2_effective_max_file_size(&meta)?;
+    let start = if append {
+        inode.size as usize
+    } else {
+        usize::try_from(offset).map_err(|_| EINVAL)?
+    };
+    if start > max_size {
+        return Ok(EXT2_JOURNAL_CREDITS_VARIABLE_BASE);
+    }
+    let room = max_size.saturating_sub(start);
+    let write_len = core::cmp::min(src_len, room);
+    let end = start.checked_add(write_len).ok_or(EIO)?;
+    let old_size = inode.size as usize;
+    let gap_blocks = if start > old_size {
+        ext2_count_blocks_in_byte_range(meta.block_size, old_size, start)?
+    } else {
+        0
+    };
+    let write_blocks = ext2_count_blocks_in_byte_range(meta.block_size, start, end)?;
+    gap_blocks
+        .checked_add(write_blocks)
+        .and_then(|blocks| blocks.checked_mul(4))
+        .and_then(|credits| credits.checked_add(EXT2_JOURNAL_CREDITS_VARIABLE_BASE))
+        .ok_or(ENOSPC)
+}
+
+fn ext2_estimate_truncate_to_zero_credits(state: &mut VfsState, ino: u32) -> Result<usize, i64> {
+    let meta = state.ext2_meta;
+    let inode = ext2_read_inode_from_state(state, ino)?;
+    let allocated = ext2_allocated_block_count_from_inode(&meta, &inode)?;
+    allocated
+        .checked_mul(2)
+        .and_then(|credits| credits.checked_add(EXT2_JOURNAL_CREDITS_VARIABLE_BASE))
+        .ok_or(ENOSPC)
+}
+
+fn ext2_estimate_truncate_to_length_credits(
+    state: &mut VfsState,
+    ino: u32,
+    length: usize,
+) -> Result<usize, i64> {
+    let meta = state.ext2_meta;
+    let inode = ext2_read_inode_from_state(state, ino)?;
+    let old_size = inode.size as usize;
+    let changed_blocks = if length > old_size {
+        ext2_count_blocks_in_byte_range(meta.block_size, old_size, length)?
+    } else {
+        ext2_count_blocks_in_byte_range(meta.block_size, length, old_size)?
+    };
+    let allocated = ext2_allocated_block_count_from_inode(&meta, &inode)?;
+    changed_blocks
+        .checked_add(allocated)
+        .and_then(|blocks| blocks.checked_mul(2))
+        .and_then(|credits| credits.checked_add(EXT2_JOURNAL_CREDITS_VARIABLE_BASE))
+        .ok_or(ENOSPC)
+}
+
+fn with_ext2_journal_scope_credits<R>(
+    state: &mut VfsState,
+    enabled: bool,
+    credits: usize,
+    f: impl FnOnce(&mut VfsState) -> Result<R, i64>,
+) -> Result<R, i64> {
+    with_ext2_journal_scope_credit_policy(state, enabled, credits, false, 0, f)
+}
+
+fn with_ext2_journal_scope_credit_policy<R>(
+    state: &mut VfsState,
+    enabled: bool,
+    credits: usize,
+    restartable: bool,
+    credit_growth_chunk: usize,
+    f: impl FnOnce(&mut VfsState) -> Result<R, i64>,
+) -> Result<R, i64> {
+    if !enabled {
+        return f(state);
+    }
+    ext2_journal::begin_mutation_scope_with_credits_options(
+        state,
+        credits,
+        restartable,
+        credit_growth_chunk,
+    )?;
+    let result = f(state);
+    let end_result = ext2_journal::end_mutation_scope(state);
+    match (result, end_result) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 fn open_at_inner(
@@ -3816,12 +4398,28 @@ fn open_at_inner(
                 touch_inode_metadata(state, inode_idx, true, true, true);
             }
             NodeBackend::Ext2 => {
-                if inode_ext2_ino == 0 {
+                let credits = if inode_ext2_ino == 0 {
                     return Err(EIO);
-                }
-                ext2_truncate_to_zero(state, inode_ext2_ino)?;
-                state.inodes[inode_idx as usize].size = 0;
-                touch_inode_metadata(state, inode_idx, true, true, true);
+                } else {
+                    ext2_estimate_truncate_to_zero_credits(state, inode_ext2_ino)?
+                };
+                let plan = ext2_plan_variable_journal_credits(credits);
+                with_ext2_journal_scope_credit_policy(
+                    state,
+                    true,
+                    plan.initial_credits,
+                    true,
+                    plan.growth_chunk,
+                    |state| {
+                    if inode_ext2_ino == 0 {
+                        return Err(EIO);
+                    }
+                    ext2_truncate_to_zero(state, inode_ext2_ino)?;
+                    state.inodes[inode_idx as usize].size = 0;
+                    touch_inode_metadata(state, inode_idx, true, true, true);
+                    Ok(())
+                },
+                )?;
             }
             _ => {}
         }
@@ -3986,8 +4584,9 @@ fn unlink_at_inner(
         if state.inodes[parent as usize].ext2_ino == 0 || child_ext2_ino == 0 {
             return Err(EIO);
         }
+        let journal_handle = ext2_journal::current_handle(state);
         let parent_ino = state.inodes[parent as usize].ext2_ino;
-        let removed = ext2_remove_dir_entry(state, parent_ino, &name[..name_len])?;
+        let removed = ext2_remove_dir_entry(state, journal_handle, parent_ino, &name[..name_len])?;
         if removed != child_ext2_ino {
             return Err(EIO);
         }
@@ -3998,7 +4597,7 @@ fn unlink_at_inner(
                 return Err(ENOTEMPTY);
             }
             ext2_free_inode_blocks(state, &mut child_ext)?;
-            ext2_free_inode(state, child_ext2_ino, true)?;
+            ext2_free_inode(state, journal_handle, child_ext2_ino, true)?;
             let mut parent_ext = ext2_read_inode_from_state(state, parent_ino)?;
             parent_ext.links_count = parent_ext.links_count.saturating_sub(1);
             parent_ext.mtime = fs_time_tick(state) as u32;
@@ -4014,7 +4613,7 @@ fn unlink_at_inner(
                 ext2_refresh_alias_nodes(state, child_ext2_ino, &child_ext);
             } else {
                 ext2_free_inode_blocks(state, &mut child_ext)?;
-                ext2_free_inode(state, child_ext2_ino, false)?;
+                ext2_free_inode(state, journal_handle, child_ext2_ino, false)?;
             }
         }
     }
@@ -4091,13 +4690,16 @@ fn rename_at_inner(
         if old_parent_ino == 0 || new_parent_ino == 0 || child_ext2_ino == 0 {
             return Err(EIO);
         }
+        let journal_handle = ext2_journal::current_handle(state);
 
-        let removed = ext2_remove_dir_entry(state, old_parent_ino, &old_name[..old_len])?;
+        let removed =
+            ext2_remove_dir_entry(state, journal_handle, old_parent_ino, &old_name[..old_len])?;
         if removed != child_ext2_ino {
             return Err(EIO);
         }
         if let Err(err) = ext2_add_dir_entry(
             state,
+            journal_handle,
             new_parent_ino,
             child_ext2_ino,
             &new_name[..new_len],
@@ -4105,6 +4707,7 @@ fn rename_at_inner(
         ) {
             let _ = ext2_add_dir_entry(
                 state,
+                journal_handle,
                 old_parent_ino,
                 child_ext2_ino,
                 &old_name[..old_len],
@@ -4114,7 +4717,7 @@ fn rename_at_inner(
         }
 
         if child_file_type == FileType::Directory && old_parent_ino != new_parent_ino {
-            ext2_patch_dotdot(state, child_ext2_ino, new_parent_ino)?;
+            ext2_patch_dotdot(state, journal_handle, child_ext2_ino, new_parent_ino)?;
             let mut old_parent_inode = ext2_read_inode_from_state(state, old_parent_ino)?;
             old_parent_inode.links_count = old_parent_inode.links_count.saturating_sub(1);
             ext2_write_inode_to_state(state, old_parent_ino, &old_parent_inode)?;
@@ -4225,9 +4828,11 @@ fn link_at_inner(
             if old_ext2_ino == 0 || new_parent_ext2_ino == 0 {
                 return Err(EIO);
             }
+            let journal_handle = ext2_journal::current_handle(state);
 
             ext2_add_dir_entry(
                 state,
+                journal_handle,
                 new_parent_ext2_ino,
                 old_ext2_ino,
                 &new_name[..new_len],
@@ -4248,7 +4853,12 @@ fn link_at_inner(
             ) {
                 Ok(inode) => inode,
                 Err(err) => {
-                    let _ = ext2_remove_dir_entry(state, new_parent_ext2_ino, &new_name[..new_len]);
+                    let _ = ext2_remove_dir_entry(
+                        state,
+                        journal_handle,
+                        new_parent_ext2_ino,
+                        &new_name[..new_len],
+                    );
                     if ext_inode.links_count > 0 {
                         ext_inode.links_count -= 1;
                     }
@@ -4263,7 +4873,12 @@ fn link_at_inner(
             }
             if let Err(err) = add_child(state, new_parent, new_inode) {
                 clear_inode(&mut state.inodes[new_inode as usize]);
-                let _ = ext2_remove_dir_entry(state, new_parent_ext2_ino, &new_name[..new_len]);
+                let _ = ext2_remove_dir_entry(
+                    state,
+                    journal_handle,
+                    new_parent_ext2_ino,
+                    &new_name[..new_len],
+                );
                 if ext_inode.links_count > 0 {
                     ext_inode.links_count -= 1;
                 }
@@ -4333,26 +4948,34 @@ fn symlink_at_inner(
             if parent_ino == 0 {
                 return Err(EIO);
             }
+            let journal_handle = ext2_journal::current_handle(state);
 
-            let (ext2_ino, _) =
-                ext2_create_child_on_disk(state, parent_ino, &name[..name_len], FileType::Symlink)?;
+            let (ext2_ino, _) = ext2_create_child_on_disk(
+                state,
+                journal_handle,
+                parent_ino,
+                &name[..name_len],
+                FileType::Symlink,
+            )?;
 
             if !target_bytes.is_empty() {
                 let wrote = match ext2_write_file(state, ext2_ino, 0, target_bytes, false) {
                     Ok(w) => w,
                     Err(err) => {
-                        let _ = ext2_remove_dir_entry(state, parent_ino, &name[..name_len]);
+                        let _ =
+                            ext2_remove_dir_entry(state, journal_handle, parent_ino, &name[..name_len]);
                         let mut child = ext2_read_inode_from_state(state, ext2_ino)?;
                         let _ = ext2_free_inode_blocks(state, &mut child);
-                        let _ = ext2_free_inode(state, ext2_ino, false);
+                        let _ = ext2_free_inode(state, journal_handle, ext2_ino, false);
                         return Err(err);
                     }
                 };
                 if wrote.written != target_bytes.len() {
-                    let _ = ext2_remove_dir_entry(state, parent_ino, &name[..name_len]);
+                    let _ =
+                        ext2_remove_dir_entry(state, journal_handle, parent_ino, &name[..name_len]);
                     let mut child = ext2_read_inode_from_state(state, ext2_ino)?;
                     let _ = ext2_free_inode_blocks(state, &mut child);
-                    let _ = ext2_free_inode(state, ext2_ino, false);
+                    let _ = ext2_free_inode(state, journal_handle, ext2_ino, false);
                     return Err(ENOSPC);
                 }
             }
@@ -4366,11 +4989,12 @@ fn symlink_at_inner(
             ) {
                 Ok(inode) => inode,
                 Err(err) => {
-                    let _ = ext2_remove_dir_entry(state, parent_ino, &name[..name_len]);
+                    let _ =
+                        ext2_remove_dir_entry(state, journal_handle, parent_ino, &name[..name_len]);
                     if let Ok(mut child) = ext2_read_inode_from_state(state, ext2_ino) {
                         let _ = ext2_free_inode_blocks(state, &mut child);
                     }
-                    let _ = ext2_free_inode(state, ext2_ino, false);
+                    let _ = ext2_free_inode(state, journal_handle, ext2_ino, false);
                     return Err(err);
                 }
             };
@@ -4390,11 +5014,12 @@ fn symlink_at_inner(
             }
             if let Err(err) = add_child(state, parent, inode) {
                 clear_inode(&mut state.inodes[inode as usize]);
-                let _ = ext2_remove_dir_entry(state, parent_ino, &name[..name_len]);
+                let _ =
+                    ext2_remove_dir_entry(state, journal_handle, parent_ino, &name[..name_len]);
                 if let Ok(mut child) = ext2_read_inode_from_state(state, ext2_ino) {
                     let _ = ext2_free_inode_blocks(state, &mut child);
                 }
-                let _ = ext2_free_inode(state, ext2_ino, false);
+                let _ = ext2_free_inode(state, journal_handle, ext2_ino, false);
                 return Err(err);
             }
 
@@ -4664,7 +5289,9 @@ pub fn unlink(path: &str) -> Result<(), i64> {
 pub fn unlinkat(start: u16, path: &str) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
-        unlink_at_inner(state, start, path, false)
+        with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_UNLINK, |state| {
+            unlink_at_inner(state, start, path, false)
+        })
     })
 }
 
@@ -4675,7 +5302,9 @@ pub fn rmdir(path: &str) -> Result<(), i64> {
 pub fn rmdirat(start: u16, path: &str) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
-        unlink_at_inner(state, start, path, true)
+        with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_UNLINK, |state| {
+            unlink_at_inner(state, start, path, true)
+        })
     })
 }
 
@@ -4686,21 +5315,27 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), i64> {
 pub fn renameat(old_start: u16, old_path: &str, new_start: u16, new_path: &str) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
-        rename_at_inner(state, old_start, old_path, new_start, new_path)
+        with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_RENAME, |state| {
+            rename_at_inner(state, old_start, old_path, new_start, new_path)
+        })
     })
 }
 
 pub fn linkat(old_start: u16, old_path: &str, new_start: u16, new_path: &str) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
-        link_at_inner(state, old_start, old_path, new_start, new_path)
+        with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_LINK, |state| {
+            link_at_inner(state, old_start, old_path, new_start, new_path)
+        })
     })
 }
 
 pub fn symlinkat(start: u16, target: &str, link_path: &str) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
-        symlink_at_inner(state, start, target, link_path)
+        with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_SYMLINK, |state| {
+            symlink_at_inner(state, start, target, link_path)
+        })
     })
 }
 
@@ -4714,21 +5349,36 @@ pub fn readlinkat(start: u16, path: &str, dst: &mut [u8]) -> Result<usize, i64> 
 pub fn set_times(inode: u16, atime: u64, mtime: u64) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
-        set_times_inner(state, inode, atime, mtime)
+        with_ext2_journal_scope_credits(
+            state,
+            true,
+            EXT2_JOURNAL_CREDITS_METADATA_UPDATE,
+            |state| set_times_inner(state, inode, atime, mtime),
+        )
     })
 }
 
 pub fn chmod(inode: u16, mode: u16) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
-        chmod_inner(state, inode, mode)
+        with_ext2_journal_scope_credits(
+            state,
+            true,
+            EXT2_JOURNAL_CREDITS_METADATA_UPDATE,
+            |state| chmod_inner(state, inode, mode),
+        )
     })
 }
 
 pub fn chown(inode: u16, uid: u32, gid: u32) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
-        chown_inner(state, inode, uid, gid)
+        with_ext2_journal_scope_credits(
+            state,
+            true,
+            EXT2_JOURNAL_CREDITS_METADATA_UPDATE,
+            |state| chown_inner(state, inode, uid, gid),
+        )
     })
 }
 
@@ -4867,7 +5517,17 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
                 if ext2_ino == 0 {
                     return Err(EIO);
                 }
-                let result = ext2_write_file(state, ext2_ino, offset, src, append)?;
+                let credits =
+                    ext2_estimate_write_credits(state, ext2_ino, offset, src.len(), append)?;
+                let plan = ext2_plan_variable_journal_credits(credits);
+                let result = with_ext2_journal_scope_credit_policy(
+                    state,
+                    true,
+                    plan.initial_credits,
+                    true,
+                    plan.growth_chunk,
+                    |state| ext2_write_file(state, ext2_ino, offset, src, append),
+                )?;
                 state.inodes[inode as usize].size =
                     core::cmp::max(state.inodes[inode as usize].size, result.new_offset as u32);
                 result
@@ -5064,9 +5724,21 @@ pub fn truncate(inode: u16) -> Result<(), i64> {
                 if ext2_ino == 0 {
                     return Err(EIO);
                 }
-                ext2_truncate_to_zero(state, ext2_ino)?;
-                state.inodes[inode as usize].size = 0;
-                touch_inode_metadata(state, inode, false, true, true);
+                let credits = ext2_estimate_truncate_to_zero_credits(state, ext2_ino)?;
+                let plan = ext2_plan_variable_journal_credits(credits);
+                with_ext2_journal_scope_credit_policy(
+                    state,
+                    true,
+                    plan.initial_credits,
+                    true,
+                    plan.growth_chunk,
+                    |state| {
+                    ext2_truncate_to_zero(state, ext2_ino)?;
+                    state.inodes[inode as usize].size = 0;
+                    touch_inode_metadata(state, inode, false, true, true);
+                    Ok(())
+                },
+                )?;
             }
             _ => {}
         }
@@ -5119,9 +5791,21 @@ pub fn truncate_to(inode: u16, length: u64) -> Result<(), i64> {
                     return Err(EIO);
                 }
                 let new_len = usize::try_from(length).map_err(|_| EINVAL)?;
-                ext2_truncate_to_length(state, ext2_ino, new_len)?;
-                state.inodes[inode as usize].size = new_len as u32;
-                touch_inode_metadata(state, inode, false, true, true);
+                let credits = ext2_estimate_truncate_to_length_credits(state, ext2_ino, new_len)?;
+                let plan = ext2_plan_variable_journal_credits(credits);
+                with_ext2_journal_scope_credit_policy(
+                    state,
+                    true,
+                    plan.initial_credits,
+                    true,
+                    plan.growth_chunk,
+                    |state| {
+                    ext2_truncate_to_length(state, ext2_ino, new_len)?;
+                    state.inodes[inode as usize].size = new_len as u32;
+                    touch_inode_metadata(state, inode, false, true, true);
+                    Ok(())
+                },
+                )?;
             }
             _ => {}
         }
@@ -6033,9 +6717,1028 @@ mod tests {
 
         with_state(|state| {
             assert!(state.ext2_journal.present);
+            assert_eq!(state.ext2_journal.mode, Ext2JournalMode::Ordered);
             assert_eq!(state.ext2_journal.inode, 8);
             assert_eq!(state.ext2_journal.start, 0);
             assert_eq!(state.ext2_journal.sequence, 56);
+        });
+    }
+
+    #[test]
+    fn ext2_journaled_mount_seals_ordered_transaction_state_after_write_scope() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open ext2 file");
+        let _ = write(file.inode, 0, b"ordered", false).expect("write ext2 file");
+
+        with_state(|state| {
+            assert!(state.ext2_journal.present);
+            assert_eq!(state.ext2_journal.mode, Ext2JournalMode::Ordered);
+            assert!(!state.ext2_journal_running_tx.active);
+            assert!(state.ext2_journal_running_tx.tracked_blocks.is_empty());
+            assert!(state.ext2_journal_running_tx.data_blocks.is_empty());
+            assert_eq!(state.ext2_journal_running_tx.scope_depth, 0);
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            assert!(!state.ext2_journal_pending_txs[0].metadata_blocks.is_empty());
+            assert!(!state.ext2_journal_pending_txs[0].data_blocks.is_empty());
+            assert_eq!(state.ext2_journal_pending_txs[0].tx_id, 1);
+            assert!(state.ext2_journal_pending_txs[0].used_credits > 0);
+        });
+
+        with_state(|state| {
+            let flushed = ext2_sync::flush_all_dirty(state).expect("flush all dirty");
+            assert!(flushed > 0);
+            assert!(!state.ext2_journal_running_tx.active);
+            assert!(state.ext2_journal_running_tx.tracked_blocks.is_empty());
+            assert!(state.ext2_journal_running_tx.data_blocks.is_empty());
+            assert!(state.ext2_journal_pending_txs.is_empty());
+            assert!(!state.ext2_journal_committed_txs.is_empty());
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_writes_file_data_home_before_checkpoint() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open ext2 file");
+        let _ = write(file.inode, 0, b"ordered!", false).expect("write ext2 file");
+
+        let file_ext2_ino = with_state(|state| state.inodes[file.inode as usize].ext2_ino);
+        let file_home_block = with_state(|state| {
+            let inode = ext2_read_inode_from_state(state, file_ext2_ino).expect("read ext2 inode");
+            ext2_data_block_for_logical_index_state(state, &inode, 0).expect("resolve data block")
+        });
+
+        with_state(|state| {
+            let flushed = ext2_sync::flush_all_dirty(state).expect("flush all dirty");
+            assert!(flushed > 0);
+            assert!(!state.ext2_journal_committed_txs.is_empty());
+        });
+
+        let block_size = 1024usize;
+        let home_off = (file_home_block as usize) * block_size;
+        assert_eq!(&ctx.image[home_off..home_off + 8], b"ordered!");
+
+        with_state(|state| {
+            let checkpointed =
+                ext2_journal::checkpoint_all_committed(state).expect("checkpoint committed");
+            assert!(checkpointed > 0);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_nested_scopes_share_transaction_id_and_credits() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            let outer = ext2_journal::begin_mutation_scope_with_credits(state, 2)
+                .expect("begin outer scope");
+            let inner = ext2_journal::begin_mutation_scope_with_credits(state, 3)
+                .expect("begin inner scope");
+            assert_eq!(outer, inner);
+            assert_eq!(state.ext2_journal_running_tx.tx_id, outer);
+            assert_eq!(state.ext2_journal_running_tx.handle_count, 2);
+            assert_eq!(state.ext2_journal_running_tx.reserved_credits, 5);
+
+            ext2_ensure_block_resident(state, 1).expect("load block");
+            {
+                let block = ext2_block_slice_mut_state(state, 1).expect("mut block");
+                block[0] ^= 0x11;
+            }
+            ext2_mark_dirty_block(state, 1).expect("mark dirty");
+
+            ext2_journal::end_mutation_scope(state).expect("end inner scope");
+            assert!(state.ext2_journal_pending_txs.is_empty());
+            assert_eq!(state.ext2_journal_running_tx.tx_id, outer);
+            assert_eq!(state.ext2_journal_running_tx.handle_count, 1);
+            assert_eq!(state.ext2_journal_running_tx.scope_depth, 1);
+
+            ext2_journal::end_mutation_scope(state).expect("end outer scope");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            let pending = &state.ext2_journal_pending_txs[0];
+            assert_eq!(pending.tx_id, outer);
+            assert_eq!(pending.reserved_credits, 5);
+            assert_eq!(pending.used_credits, 1);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_credit_budget_rejects_extra_unique_blocks() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            let tx_id = ext2_journal::begin_mutation_scope_with_credits(state, 1)
+                .expect("begin credited scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_ensure_block_resident(state, 2).expect("load block 2");
+
+            ext2_journal::note_metadata_block(state, 1).expect("track first block");
+            assert_eq!(
+                ext2_journal::note_metadata_block(state, 2).unwrap_err(),
+                ENOSPC
+            );
+
+            ext2_journal::end_mutation_scope(state).expect("end credited scope");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            let pending = &state.ext2_journal_pending_txs[0];
+            assert_eq!(pending.tx_id, tx_id);
+            assert_eq!(pending.restart_count, 0);
+            assert_eq!(pending.reserved_credits, 1);
+            assert_eq!(pending.used_credits, 1);
+            assert_eq!(pending.metadata_blocks, std::vec![1]);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_restartable_scope_seals_multiple_segments() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            let tx_id = ext2_journal::begin_mutation_scope_with_credits_options(state, 1, true, 2)
+                .expect("begin restartable scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_ensure_block_resident(state, 2).expect("load block 2");
+            ext2_ensure_block_resident(state, 3).expect("load block 3");
+
+            ext2_journal::note_metadata_block(state, 1).expect("track first block");
+            ext2_journal::note_metadata_block(state, 2).expect("track second block");
+            ext2_journal::note_metadata_block(state, 3).expect("track third block");
+
+            assert_eq!(state.ext2_journal_running_tx.op_id, tx_id);
+            assert_ne!(state.ext2_journal_running_tx.tx_id, tx_id);
+            assert_eq!(state.ext2_journal_running_tx.segment_index, 1);
+            assert_eq!(state.ext2_journal_running_tx.restart_count, 1);
+            assert_eq!(state.ext2_journal_running_tx.reserved_credits, 2);
+            assert_eq!(state.ext2_journal_running_tx.used_credits, 2);
+
+            ext2_journal::end_mutation_scope(state).expect("end restartable scope");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 2);
+
+            let first = &state.ext2_journal_pending_txs[0];
+            assert_eq!(first.op_id, tx_id);
+            assert_eq!(first.tx_id, tx_id);
+            assert_eq!(first.segment_index, 0);
+            assert_eq!(first.restart_count, 0);
+            assert_eq!(first.reserved_credits, 1);
+            assert_eq!(first.used_credits, 1);
+            assert_eq!(first.metadata_blocks, std::vec![1]);
+
+            let second = &state.ext2_journal_pending_txs[1];
+            assert_eq!(second.op_id, tx_id);
+            assert_ne!(second.tx_id, tx_id);
+            assert_eq!(second.segment_index, 1);
+            assert_eq!(second.restart_count, 1);
+            assert_eq!(second.reserved_credits, 2);
+            assert_eq!(second.used_credits, 2);
+            assert_eq!(second.metadata_blocks, std::vec![2, 3]);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_prepare_running_tx_credits_rotates_before_next_step() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            let op_id = ext2_journal::begin_mutation_scope_with_credits_options(state, 1, true, 1)
+                .expect("begin restartable scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_ensure_block_resident(state, 2).expect("load block 2");
+
+            ext2_journal::note_metadata_block(state, 1).expect("track first block");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 0);
+
+            ext2_journal::begin_restartable_phase(
+                state,
+                Ext2JournalPhaseKind::DataWrite,
+                1,
+            )
+            .expect("begin next phase");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            assert_eq!(state.ext2_journal_pending_txs[0].op_id, op_id);
+            assert_eq!(state.ext2_journal_pending_txs[0].segment_index, 0);
+            assert_eq!(state.ext2_journal_pending_txs[0].metadata_blocks, std::vec![1]);
+            assert_eq!(state.ext2_journal_pending_txs[0].phase_entries, 0);
+            assert_eq!(
+                state.ext2_journal_running_tx.last_phase_kind,
+                Ext2JournalPhaseKind::DataWrite
+            );
+            assert_eq!(state.ext2_journal_running_tx.phase_entries, 1);
+
+            ext2_journal::note_metadata_block(state, 2).expect("track second block");
+            assert_eq!(state.ext2_journal_running_tx.op_id, op_id);
+            assert_eq!(state.ext2_journal_running_tx.segment_index, 1);
+            assert_eq!(state.ext2_journal_running_tx.restart_count, 1);
+
+            ext2_journal::end_mutation_scope(state).expect("end scope");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 2);
+            assert_eq!(state.ext2_journal_pending_txs[1].metadata_blocks, std::vec![2]);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_restartable_phase_helper_groups_work_into_named_subhandles() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            ext2_journal::begin_mutation_scope_with_credits_options(state, 4, true, 4)
+                .expect("begin restartable scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_ensure_block_resident(state, 2).expect("load block 2");
+            ext2_ensure_block_resident(state, 3).expect("load block 3");
+
+            ext2_journal::with_restartable_phase(
+                state,
+                Ext2JournalPhaseKind::DataWrite,
+                2,
+                |state| {
+                    ext2_journal::note_metadata_block(state, 1)?;
+                    ext2_journal::note_metadata_block(state, 2)?;
+                    Ok(())
+                },
+            )
+            .expect("data-write phase");
+            assert_eq!(state.ext2_journal_running_tx.phase_entries, 1);
+            assert_eq!(
+                state.ext2_journal_running_tx.last_phase_kind,
+                Ext2JournalPhaseKind::DataWrite
+            );
+
+            ext2_journal::with_restartable_phase(
+                state,
+                Ext2JournalPhaseKind::InodeCloseout,
+                1,
+                |state| ext2_journal::note_metadata_block(state, 3),
+            )
+            .expect("inode-closeout phase");
+            assert_eq!(state.ext2_journal_running_tx.phase_entries, 2);
+            assert_eq!(
+                state.ext2_journal_running_tx.last_phase_kind,
+                Ext2JournalPhaseKind::InodeCloseout
+            );
+
+            ext2_journal::end_mutation_scope(state).expect("end scope");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            let pending = &state.ext2_journal_pending_txs[0];
+            assert_eq!(pending.phase_entries, 2);
+            assert_eq!(pending.last_phase_kind, Ext2JournalPhaseKind::InodeCloseout);
+            assert_eq!(pending.metadata_blocks, std::vec![1, 2, 3]);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_handle_phase_rejects_stale_handle() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            ext2_journal::begin_mutation_scope_with_credits_options(state, 2, true, 2)
+                .expect("begin restartable scope");
+            let handle = ext2_journal::current_handle(state).expect("current handle");
+            ext2_journal::end_mutation_scope(state).expect("end scope");
+
+            let err = ext2_journal::with_handle_restartable_phase(
+                state,
+                Some(handle),
+                Ext2JournalPhaseKind::DataWrite,
+                1,
+                |_state| Ok(()),
+            )
+            .expect_err("stale handle should fail");
+            assert_eq!(err, EINVAL);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_step_credit_estimators_account_for_indirection() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/estimate.bin", O_CREAT | O_RDWR, 0).expect("create file");
+        with_state(|state| {
+            ext2_sync::flush_all_dirty(state).expect("flush create");
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint create");
+        });
+
+        with_state(|state| {
+            let ext2_ino = state.inodes[file.inode as usize].ext2_ino;
+            let mut inode = ext2_read_inode_from_state(state, ext2_ino).expect("read inode");
+
+            assert_eq!(
+                ext2_estimate_data_write_step_credits(state, &inode, 0).expect("direct estimate"),
+                EXT2_JOURNAL_CREDITS_STEP_ALLOC_DIRECT
+            );
+            assert_eq!(
+                ext2_estimate_data_write_step_credits(state, &inode, EXT2_INODE_DIRECT_COUNT)
+                    .expect("single estimate"),
+                EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY
+                    + EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ROOT
+            );
+
+            let single_root = ext2_alloc_block(state, None).expect("alloc single root");
+            inode.blocks[12] = single_root;
+            assert_eq!(
+                ext2_estimate_data_write_step_credits(state, &inode, EXT2_INODE_DIRECT_COUNT)
+                    .expect("single estimate with root"),
+                EXT2_JOURNAL_CREDITS_STEP_ALLOC_TABLE_ENTRY
+            );
+
+            inode.blocks[0] = ext2_alloc_block(state, None).expect("alloc direct data");
+            let single_leaf = ext2_alloc_block(state, None).expect("alloc single data");
+            ext2_write_indirect_entry_from_state(state, single_root, 0, single_leaf)
+                .expect("populate single leaf");
+            assert_eq!(
+                ext2_estimate_data_write_step_credits(state, &inode, 0)
+                    .expect("existing direct estimate"),
+                EXT2_JOURNAL_CREDITS_STEP_EXISTING_DATA
+            );
+            assert_eq!(
+                ext2_estimate_detach_step_credits(state, &inode, 0).expect("detach direct estimate"),
+                EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT
+            );
+            assert_eq!(
+                ext2_estimate_detach_step_credits(state, &inode, EXT2_INODE_DIRECT_COUNT)
+                    .expect("detach single estimate"),
+                EXT2_JOURNAL_CREDITS_STEP_FREE_TABLE_ENTRY
+                    + EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT
+            );
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_indirect_step_estimate_rotates_before_allocation() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/indirect-rotate.bin", O_CREAT | O_RDWR, 0).expect("create file");
+        with_state(|state| {
+            ext2_sync::flush_all_dirty(state).expect("flush create");
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint create");
+        });
+
+        with_state(|state| {
+            let ext2_ino = state.inodes[file.inode as usize].ext2_ino;
+            let inode = ext2_read_inode_from_state(state, ext2_ino).expect("read inode");
+            let tx_id = ext2_journal::begin_mutation_scope_with_credits_options(state, 4, true, 4)
+                .expect("begin restartable scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_journal::note_metadata_block(state, 1).expect("track initial metadata");
+
+            let needed = ext2_estimate_data_write_step_credits(state, &inode, EXT2_INODE_DIRECT_COUNT)
+                .expect("estimate indirect allocation");
+            assert!(needed > 3);
+
+            ext2_journal::begin_restartable_phase(
+                state,
+                Ext2JournalPhaseKind::IndirectLink,
+                needed,
+            )
+            .expect("prepare indirect allocation");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            assert_eq!(state.ext2_journal_pending_txs[0].op_id, tx_id);
+            assert_eq!(state.ext2_journal_pending_txs[0].segment_index, 0);
+            assert_eq!(state.ext2_journal_running_tx.segment_index, 1);
+            assert_eq!(
+                state.ext2_journal_running_tx.last_phase_kind,
+                Ext2JournalPhaseKind::IndirectLink
+            );
+
+            ext2_journal::end_mutation_scope(state).expect("end scope");
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_alloc_block_helper_rotates_before_bitmap_update() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            let tx_id = ext2_journal::begin_mutation_scope_with_credits_options(state, 1, true, 1)
+                .expect("begin restartable alloc scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_journal::note_metadata_block(state, 1).expect("track initial metadata");
+
+            let _ = ext2_alloc_block(state, ext2_journal::current_handle(state)).expect("alloc block");
+
+            assert!(!state.ext2_journal_pending_txs.is_empty());
+            assert!(state
+                .ext2_journal_pending_txs
+                .iter()
+                .any(|tx| tx.op_id == tx_id));
+            assert!(state.ext2_journal_running_tx.segment_index > 0);
+
+            ext2_journal::end_mutation_scope(state).expect("end alloc scope");
+            let segment_count = state
+                .ext2_journal_pending_txs
+                .iter()
+                .filter(|tx| tx.op_id == tx_id)
+                .count();
+            assert!(segment_count >= 2);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_alloc_inode_helper_rotates_before_inode_bitmap_update() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            let tx_id = ext2_journal::begin_mutation_scope_with_credits_options(state, 1, true, 1)
+                .expect("begin restartable inode alloc scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_journal::note_metadata_block(state, 1).expect("track initial metadata");
+
+            let _ = ext2_alloc_inode(state, ext2_journal::current_handle(state), false)
+                .expect("alloc inode");
+
+            assert!(!state.ext2_journal_pending_txs.is_empty());
+            assert!(state
+                .ext2_journal_pending_txs
+                .iter()
+                .any(|tx| tx.op_id == tx_id));
+            assert!(state.ext2_journal_running_tx.segment_index > 0);
+
+            ext2_journal::end_mutation_scope(state).expect("end inode alloc scope");
+            let segment_count = state
+                .ext2_journal_pending_txs
+                .iter()
+                .filter(|tx| tx.op_id == tx_id)
+                .count();
+            assert!(segment_count >= 2);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_free_block_helper_can_split_revoke_phase() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        with_state(|state| {
+            let block = ext2_alloc_block(state, None).expect("seed allocated block");
+            ext2_sync::flush_all_dirty(state).expect("flush seed alloc");
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint seed alloc");
+
+            let tx_id = ext2_journal::begin_mutation_scope_with_credits_options(state, 1, true, 1)
+                .expect("begin restartable free scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_journal::note_metadata_block(state, 1).expect("track initial metadata");
+
+            ext2_free_block(state, ext2_journal::current_handle(state), block).expect("free block");
+            ext2_journal::end_mutation_scope(state).expect("end free scope");
+
+            let segment_count = state
+                .ext2_journal_pending_txs
+                .iter()
+                .filter(|tx| tx.op_id == tx_id)
+                .count();
+            assert!(segment_count >= 2);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_detach_helper_can_split_unlink_phase() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/detach.bin", O_CREAT | O_RDWR, 0).expect("create file");
+        with_state(|state| {
+            ext2_sync::flush_all_dirty(state).expect("flush create");
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint create");
+        });
+
+        with_state(|state| {
+            let ext2_ino = state.inodes[file.inode as usize].ext2_ino;
+            let mut inode = ext2_read_inode_from_state(state, ext2_ino).expect("read inode");
+            let single_root = ext2_alloc_block(state, None).expect("alloc single root");
+            let single_leaf = ext2_alloc_block(state, None).expect("alloc single leaf");
+            ext2_write_indirect_entry_from_state(state, single_root, 0, single_leaf)
+                .expect("link single leaf");
+            inode.blocks[12] = single_root;
+            ext2_write_inode_to_state(state, ext2_ino, &inode).expect("persist inode");
+            ext2_sync::flush_all_dirty(state).expect("flush seeded inode");
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint seeded inode");
+
+            let tx_id = ext2_journal::begin_mutation_scope_with_credits_options(state, 1, true, 1)
+                .expect("begin restartable detach scope");
+            ext2_ensure_block_resident(state, 1).expect("load block 1");
+            ext2_journal::note_metadata_block(state, 1).expect("track initial metadata");
+
+            let removed = ext2_detach_data_block(
+                state,
+                ext2_journal::current_handle(state),
+                &mut inode,
+                EXT2_INODE_DIRECT_COUNT,
+            )
+                .expect("detach single indirect block");
+            assert_eq!(removed, single_leaf);
+            ext2_free_block(state, ext2_journal::current_handle(state), removed)
+                .expect("free detached block");
+            ext2_journal::end_mutation_scope(state).expect("end detach scope");
+
+            let segment_count = state
+                .ext2_journal_pending_txs
+                .iter()
+                .filter(|tx| tx.op_id == tx_id)
+                .count();
+            assert!(segment_count >= 2);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_public_metadata_mutator_reserves_bounded_credits() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open ext2 file");
+        chmod(file.inode, 0o600).expect("chmod file");
+
+        with_state(|state| {
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            let pending = &state.ext2_journal_pending_txs[0];
+            assert_eq!(
+                pending.reserved_credits,
+                EXT2_JOURNAL_CREDITS_METADATA_UPDATE
+            );
+            assert!(pending.used_credits > 0);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_write_reserves_estimated_bounded_credits() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open ext2 file");
+        let ext2_ino = with_state(|state| state.inodes[file.inode as usize].ext2_ino);
+        let expected = with_state(|state| {
+            ext2_estimate_write_credits(state, ext2_ino, 0, b"credit write".len(), false)
+                .expect("estimate write credits")
+        });
+        let plan = ext2_plan_variable_journal_credits(expected);
+
+        let _ = write(file.inode, 0, b"credit write", false).expect("write file");
+
+        with_state(|state| {
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            let pending = &state.ext2_journal_pending_txs[0];
+            assert_eq!(pending.reserved_credits, plan.initial_credits);
+            assert!(pending.used_credits > 0);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_truncate_reserves_estimated_bounded_credits() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/trunc-credit.bin", O_CREAT | O_RDWR, 0).expect("create file");
+        let payload = [0x44u8; 2048];
+        let _ = write(file.inode, 0, &payload, false).expect("seed file");
+        with_state(|state| {
+            ext2_sync::flush_all_dirty(state).expect("flush seed write");
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint seed write");
+        });
+
+        let ext2_ino = with_state(|state| state.inodes[file.inode as usize].ext2_ino);
+        let expected = with_state(|state| {
+            ext2_estimate_truncate_to_length_credits(state, ext2_ino, 512)
+                .expect("estimate truncate credits")
+        });
+        let plan = ext2_plan_variable_journal_credits(expected);
+
+        truncate_to(file.inode, 512).expect("truncate file");
+
+        with_state(|state| {
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            let pending = &state.ext2_journal_pending_txs[0];
+            assert_eq!(pending.reserved_credits, plan.initial_credits);
+            assert!(pending.used_credits > 0);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_large_public_truncate_splits_into_planned_segments() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/segmented.bin", O_CREAT | O_RDWR, 0).expect("create file");
+        let payload = [0x5Au8; 32 * 1024];
+        let _ = write(file.inode, 0, &payload, false).expect("seed file");
+        with_state(|state| {
+            ext2_sync::flush_all_dirty(state).expect("flush seed write");
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint seed write");
+        });
+
+        let expected = with_state(|state| {
+            ext2_estimate_truncate_to_zero_credits(state, state.inodes[file.inode as usize].ext2_ino)
+                .expect("estimate large truncate credits")
+        });
+        let plan = ext2_plan_variable_journal_credits(expected);
+        assert!(expected > plan.initial_credits);
+
+        truncate(file.inode).expect("truncate large file");
+
+        with_state(|state| {
+            assert!(state.ext2_journal_pending_txs.len() >= 2);
+            let op_id = state.ext2_journal_pending_txs[0].op_id;
+            let mut tx_idx = 0usize;
+            let mut saw_later_segment = false;
+            while tx_idx < state.ext2_journal_pending_txs.len() {
+                let tx = &state.ext2_journal_pending_txs[tx_idx];
+                assert_eq!(tx.op_id, op_id);
+                assert_eq!(tx.reserved_credits, plan.initial_credits);
+                if tx.segment_index > 0 {
+                    saw_later_segment = true;
+                    assert_ne!(tx.tx_id, op_id);
+                    assert!(tx.restart_count > 0);
+                }
+                tx_idx += 1;
+            }
+            assert!(saw_later_segment);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_large_write_ends_with_metadata_closeout_segment() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/closeout.bin", O_CREAT | O_RDWR, 0).expect("create file");
+        with_state(|state| {
+            ext2_sync::flush_all_dirty(state).expect("flush create");
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint create");
+        });
+        let payload = [0xA5u8; 32 * 1024];
+
+        with_state(|state| {
+            let ext2_ino = state.inodes[file.inode as usize].ext2_ino;
+            let tx_id = ext2_journal::begin_mutation_scope_with_credits_options(state, 1, true, 1)
+                .expect("begin restartable write scope");
+            let wrote = ext2_write_file(state, ext2_ino, 0, &payload, false).expect("large write");
+            assert_eq!(wrote.written, payload.len());
+            ext2_journal::end_mutation_scope(state).expect("end restartable write scope");
+
+            assert!(state.ext2_journal_pending_txs.len() >= 2);
+            let first_op = state.ext2_journal_pending_txs[0].op_id;
+            assert_eq!(first_op, tx_id);
+            let last = state.ext2_journal_pending_txs.last().expect("last pending tx");
+            assert_eq!(last.op_id, first_op);
+            assert!(last.segment_index > 0);
+            assert!(last.data_blocks.is_empty());
+            assert!(!last.metadata_blocks.is_empty());
+            assert_eq!(last.last_phase_kind, Ext2JournalPhaseKind::InodeCloseout);
+            assert!(last.phase_entries >= 1);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_journals_metadata_without_file_data_tag() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open ext2 file");
+        let _ = write(file.inode, 0, b"ordered!", false).expect("write ext2 file");
+
+        let file_ext2_ino = with_state(|state| state.inodes[file.inode as usize].ext2_ino);
+        let file_home_block = with_state(|state| {
+            let inode = ext2_read_inode_from_state(state, file_ext2_ino).expect("read ext2 inode");
+            ext2_data_block_for_logical_index_state(state, &inode, 0).expect("resolve data block")
+        });
+
+        with_state(|state| {
+            let flushed = ext2_sync::flush_all_dirty(state).expect("flush all dirty");
+            assert!(flushed > 0);
+        });
+
+        let descriptor_off = 41usize * 1024usize;
+        assert_eq!(read_u32_be(&ctx.image, descriptor_off), 0xC03B_3998);
+        assert_eq!(read_u32_be(&ctx.image, descriptor_off + 4), 1);
+
+        let mut off = descriptor_off + 12;
+        loop {
+            let home_block = read_u32_be(&ctx.image, off);
+            let flags = read_u32_be(&ctx.image, off + 4);
+            assert_ne!(home_block, file_home_block);
+            off += 8;
+            if (flags & 0x0000_0008) != 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn ext2_ordered_mode_prefers_running_transaction_metadata_set() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open ext2 file");
+        let _ = write(file.inode, 0, b"ordered!", false).expect("write ext2 file");
+
+        with_state(|state| {
+            let tracked_metadata = state.ext2_journal_pending_txs[0].metadata_blocks.clone();
+            assert!(!tracked_metadata.is_empty());
+
+            let unrelated_block = 63u32;
+            assert!(!tracked_metadata.contains(&unrelated_block));
+            assert!(!state.ext2_journal_pending_txs[0].data_blocks.contains(&unrelated_block));
+
+            {
+                let blk = ext2_block_slice_mut_state(state, unrelated_block).expect("mut block");
+                blk[0] ^= 0x5A;
+            }
+            ext2_mark_dirty_block(state, unrelated_block).expect("mark unrelated dirty");
+            assert!(
+                state
+                    .ext2_journal_running_tx
+                    .tracked_blocks
+                    .binary_search(&unrelated_block)
+                    .is_err()
+            );
+
+            let flushed = ext2_journal::flush_dirty_batch(state, 64).expect("flush tx batch");
+            assert!(flushed > 0);
+            assert!(!state.ext2_journal_committed_txs.is_empty());
+
+            let updates = &state.ext2_journal_committed_txs[0].updates;
+            assert!(!updates.is_empty());
+            for update in updates.iter() {
+                assert!(tracked_metadata.contains(&update.home_block));
+                assert_ne!(update.home_block, unrelated_block);
+            }
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_queues_separate_pending_transactions_per_scope() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open ext2 file");
+        let _ = write(file.inode, 0, b"scope1", false).expect("first write");
+        let _ = truncate_to(file.inode, 3).expect("truncate second scope");
+
+        with_state(|state| {
+            assert!(!state.ext2_journal_running_tx.active);
+            assert_eq!(state.ext2_journal_running_tx.scope_depth, 0);
+            assert_eq!(state.ext2_journal_pending_txs.len(), 2);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_seals_revoke_blocks_with_truncate_transaction() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/revoke.bin", O_CREAT | O_RDWR, 0).expect("create file");
+        let payload = [0xABu8; 2048];
+        let _ = write(file.inode, 0, &payload, false).expect("write payload");
+        truncate(file.inode).expect("truncate file");
+
+        with_state(|state| {
+            assert!(state.ext2_journal_pending_txs.len() >= 2);
+            let revoke_tx = state.ext2_journal_pending_txs.last().expect("pending tx");
+            assert!(!revoke_tx.revoke_blocks.is_empty());
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_commits_sealed_metadata_snapshot_before_newer_cache_state() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+
+        let file = open("/mnt/ext2/snapshot.txt", O_CREAT | O_RDWR, 0).expect("create file");
+        chmod(file.inode, 0o600).expect("chmod file");
+
+        let (shared_block, first_snapshot, second_snapshot) = with_state(|state| {
+            assert!(state.ext2_journal_pending_txs.len() >= 2);
+            let first = &state.ext2_journal_pending_txs[0];
+            let second = &state.ext2_journal_pending_txs[1];
+
+            let mut shared = None;
+            let mut idx = 0usize;
+            while idx < first.metadata_blocks.len() {
+                let block = first.metadata_blocks[idx];
+                if second.metadata_blocks.binary_search(&block).is_ok() {
+                    shared = Some(block);
+                    break;
+                }
+                idx += 1;
+            }
+
+            let shared_block = shared.expect("shared metadata block");
+            let first_snapshot = first
+                .metadata_snapshots
+                .iter()
+                .find(|entry| entry.home_block == shared_block)
+                .expect("first snapshot")
+                .data
+                .clone();
+            let second_snapshot = second
+                .metadata_snapshots
+                .iter()
+                .find(|entry| entry.home_block == shared_block)
+                .expect("second snapshot")
+                .data
+                .clone();
+            assert_ne!(first_snapshot, second_snapshot);
+
+            let flushed = ext2_journal::flush_dirty_batch(state, 64).expect("flush first tx");
+            assert!(flushed > 0);
+            ext2_journal::checkpoint_all_committed(state).expect("checkpoint first tx");
+
+            let cache_idx = ext2_cache_find(state, shared_block).expect("shared block cached");
+            assert!(state.ext2_cached_blocks[cache_idx].dirty);
+            assert_eq!(
+                state.ext2_cached_blocks[cache_idx].data.as_slice(),
+                second_snapshot.as_slice()
+            );
+
+            (shared_block, first_snapshot, second_snapshot)
+        });
+
+        let block_off = (shared_block as usize) * 1024usize;
+        assert_eq!(
+            &ctx.image[block_off..block_off + first_snapshot.len()],
+            first_snapshot.as_slice()
+        );
+        assert_ne!(
+            &ctx.image[block_off..block_off + second_snapshot.len()],
+            second_snapshot.as_slice()
+        );
+    }
+
+    #[test]
+    fn ext2_ordered_mode_flush_dirty_block_preserves_pending_transaction_order() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        set_ext2_cache_policy(16, 90).expect("set relaxed cache policy");
+
+        let file1 = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open first file");
+        let _ = write(file1.inode, 0, b"first tx", false).expect("write first file");
+
+        let file2 = open("/mnt/ext2/later.bin", O_CREAT | O_RDWR, 0).expect("create second file");
+        let payload = [0xCDu8; 1024];
+        let _ = write(file2.inode, 0, &payload, false).expect("write second file");
+
+        with_state(|state| {
+            assert!(state.ext2_journal_pending_txs.len() >= 2);
+            let target_block = *state.ext2_journal_pending_txs.last().expect("last pending tx")
+                .data_blocks
+                .first()
+                .expect("target data block");
+
+            let mut target_owner_idx = None;
+            let mut tx_idx = 0usize;
+            while tx_idx < state.ext2_journal_pending_txs.len() {
+                let tx = &state.ext2_journal_pending_txs[tx_idx];
+                if tx.metadata_blocks.binary_search(&target_block).is_ok()
+                    || tx.data_blocks.binary_search(&target_block).is_ok()
+                {
+                    target_owner_idx = Some(tx_idx);
+                    break;
+                }
+                tx_idx += 1;
+            }
+            let target_owner_idx = target_owner_idx.expect("target owner tx");
+            assert!(target_owner_idx > 0);
+
+            let mut retired_prefix_blocks = std::vec::Vec::new();
+            tx_idx = 0;
+            while tx_idx <= target_owner_idx {
+                let tx = &state.ext2_journal_pending_txs[tx_idx];
+                retired_prefix_blocks.extend_from_slice(tx.metadata_blocks.as_slice());
+                retired_prefix_blocks.extend_from_slice(tx.data_blocks.as_slice());
+                tx_idx += 1;
+            }
+
+            ext2_journal::flush_dirty_block(state, target_block).expect("flush later dirty block");
+
+            tx_idx = 0;
+            while tx_idx < state.ext2_journal_pending_txs.len() {
+                let tx = &state.ext2_journal_pending_txs[tx_idx];
+                let mut block_idx = 0usize;
+                while block_idx < retired_prefix_blocks.len() {
+                    let block = retired_prefix_blocks[block_idx];
+                    assert!(tx.metadata_blocks.binary_search(&block).is_err());
+                    assert!(tx.data_blocks.binary_search(&block).is_err());
+                    block_idx += 1;
+                }
+                tx_idx += 1;
+            }
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_dirty_pressure_flushes_oldest_pending_transaction() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        set_ext2_cache_policy(16, 90).expect("set relaxed cache policy");
+
+        let file1 = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open first file");
+        let _ = write(file1.inode, 0, b"first pending tx", false).expect("write first file");
+
+        let file2 = open("/mnt/ext2/pressure.bin", O_CREAT | O_RDWR, 0).expect("create second file");
+        let payload = [0xEFu8; 1024];
+        let _ = write(file2.inode, 0, &payload, false).expect("write second file");
+        set_ext2_cache_policy(16, 10).expect("set pressure cache policy");
+
+        with_state(|state| {
+            assert!(state.ext2_journal_pending_txs.len() >= 2);
+            let first_metadata = state.ext2_journal_pending_txs[0].metadata_blocks.clone();
+            assert!(!first_metadata.is_empty());
+
+            ext2_cache_maybe_flush_dirty_pressure(state).expect("pressure flush");
+
+            assert!(!state.ext2_journal_committed_txs.is_empty());
+            let first_committed = &state.ext2_journal_committed_txs[0].updates;
+            assert!(!first_committed.is_empty());
+            for update in first_committed.iter() {
+                assert!(first_metadata.contains(&update.home_block));
+            }
         });
     }
 
@@ -6774,6 +8477,7 @@ mod tests {
 
                 ext2_add_dir_entry(
                     state,
+                    None,
                     EXT2_ROOT_INODE,
                     EXT2_ROOT_INODE,
                     &name,
@@ -6958,6 +8662,105 @@ mod tests {
             assert!(state.ext2_dirty_blocks.binary_search(&1).is_err());
         });
         assert!(ctx.writes > 0);
+    }
+
+    #[test]
+    fn ext2_ordered_mode_eviction_flushes_oldest_pending_transaction() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        set_ext2_cache_policy(16, 100).expect("set relaxed cache policy");
+
+        let file = open("/mnt/ext2/hello.txt", O_RDWR, 0).expect("open file");
+        let _ = write(file.inode, 0, b"evict tx", false).expect("write file");
+
+        let mut retired_prefix_blocks = std::vec::Vec::new();
+        with_state(|state| {
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+            let first_tx = &state.ext2_journal_pending_txs[0];
+            retired_prefix_blocks.extend_from_slice(first_tx.metadata_blocks.as_slice());
+            retired_prefix_blocks.extend_from_slice(first_tx.data_blocks.as_slice());
+            assert!(!retired_prefix_blocks.is_empty());
+        });
+
+        set_ext2_cache_policy(1, 100).expect("set eviction cache policy");
+
+        with_state(|state| {
+            ext2_ensure_block_resident(state, 2).expect("force eviction");
+            assert!(state.ext2_journal_pending_txs.is_empty());
+            let mut tx_idx = 0usize;
+            while tx_idx < state.ext2_journal_pending_txs.len() {
+                let tx = &state.ext2_journal_pending_txs[tx_idx];
+                let mut block_idx = 0usize;
+                while block_idx < retired_prefix_blocks.len() {
+                    let block = retired_prefix_blocks[block_idx];
+                    assert!(tx.metadata_blocks.binary_search(&block).is_err());
+                    assert!(tx.data_blocks.binary_search(&block).is_err());
+                    block_idx += 1;
+                }
+                tx_idx += 1;
+            }
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_dirty_pressure_does_not_flush_running_scope() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+        set_ext2_cache_policy(4, 25).expect("set cache policy");
+        let writes_before = ctx.writes;
+        with_state(|state| {
+            ext2_journal::begin_mutation_scope_with_credits(state, 0).expect("begin scope");
+
+            let mut block = 1u32;
+            while block <= 4 {
+                ext2_ensure_block_resident(state, block).expect("load cache set");
+                block += 1;
+            }
+
+            {
+                let first = ext2_block_slice_mut_state(state, 1).expect("first block");
+                first[0] = b'a';
+            }
+            ext2_mark_dirty_block(state, 1).expect("dirty first block");
+            {
+                let second = ext2_block_slice_mut_state(state, 2).expect("second block");
+                second[0] = b'b';
+            }
+            ext2_mark_dirty_block(state, 2).expect("dirty second block");
+
+            assert!(state.ext2_journal_running_tx.active);
+            assert!(state.ext2_journal_pending_txs.is_empty());
+            assert!(state.ext2_journal_committed_txs.is_empty());
+            assert_eq!(ctx.writes, writes_before);
+
+            ext2_journal::end_mutation_scope(state).expect("end scope");
+            assert_eq!(state.ext2_journal_pending_txs.len(), 1);
+        });
+    }
+
+    #[test]
+    fn ext2_ordered_mode_eviction_rejects_dirty_running_scope_victim() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let (image, _target_block, _payload) = build_internal_journal_replay_image();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        with_state(|state| {
+            ext2_journal::begin_mutation_scope_with_credits(state, 0).expect("begin scope");
+            let block_size = state.ext2_meta.block_size;
+            ext2_write_range_to_state(state, block_size, b"z").expect("dirty block 1");
+
+            ext2_set_cache_policy(state, 1, 100).expect("set cache policy");
+            assert_eq!(ext2_ensure_block_resident(state, 2).unwrap_err(), ENOSPC);
+
+            ext2_journal::end_mutation_scope(state).expect("end scope");
+        });
     }
 
     #[test]

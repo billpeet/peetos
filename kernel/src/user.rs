@@ -1,6 +1,7 @@
 use core::cmp;
 use core::mem::size_of;
 use core::ptr;
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
 use arch_x86_64::gdt;
@@ -31,6 +32,10 @@ const EXEC_MAX_INTERP_IMAGE: usize = 2 * 1024 * 1024;
     feature = "musl-ext2-unix-rights-smoke",
     feature = "musl-ext2-epoll-smoke",
     feature = "musl-ext2-shared-buffer-smoke",
+    feature = "musl-ext2-console-first-smoke",
+    feature = "musl-ext2-gui-smoke",
+    feature = "musl-ext2-peet-gui-smoke",
+    feature = "musl-ext2-peet-shell-demo",
     feature = "musl-ext2-quickjs-smoke",
     feature = "musl-ext2-micropython-smoke",
     feature = "musl-ext2-dropbear-smoke"
@@ -43,6 +48,10 @@ const INIT_ARGV0: &[u8] = b"/init-ext2\0";
     not(feature = "musl-ext2-unix-rights-smoke"),
     not(feature = "musl-ext2-epoll-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    not(feature = "musl-ext2-peet-gui-smoke"),
+    not(feature = "musl-ext2-peet-shell-demo"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
@@ -56,6 +65,10 @@ const INIT_ARGV0: &[u8] = b"/bin/echo\0";
     not(feature = "musl-ext2-unix-rights-smoke"),
     not(feature = "musl-ext2-epoll-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    not(feature = "musl-ext2-peet-gui-smoke"),
+    not(feature = "musl-ext2-peet-shell-demo"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
@@ -87,6 +100,8 @@ const ENOMEM: i64 = 12;
 const EINVAL: i64 = 22;
 const E2BIG: i64 = 7;
 const EACCES: i64 = 13;
+
+static INIT_PID: AtomicI32 = AtomicI32::new(task::INVALID_PID);
 
 #[cfg(feature = "musl-ext2-dropbear-smoke")]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_dropbear_smoke.elf");
@@ -132,6 +147,56 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_epoll_smoke
     not(feature = "musl-ext2-ping-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
     not(feature = "musl-ext2-epoll-smoke"),
+    feature = "musl-ext2-console-first-smoke"
+))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_console_first_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-dropbear-smoke"),
+    not(feature = "musl-ext2-micropython-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
+    not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    feature = "musl-ext2-gui-smoke"
+))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_gui_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-dropbear-smoke"),
+    not(feature = "musl-ext2-micropython-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
+    not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    feature = "musl-ext2-peet-gui-smoke"
+))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_peet_gui_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-dropbear-smoke"),
+    not(feature = "musl-ext2-micropython-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
+    not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    not(feature = "musl-ext2-peet-gui-smoke"),
+    feature = "musl-ext2-peet-shell-demo"
+))]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_peet_shell_demo.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-dropbear-smoke"),
+    not(feature = "musl-ext2-micropython-smoke"),
+    not(feature = "musl-ext2-quickjs-smoke"),
+    not(feature = "musl-ext2-ping-smoke"),
+    not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    not(feature = "musl-ext2-peet-gui-smoke"),
+    not(feature = "musl-ext2-peet-shell-demo"),
     feature = "musl-ext2-unix-rights-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_unix_rights_smoke.elf");
@@ -142,6 +207,10 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_unix_rights
     not(feature = "musl-ext2-ping-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
     not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    not(feature = "musl-ext2-peet-gui-smoke"),
+    not(feature = "musl-ext2-peet-shell-demo"),
     not(feature = "musl-ext2-unix-rights-smoke"),
     feature = "musl-ext2-cmd-smoke"
 ))]
@@ -153,6 +222,10 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_smoke.elf")
     not(feature = "musl-ext2-ping-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
     not(feature = "musl-ext2-epoll-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    not(feature = "musl-ext2-peet-gui-smoke"),
+    not(feature = "musl-ext2-peet-shell-demo"),
     not(feature = "musl-ext2-unix-rights-smoke"),
     not(feature = "musl-ext2-cmd-smoke"),
     feature = "musl-ext2-exec"
@@ -165,6 +238,10 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2.elf");
     not(feature = "musl-ext2-unix-rights-smoke"),
     not(feature = "musl-ext2-epoll-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    not(feature = "musl-ext2-peet-gui-smoke"),
+    not(feature = "musl-ext2-peet-shell-demo"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
@@ -178,6 +255,10 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
     not(feature = "musl-ext2-unix-rights-smoke"),
     not(feature = "musl-ext2-epoll-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
+    not(feature = "musl-ext2-console-first-smoke"),
+    not(feature = "musl-ext2-gui-smoke"),
+    not(feature = "musl-ext2-peet-gui-smoke"),
+    not(feature = "musl-ext2-peet-shell-demo"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
@@ -822,6 +903,12 @@ pub fn spawn_init() -> bool {
         serial_println!("[USER] musl-ext2-shared-buffer-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-epoll-smoke") {
         serial_println!("[USER] musl-ext2-epoll-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-console-first-smoke") {
+        serial_println!("[USER] musl-ext2-console-first-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-gui-smoke") {
+        serial_println!("[USER] musl-ext2-gui-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-peet-gui-smoke") {
+        serial_println!("[USER] musl-ext2-peet-gui-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-unix-rights-smoke") {
         serial_println!("[USER] musl-ext2-unix-rights-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-cmd-smoke") {
@@ -933,6 +1020,8 @@ pub fn spawn_init() -> bool {
         feature = "musl-ext2-unix-rights-smoke",
         feature = "musl-ext2-epoll-smoke",
         feature = "musl-ext2-shared-buffer-smoke",
+        feature = "musl-ext2-console-first-smoke",
+        feature = "musl-ext2-gui-smoke",
         feature = "musl-ext2-quickjs-smoke",
         feature = "musl-ext2-micropython-smoke",
         feature = "musl-ext2-dropbear-smoke",
@@ -1015,6 +1104,8 @@ pub fn spawn_init() -> bool {
         (*task_ptr).state = TaskState::Ready;
     }
 
+    INIT_PID.store(unsafe { (*task_ptr).pid }, Ordering::Release);
+
     task::user_stdio_init(task_ptr);
 
     crate::sched::add_task(task_ptr);
@@ -1026,6 +1117,37 @@ pub fn spawn_init() -> bool {
         stack_plan.initial_rsp
     );
     true
+}
+
+fn init_pid() -> task::Pid {
+    INIT_PID.load(Ordering::Acquire)
+}
+
+fn exiting_pid_needs_console_fallback(pid: task::Pid) -> bool {
+    pid != task::INVALID_PID
+        && pid == init_pid()
+        && crate::display_mode::compositor_active()
+}
+
+pub fn maybe_restore_console_after_init_exit(task_ptr: *mut task::Task, exit_code: i32) {
+    if task_ptr.is_null() {
+        return;
+    }
+
+    let pid = unsafe { (*task_ptr).pid };
+    if !exiting_pid_needs_console_fallback(pid) {
+        return;
+    }
+
+    crate::display_mode::activate_console();
+    crate::fb_console::set_active(true, true);
+    crate::mouse::sync_display_owner();
+    INIT_PID.store(task::INVALID_PID, Ordering::Release);
+    serial_println!(
+        "[GUI] Compositor-owned init exited (pid={}, code={}); framebuffer ownership returned to console",
+        pid,
+        exit_code
+    );
 }
 
 pub fn exec_current_image(
@@ -1310,5 +1432,20 @@ mod tests {
         fill_startup_random(&mut random);
         assert!(random.iter().any(|b| *b != 0));
         assert_ne!(&random[..8], &random[8..]);
+    }
+
+    #[test]
+    fn console_fallback_only_triggers_for_compositor_owned_init() {
+        INIT_PID.store(42, Ordering::Release);
+        crate::display_mode::activate_console();
+        assert!(!exiting_pid_needs_console_fallback(42));
+
+        crate::display_mode::activate_compositor();
+        assert!(exiting_pid_needs_console_fallback(42));
+        assert!(!exiting_pid_needs_console_fallback(7));
+
+        INIT_PID.store(task::INVALID_PID, Ordering::Release);
+        assert!(!exiting_pid_needs_console_fallback(42));
+        crate::display_mode::activate_console();
     }
 }

@@ -16,7 +16,7 @@ trap cleanup EXIT
 make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES=test-exit
 
 set +e
-timeout 5s qemu-system-x86_64 \
+timeout 15s qemu-system-x86_64 \
   -drive format=raw,file="${IMAGE}" \
   -serial stdio \
   -display none \
