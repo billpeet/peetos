@@ -50,6 +50,7 @@ static mut USED_PAGE_COUNT: u64 = 0;
 static mut FIRST_USABLE_PFN: u64 = 0;
 static mut LAST_USABLE_PFN: u64 = 0;
 static mut SEARCH_HINT: u64 = 0;
+static mut DEBUG_TRACKED_PAGE: u64 = 0;
 static mut PMM_INITIALIZED: bool = false;
 
 extern "C" {
@@ -141,6 +142,16 @@ pub fn init() {
 #[cfg(not(target_os = "none"))]
 pub fn init() {}
 
+#[cfg(feature = "musl-ext2-cmd-smoke")]
+pub fn debug_track_page(addr: PhysAddr) {
+    unsafe {
+        DEBUG_TRACKED_PAGE = addr.as_u64() & !PAGE_OFFSET_MASK;
+    }
+}
+
+#[cfg(not(feature = "musl-ext2-cmd-smoke"))]
+pub fn debug_track_page(_addr: PhysAddr) {}
+
 #[cfg(target_os = "none")]
 pub fn alloc_page() -> PhysAddr {
     unsafe {
@@ -168,7 +179,14 @@ pub fn alloc_page() -> PhysAddr {
                     SEARCH_HINT = FIRST_USABLE_PFN;
                 }
 
-                return PhysAddr::new(pfn_to_addr(pfn));
+                let addr = PhysAddr::new(pfn_to_addr(pfn));
+                if cfg!(feature = "musl-ext2-cmd-smoke")
+                    && DEBUG_TRACKED_PAGE != 0
+                    && addr.as_u64() == DEBUG_TRACKED_PAGE
+                {
+                    serial_println!("[PMM] alloc tracked page 0x{:x}", addr.as_u64());
+                }
+                return addr;
             }
 
             pfn += 1;
@@ -217,6 +235,13 @@ pub fn free_page(addr: PhysAddr) {
                 addr.as_u64()
             );
             return;
+        }
+
+        if cfg!(feature = "musl-ext2-cmd-smoke")
+            && DEBUG_TRACKED_PAGE != 0
+            && addr.as_u64() == DEBUG_TRACKED_PAGE
+        {
+            serial_println!("[PMM] free tracked page 0x{:x}", addr.as_u64());
         }
 
         bitmap_clear(pfn);

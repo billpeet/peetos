@@ -3763,7 +3763,11 @@ pub fn try_handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
     mmap_fault_map_page(pml4, page_addr, mapping).is_ok()
 }
 
-pub fn terminate_current_user_fault(error_code: u64, fault_addr: u64) -> bool {
+pub fn terminate_current_user_fault(
+    frame: &InterruptFrame,
+    error_code: u64,
+    fault_addr: u64,
+) -> bool {
     if (error_code & PAGE_FAULT_ERROR_USER) == 0 {
         return false;
     }
@@ -3778,11 +3782,15 @@ pub fn terminate_current_user_fault(error_code: u64, fault_addr: u64) -> bool {
     }
 
     let pid = unsafe { (*current).pid };
+    let rip = unsafe { ptr::read_unaligned(ptr::addr_of!(frame.rip)) };
+    let rsp = unsafe { ptr::read_unaligned(ptr::addr_of!(frame.rsp)) };
     sys_log!(
-        "[SYSCALL] pid {} terminated after page fault at 0x{:x} (err=0x{:x})",
+        "[SYSCALL] pid {} terminated after page fault at 0x{:x} (err=0x{:x}, rip=0x{:x}, rsp=0x{:x})",
         pid,
         fault_addr,
-        error_code
+        error_code,
+        rip,
+        rsp
     );
 
     let ctx = SyscallContext::new(current);

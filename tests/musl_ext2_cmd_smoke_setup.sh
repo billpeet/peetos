@@ -50,6 +50,11 @@ if ! grep -q 'run-shell-smoke' "${MAKEFILE}"; then
   exit 1
 fi
 
+if ! grep -F -q 'Display owner: console' "${RUNNER}"; then
+  echo "toybox next smoke runner is not asserting console-first display ownership" >&2
+  exit 1
+fi
+
 if [[ ! -x "${RUNNER}" ]]; then
   echo "toybox next smoke runner is missing or not executable" >&2
   exit 1

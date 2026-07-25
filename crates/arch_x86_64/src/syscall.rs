@@ -79,6 +79,18 @@ pub fn user_fs_base() -> u64 {
 }
 
 #[cfg(target_os = "none")]
+#[inline]
+pub fn user_rsp() -> u64 {
+    unsafe { ARCH_X86_64_SYSCALL_USER_RSP }
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn user_rsp() -> u64 {
+    0
+}
+
+#[cfg(target_os = "none")]
 extern "C" {
     fn syscall_entry();
 }

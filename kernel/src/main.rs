@@ -15,6 +15,10 @@ mod elf;
 mod ethernet;
 mod exception;
 mod framebuffer;
+#[cfg(test)]
+mod gui_protocol;
+#[cfg(any(feature = "musl-ext2-gui-smoke", feature = "musl-ext2-gui-demo"))]
+mod gui_smoke;
 mod icmp;
 mod input;
 mod ipc;
@@ -208,6 +212,8 @@ pub extern "C" fn kmain() -> ! {
         fb_console::tick();
         mouse::end_framebuffer_update();
         mouse::tick();
+        #[cfg(any(feature = "musl-ext2-gui-smoke", feature = "musl-ext2-gui-demo"))]
+        gui_smoke::tick();
         unsafe {
             core::arch::asm!("hlt");
         }

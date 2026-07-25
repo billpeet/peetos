@@ -15,7 +15,7 @@ pub fn handle(frame: &mut idt::InterruptFrame) -> bool {
     if crate::syscall::try_handle_page_fault(fault_addr, error_code) {
         return true;
     }
-    crate::syscall::terminate_current_user_fault(error_code, fault_addr)
+    crate::syscall::terminate_current_user_fault(frame, error_code, fault_addr)
 }
 
 pub fn report(frame: &idt::InterruptFrame) {

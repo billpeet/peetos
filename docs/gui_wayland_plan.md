@@ -1,7 +1,7 @@
 # GUI and Wayland Compatibility Plan (Living Document)
 
-Last updated: 2026-04-12
-Status: Draft roadmap, Phase 1 implementation complete; Phase 2 implementation and required tests complete; Phase 3 userspace device ABI now includes `/dev/fb0` metadata + mmap plus pollable `/dev/input/event{0,1}` queues, kernel display ownership now supports explicit console-first vs compositor-first handoff, compositor-first userspace init has dedicated ext2 smokes for framebuffer/input delivery plus post-exit console fallback, and Phase 4 has started with a compositor-core smoke that renders two independent surfaces, tracks focus, and routes injected keyboard/pointer input over the compositor-first profile
+Last updated: 2026-03-14
+Status: Draft roadmap, Phase 1 implementation complete; Phase 2 required tests now cover host shared-buffer/epoll units plus QEMU epoll/shared-buffer smokes; Phase 3 is complete with `/dev/fb0` metadata + mmap, pollable `/dev/input/event{0,1}` queues, explicit console-first vs compositor-first display ownership, console fallback after tracked compositor termination, and QEMU smoke coverage for console-first, compositor-first, and compositor-failure flows; Phase 4 is complete with a dedicated userspace compositor smoke session that owns framebuffer/input, accepts multiple client shared buffers over inherited `AF_UNIX` streams, runs explicit surface lifecycle plus clipped `DAMAGE` notifications under QEMU regression, redraws through coalesced dirty regions, routes hover pointer focus plus click-to-focus keyboard input to an input-aware client, rejects invalid attach fds and stale post-destroy traffic without wedging, and now stays green in the full `make test` harness
 
 ## Purpose
 
@@ -170,7 +170,7 @@ Detailed checklist:
   process B uses received fds successfully.
 - [x] Add negative-path smoke coverage:
   malformed cmsg, invalid fd, closed sender fd after transfer, buffer truncation.
-- [x] Keep existing networking/TTY smokes green (`make test` baseline unaffected).
+- [x] Keep existing default regression baseline green (`make test` shell/TTY coverage unaffected).
 
 ### 8. Documentation and tracking
 
@@ -302,8 +302,8 @@ Detailed checklist:
 - [x] Define explicit mode selection for console-first vs compositor-first boot
   (currently via kernel feature profile; boot-arg path still pending).
 - [x] Keep default boot path console-first when GUI mode is not requested.
-- [x] Define failure policy: if compositor launch fails or compositor-owned init exits,
-  return to visible console fallback without reboot.
+- [x] Define failure policy: if compositor launch fails, return to visible console
+  fallback without reboot.
 
 ### 2. Display device ABI surface
 
@@ -366,12 +366,13 @@ Acceptance criteria:
 
 - Userspace compositor can read input events and draw output without kernel UI loop.
 - Existing shell/console workflows still work when GUI mode is disabled.
-- QEMU smoke can boot into both console-first and compositor-first profiles.
+- QEMU smoke can boot into console-first and compositor-first profiles, with compositor-failure fallback coverage.
 
 Limitations / Simplifications:
 - Explicit GUI mode selection currently uses a kernel feature/build profile (`compositor-first`), not a runtime boot arg.
-- The current fallback policy covers init-launch failure before userspace takeover, compositor-owned init exit/crash after takeover, plus fatal panic/exception paths.
-- The compositor-first smoke validates environment/device wiring, framebuffer mmap/write, and injected keyboard/pointer delivery, but it remains a single-client smoke rather than a compositor lifecycle or crash-recovery test.
+- The current fallback policy covers init-launch failure before userspace takeover, tracked compositor/init termination after successful userspace takeover, and fatal panic/exception paths.
+- The current compositor-first QEMU regression now launches a dedicated smoke compositor plus smoke clients, but it still uses a narrow internal protocol and fixed surface model rather than a general compositor service/ABI.
+- Headless QEMU regression currently injects smoke-only synthetic keyboard/pointer events from the kernel because the harness does not yet provide direct host input injection.
 - Console fallback redraw is fresh-state only; there is no preserved compositor-era backbuffer or scrollback restore.
 
 - Initial display path can remain fixed-mode framebuffer (no mode setting).
@@ -391,23 +392,82 @@ Scope:
   - input dispatch and focus
 - Implement software composition with dirty region tracking.
 
-Current slice landed:
+Detailed checklist:
 
-- A dedicated compositor-first smoke profile now boots `peet_gui_compositor_smoke`.
-- The smoke creates two overlapping userspace surfaces, composites them onto `/dev/fb0`,
-  validates initial top-surface ordering, highlights focus, validates a damage-limited partial
-  redraw/commit on one surface, raises the focused surface after injected pointer activity so
-  keyboard delivery follows the new frontmost surface, and explicitly detaches one client surface
-  after input delivery so the compositor proves it can redraw and continue with the remaining surface.
-- `make run-peet-gui-smoke` exercises this path end to end in QEMU.
-- A separate compositor-first shell demo now boots `peet_shell_demo` for manual visual iteration:
-  it draws desktop chrome, a launcher strip, terminal/files/inspector panels, a software pointer
-  cursor, keyboard focus changes, theme rotation, and terminal-style command feedback directly on
-  `/dev/fb0`. The current slice now composes those panels from independent offscreen surfaces and
-  raises the focused panel in z-order. The newest slice moves the `FILES` panel into a separate
-  forked userspace client over an `AF_UNIX socketpair` control path, with `make run-peet-shell-demo`
-  for interactive use and a small smoke runner to verify the shell reaches its ready state and reacts
-  to injected keyboard input.
+### 1. Compositor process and runtime bring-up
+
+- [x] Introduce a dedicated userspace compositor process instead of relying on the current single-process framebuffer smoke helper.
+- [x] Define the initial compositor process model: single-threaded event loop first, with protocol handling, composition, and input policy all in one process.
+- [x] Add explicit startup wiring so init can launch the compositor in a Phase 4 profile without changing the default console-first boot path.
+- [x] Define the compositor logging/diagnostic contract needed by smoke tests (`ready`, client connect/disconnect, focus changes, fatal error path).
+
+### 2. Internal protocol and transport contract (`peet-gui`)
+
+- [x] Define the protocol transport around existing Phase 1 and Phase 2 primitives (`AF_UNIX` streams first; inherited `socketpair()` channels for the initial smoke path) so the compositor architecture stays independent from Wayland wire details.
+- [x] Specify an initial minimal request model for client surface registration, shared-buffer attach/commit, and clipped `DAMAGE` notifications (client id + rectangle geometry + stride + one shared buffer fd), with the initial landed slice later extended to cover compositor-routed pointer/keyboard delivery to a focused client.
+- [x] Define object/resource identifiers, versioning rules, and malformed-message handling so unsupported or invalid requests fail predictably.
+- [x] Decide and document whether the MVP protocol is binary-framed, fixed-struct, or otherwise intentionally temporary, with a clear note that this is not the long-term public ABI.
+
+### 3. Surface, buffer, and scene-graph state
+
+- [x] Implement compositor-side client/session tracking with cleanup on orderly disconnect and crash.
+- [x] Implement compositor-side surface objects with explicit create/destroy, pending vs committed state, and stable stacking order rules.
+- [x] Define buffer ownership/lifetime semantics for attached shared-memory buffers, including current MVP rules for one attached buffer per client/session and compositor-side mapping lifetime.
+- [x] Keep the initial scene graph intentionally small: top-level rectangular surfaces only, no subsurfaces/popups yet.
+
+### 4. Software composition and presentation
+
+- [x] Build a compositor redraw loop that maps `/dev/fb0`, composites initial client-owned surface state into the framebuffer, and keeps the existing fixed-mode display assumptions from Phase 3.
+- [x] Implement dirty-rectangle tracking for client damage and compositor-owned regions so redraw work is bounded.
+- [x] Define overlap/clipping behavior for partially obscured surfaces and off-screen damage.
+- [x] Keep presentation policy simple for the MVP: immediate or coalesced redraws are acceptable, but the compositor must avoid obvious busy-loop redraw behavior.
+
+### 5. Input routing and focus policy
+
+- [x] Consume `/dev/input/event0` and `/dev/input/event1` from the compositor event loop rather than from a single smoke client directly.
+- [x] Implement baseline pointer hit-testing against visible surfaces and assign pointer focus deterministically.
+- [x] Implement baseline keyboard focus policy tied to explicit surface activation/click-to-focus rules.
+- [x] Define and document minimal compositor-owned interactions needed for the MVP (for example surface move/raise policy or fixed placement if interactive move is deferred).
+
+### 6. Robustness and lifecycle rules
+
+- [x] Ensure client disconnect, malformed protocol traffic, invalid fd passing, and stale buffer use cannot crash or wedge the compositor.
+- [x] Ensure compositor teardown cleanly closes client sockets, unmaps owned resources, and returns framebuffer ownership according to the Phase 3 fallback policy.
+- [x] Add explicit limits for maximum clients, surfaces per client, and attached buffer size/count to keep the MVP failure modes bounded.
+- [x] Define behavior for clients that stop committing new frames, flood damage, or disconnect with focused surfaces.
+
+### 7. Userspace helper clients and integration path
+
+- [x] Replace or extend the current `gui_compositor_smoke` helper into at least two roles: compositor server and simple protocol clients that exercise independent surfaces.
+- [x] Add one minimal test client that renders a static or animated surface via shared memory and commit messages.
+- [x] Add one minimal input-aware client that can receive focus/input events and visibly react so pointer/keyboard routing is testable.
+- [x] Keep the Phase 4 profile isolated from default boot/test paths; do not regress existing console-first or Phase 3 compositor-first smoke coverage.
+
+### 8. Tests (required before Phase 4 close)
+
+- [x] Add host unit tests for protocol framing/parsing, object id validation, and malformed-message rejection.
+- [x] Add host unit tests for compositor scene-state transitions: surface create/destroy, attach/commit, and stable stacking order.
+- [x] Add host unit tests for dirty-region accumulation and presentation coalescing.
+- [x] Add host unit tests for focus assignment and disconnect cleanup behavior.
+- [x] Add QEMU smoke test: compositor boots, accepts at least two clients, and presents two independently updated surfaces.
+- [x] Add QEMU smoke test: pointer and keyboard events are routed to the focused client and produce visible/logged acknowledgement.
+- [x] Add QEMU smoke test: one client crashes or disconnects while another continues rendering, with compositor survival verified.
+- [x] Keep existing `make test` baseline green for default, Phase 3 GUI smoke, and new Phase 4 compositor-session smoke profiles.
+
+### 9. Documentation and tracking
+
+- [x] Add a compositor subsystem doc under `docs/` covering runtime architecture, protocol scope, focus policy, and known gaps.
+- [x] Update framebuffer/input docs where Phase 4 clarifies ownership or lifetime semantics not already captured in Phases 1-3 docs.
+- [x] Update `README.md` with Phase 4 bring-up and smoke-test instructions once the profile exists.
+- [x] Update `docs/PORTING_PLAN.md` and this roadmap with Phase 4 status, deferred items, and the explicit handoff boundary to Phase 5 Wayland work.
+
+Phase 4 exit checklist:
+
+- [x] A dedicated userspace compositor process owns framebuffer/input handling in the Phase 4 profile.
+- [x] Multiple independent clients can create surfaces, attach shared buffers, and commit visible updates.
+- [x] Pointer and keyboard focus are routed by the compositor instead of directly by test helpers.
+- [x] Client disconnect/crash behavior is covered without compositor or kernel instability.
+- [x] Automated tests cover protocol parsing, scene-state transitions, focus routing, and multi-client QEMU smokes.
 
 Acceptance criteria:
 
@@ -417,13 +477,16 @@ Acceptance criteria:
 
 Limitations / Simplifications:
 
-- The current Phase 4 smoke is a compositor-core harness, not yet a true multi-process
-  `peet-gui` server/client transport. Surface storage is local userspace memory rather than
-  shared-buffer fd handoff, and protocol messages are currently exercised through the
-  in-process queue harness rather than kernel-backed IPC.
-- The visual shell scaffold is still only a partial split: `FILES` now runs out-of-process over a
-  real message path, but `TERMINAL` and `INSPECTOR` are still local to the compositor process, and
-  there is not yet shared-buffer handoff between processes.
+- The MVP protocol is intentionally internal and temporary; compatibility stability is not required before Phase 5 Wayland bring-up.
+- The current landed slice uses inherited `AF_UNIX` `socketpair()` channels plus fixed-struct create/attach/commit/damage/destroy messages with one shared buffer per client, explicit client/buffer bounds, clipped damage rectangles, slot-oriented disconnect/reject handling, invalid-fd and stale-message rejection, and compositor-routed hover pointer focus plus click-to-focus keyboard delivery to one focused top-level client, not a long-lived public socket/listener ABI yet.
+- Static committed surfaces intentionally remain visible until a new commit,
+  destroy, or disconnect changes them.
+- Repeated damage is intentionally handled by draining queued messages and
+  coalescing redraw to one accumulated box per poll cycle instead of tracking a
+  richer region list or applying throttling.
+- Single-threaded compositor architecture is acceptable initially if latency and busy-loop behavior remain reasonable.
+- Dirty presentation is intentionally conservative: one accumulated bounding rectangle is redrawn per poll cycle instead of tracking a disjoint region set.
+- Surface model can remain top-level-only with fixed placement or minimal raise/focus rules.
 - Decorations/window-management policy can be minimal.
 - No hardware acceleration requirement.
 
@@ -511,10 +574,10 @@ Use this table for ongoing updates:
 | Phase | Status | Owner | Last Updated | Notes |
 | --- | --- | --- | --- | --- |
 | 0 | Planned | TBD | 2026-02-28 | Doc and baseline alignment |
-| 1 | Complete | TBD | 2026-04-12 | AF_UNIX + SCM_RIGHTS implementation, host coverage, negative-path tests, QEMU smokes, and `make test` regression coverage are green |
-| 2 | Complete | TBD | 2026-04-12 | Shared-buffer lifecycle, writable shared `mmap`, baseline `epoll`, fd/flag semantics, hardening/resource caps, host coverage, and QEMU compositor-loop/shared-buffer smokes are complete and green |
-| 3 | Complete | TBD | 2026-04-12 | Device ABI includes `/dev/fb0` + `FBIOGETINFO` + shared framebuffer `mmap`, plus `/dev/input/event0` keyboard and `/dev/input/event1` pointer queues with nonblocking read + poll/select/epoll readiness + `SYN_DROPPED` overflow signalling. Kernel display ownership is explicitly gated (`compositor-first` profile), userspace init has compositor-first smokes for input/rendering and post-exit fallback, a dedicated console-first shell smoke keeps default ownership intact, and `make test` now includes these paths cleanly |
-| 4 | In Progress | TBD | 2026-04-12 | Initial compositor-core smoke landed: two overlapping userspace surfaces render to `/dev/fb0`, explicit attach/damage/commit/focus/key message flow drives focus/input routing, initial z-order plus raise-on-focus behavior are validated, a partial damage/commit redraw is validated, one client detach path is validated end to end, and `make run-peet-gui-smoke` covers the compositor-first path. A separate `make run-peet-shell-demo` visual shell scaffold now exercises desktop chrome, launcher/panel layout, terminal/files/inspector surfaces, focus raise, theme switching, and terminal-style feedback on the same compositor-first ABI; `FILES` is now a separate forked client over `AF_UNIX socketpair`; pending: shared-buffer handoff and broader multi-process `peet-gui` transport |
+| 1 | Complete | TBD | 2026-03-07 | `AF_UNIX` stream IPC, `socketpair`, `sendmsg`/`recvmsg`, and `SCM_RIGHTS` are in place with host coverage plus QEMU fd-transfer smoke coverage in the default regression workflow |
+| 2 | Complete | TBD | 2026-03-07 | Shared-buffer (`memfd_create` + writable shared `mmap`) and baseline `epoll` support are in place with host unit coverage plus QEMU epoll/shared-buffer compositor-style smokes in `make test` |
+| 3 | Complete | TBD | 2026-03-07 | `/dev/fb0` metadata + shared framebuffer `mmap`, `/dev/input/event0`/`event1` pollable queues, explicit console-first vs compositor-first display ownership, and tracked compositor/init termination fallback to the kernel console are in place; `make test` now covers console-first shell workflows plus compositor-first framebuffer/input and compositor-failure fallback smoke paths |
+| 4 | Complete | TBD | 2026-03-14 | Userspace compositor MVP is now closed: dedicated compositor plus bounded smoke clients over inherited `AF_UNIX` streams, shared-buffer attach/commit via `memfd_create` + `SCM_RIGHTS`, explicit clipped `DAMAGE` notifications, coalesced dirty redraw, hover pointer focus plus click-to-focus keyboard routing to an input-aware client, invalid-fd/stale-message rejection, disconnect-survival coverage, a separate compositor-first demo profile, and full-regression coverage in `make test` |
 | 5 | Planned | TBD | 2026-02-28 | Wayland core subset |
 | 6 | Planned | TBD | 2026-02-28 | Near-compat target |
 

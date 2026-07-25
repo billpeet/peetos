@@ -100,6 +100,10 @@ if [[ -x "${ROOT_DIR}/user/epoll_compositor_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/epoll_compositor_smoke.elf" "${STAGE_ROOT}/bin/epoll_compositor_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/epoll_compositor_smoke"
 fi
+if [[ -x "${ROOT_DIR}/user/gui_compositor_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/gui_compositor_smoke.elf" "${STAGE_ROOT}/bin/gui_compositor_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/gui_compositor_smoke"
+fi
 if [[ -x "${ROOT_DIR}/user/shared_buffer_rights_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/shared_buffer_rights_smoke.elf" "${STAGE_ROOT}/bin/shared_buffer_rights_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/shared_buffer_rights_smoke"
@@ -120,6 +124,7 @@ fi
 # Applets are invoked as `toybox <applet>` to keep the smoke image compact.
 cat > "${STAGE_ROOT}/bin/next_smoke.sh" <<'EOS'
 fail=0
+set -x
 pwd || fail=1
 toybox ls bin || fail=1
 toybox mkdir -p /tmp/smoke || fail=1
@@ -363,6 +368,40 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/micropython_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/gui_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/gui_compositor_smoke ]; then
+  echo [musl-ext2-gui-smoke] missing bin/gui_compositor_smoke
+  fail=1
+else
+  bin/gui_compositor_smoke smoke || fail=1
+fi
+
+echo [musl-ext2-gui-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-gui-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/gui_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/gui_demo.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/gui_compositor_smoke ]; then
+  echo [musl-ext2-gui-demo] missing bin/gui_compositor_smoke
+  fail=1
+else
+  bin/gui_compositor_smoke demo || fail=1
+fi
+
+echo [musl-ext2-gui-demo] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-gui-demo] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/gui_demo.sh"
 
 cat > "${STAGE_ROOT}/bin/dropbear_smoke.sh" <<'EOS'
 fail=0

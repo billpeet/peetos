@@ -10,4 +10,5 @@ setup_rust_build_compat "${ROOT_DIR}"
 cargo test -p arch_x86_64 --target "${HOST}"
 cargo test -p drivers --target "${HOST}"
 cargo test -p fs --target "${HOST}"
-cargo test -p kernel --target "${HOST}"
+# The kernel host tests share global singleton state and are not thread-safe yet.
+cargo test -p kernel --target "${HOST}" -- --test-threads=1

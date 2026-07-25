@@ -238,6 +238,9 @@ pub fn pipe_open() -> Result<u16, i64> {
     let pipe_id = alloc_pipe_locked(&mut state)?;
     state.pipes[pipe_id as usize].read_ends = 1;
     state.pipes[pipe_id as usize].write_ends = 1;
+    if cfg!(feature = "musl-ext2-cmd-smoke") {
+        crate::serial_println!("[IPC] pipe {} open r=1 w=1", pipe_id);
+    }
     Ok(pipe_id)
 }
 
@@ -255,6 +258,16 @@ pub fn pipe_retain(pipe_id: u16, retain_read: bool, retain_write: bool) -> Resul
     if retain_write {
         pipe.write_ends = pipe.write_ends.saturating_add(1);
     }
+    if cfg!(feature = "musl-ext2-cmd-smoke") {
+        crate::serial_println!(
+            "[IPC] pipe {} retain read={} write={} -> r={} w={}",
+            pipe_id,
+            retain_read,
+            retain_write,
+            pipe.read_ends,
+            pipe.write_ends
+        );
+    }
     Ok(())
 }
 
@@ -271,6 +284,16 @@ pub fn pipe_close(pipe_id: u16, close_read: bool, close_write: bool) -> Result<(
     }
     if close_write && pipe.write_ends > 0 {
         pipe.write_ends -= 1;
+    }
+    if cfg!(feature = "musl-ext2-cmd-smoke") {
+        crate::serial_println!(
+            "[IPC] pipe {} close read={} write={} -> r={} w={}",
+            pipe_id,
+            close_read,
+            close_write,
+            pipe.read_ends,
+            pipe.write_ends
+        );
     }
 
     let free_pipe = pipe.read_ends == 0 && pipe.write_ends == 0;

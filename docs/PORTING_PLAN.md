@@ -10,7 +10,7 @@ current Rust kernel implementation and forward roadmap.
 - Stage 1-9 parity goals are largely complete; remaining work focuses on
   hardening, completeness, and new capability.
 
-## Status Snapshot (Last reviewed: 2026-04-12)
+## Status Snapshot (Last reviewed: 2026-03-14)
 
 ### Kernel Foundation
 
@@ -44,25 +44,6 @@ current Rust kernel implementation and forward roadmap.
 - Internal ext journal handling (surfaced as ext3 mounts) supports mount-time
   replay plus runtime journal transaction emission with deferred checkpointing
   and revoke handling, with baseline runtime journal abort-on-I/O-fault state.
-- Ordered-mode journaling now uses bounded credits for most mutators, plans
-  variable-size paths around capped per-segment reservations, rotates those
-  restartable scopes at block-walking loop boundaries and final inode closeout,
-  now uses indirection-aware allocation/free step estimates instead of a flat
-  loop heuristic, lets allocator/free helpers request restart headroom for
-  their own metadata phases, now splits allocation helpers into bookkeeping
-  versus initialization/link phases, gives truncate-side detach/free work
-  explicit unlink-table versus free/revoke restart boundaries, records restart
-  points as named journal phases on sealed ordered segments, now groups the
-  actual metadata work for those phases through closure-scoped restart-phase
-  helpers, now threads a lightweight internal journal-handle token through the
-  main ordered write/truncate/alloc/free paths and the fixed-shape directory
-  metadata mutators, and can split mutations into multiple sealed ordered
-  transaction segments when they outgrow an initial credit reservation.
-- ext2/ext3 feature acceptance is intentionally conservative: mounts currently
-  allow `HAS_JOURNAL` in compat bits, `FILETYPE`/`RECOVER`/`JOURNAL_DEV` in
-  incompat bits, and `SPARSE_SUPER` in ro-compat bits. Images carrying
-  `EXT_ATTR`, `DIR_INDEX`, `RESIZE_INO`, `IMAGIC_INODES`, `DIR_PREALLOC`, or
-  `LARGE_FILE` are rejected until the corresponding behavior exists.
 - Block cache residency is bounded with CLOCK eviction and dirty-pressure flush.
 
 ### IPC and Signals
@@ -89,42 +70,33 @@ current Rust kernel implementation and forward roadmap.
 - Phase 3 display ownership is now explicitly gated: default boots remain
   console-first, while the `compositor-first` kernel feature suppresses kernel
   framebuffer console/cursor composition, keeps panic/oops fallback readable,
-  and restores a visible console if init launch fails before userspace takes
-  over the display.
-- Phase 3 userspace bring-up now includes a compositor-first ext2 smoke profile:
-  `musl-ext2-gui-smoke` launches an ext2-hosted helper that validates exported
-  framebuffer/input environment variables, opens `/dev/fb0` and
-  `/dev/input/event{0,1}`, maps and writes the framebuffer, and confirms
-  injected keyboard/pointer events arrive through the userspace input-device
-  path under `compositor-first`.
-- Phase 3 compositor fallback policy now extends past init-launch failure:
-  when the compositor-owned initial userspace task exits or crashes after
-  successful takeover, the kernel restores framebuffer ownership to the console,
-  redraws the fallback UI, and exposes that transition through a dedicated QEMU
-  smoke target.
-- Phase 3 console-first smoke coverage is now explicit: a dedicated shell smoke
-  runner asserts the kernel keeps display ownership in console mode while the
-  scripted Toybox workload completes under the default profile.
-- The repository test harness is green again with current Phase 3 coverage:
-  `make test` now includes the default `test-exit` QEMU smoke alongside the
-  dedicated console-first/compositor-first/fallback smoke scripts and host
-  unit suites without known red paths.
-- Phase 4 bring-up has started with a compositor-core smoke profile:
-  `musl-ext2-peet-gui-smoke` boots a compositor-first userspace helper that
-  renders two overlapping surfaces to `/dev/fb0`, validates initial z-order
-  plus raise-on-focus behavior, routes injected keyboard/pointer activity
-  through the initial compositor event loop, validates a damage-limited
-  partial redraw/commit path, and verifies that one client can detach cleanly
-  without destabilizing the compositor-owned session. Real multi-process
-  `peet-gui` transport is still pending.
-- A separate `musl-ext2-peet-shell-demo` profile now scaffolds a more realistic
-  visual shell on the same compositor-first device ABI: top bar, launcher,
-  terminal/files/inspector panels, pointer cursor, focus switching, theme
-  cycling, and terminal-style command feedback are rendered through an internal
-  compositor path where each panel has its own surface buffer and focus raises
-  the active panel in z-order. The `FILES` panel now runs as a separate forked
-  userspace client over an `AF_UNIX socketpair` control channel, giving GUI
-  work a more realistic visual target before full buffer handoff is finished.
+  and restores a visible console if init launch fails or the tracked userspace
+  display owner later exits after taking over the framebuffer.
+- A dedicated Phase 3 compositor-first smoke profile is now wired through the
+  userspace init path (`musl-ext2-gui-smoke`): a userspace compositor process
+  now maps `/dev/fb0`, polls `/dev/input/event0` and `/dev/input/event1`,
+  composites multiple smoke-client surfaces received over inherited `AF_UNIX`
+  stream channels, and is covered by a headless QEMU regression target that
+  also verifies console fallback after compositor exit.
+- A separate compositor-first demo profile (`musl-ext2-gui-demo`) now reuses
+  the same userspace compositor stack in a manual QEMU bring-up path with a
+  larger multi-surface layout and routed client input feedback.
+- The current landed Phase 4 compositor-MVP baseline is now complete and includes dedicated
+  compositor/client process topology, compositor-owned framebuffer/input
+  handling, and shared-buffer attach/commit over inherited `AF_UNIX` streams
+  using `memfd_create` + `SCM_RIGHTS`, explicit create/attach/commit/damage/
+  destroy surface lifecycle with pending vs committed state, conservative
+  dirty-region redraw/coalescing with clipped framebuffer presentation,
+  bounded client/buffer limits, host unit coverage for protocol parsing/object
+  validation/scene transitions/dirty accumulation, smoke coverage for
+  malformed-client rejection, invalid-fd and stale post-destroy message
+  rejection, transient client disconnect survival, baseline hover pointer
+  focus plus click-to-focus keyboard routing to an input-aware client, and a
+  green default regression run through `make test`.
+- The console-first shell smoke now explicitly asserts that the kernel keeps
+  framebuffer ownership in console mode, but the broader toybox shell workflow
+  still needs runtime stabilization before Phase 3 can be considered fully
+  closed.
 
 ### Networking
 
@@ -176,8 +148,7 @@ current Rust kernel implementation and forward roadmap.
   (storage/network paths still contain polling-heavy flows).
 - Broaden USB/input/device coverage beyond the current focused baseline.
 - Continue framebuffer/terminal work toward fuller VT and pty semantics,
-  including runtime compositor/console ownership negotiation, compositor-exit
-  policy hardening beyond the current init-owned handoff, and richer input
+  including runtime compositor/console ownership negotiation and richer input
   semantics.
 
 ### 5. Networking Completeness
@@ -193,7 +164,11 @@ current Rust kernel implementation and forward roadmap.
 - Replace targeted smoke checks with broader integration suites as syscall and
   runtime behavior stabilize.
 - Keep the dedicated AF_UNIX/SCM_RIGHTS smoke (`run-unix-rights-smoke`) in the
-  regression workflow and add dedicated epoll compositor-loop smokes for Phase 2.
+  regression workflow, keep the dedicated compositor-first GUI smoke
+  (`run-gui-smoke`) in the regression workflow, and evolve the current
+  two-client shared-buffer compositor-session smoke into broader focus-routing,
+  disconnect-survival, and scene-management compositor integration as runtime
+  semantics harden further.
 
 ## Tracking Conventions
 

@@ -6,6 +6,9 @@ IMAGE="${ROOT_DIR}/build/peetos.img"
 EXT2_IMG="${ROOT_DIR}/user/sample_ext2_musl.img"
 LOG_FILE="$(mktemp)"
 
+source "${ROOT_DIR}/tests/rust_build_compat_env.bash"
+setup_rust_build_compat "${ROOT_DIR}"
+
 cleanup() {
   rm -f "${LOG_FILE}"
 }
@@ -36,6 +39,12 @@ fi
 
 if ! rg -q '\[musl-ext2-cmd-smoke\] done' "${LOG_FILE}"; then
   echo "Smoke command sequence did not reach completion marker" >&2
+  cat "${LOG_FILE}" >&2
+  exit 1
+fi
+
+if ! rg -q '\[GUI\] Display owner: console' "${LOG_FILE}"; then
+  echo "Kernel did not remain in console-first display ownership for shell smoke" >&2
   cat "${LOG_FILE}" >&2
   exit 1
 fi

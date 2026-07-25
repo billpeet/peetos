@@ -102,7 +102,8 @@ Color values are treated as 32-bit packed pixels (current baseline assumes 32-bp
   - Kernel rendering follows a single-owner policy: either the kernel console/cursor owns the framebuffer, or a userspace compositor does.
   - Default boots are console-first.
   - `KERNEL_FEATURES=compositor-first` suppresses kernel framebuffer console updates and software cursor composition so userspace can take ownership of `/dev/fb0`.
-  - If userspace init fails to launch in `compositor-first`, or the kernel hits a fatal panic/exception, the kernel reactivates a fresh visible framebuffer console without rebooting.
+  - The `musl-ext2-gui-smoke` profile now exercises the first userspace compositor MVP slice by launching a compositor process plus two smoke clients from the staged ext2 image; the compositor owns `/dev/fb0`, composites multiple surfaces, consumes `/dev/input/event0` and `/dev/input/event1`, and then the harness asserts console fallback after compositor exit.
+  - If userspace init fails to launch in `compositor-first`, the tracked userspace display owner later exits after takeover, or the kernel hits a fatal panic/exception, the kernel reactivates a fresh visible framebuffer console without rebooting.
 
 Limitations / Simplifications
 - Only bootloader-provided VESA mode is supported; kernel-side mode discovery/switching is not implemented.
@@ -114,7 +115,8 @@ Limitations / Simplifications
 - Title-bar cwd uses bounded in-kernel traversal from the active task inode and is polled periodically rather than event-driven, so updates are near-real-time but not instantaneous on every internal cwd mutation.
 - No double buffering, dirty-region tracking, or acceleration path exists.
 - Mapping is boot-time fixed-size (`16 MiB`) and not dynamically expanded/remapped.
-- `/dev/fb0` mapping is currently direct and shared-only; there is no userspace-visible ownership arbitration API, fencing, dirty-region tracking, or cache policy tuning yet.
+- `/dev/fb0` mapping is currently direct and shared-only; there is no userspace-visible ownership arbitration API, fencing, cache policy tuning, or stable public compositor/listener ABI yet. The current Phase 4 shared-buffer attach/commit path is internal to the smoke compositor protocol.
 - `compositor-first` selection is currently a kernel feature/build profile, not a runtime boot arg or negotiated handoff protocol.
+- Headless GUI regression coverage currently uses a smoke-only synthetic input injection path (`musl-ext2-gui-smoke`) because the QEMU harness does not yet inject host keyboard/pointer events directly under the current test environment.
 - Console fallback redraw after compositor ownership loss is intentionally fresh; the kernel does not retain a full scrollback/backbuffer copy of compositor-overwritten pixels.
 - Kernel bring-up does not clear the full framebuffer during early boot; only probe/logging is done at init.

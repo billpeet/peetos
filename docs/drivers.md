@@ -86,7 +86,7 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
 - Motion deltas are accumulated in IRQ context and applied in the main loop to a software framebuffer cursor.
 - Cursor rendering uses save/restore of covered pixels and clamps movement to screen bounds.
 - Framebuffer console writes/ticks temporarily hide the cursor and redraw it after updates so text rendering and cursor overlay stay coherent.
-- `KERNEL_FEATURES=compositor-first` disables kernel cursor composition and framebuffer-console updates so userspace can own the display without kernel redraw interference; fatal panic/exception paths and init-launch failure reactivate the kernel console fallback.
+- `KERNEL_FEATURES=compositor-first` disables kernel cursor composition and framebuffer-console updates so userspace can own the display without kernel redraw interference; fatal panic/exception paths, init-launch failure, and tracked compositor/init exit reactivate the kernel console fallback.
 
 **USB UHCI Tablet Baseline**
 - Feature-gated behind `KERNEL_FEATURES=usb-tablet` so default builds stay minimal and the optional UHCI path remains opt-in.
@@ -108,12 +108,13 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
   - `value: i32`
 - Timestamps are sourced from monotonic PIT uptime.
 - `read` is packet-preserving at event-record granularity, nonblocking empty reads return `-EAGAIN`, and readiness is wired through `poll`/`select`/`epoll` as `POLLIN`.
+- The dedicated compositor-first smoke profile now launches a userspace compositor process that consumes these devices while compositing multiple client surfaces to `/dev/fb0`; clients attach shared-memory buffers with `memfd_create` + `SCM_RIGHTS`, giving the current Phase 4 compositor slice a direct framebuffer/input regression path.
 
 **Framebuffer Baseline**
 - Bootloader-provided VESA handoff structures are consumed from fixed higher-half addresses:
   - status block: `0xFFFF_FFFF_8000_0B00`
   - mode info block: `0xFFFF_FFFF_8000_0A00`
-- The kernel validates mode geometry and bpp (`32` for current baseline) and computes framebuffer virtual address inside the pre-mapped boot window at `0xFFFF_FFFF_8100_0000`.
+- The kernel validates mode geometry and bpp (`32` for current baseline) and computes framebuffer virtual address inside the pre-mapped boot window at `0xFFFF_FFFF_8800_0000`.
 - The active window size is treated as `16 MiB`; initialization rejects modes whose offset+size exceeds that window.
 - Baseline drawing primitives are provided in-kernel:
   - pixel write (`set_pixel`)
@@ -133,6 +134,11 @@ Limitations / Simplifications
 - Input-event ABI coverage is intentionally narrow: fixed `event0`/`event1`
   numbering, no `EVIOC*` capability ioctls, no hotplug, and no multi-seat or
   focus-routing policy yet.
+- Headless GUI smoke coverage currently injects synthetic keyboard/pointer
+  events from a smoke-only kernel hook because the CI/QEMU harness does not yet
+  provide direct host-input injection.
+- The current compositor smoke still routes input only to the compositor itself;
+  client-facing input dispatch/focus policy is a later Phase 4 step.
 - Cursor composition is software-only over the shared framebuffer; there is no true hardware cursor plane, alpha blending, or z-order compositor yet.
 - Display ownership is still coarse-grained: the current model is console-or-compositor with a kernel-internal mode switch, not a runtime userspace lock/lease ABI.
 - TTY is canonical-line buffered only; no `termios`, ptys, or virtual terminal switching yet.

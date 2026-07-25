@@ -953,6 +953,22 @@ fn add_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
     Ok(())
 }
 
+fn two_inodes_mut(state: &mut VfsState, left: u16, right: u16) -> Option<(&mut Inode, &mut Inode)> {
+    let left = left as usize;
+    let right = right as usize;
+    if left >= VFS_MAX_INODES || right >= VFS_MAX_INODES || left == right {
+        return None;
+    }
+
+    if left < right {
+        let (head, tail) = state.inodes.split_at_mut(right);
+        Some((&mut head[left], &mut tail[0]))
+    } else {
+        let (head, tail) = state.inodes.split_at_mut(left);
+        Some((&mut tail[0], &mut head[right]))
+    }
+}
+
 fn remove_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
     if (dir as usize) >= VFS_MAX_INODES {
         return Err(ENOENT);
@@ -3909,18 +3925,27 @@ fn ext2_ensure_dir_children_loaded(state: &mut VfsState, dir: u16) -> Result<(),
         return Ok(());
     }
 
-    let node = state.inodes[dir as usize];
-    if !node.used || node.file_type != FileType::Directory || node.backend != NodeBackend::Ext2 {
+    let (node_used, node_file_type, node_backend, node_ext2_ino, children_loaded) = {
+        let node = &state.inodes[dir as usize];
+        (
+            node.used,
+            node.file_type,
+            node.backend,
+            node.ext2_ino,
+            node.ext2_children_loaded,
+        )
+    };
+    if !node_used || node_file_type != FileType::Directory || node_backend != NodeBackend::Ext2 {
         return Ok(());
     }
-    if node.ext2_ino == 0 {
+    if node_ext2_ino == 0 {
         return Err(EIO);
     }
-    if node.ext2_children_loaded {
+    if children_loaded {
         return Ok(());
     }
 
-    let ext2_inode = ext2_read_inode_from_state(state, node.ext2_ino)?;
+    let ext2_inode = ext2_read_inode_from_state(state, node_ext2_ino)?;
     if ext2_mode_to_filetype(ext2_inode.mode) != Some(FileType::Directory) {
         return Err(EIO);
     }
@@ -4000,14 +4025,20 @@ fn prune_root_overlays_after_ext2_mount(state: &mut VfsState) {
             idx += 1;
             continue;
         }
-        let node = state.inodes[child as usize];
-        if !node.used {
+        let keep = {
+            let node = &state.inodes[child as usize];
+            if !node.used {
+                false
+            } else {
+                let name_len = node.name_len as usize;
+                node.file_type == FileType::Directory
+                    && is_root_pseudo_mount_name(&node.name[..name_len])
+            }
+        };
+        if !state.inodes[child as usize].used {
             idx += 1;
             continue;
         }
-        let name_len = node.name_len as usize;
-        let keep = node.file_type == FileType::Directory
-            && is_root_pseudo_mount_name(&node.name[..name_len]);
         if keep {
             idx += 1;
             continue;
@@ -4506,32 +4537,44 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
     if (inode as usize) >= VFS_MAX_INODES {
         return Err(ENOENT);
     }
-    let node = state.inodes[inode as usize];
+    let node = &state.inodes[inode as usize];
     if !node.used {
         return Err(ENOENT);
     }
+    let node_ino = inode_number(node, inode);
+    let node_mode = inode_mode_for_stat(node);
+    let node_uid = node.uid as u32;
+    let node_gid = node.gid as u32;
+    let node_nlink = core::cmp::max(1, node.links_count as u32);
+    let node_size = node.size as u64;
+    let node_atime = node.atime;
+    let node_mtime = node.mtime;
+    let node_ctime = node.ctime;
+    let node_file_type = node.file_type;
+    let node_backend = node.backend;
+    let node_ext2_ino = node.ext2_ino;
 
     let mut stat = FileStat {
-        ino: inode_number(&node, inode),
-        mode: inode_mode_for_stat(&node),
-        uid: node.uid as u32,
-        gid: node.gid as u32,
-        nlink: core::cmp::max(1, node.links_count as u32),
-        size: node.size as u64,
+        ino: node_ino,
+        mode: node_mode,
+        uid: node_uid,
+        gid: node_gid,
+        nlink: node_nlink,
+        size: node_size,
         blksize: 4096,
-        blocks: ((node.size as u64) + 511) / 512,
-        atime: node.atime,
-        mtime: node.mtime,
-        ctime: node.ctime,
-        file_type: node.file_type,
+        blocks: (node_size + 511) / 512,
+        atime: node_atime,
+        mtime: node_mtime,
+        ctime: node_ctime,
+        file_type: node_file_type,
     };
 
-    if node.backend == NodeBackend::Ext2 {
-        if node.ext2_ino == 0 {
+    if node_backend == NodeBackend::Ext2 {
+        if node_ext2_ino == 0 {
             return Err(EIO);
         }
-        let ext = ext2_read_inode_from_state(state, node.ext2_ino)?;
-        stat.ino = node.ext2_ino as u64;
+        let ext = ext2_read_inode_from_state(state, node_ext2_ino)?;
+        stat.ino = node_ext2_ino as u64;
         stat.mode = ext.mode as u32;
         stat.uid = ext.uid as u32;
         stat.gid = ext.gid as u32;
@@ -4766,7 +4809,7 @@ fn link_at_inner(
         return Err(EEXIST);
     }
 
-    let old_node = state.inodes[old_inode as usize];
+    let old_node = &state.inodes[old_inode as usize];
     if !old_node.used {
         return Err(ENOENT);
     }
@@ -4774,11 +4817,21 @@ fn link_at_inner(
         return Err(EPERM);
     }
 
+    let old_file_type = old_node.file_type;
+    let old_backend = old_node.backend;
+    let old_size = old_node.size as usize;
+    let old_mode = old_node.mode;
+    let old_uid = old_node.uid;
+    let old_gid = old_node.gid;
+    let old_atime = old_node.atime;
+    let old_mtime = old_node.mtime;
+    let old_ext2_ino = old_node.ext2_ino;
+
     let new_backend = state.inodes[new_parent as usize].backend;
-    if old_node.backend != new_backend {
+    if old_backend != new_backend {
         return Err(EINVAL);
     }
-    if !backend_mutable(old_node.backend) {
+    if !backend_mutable(old_backend) {
         return Err(EROFS);
     }
     if state.inodes[new_parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
@@ -4788,34 +4841,27 @@ fn link_at_inner(
         return Err(ENOSPC);
     }
 
-    match old_node.backend {
+    match old_backend {
         NodeBackend::Tmpfs => {
-            let new_inode = alloc_inode(
-                state,
-                old_node.file_type,
-                NodeBackend::Tmpfs,
-                new_parent,
-                &new_name[..new_len],
-            )?;
+            let new_inode =
+                alloc_inode(state, old_file_type, NodeBackend::Tmpfs, new_parent, &new_name[..new_len])?;
             {
                 let now = fs_time_tick(state);
                 let old_links = state.inodes[old_inode as usize]
                     .links_count
                     .saturating_add(1);
-                let old = &mut state.inodes[old_inode as usize];
+                let (old, link) = two_inodes_mut(state, old_inode, new_inode).ok_or(EIO)?;
                 old.links_count = old_links;
                 old.ctime = now;
 
-                let link = &mut state.inodes[new_inode as usize];
-                link.size = old_node.size;
-                link.data[..old_node.size as usize]
-                    .copy_from_slice(&old_node.data[..old_node.size as usize]);
-                link.mode = old_node.mode;
-                link.uid = old_node.uid;
-                link.gid = old_node.gid;
+                link.size = old_size as u32;
+                link.data[..old_size].copy_from_slice(&old.data[..old_size]);
+                link.mode = old_mode;
+                link.uid = old_uid;
+                link.gid = old_gid;
                 link.links_count = old_links;
-                link.atime = old_node.atime;
-                link.mtime = old_node.mtime;
+                link.atime = old_atime;
+                link.mtime = old_mtime;
                 link.ctime = now;
             }
             add_child(state, new_parent, new_inode)?;
@@ -4823,7 +4869,6 @@ fn link_at_inner(
             Ok(())
         }
         NodeBackend::Ext2 => {
-            let old_ext2_ino = old_node.ext2_ino;
             let new_parent_ext2_ino = state.inodes[new_parent as usize].ext2_ino;
             if old_ext2_ino == 0 || new_parent_ext2_ino == 0 {
                 return Err(EIO);
@@ -4836,7 +4881,7 @@ fn link_at_inner(
                 new_parent_ext2_ino,
                 old_ext2_ino,
                 &new_name[..new_len],
-                old_node.file_type,
+                old_file_type,
             )?;
 
             let mut ext_inode = ext2_read_inode_from_state(state, old_ext2_ino)?;
@@ -4846,7 +4891,7 @@ fn link_at_inner(
 
             let new_inode = match alloc_inode(
                 state,
-                old_node.file_type,
+                old_file_type,
                 NodeBackend::Ext2,
                 new_parent,
                 &new_name[..new_len],
@@ -5565,28 +5610,31 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
             return Err(ENOENT);
         }
 
-        let node = state.inodes[inode as usize];
+        let node = &state.inodes[inode as usize];
         if !node.used {
             return Err(ENOENT);
         }
         if node.file_type == FileType::Directory {
             return Err(EISDIR);
         }
+        let node_backend = node.backend;
+        let node_size = node.size as u64;
+        let node_ext2_ino = node.ext2_ino;
 
-        let end = match node.backend {
-            NodeBackend::Tmpfs => node.size as u64,
+        let end = match node_backend {
+            NodeBackend::Tmpfs => node_size,
             NodeBackend::Ext2 => {
-                if node.ext2_ino == 0 {
+                if node_ext2_ino == 0 {
                     return Err(EIO);
                 }
-                ext2_read_inode_from_state(state, node.ext2_ino)?.size as u64
+                ext2_read_inode_from_state(state, node_ext2_ino)?.size as u64
             }
             NodeBackend::ProcUptime
             | NodeBackend::ProcMeminfo
             | NodeBackend::ProcMounts
             | NodeBackend::ProcVersion => {
                 let mut buf = [0u8; PROCFS_BUFFER_MAX];
-                format_proc_payload(state, node.backend, &mut buf) as u64
+                format_proc_payload(state, node_backend, &mut buf) as u64
             }
             NodeBackend::DevNull
             | NodeBackend::DevZero
@@ -5611,7 +5659,7 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
             return Err(EINVAL);
         }
 
-        match node.backend {
+        match node_backend {
             NodeBackend::Tmpfs => {
                 if target > TMPFS_MAX_FILE_SIZE as i128 {
                     return Err(EINVAL);
