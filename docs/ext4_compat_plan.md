@@ -73,10 +73,11 @@ clean on every image the kernel wrote, and docs updated
 ### M0 - Foundations (no new features accepted yet)
 
 1. **Fixtures**: `scripts/build_ext4_sample.sh` producing
-   `user/sample_ext4.img` (stock features) plus variants built on the fly by
-   tests: `-O ^metadata_csum`, `-O ^64bit`, `-O ^flex_bg,^metadata_csum`, and
-   a deep extent tree (fragmented file via `debugfs`/`fallocate` patterns,
-   depth >= 1), a large htree directory, xattrs, a 5 GiB sparse file.
+   `user/sample_ext4.img` (stock features) and `user/sample_ext4_nocsum.img`
+   (`^metadata_csum,uninit_bg`), both split into four block groups
+   (`-g 1024`) so flex_bg packing and uninit groups are present, with a
+   depth-1 extent tree (20-extent fragmented file), a two-block htree
+   directory, an xattr block, a fast symlink, and a 5 GiB sparse file.
 2. **Group descriptor layer**: replace fixed 32-byte offsets with accessors
    (`desc_size`, block/inode bitmap, inode table, free counts, flags,
    checksums, `_hi` halves). Reject `64bit` filesystems whose high halves are
@@ -88,6 +89,26 @@ clean on every image the kernel wrote, and docs updated
    Pure refactor; all ext2/ext3 tests must stay green.
 
 Exit: no behaviour change; refactor covered by the existing 100+ fs tests.
+
+**Status: done.**
+- `scripts/build_ext4_sample.sh` builds both fixtures; they are committed
+  (16 MiB each, ~20 KiB compressed).
+- Superblock parsing is split into `ext2_parse_layout_with_len` (geometry,
+  descriptor size; no feature judgement, so tests can inspect ext4 layouts)
+  and `ext2_parse_meta_with_len` (layout + feature allowlist for mounting).
+- `Ext2Meta::desc_size` (32, or `s_desc_size` with `64bit`, validated as a
+  power of two in 64..=1024); `ext2_gd_location*` read lo/hi locations and
+  refuse non-zero high halves with `EIO`; `ext2_gd_adjust_counter_state`
+  updates 16+16-bit counters. All 13 fixed-size uses are gone.
+- `crates/fs/src/ext4_csum.rs`: table-driven crc32c/crc16 and verifiers for
+  the superblock, group descriptors (crc32c and crc16 variants), block/inode
+  bitmaps, inodes (lo/hi with `extra_isize`), extent tree blocks, and
+  directory leaf tails. Tests check every checksum `mkfs.ext4` wrote in both
+  fixtures and that single-byte corruption is detected.
+- `crates/fs/src/ext2_bmap.rs`: lookup/ensure/detach/free-all/count
+  dispatch on `EXT4_EXTENTS_FL`; the indirect code is the only backend and an
+  extent-flagged inode returns `EIO` (corruption on ext2/ext3).
+- Both ext4 fixtures are still rejected at mount (`EINVAL`), as intended.
 
 ### M1 - Read-only ext4 mount
 
@@ -112,8 +133,10 @@ smoke boots with an ext4 root mounted read-only and lists/reads files.
 
 ### M2 - Read-write on ext4 without `metadata_csum`
 
-Target images: `mke2fs -t ext4 -O ^metadata_csum` (which enables
-`uninit_bg`/`gdt_csum`, so crc16 descriptor checksums are needed here).
+Target images: `mke2fs -t ext4 -O ^metadata_csum,uninit_bg`, the pre-1.43
+e2fsprogs ext4 default (`user/sample_ext4_nocsum.img`): crc16 group
+descriptor checksums (`gdt_csum`) and lazy-init groups, but no crc32c. On
+e2fsprogs 1.47, `^metadata_csum` alone does not add `uninit_bg`.
 
 1. Extent write path: allocate into the in-inode extent array, merge
    adjacent extents, split leaves, grow depth, free on truncate/unlink

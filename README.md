@@ -98,7 +98,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 Optional but commonly required:
 
 - `rust-src` component if you need to rebuild `core` for a target.
-- `mke2fs` (`e2fsprogs`) to regenerate `user/sample_ext2.img` and `user/sample_ext3.img` (`scripts/build_ext3_sample.sh` also uses `debugfs`).
+- `mke2fs` (`e2fsprogs`) to regenerate `user/sample_ext2.img`, `user/sample_ext3.img`, and the ext4 fixtures `user/sample_ext4*.img` (`scripts/build_ext3_sample.sh` and `scripts/build_ext4_sample.sh` also use `debugfs`).
 - `e2fsck` (`e2fsprogs`) for `tests/ext3_fsck.sh`, which checks images written by the kernel's ext2/ext3 code.
 - `curl` or `wget` for fetching musl/toybox/quickjs/micropython/dropbear sources.
 

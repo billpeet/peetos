@@ -1,12 +1,13 @@
 use super::{
     ext2_adjust_group_counters_state, ext2_adjust_super_counters_state, ext2_bitmap_get,
     ext2_bitmap_set, ext2_block_group_and_bit, ext2_block_slice_mut_state, ext2_block_slice_state,
+    ext2_ensure_data_block,
     ext2_ensure_range_resident, ext2_group_block_bitmap_block_state, ext2_group_desc_offset,
     ext2_group_inode_bitmap_block_state, ext2_indirect_entries_per_block, ext2_inode_group_and_bit,
     ext2_inode_offset_in_state, ext2_mark_dirty_block, ext2_mark_dirty_range,
     ext2_read_indirect_entry_from_state, ext2_write_indirect_entry_from_state,
     ext2_write_u16_state, ext2_write_u32_state, ext2_zero_range_state, Ext2Inode,
-    Ext2JournalHandle, VfsState, EINVAL, EIO, ENOSPC, EXT2_GROUP_DESC_SIZE,
+    Ext2JournalHandle, VfsState, EINVAL, EIO, ENOSPC,
     EXT2_INODE_DIRECT_COUNT, EXT2_SUPERBLOCK_OFFSET,
 };
 
@@ -23,7 +24,7 @@ pub(super) fn ext2_alloc_block(
     let mut group = 0u32;
     while group < meta.group_count {
         let desc_offset = ext2_group_desc_offset(&meta, group)?;
-        ext2_ensure_range_resident(state, desc_offset, EXT2_GROUP_DESC_SIZE)?;
+        ext2_ensure_range_resident(state, desc_offset, meta.desc_size)?;
         let bitmap_block = ext2_group_block_bitmap_block_state(state, &meta, group)?;
         let mut found = None;
 
@@ -65,7 +66,7 @@ pub(super) fn ext2_alloc_block(
                     ext2_adjust_group_counters_state(state, &meta, group, -1, 0, 0)?;
                     ext2_mark_dirty_range(state, EXT2_SUPERBLOCK_OFFSET, 1024)?;
                     let desc_offset = ext2_group_desc_offset(&meta, group)?;
-                    ext2_mark_dirty_range(state, desc_offset, EXT2_GROUP_DESC_SIZE)?;
+                    ext2_mark_dirty_range(state, desc_offset, meta.desc_size)?;
                     Ok(())
                 },
             )?;
@@ -104,7 +105,7 @@ pub(super) fn ext2_free_block(
     let meta = state.ext2_meta;
     let (group, bit) = ext2_block_group_and_bit(&meta, block_num)?;
     let desc_offset = ext2_group_desc_offset(&meta, group)?;
-    ext2_ensure_range_resident(state, desc_offset, EXT2_GROUP_DESC_SIZE)?;
+    ext2_ensure_range_resident(state, desc_offset, meta.desc_size)?;
     let bitmap_block = ext2_group_block_bitmap_block_state(state, &meta, group)?;
     let mut was_set = false;
 
@@ -129,7 +130,7 @@ pub(super) fn ext2_free_block(
                 ext2_adjust_group_counters_state(state, &meta, group, 1, 0, 0)?;
                 ext2_mark_dirty_range(state, EXT2_SUPERBLOCK_OFFSET, 1024)?;
                 let desc_offset = ext2_group_desc_offset(&meta, group)?;
-                ext2_mark_dirty_range(state, desc_offset, EXT2_GROUP_DESC_SIZE)?;
+                ext2_mark_dirty_range(state, desc_offset, meta.desc_size)?;
                 Ok(())
             },
         )?;
@@ -159,7 +160,7 @@ pub(super) fn ext2_alloc_inode(
 
     while group < meta.group_count {
         let desc_offset = ext2_group_desc_offset(&meta, group)?;
-        ext2_ensure_range_resident(state, desc_offset, EXT2_GROUP_DESC_SIZE)?;
+        ext2_ensure_range_resident(state, desc_offset, meta.desc_size)?;
         let bitmap_block = ext2_group_inode_bitmap_block_state(state, &meta, group)?;
         let mut found = None;
 
@@ -208,7 +209,7 @@ pub(super) fn ext2_alloc_inode(
                     )?;
                     ext2_mark_dirty_range(state, EXT2_SUPERBLOCK_OFFSET, 1024)?;
                     let desc_offset = ext2_group_desc_offset(&meta, group)?;
-                    ext2_mark_dirty_range(state, desc_offset, EXT2_GROUP_DESC_SIZE)?;
+                    ext2_mark_dirty_range(state, desc_offset, meta.desc_size)?;
                     Ok(())
                 },
             )?;
@@ -251,7 +252,7 @@ pub(super) fn ext2_free_inode(
     let meta = state.ext2_meta;
     let (group, bit) = ext2_inode_group_and_bit(&meta, ino)?;
     let desc_offset = ext2_group_desc_offset(&meta, group)?;
-    ext2_ensure_range_resident(state, desc_offset, EXT2_GROUP_DESC_SIZE)?;
+    ext2_ensure_range_resident(state, desc_offset, meta.desc_size)?;
     let bitmap_block = ext2_group_inode_bitmap_block_state(state, &meta, group)?;
     let mut was_set = false;
 
@@ -283,7 +284,7 @@ pub(super) fn ext2_free_inode(
                 )?;
                 ext2_mark_dirty_range(state, EXT2_SUPERBLOCK_OFFSET, 1024)?;
                 let desc_offset = ext2_group_desc_offset(&meta, group)?;
-                ext2_mark_dirty_range(state, desc_offset, EXT2_GROUP_DESC_SIZE)?;
+                ext2_mark_dirty_range(state, desc_offset, meta.desc_size)?;
                 Ok(())
             },
         )?;
@@ -345,7 +346,7 @@ pub(super) fn ext2_write_inode_to_state(
     Ok(())
 }
 
-pub(super) fn ext2_ensure_data_block(
+pub(super) fn indirect_ensure_block(
     state: &mut VfsState,
     journal_handle: Option<Ext2JournalHandle>,
     inode: &mut Ext2Inode,

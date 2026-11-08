@@ -4,18 +4,24 @@ extern crate alloc;
 
 mod ext2_alloc;
 mod ext2_api;
+mod ext2_bmap;
 mod ext2_backend;
 mod ext2_dir;
 mod ext2_journal;
 mod ext2_sync;
+mod ext4_csum;
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
 use ext2_alloc::{
-    ext2_alloc_block, ext2_alloc_inode, ext2_ensure_data_block, ext2_free_block, ext2_free_inode,
-    ext2_write_inode_to_state, ext2_write_zero_range,
+    ext2_alloc_block, ext2_alloc_inode, ext2_free_block, ext2_free_inode, ext2_write_inode_to_state,
+    ext2_write_zero_range, indirect_ensure_block,
+};
+use ext2_bmap::{
+    bmap_free_all_blocks, ext2_data_block_for_logical_index_state, ext2_detach_data_block,
+    ext2_ensure_data_block, ext2_recalc_inode_block_count_512_state,
 };
 use ext2_dir::{
     ext2_add_dir_entry, ext2_directory_is_empty, ext2_remove_dir_entry, ext2_write_dirent,
@@ -97,7 +103,15 @@ pub const DT_LNK: u8 = 10;
 const EXT2_SUPERBLOCK_OFFSET: usize = 1024;
 const EXT2_SUPER_MAGIC: u16 = 0xEF53;
 const EXT2_ROOT_INODE: u32 = 2;
+/// Group descriptor size without the ext4 `64bit` feature.
 const EXT2_GROUP_DESC_SIZE: usize = 32;
+/// Smallest descriptor size the `64bit` feature allows (`s_desc_size`).
+const EXT4_MIN_DESC_SIZE_64BIT: usize = 64;
+/// Upper bound accepted for `s_desc_size` (Linux: EXT4_MAX_DESC_SIZE).
+const EXT4_MAX_DESC_SIZE: usize = 1024;
+/// Offset of a descriptor field's high half (`bg_*_hi`) relative to its low
+/// half, for the fields that have one, when descriptors are >= 64 bytes.
+const EXT4_GD_HI_DELTA: usize = 0x20;
 const EXT2_INODE_DIRECT_COUNT: usize = 12;
 const EXT2_CACHE_MAX_BLOCKS_DEFAULT: usize = 2048;
 const EXT2_CACHE_DIRTY_HIGH_WATERMARK_PERCENT_DEFAULT: u8 = 30;
@@ -126,6 +140,8 @@ const EXT2_FEATURE_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_COMPAT_HAS_JOURNAL
 const EXT2_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const EXT2_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
 const EXT2_FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
+/// ext4 `64bit`: 64-bit block numbers and `s_desc_size`-byte descriptors.
+const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
 const EXT2_FEATURE_INCOMPAT_SUPPORTED: u32 = EXT2_FEATURE_INCOMPAT_FILETYPE
     | EXT2_FEATURE_INCOMPAT_RECOVER
     | EXT2_FEATURE_INCOMPAT_JOURNAL_DEV;
@@ -635,6 +651,8 @@ struct Ext2Meta {
     gdt_offset: usize,
     feature_compat: u32,
     feature_incompat: u32,
+    /// On-disk group descriptor size: 32, or `s_desc_size` with `64bit`.
+    desc_size: usize,
     journal_inode: u32,
     journal_dev: u32,
 }
@@ -653,6 +671,7 @@ impl Ext2Meta {
             gdt_offset: 0,
             feature_compat: 0,
             feature_incompat: 0,
+            desc_size: EXT2_GROUP_DESC_SIZE,
             journal_inode: 0,
             journal_dev: 0,
         }
@@ -1634,7 +1653,32 @@ fn write_u32_le(buf: &mut [u8], offset: usize, value: u32) -> Result<(), i64> {
     Ok(())
 }
 
+/// Parses and validates a superblock for mounting: the layout must be sane
+/// and every feature bit must be one this implementation supports.
 fn ext2_parse_meta_with_len(
+    image: &[u8],
+    logical_image_len: usize,
+    require_gdt_resident: bool,
+) -> Result<Ext2Meta, i64> {
+    let meta = ext2_parse_layout_with_len(image, logical_image_len, require_gdt_resident)?;
+    let sb = EXT2_SUPERBLOCK_OFFSET;
+    let feature_ro_compat = read_u32_le(image, sb + 100)?;
+    if (meta.feature_compat & !EXT2_FEATURE_COMPAT_SUPPORTED) != 0 {
+        return Err(EINVAL);
+    }
+    if (meta.feature_incompat & !EXT2_FEATURE_INCOMPAT_SUPPORTED) != 0 {
+        return Err(EINVAL);
+    }
+    if (feature_ro_compat & !EXT2_FEATURE_RO_COMPAT_SUPPORTED) != 0 {
+        return Err(EINVAL);
+    }
+    Ok(meta)
+}
+
+/// Parses the on-disk layout (geometry, descriptor size, journal fields)
+/// without judging feature bits, so images that do not mount yet (ext4) can
+/// still be inspected by tests and diagnostics.
+fn ext2_parse_layout_with_len(
     image: &[u8],
     logical_image_len: usize,
     require_gdt_resident: bool,
@@ -1659,7 +1703,6 @@ fn ext2_parse_meta_with_len(
     let rev_level = read_u32_le(image, sb + 76)?;
     let feature_compat = read_u32_le(image, sb + 92)?;
     let feature_incompat = read_u32_le(image, sb + 96)?;
-    let feature_ro_compat = read_u32_le(image, sb + 100)?;
     let journal_inode = read_u32_le(image, sb + 224)?;
     let journal_dev = read_u32_le(image, sb + 228)?;
 
@@ -1669,16 +1712,6 @@ fn ext2_parse_meta_with_len(
 
     let block_size = 1024usize.checked_shl(log_block_size).ok_or(EINVAL)?;
     if block_size < 1024 || block_size > 4096 {
-        return Err(EINVAL);
-    }
-
-    if (feature_compat & !EXT2_FEATURE_COMPAT_SUPPORTED) != 0 {
-        return Err(EINVAL);
-    }
-    if (feature_incompat & !EXT2_FEATURE_INCOMPAT_SUPPORTED) != 0 {
-        return Err(EINVAL);
-    }
-    if (feature_ro_compat & !EXT2_FEATURE_RO_COMPAT_SUPPORTED) != 0 {
         return Err(EINVAL);
     }
 
@@ -1703,8 +1736,9 @@ fn ext2_parse_meta_with_len(
         block_size
     };
 
+    let desc_size = ext2_desc_size_from_superblock(image, feature_incompat)?;
     let gdt_size = (group_count as usize)
-        .checked_mul(EXT2_GROUP_DESC_SIZE)
+        .checked_mul(desc_size)
         .ok_or(EIO)?;
     let gdt_end = gdt_offset.checked_add(gdt_size).ok_or(EIO)?;
     if gdt_end > logical_image_len {
@@ -1726,6 +1760,7 @@ fn ext2_parse_meta_with_len(
         gdt_offset,
         feature_compat,
         feature_incompat,
+        desc_size,
         journal_inode,
         journal_dev,
     })
@@ -2201,11 +2236,7 @@ fn ext2_group_inode_table_block(image: &[u8], meta: &Ext2Meta, group: u32) -> Re
         return Err(EIO);
     }
 
-    let desc_offset = meta
-        .gdt_offset
-        .checked_add((group as usize) * EXT2_GROUP_DESC_SIZE)
-        .ok_or(EIO)?;
-    read_u32_le(image, desc_offset + 8)
+    ext2_gd_location(image, meta, group, 8)
 }
 
 #[allow(dead_code)]
@@ -2401,13 +2432,90 @@ fn ext2_block_cached(state: &VfsState, block: u32) -> bool {
     ext2_cache_has_block(state, block)
 }
 
+/// Group descriptor size for this superblock: 32 bytes, or `s_desc_size`
+/// (offset 0xFE) when the ext4 `64bit` feature is set.
+fn ext2_desc_size_from_superblock(image: &[u8], feature_incompat: u32) -> Result<usize, i64> {
+    if (feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) == 0 {
+        return Ok(EXT2_GROUP_DESC_SIZE);
+    }
+    let size = read_u16_le(image, EXT2_SUPERBLOCK_OFFSET + 0xFE)? as usize;
+    if size < EXT4_MIN_DESC_SIZE_64BIT || size > EXT4_MAX_DESC_SIZE || !size.is_power_of_two() {
+        return Err(EINVAL);
+    }
+    Ok(size)
+}
+
 fn ext2_group_desc_offset(meta: &Ext2Meta, group: u32) -> Result<usize, i64> {
     if group >= meta.group_count {
         return Err(EIO);
     }
     meta.gdt_offset
-        .checked_add((group as usize) * EXT2_GROUP_DESC_SIZE)
+        .checked_add((group as usize) * meta.desc_size)
         .ok_or(EIO)
+}
+
+/// Reads a 32-bit descriptor location (block/inode bitmap, inode table)
+/// whose high half lives `EXT4_GD_HI_DELTA` bytes later in >= 64-byte
+/// descriptors. Block numbers are 32-bit internally, so a non-zero high half
+/// (a filesystem above 2^32 blocks) is refused with `EIO`.
+fn ext2_gd_location_state(
+    state: &mut VfsState,
+    meta: &Ext2Meta,
+    group: u32,
+    lo_offset: usize,
+) -> Result<u32, i64> {
+    let desc_offset = ext2_group_desc_offset(meta, group)?;
+    let lo = ext2_read_u32_state(state, desc_offset + lo_offset)?;
+    if meta.desc_size >= EXT4_MIN_DESC_SIZE_64BIT {
+        let hi = ext2_read_u32_state(state, desc_offset + lo_offset + EXT4_GD_HI_DELTA)?;
+        if hi != 0 {
+            return Err(EIO);
+        }
+    }
+    Ok(lo)
+}
+
+/// Image-buffer variant of `ext2_gd_location_state`.
+fn ext2_gd_location(image: &[u8], meta: &Ext2Meta, group: u32, lo_offset: usize) -> Result<u32, i64> {
+    let desc_offset = ext2_group_desc_offset(meta, group)?;
+    let lo = read_u32_le(image, desc_offset + lo_offset)?;
+    if meta.desc_size >= EXT4_MIN_DESC_SIZE_64BIT
+        && read_u32_le(image, desc_offset + lo_offset + EXT4_GD_HI_DELTA)? != 0
+    {
+        return Err(EIO);
+    }
+    Ok(lo)
+}
+
+/// Adjusts a 16-bit descriptor counter (free blocks/inodes, used dirs) that
+/// gains a high 16-bit half `EXT4_GD_HI_DELTA` bytes later in >= 64-byte
+/// descriptors.
+fn ext2_gd_adjust_counter_state(
+    state: &mut VfsState,
+    meta: &Ext2Meta,
+    group: u32,
+    lo_offset: usize,
+    delta: i32,
+) -> Result<(), i64> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let desc_offset = ext2_group_desc_offset(meta, group)?;
+    if meta.desc_size < EXT4_MIN_DESC_SIZE_64BIT {
+        return ext2_adjust_counter_u16_state(state, desc_offset + lo_offset, delta);
+    }
+    let lo = ext2_read_u16_state(state, desc_offset + lo_offset)? as i64;
+    let hi = ext2_read_u16_state(state, desc_offset + lo_offset + EXT4_GD_HI_DELTA)? as i64;
+    let next = ((hi << 16) | lo) + delta as i64;
+    if next < 0 || next > u32::MAX as i64 {
+        return Err(EIO);
+    }
+    ext2_write_u16_state(state, desc_offset + lo_offset, (next & 0xFFFF) as u16)?;
+    ext2_write_u16_state(
+        state,
+        desc_offset + lo_offset + EXT4_GD_HI_DELTA,
+        ((next >> 16) & 0xFFFF) as u16,
+    )
 }
 
 #[allow(dead_code)]
@@ -2417,8 +2525,7 @@ fn ext2_group_bitmap_block(
     group: u32,
     field_offset: usize,
 ) -> Result<u32, i64> {
-    let desc_offset = ext2_group_desc_offset(meta, group)?;
-    read_u32_le(image, desc_offset + field_offset)
+    ext2_gd_location(image, meta, group, field_offset)
 }
 
 #[allow(dead_code)]
@@ -2437,8 +2544,7 @@ fn ext2_group_bitmap_block_state(
     group: u32,
     field_offset: usize,
 ) -> Result<u32, i64> {
-    let desc_offset = ext2_group_desc_offset(meta, group)?;
-    ext2_read_u32_state(state, desc_offset + field_offset)
+    ext2_gd_location_state(state, meta, group, field_offset)
 }
 
 fn ext2_group_block_bitmap_block_state(
@@ -2465,8 +2571,7 @@ fn ext2_group_inode_table_block_state(
     if group >= meta.group_count {
         return Err(EIO);
     }
-    let desc_offset = ext2_group_desc_offset(meta, group)?;
-    ext2_read_u32_state(state, desc_offset + 8)
+    ext2_gd_location_state(state, meta, group, 8)
 }
 
 #[allow(dead_code)]
@@ -2663,10 +2768,9 @@ fn ext2_adjust_group_counters_state(
     inode_delta: i32,
     used_dir_delta: i32,
 ) -> Result<(), i64> {
-    let desc_offset = ext2_group_desc_offset(meta, group)?;
-    ext2_adjust_counter_u16_state(state, desc_offset + 12, block_delta)?;
-    ext2_adjust_counter_u16_state(state, desc_offset + 14, inode_delta)?;
-    ext2_adjust_counter_u16_state(state, desc_offset + 16, used_dir_delta)?;
+    ext2_gd_adjust_counter_state(state, meta, group, 12, block_delta)?;
+    ext2_gd_adjust_counter_state(state, meta, group, 14, inode_delta)?;
+    ext2_gd_adjust_counter_state(state, meta, group, 16, used_dir_delta)?;
     Ok(())
 }
 
@@ -2815,7 +2919,7 @@ fn ext2_count_indirect_tree_blocks_state(
     Ok(count)
 }
 
-fn ext2_recalc_inode_block_count_512_state(
+fn indirect_recalc_block_count_512_state(
     state: &mut VfsState,
     inode: &Ext2Inode,
 ) -> Result<u32, i64> {
@@ -3205,7 +3309,7 @@ fn ext2_data_block_for_logical_index(
     Err(EIO)
 }
 
-fn ext2_data_block_for_logical_index_state(
+fn indirect_lookup_state(
     state: &mut VfsState,
     inode: &Ext2Inode,
     block_idx: usize,
@@ -3285,7 +3389,7 @@ fn ext2_table_has_nonzero_entries_state(
     Ok(false)
 }
 
-fn ext2_detach_data_block(
+fn indirect_detach_block(
     state: &mut VfsState,
     journal_handle: Option<Ext2JournalHandle>,
     inode: &mut Ext2Inode,
@@ -3655,35 +3759,7 @@ fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
         return Err(EFBIG);
     }
     let journal_handle = ext2_journal::current_handle(state);
-
-    let mut i = 0usize;
-    while i < EXT2_INODE_DIRECT_COUNT {
-        let block = inode.blocks[i];
-        if block != 0 {
-            ext2_journal::with_handle_restartable_phase(
-                state,
-                journal_handle,
-                Ext2JournalPhaseKind::FreeBlockBookkeeping,
-                EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT,
-                |state| ext2_free_block(state, journal_handle, block),
-            )?;
-            inode.blocks[i] = 0;
-        }
-        i += 1;
-    }
-
-    if inode.blocks[12] != 0 {
-        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[12], 1)?;
-        inode.blocks[12] = 0;
-    }
-    if inode.blocks[13] != 0 {
-        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[13], 2)?;
-        inode.blocks[13] = 0;
-    }
-    if inode.blocks[14] != 0 {
-        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[14], 3)?;
-        inode.blocks[14] = 0;
-    }
+    bmap_free_all_blocks(state, journal_handle, &mut inode, true)?;
 
     inode.size = 0;
     inode.block_count_512 = ext2_inode_acl_sectors(&state.ext2_meta, &inode);
@@ -3840,33 +3916,48 @@ fn ext2_free_inode_blocks(state: &mut VfsState, inode: &mut Ext2Inode) -> Result
         return Ok(());
     }
     ext2_release_xattr_block(state, journal_handle, inode)?;
+    bmap_free_all_blocks(state, journal_handle, inode, false)?;
+    inode.size = 0;
+    inode.block_count_512 = 0;
+    Ok(())
+}
+
+/// Indirect-map implementation behind `bmap_free_all_blocks`.
+fn indirect_free_all_blocks(
+    state: &mut VfsState,
+    journal_handle: Option<Ext2JournalHandle>,
+    inode: &mut Ext2Inode,
+    phased: bool,
+) -> Result<(), i64> {
     let mut idx = 0usize;
     while idx < EXT2_INODE_DIRECT_COUNT {
         let block = inode.blocks[idx];
         if block != 0 {
-            ext2_free_block(state, journal_handle, block)?;
+            if phased {
+                ext2_journal::with_handle_restartable_phase(
+                    state,
+                    journal_handle,
+                    Ext2JournalPhaseKind::FreeBlockBookkeeping,
+                    EXT2_JOURNAL_CREDITS_STEP_FREE_DIRECT,
+                    |state| ext2_free_block(state, journal_handle, block),
+                )?;
+            } else {
+                ext2_free_block(state, journal_handle, block)?;
+            }
             inode.blocks[idx] = 0;
         }
         idx += 1;
     }
 
-    if inode.blocks[12] != 0 {
-        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[12], 1)?;
-        inode.blocks[12] = 0;
+    let mut level = 1u8;
+    while level <= 3 {
+        let slot = EXT2_INODE_DIRECT_COUNT + level as usize - 1;
+        if inode.blocks[slot] != 0 {
+            ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[slot], level)?;
+            inode.blocks[slot] = 0;
+        }
+        level += 1;
     }
-
-    if inode.blocks[13] != 0 {
-        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[13], 2)?;
-        inode.blocks[13] = 0;
-    }
-
-    if inode.blocks[14] != 0 {
-        ext2_free_indirect_tree_blocks(state, journal_handle, inode.blocks[14], 3)?;
-        inode.blocks[14] = 0;
-    }
-
-    inode.size = 0;
-    inode.block_count_512 = 0;
     Ok(())
 }
 
@@ -10156,5 +10247,253 @@ mod tests {
         assert_eq!(&long_buf[..n], EXT3_LONG_SYMLINK_TARGET.as_bytes());
         assert_eq!(count_dir_entries("/mnt/ext2/bigdir"), EXT3_BIGDIR_ENTRIES + 1);
         assert_eq!(open("/mnt/ext2/large.bin", O_RDONLY, 0).unwrap_err(), ENOENT);
+    }
+
+    // ---- ext4 M0: fixtures, descriptor layer, checksums, block-map seam ----
+    //
+    // user/sample_ext4.img (stock mkfs.ext4) and user/sample_ext4_nocsum.img
+    // (^metadata_csum,uninit_bg) come from scripts/build_ext4_sample.sh: four
+    // 1024-block groups, flex_bg (all bitmaps/inode tables in group 0), groups
+    // 1-3 INODE_UNINIT (group 1 also BLOCK_UNINIT), 4 KiB blocks, 64-byte
+    // descriptors, 256-byte inodes; frag.bin (inode 76) has a depth-1 extent
+    // tree. Nothing ext4-specific mounts yet; these tests read raw images.
+
+    static SAMPLE_EXT4: &[u8] = include_bytes!("../../../user/sample_ext4.img");
+    static SAMPLE_EXT4_NOCSUM: &[u8] = include_bytes!("../../../user/sample_ext4_nocsum.img");
+    const EXT4_FRAG_INO: u32 = 76;
+
+    fn ext4_layout(image: &[u8]) -> Ext2Meta {
+        ext2_parse_layout_with_len(image, image.len(), true).expect("parse ext4 layout")
+    }
+
+    fn ext4_csum_params(image: &[u8]) -> ext4_csum::Ext4Csum {
+        ext4_csum::Ext4Csum::from_superblock(
+            &image[EXT2_SUPERBLOCK_OFFSET..EXT2_SUPERBLOCK_OFFSET + 1024],
+        )
+        .expect("checksum params")
+    }
+
+    fn ext4_desc<'a>(image: &'a [u8], meta: &Ext2Meta, group: u32) -> &'a [u8] {
+        let off = ext2_group_desc_offset(meta, group).unwrap();
+        &image[off..off + meta.desc_size]
+    }
+
+    fn ext4_raw_inode<'a>(image: &'a [u8], meta: &Ext2Meta, ino: u32) -> &'a [u8] {
+        let off = ext2_inode_offset_in_image(image, meta, ino).unwrap();
+        &image[off..off + meta.inode_size]
+    }
+
+    fn ext4_block<'a>(image: &'a [u8], meta: &Ext2Meta, block: u32) -> &'a [u8] {
+        let off = block as usize * meta.block_size;
+        &image[off..off + meta.block_size]
+    }
+
+    /// Allocated inodes: initialized groups, below the unused tail, bitmap set.
+    fn ext4_allocated_inodes(image: &[u8], meta: &Ext2Meta) -> std::vec::Vec<u32> {
+        let mut out = std::vec::Vec::new();
+        for group in 0..meta.group_count {
+            let desc = ext4_desc(image, meta, group);
+            let flags = read_u16_le(desc, 0x12).unwrap();
+            if (flags & ext4_csum::EXT4_BG_INODE_UNINIT) != 0 {
+                continue;
+            }
+            let unused = read_u16_le(desc, 0x1C).unwrap() as u32
+                | ((read_u16_le(desc, 0x32).unwrap() as u32) << 16);
+            let bitmap_block = ext2_gd_location(image, meta, group, 4).unwrap();
+            let bitmap = ext4_block(image, meta, bitmap_block);
+            for idx in 0..meta.inodes_per_group.saturating_sub(unused) {
+                if ext2_bitmap_get(bitmap, idx).unwrap() {
+                    out.push(group * meta.inodes_per_group + idx + 1);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ext4_crc_known_answers() {
+        // CRC-32C check value: standard init/final inversion around crc32c_le.
+        assert_eq!(!ext4_csum::crc32c(!0, b"123456789"), 0xE306_9283);
+        // CRC-16/ARC check value (poly 0xA001 reflected, init 0).
+        assert_eq!(ext4_csum::crc16(0, b"123456789"), 0xBB3D);
+    }
+
+    #[test]
+    fn ext4_images_are_still_rejected_at_mount() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        for image in [SAMPLE_EXT4, SAMPLE_EXT4_NOCSUM] {
+            init();
+            assert_eq!(mount_ext2_backend_image_expect_err(image, 4096), EINVAL);
+        }
+    }
+
+    #[test]
+    fn ext4_layout_uses_64_byte_descriptors_and_flex_bg_locations() {
+        for image in [SAMPLE_EXT4, SAMPLE_EXT4_NOCSUM] {
+            let meta = ext4_layout(image);
+            assert_eq!(meta.block_size, 4096);
+            assert_eq!(meta.desc_size, 64);
+            assert_eq!(meta.inode_size, 256);
+            assert_eq!(meta.group_count, 4);
+            // flex_bg packs every group's metadata into group 0 (dumpe2fs).
+            for group in 0..4u32 {
+                assert_eq!(ext2_gd_location(image, &meta, group, 0).unwrap(), 65 + group);
+                assert_eq!(ext2_gd_location(image, &meta, group, 4).unwrap(), 69 + group);
+                assert_eq!(
+                    ext2_group_inode_table_block(image, &meta, group).unwrap(),
+                    73 + 8 * group
+                );
+            }
+        }
+        // A non-zero high half (> 2^32 blocks) is refused, not truncated.
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4);
+        let meta = ext4_layout(&image);
+        let off = ext2_group_desc_offset(&meta, 1).unwrap();
+        write_u32_le(&mut image, off + 0x20, 1).unwrap();
+        assert_eq!(ext2_gd_location(&image, &meta, 1, 0).unwrap_err(), EIO);
+        // 64bit with an out-of-range s_desc_size is invalid.
+        let mut bad = std::vec::Vec::from(SAMPLE_EXT4);
+        bad[EXT2_SUPERBLOCK_OFFSET + 0xFE..EXT2_SUPERBLOCK_OFFSET + 0x100]
+            .copy_from_slice(&48u16.to_le_bytes());
+        assert_eq!(
+            ext2_parse_layout_with_len(&bad, bad.len(), true).err(),
+            Some(EINVAL)
+        );
+    }
+
+    #[test]
+    fn ext4_superblock_and_group_descriptor_checksums_verify() {
+        let sb = &SAMPLE_EXT4[EXT2_SUPERBLOCK_OFFSET..EXT2_SUPERBLOCK_OFFSET + 1024];
+        assert!(ext4_csum::superblock_csum_ok(sb).unwrap());
+        let mut bad_sb = std::vec::Vec::from(sb);
+        bad_sb[0x78] ^= 1; // volume label byte
+        assert!(!ext4_csum::superblock_csum_ok(&bad_sb).unwrap());
+
+        // metadata_csum: crc32c low 16 bits; uninit_bg: crc16.
+        for (image, metadata_csum) in [(SAMPLE_EXT4, true), (SAMPLE_EXT4_NOCSUM, false)] {
+            let meta = ext4_layout(image);
+            let csum = ext4_csum_params(image);
+            assert_eq!(csum.metadata_csum, metadata_csum);
+            assert_eq!(csum.gdt_csum, !metadata_csum);
+            for group in 0..meta.group_count {
+                let desc = ext4_desc(image, &meta, group);
+                assert!(csum.group_desc(group, desc).unwrap().is_some());
+                assert!(csum.group_desc_ok(group, desc).unwrap(), "group {group}");
+                let mut bad = std::vec::Vec::from(desc);
+                bad[0x0C] ^= 1; // free blocks count
+                assert!(!csum.group_desc_ok(group, &bad).unwrap(), "group {group} corrupt");
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_bitmap_and_inode_checksums_verify() {
+        let image = SAMPLE_EXT4;
+        let meta = ext4_layout(image);
+        let csum = ext4_csum_params(image);
+        let mut bitmaps_checked = 0;
+        for group in 0..meta.group_count {
+            let desc = ext4_desc(image, &meta, group);
+            let flags = read_u16_le(desc, 0x12).unwrap();
+            if (flags & ext4_csum::EXT4_BG_BLOCK_UNINIT) == 0 {
+                let bitmap = ext4_block(image, &meta, ext2_gd_location(image, &meta, group, 0).unwrap());
+                assert!(csum.block_bitmap_ok(desc, bitmap).unwrap(), "block bitmap {group}");
+                bitmaps_checked += 1;
+            }
+            if (flags & ext4_csum::EXT4_BG_INODE_UNINIT) == 0 {
+                let bitmap = ext4_block(image, &meta, ext2_gd_location(image, &meta, group, 4).unwrap());
+                assert!(csum.inode_bitmap_ok(desc, bitmap).unwrap(), "inode bitmap {group}");
+                bitmaps_checked += 1;
+            }
+        }
+        assert_eq!(bitmaps_checked, 4, "3 initialized block bitmaps + 1 inode bitmap");
+
+        let inodes = ext4_allocated_inodes(image, &meta);
+        assert_eq!(inodes.len(), 512 - 431, "matches dumpe2fs free inode count");
+        for &ino in &inodes {
+            assert!(csum.inode_ok(ino, ext4_raw_inode(image, &meta, ino)).unwrap(), "inode {ino}");
+        }
+        let mut bad = std::vec::Vec::from(ext4_raw_inode(image, &meta, EXT4_FRAG_INO));
+        bad[0x04] ^= 1; // i_size
+        assert!(!csum.inode_ok(EXT4_FRAG_INO, &bad).unwrap());
+    }
+
+    #[test]
+    fn ext4_extent_and_directory_block_checksums_verify() {
+        let image = SAMPLE_EXT4;
+        let meta = ext4_layout(image);
+        let csum = ext4_csum_params(image);
+
+        // frag.bin: depth-1 tree; the in-inode root holds one index entry.
+        let raw = ext4_raw_inode(image, &meta, EXT4_FRAG_INO);
+        let root = 0x28;
+        assert_eq!(read_u16_le(raw, root).unwrap(), ext4_csum::EXT4_EXTENT_MAGIC);
+        assert_eq!(read_u16_le(raw, root + 6).unwrap(), 1, "depth");
+        let leaf_lo = read_u32_le(raw, root + 12 + 4).unwrap();
+        let leaf_hi = read_u16_le(raw, root + 12 + 8).unwrap();
+        assert_eq!(leaf_hi, 0);
+        let seed = csum.inode_seed(EXT4_FRAG_INO, raw).unwrap();
+        let leaf = ext4_block(image, &meta, leaf_lo);
+        assert_eq!(read_u16_le(leaf, 2).unwrap(), 20, "20 extents in the leaf");
+        assert!(ext4_csum::extent_block_csum_ok(seed, leaf).unwrap());
+        let mut bad = std::vec::Vec::from(leaf);
+        bad[12] ^= 1;
+        assert!(!ext4_csum::extent_block_csum_ok(seed, &bad).unwrap());
+
+        // Every directory data block reachable through a depth-0 root.
+        let mut leaves = 0;
+        let mut dx_blocks = 0;
+        for ino in ext4_allocated_inodes(image, &meta) {
+            let raw = ext4_raw_inode(image, &meta, ino);
+            if (read_u16_le(raw, 0).unwrap() & EXT2_S_IFMT) != EXT2_S_IFDIR {
+                continue;
+            }
+            assert_eq!(read_u16_le(raw, root + 6).unwrap(), 0, "small dirs have depth 0");
+            let seed = csum.inode_seed(ino, raw).unwrap();
+            let entries = read_u16_le(raw, root + 2).unwrap() as usize;
+            for e in 0..entries {
+                let ext = root + 12 + e * 12;
+                let len = read_u16_le(raw, ext + 4).unwrap() as u32;
+                let start = read_u32_le(raw, ext + 8).unwrap();
+                for b in 0..len {
+                    match ext4_csum::dir_leaf_csum_ok(seed, ext4_block(image, &meta, start + b))
+                        .unwrap()
+                    {
+                        Some(ok) => {
+                            assert!(ok, "dir inode {ino} block {}", start + b);
+                            leaves += 1;
+                        }
+                        None => dx_blocks += 1,
+                    }
+                }
+            }
+        }
+        assert!(leaves >= 4, "root, sub, lost+found, bigdir leaves: {leaves}");
+        assert!(dx_blocks >= 1, "bigdir has an htree root block");
+    }
+
+    /// The block-map seam refuses extent-mapped inodes until M1 implements
+    /// the extent backend: on an ext2/ext3 filesystem such an inode is corrupt.
+    #[test]
+    fn ext4_extent_flagged_inode_on_ext2_returns_eio() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let mut image = std::vec::Vec::from(SAMPLE_EXT3);
+        let meta = ext2_parse_meta_with_len(&image, image.len(), true).unwrap();
+        // Root directory entry for hello.txt: find its inode via a mount.
+        let ino = {
+            let _ctx = mount_ext2_backend_image(&image, 4096);
+            let node = lookup("/mnt/ext2/hello.txt").unwrap();
+            stat(node).unwrap().ino as u32
+        };
+        let off = ext2_inode_offset_in_image(&image, &meta, ino).unwrap();
+        let flags = read_u32_le(&image, off + 32).unwrap();
+        write_u32_le(&mut image, off + 32, flags | ext2_bmap::EXT4_EXTENTS_FL).unwrap();
+
+        init();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        let opened = open("/mnt/ext2/hello.txt", O_RDONLY, 0).expect("open");
+        let mut buf = [0u8; 16];
+        assert_eq!(read(opened.inode, 0, &mut buf).unwrap_err(), EIO);
     }
 }
