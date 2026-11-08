@@ -395,6 +395,9 @@ pub fn tick() {
         let now = pit::ticks();
         for idx in 0..task::MAX_TASKS {
             let t = task::get_by_index(idx);
+            if !t.is_null() {
+                crate::signal::itimer_real_tick(t, now);
+            }
             if !t.is_null() && (*t).state == TaskState::Sleeping {
                 if now >= (*t).sleep_until {
                     (*t).sleep_until = 0;

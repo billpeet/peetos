@@ -120,7 +120,7 @@ This document describes the current baseline IPC/synchronization implementation 
   - sender-side references are retained at send time
   - queued rights are released on truncation/drop/close paths
   - transferred resources remain valid if sender closes after successful send
-  - bound pathname entries are released when the bound socket is closed
+  - closing a bound socket drops its binding (later `connect`s get `ECONNREFUSED`) but, as on Linux, leaves the pathname node until someone `unlink`s it. A binding is only reachable while its path still names the node `bind` created, so `unlink` + re-`bind` of a stale path works (libwayland relies on both).
 - Baseline truncation behavior:
   - if receive control buffer is missing/too short, pending rights are dropped
     and `MSG_CTRUNC` is reported
@@ -167,4 +167,5 @@ Limitations / Simplifications
   - level-triggered `epoll_create1`/`epoll_ctl`/`epoll_wait` is implemented
   - per-task watch ownership is capped (`64`) for hardening
   - advanced flags/variants (`EPOLLET`, `EPOLLONESHOT`, `epoll_pwait*`) are deferred
+- Socket tables are static: 96 sockets system-wide (`MAX_SOCKETS`) and 48 `AF_UNIX` pathname bindings. A bound socket's filesystem node is a regular file (`stat` does not report `S_IFSOCK`).
 - No message-queue IPC primitives are implemented yet.

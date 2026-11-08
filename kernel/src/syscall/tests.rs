@@ -38,6 +38,139 @@ fn page_align_up_rounds_correctly() {
 }
 
 #[test]
+fn dev_fd_dir_entry_lists_open_descriptors_in_order() {
+    let open = |fd: usize| matches!(fd, 0 | 1 | 2 | 7 | 12);
+    let mut names = std::vec::Vec::new();
+    let mut offset = DEV_FD_FIRST_OFFSET;
+    while let Some(entry) = dev_fd_dir_entry(offset, open) {
+        assert_eq!(entry.d_type, fs::DT_LNK);
+        assert!(entry.next_offset > offset);
+        names.push(std::string::String::from_utf8(entry.name[..entry.name_len].to_vec()).unwrap());
+        offset = entry.next_offset;
+    }
+    assert_eq!(names, ["0", "1", "2", "7", "12"]);
+    // "." and ".." offsets belong to the filesystem, not the synthesized list.
+    assert!(dev_fd_dir_entry(0, open).is_none());
+    assert!(dev_fd_dir_entry(1, open).is_none());
+    // Resuming mid-listing continues after the last returned descriptor.
+    let resumed = dev_fd_dir_entry(DEV_FD_FIRST_OFFSET + 8, open).unwrap();
+    assert_eq!(&resumed.name[..resumed.name_len], b"12");
+    assert!(dev_fd_dir_entry(DEV_FD_FIRST_OFFSET + 13, open).is_none());
+}
+
+#[test]
+fn synthetic_fd_stat_identity_covers_non_file_kinds() {
+    let sock = synthetic_fd_stat_identity(task::USER_FD_KIND_SOCKET).unwrap();
+    assert_eq!(sock.1 & 0o170000, 0o140000);
+    let pipe = synthetic_fd_stat_identity(task::USER_FD_KIND_PIPE).unwrap();
+    assert_eq!(pipe.1 & 0o170000, 0o010000);
+    let evfd = synthetic_fd_stat_identity(task::USER_FD_KIND_EVENTFD).unwrap();
+    assert_eq!(evfd.1 & 0o170000, 0);
+    let console = synthetic_fd_stat_identity(task::USER_FD_KIND_CONSOLE).unwrap();
+    assert_eq!(console.1 & 0o170000, 0o020000);
+    // Kinds sharing an id space must not collide on st_dev.
+    assert_ne!(sock.0, pipe.0);
+    assert_ne!(sock.0, evfd.0);
+    // VFS files use the filesystem's own stat; empty slots have none.
+    assert!(synthetic_fd_stat_identity(task::USER_FD_KIND_VFS).is_none());
+    assert!(synthetic_fd_stat_identity(task::USER_FD_KIND_EMPTY).is_none());
+}
+
+#[test]
+fn itimer_timeval_conversion_rounds_up_and_validates() {
+    let tv = |s, us| LinuxTimeVal { tv_sec: s, tv_usec: us };
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 0)), Ok(0));
+    // 100 Hz: anything up to 10 ms is one tick, never zero.
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 1)), Ok(1));
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 10_000)), Ok(1));
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 10_001)), Ok(2));
+    assert_eq!(itimer_timeval_to_ticks(tv(2, 0)), Ok(2 * pit::TIMER_FREQUENCY as u64));
+    assert_eq!(itimer_timeval_to_ticks(tv(-1, 0)), Err(-EINVAL));
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 1_000_000)), Err(-EINVAL));
+}
+
+#[test]
+fn itimer_real_read_reports_remaining_and_interval() {
+    let hz = pit::TIMER_FREQUENCY as u64;
+    let disarmed = itimer_real_read(0, 0, 500);
+    assert_eq!(disarmed, LinuxITimerVal::default());
+    let armed = itimer_real_read(500 + 3 * hz / 2, hz, 500);
+    assert_eq!(armed.it_value, LinuxTimeVal { tv_sec: 1, tv_usec: 500_000 });
+    assert_eq!(armed.it_interval, LinuxTimeVal { tv_sec: 1, tv_usec: 0 });
+    // Expired but not yet delivered still reads as armed.
+    assert_ne!(itimer_real_read(400, 0, 500).it_value, LinuxTimeVal::default());
+}
+
+#[test]
+fn alarm_seconds_left_rounds_like_linux() {
+    let tv = |s, us| LinuxTimeVal { tv_sec: s, tv_usec: us };
+    assert_eq!(alarm_seconds_left(tv(0, 0)), 0);
+    assert_eq!(alarm_seconds_left(tv(0, 1)), 1);
+    assert_eq!(alarm_seconds_left(tv(3, 499_999)), 3);
+    assert_eq!(alarm_seconds_left(tv(3, 500_000)), 4);
+}
+
+#[test]
+fn vm_mapped_inodes_collects_file_backed_regions_across_tasks() {
+    let mut tables = [[VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK]; 2];
+    tables[0][0] = VmMapping {
+        start: MMAP_BASE_ADDR,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: 7,
+        prot: PROT_READ,
+        map_shared: true,
+        map_shared_can_write: false,
+    };
+    // Anonymous region: no inode.
+    tables[0][1] = VmMapping {
+        start: MMAP_BASE_ADDR + PAGE_SIZE,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+    tables[1][3] = VmMapping { file_inode: 9, ..tables[0][0] };
+    let mapped = vm_mapped_inodes(&tables);
+    let set: std::vec::Vec<usize> = (0..fs::VFS_MAX_INODES).filter(|&i| mapped[i]).collect();
+    assert_eq!(set, [7, 9]);
+}
+
+#[test]
+fn vm_inode_pins_keep_unlinked_mapped_file_alive() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+
+    let opened = fs::open("/tmp/mapped-orphan", fs::O_CREAT | fs::O_RDWR, 0o600).expect("create");
+    let inode = opened.inode;
+    let slot = 5;
+    unsafe {
+        TASK_VM_MAPPINGS[slot][0] = VmMapping {
+            start: MMAP_BASE_ADDR,
+            len: PAGE_SIZE,
+            file_offset: 0,
+            file_inode: inode,
+            prot: PROT_READ | PROT_WRITE,
+            map_shared: true,
+            map_shared_can_write: true,
+        };
+    }
+    vm_sync_inode_pins();
+    assert_eq!(fs::inode_open_refs(inode), 1);
+
+    fs::unlink("/tmp/mapped-orphan").expect("unlink while mapped");
+    assert!(fs::stat(inode).is_ok(), "mapping keeps the orphan alive");
+
+    unsafe {
+        TASK_VM_MAPPINGS[slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    }
+    vm_sync_inode_pins();
+    assert!(fs::stat(inode).is_err(), "last unmap frees it");
+}
+
+#[test]
 fn syscall_lookup_finds_known_entry() {
     let def = lookup_syscall(SYS_GETPID).expect("syscall should exist");
     assert_eq!(def.name, "getpid");
@@ -81,6 +214,11 @@ fn syscall_lookup_includes_vfs_extensions() {
     assert_eq!(lookup_syscall(SYS_SHMCTL).map(|d| d.name), Some("shmctl"));
     assert_eq!(lookup_syscall(SYS_UMASK).map(|d| d.name), Some("umask"));
     assert_eq!(lookup_syscall(SYS_MKDIRAT).map(|d| d.name), Some("mkdirat"));
+    assert_eq!(lookup_syscall(SYS_MKDIR).map(|d| d.name), Some("mkdir"));
+    assert_eq!(lookup_syscall(SYS_SETITIMER).map(|d| d.name), Some("setitimer"));
+    assert_eq!(lookup_syscall(SYS_GETITIMER).map(|d| d.name), Some("getitimer"));
+    assert_eq!(lookup_syscall(SYS_ALARM).map(|d| d.name), Some("alarm"));
+    assert_eq!(lookup_syscall(SYS_RMDIR).map(|d| d.name), Some("rmdir"));
     assert_eq!(lookup_syscall(SYS_FUTEX).map(|d| d.name), Some("futex"));
     assert_eq!(
         lookup_syscall(SYS_NEWFSTATAT).map(|d| d.name),
@@ -1450,6 +1588,13 @@ fn wait_status_encodes_exit_code_for_waitpid_macros() {
     assert_eq!(wait_status_from_exit_code(0), 0);
     assert_eq!(wait_status_from_exit_code(1), 0x0100);
     assert_eq!(wait_status_from_exit_code(255), 0xFF00_u32 as i32);
+    // exit(134) and death by SIGABRT (6) must decode differently.
+    assert_eq!(wait_status_from_exit_code(134), 134 << 8);
+    let killed = wait_status_from_exit_code(exit_code_for_signal(signal::SIGABRT));
+    assert_eq!(killed & 0x7f, signal::SIGABRT as i32); // WIFSIGNALED, WTERMSIG
+    assert_eq!(killed & 0xff00, 0);
+    let segv = wait_status_from_exit_code(exit_code_for_signal(signal::SIGSEGV));
+    assert_eq!(segv, signal::SIGSEGV as i32);
 }
 
 #[test]
@@ -1791,6 +1936,18 @@ fn timespec_conversion_validates_nanoseconds() {
     assert_eq!(timespec_parts_to_ns(0, 1_000_000_000), Err(-EINVAL));
     assert_eq!(timespec_parts_to_ns(-1, 0), Err(-EINVAL));
     assert_eq!(ns_to_timespec_parts(2_000_000_001), (2, 1));
+}
+
+#[test]
+fn flock_table_holds_one_lock_per_wayland_auto_socket() {
+    let _guard = evfd_test_setup();
+    // wl_display_add_socket_auto holds wayland-0.lock .. wayland-32.lock.
+    for i in 0..33u16 {
+        assert_eq!(flock_try_acquire(100 + i, 1, 3 + i as i32, true), Ok(()));
+    }
+    for i in 0..33u16 {
+        flock_release_fd(1, 3 + i as i32);
+    }
 }
 
 #[test]

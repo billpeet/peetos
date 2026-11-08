@@ -110,6 +110,11 @@ process (not the thread) as its parent.
 - `SA_SIGINFO`, `SA_RESTART`, `SA_NODEFER` and `SA_RESETHAND` are honored.
 - Ignored signals that are not blocked are discarded when sent, as on Linux,
   so they never wake or interrupt anything.
+- `setitimer(ITIMER_REAL)`/`alarm` arm a per-process timer stored on the
+  thread-group leader (`itimer_real_deadline`/`itimer_real_interval`, in
+  ticks). The timer tick sends `SIGALRM` to the process when it expires and
+  reloads periodic timers. Timers survive `execve` (including a non-leader
+  `execve` taking over the leader) and are cleared in `fork` children.
 
 ## Interrupted Syscalls
 
@@ -157,6 +162,9 @@ Pipe writes that already moved data return the partial count.
   space.
 - An exiting task never returns to user mode: after becoming a zombie it
   yields, and the scheduler never runs a zombie again.
+- `wait4` reports a process killed by a signal (default "terminate" action,
+  or a fatal fault as `SIGSEGV`) as `WIFSIGNALED` with `WTERMSIG`, not as an
+  `exit(128 + sig)`.
 - Only thread group leaders are visible to `wait4`. A leader that exited
   before its threads (e.g. the main thread called `pthread_exit`) is reaped
   only after the whole group is gone. Exited non-leader threads are freed

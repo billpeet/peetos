@@ -9,12 +9,15 @@ use crate::{tcp, udp};
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_SOCKETS: usize = 32;
+/// Socket table size. A libwayland compositor holds one listening socket
+/// per display socket (`wl_display_add_socket_auto` tries up to 33) plus
+/// one per client.
+const MAX_SOCKETS: usize = 96;
 const TCP_TIMEOUT_MS: u64 = 30_000;
 const UNIX_STREAM_BUF_SIZE: usize = 2048;
 const UNIX_NO_PEER: u16 = u16::MAX;
 const UNIX_PATH_MAX: usize = 108;
-const UNIX_BINDINGS_MAX: usize = 16;
+const UNIX_BINDINGS_MAX: usize = 48;
 const UNIX_ACCEPT_QUEUE_SIZE: usize = 8;
 const UNIX_RIGHTS_QUEUE_SIZE: usize = 8;
 pub const UNIX_RIGHTS_MAX_FDS: usize = 8;
@@ -220,6 +223,9 @@ impl UnixRightsQueueEntry {
 struct UnixBinding {
     used: bool,
     listener: u16,
+    /// VFS node created by `bind`; the binding is only reachable while the
+    /// path still names this node (so `unlink` + re-`bind` works).
+    inode: u16,
     path_len: u8,
     path: [u8; UNIX_PATH_MAX],
 }
@@ -229,6 +235,7 @@ impl UnixBinding {
         Self {
             used: false,
             listener: UNIX_NO_PEER,
+            inode: 0,
             path_len: 0,
             path: [0; UNIX_PATH_MAX],
         }
@@ -391,7 +398,7 @@ fn unix_binding_lookup(path: &[u8]) -> Option<usize> {
         let mut idx = 0usize;
         while idx < UNIX_BINDINGS_MAX {
             let b = &UNIX_BINDINGS[idx];
-            if b.used && unix_path_eq(b, path) {
+            if b.used && unix_path_eq(b, path) && unix_binding_vfs_current(path, b.inode) {
                 return Some(idx);
             }
             idx += 1;
@@ -400,7 +407,7 @@ fn unix_binding_lookup(path: &[u8]) -> Option<usize> {
     None
 }
 
-fn unix_binding_alloc(listener: u16, path: &[u8]) -> Result<(), i64> {
+fn unix_binding_alloc(listener: u16, path: &[u8], inode: u16) -> Result<(), i64> {
     if path.is_empty() || path.len() > UNIX_PATH_MAX {
         return Err(-EINVAL);
     }
@@ -408,12 +415,24 @@ fn unix_binding_alloc(listener: u16, path: &[u8]) -> Result<(), i64> {
         return Err(-EADDRINUSE);
     }
     unsafe {
+        // A listener whose path was unlinked is unreachable; drop its stale
+        // entry so the path can be bound again.
+        let mut idx = 0usize;
+        while idx < UNIX_BINDINGS_MAX {
+            let b = &mut UNIX_BINDINGS[idx];
+            if b.used && unix_path_eq(b, path) {
+                b.path_len = 0;
+                b.path.fill(0);
+            }
+            idx += 1;
+        }
         let mut idx = 0usize;
         while idx < UNIX_BINDINGS_MAX {
             if !UNIX_BINDINGS[idx].used {
                 let b = &mut UNIX_BINDINGS[idx];
                 b.used = true;
                 b.listener = listener;
+                b.inode = inode;
                 b.path_len = path.len() as u8;
                 b.path.fill(0);
                 b.path[..path.len()].copy_from_slice(path);
@@ -425,11 +444,13 @@ fn unix_binding_alloc(listener: u16, path: &[u8]) -> Result<(), i64> {
     Err(-ENOMEM)
 }
 
+/// Create the socket's filesystem node (`bind` fails with `EADDRINUSE` if
+/// the path exists, as on Linux). Returns its inode.
 #[cfg(not(test))]
-fn unix_binding_vfs_claim(path: &[u8]) -> Result<(), i64> {
+fn unix_binding_vfs_claim(path: &[u8]) -> Result<u16, i64> {
     let path_str = core::str::from_utf8(path).map_err(|_| -EINVAL)?;
     match fs::open(path_str, fs::O_CREAT | fs::O_EXCL | fs::O_RDWR, 0o600) {
-        Ok(_) => Ok(()),
+        Ok(opened) => Ok(opened.inode),
         Err(fs::EEXIST) => Err(-EADDRINUSE),
         Err(fs::ENOENT) => Err(-ENOENT),
         Err(fs::ENOTDIR) => Err(-ENOTDIR),
@@ -439,8 +460,22 @@ fn unix_binding_vfs_claim(path: &[u8]) -> Result<(), i64> {
 }
 
 #[cfg(test)]
-fn unix_binding_vfs_claim(_path: &[u8]) -> Result<(), i64> {
-    Ok(())
+fn unix_binding_vfs_claim(_path: &[u8]) -> Result<u16, i64> {
+    Ok(0)
+}
+
+/// True while `path` still names the node created when it was bound.
+#[cfg(not(test))]
+fn unix_binding_vfs_current(path: &[u8], inode: u16) -> bool {
+    match core::str::from_utf8(path) {
+        Ok(path_str) => fs::lookup(path_str) == Ok(inode),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+fn unix_binding_vfs_current(_path: &[u8], _inode: u16) -> bool {
+    true
 }
 
 #[cfg(not(test))]
@@ -789,8 +824,8 @@ pub fn socket_bind_unix(id: u16, path: &[u8]) -> Result<(), i64> {
         return Err(-EOPNOTSUPP);
     }
 
-    unix_binding_vfs_claim(path)?;
-    if let Err(e) = unix_binding_alloc(id, path) {
+    let inode = unix_binding_vfs_claim(path)?;
+    if let Err(e) = unix_binding_alloc(id, path, inode) {
         unix_binding_vfs_release(path);
         return Err(e);
     }
@@ -1709,10 +1744,9 @@ pub fn socket_close(id: u16) -> Result<(), i64> {
         }
 
         if s.protocol == PROTO_UNIX {
-            if s.unix_bound_path_len > 0 {
-                let path_len = s.unix_bound_path_len as usize;
-                unix_binding_vfs_release(&s.unix_bound_path[..path_len]);
-            }
+            // Like Linux, the bound path's filesystem node outlives the
+            // socket: only the binding goes away (connect then fails with
+            // ECONNREFUSED), and the owner must unlink the path itself.
             unix_binding_remove_listener(id);
             unix_notify_peer_closed(id);
             unix_rights_drain_socket(s);
@@ -1928,6 +1962,35 @@ mod tests {
         let _ = socket_close(server);
         let _ = socket_close(client);
         let _ = socket_close(listener);
+    }
+
+    #[test]
+    fn unix_bindings_hold_more_than_32_listeners_and_close_unbinds() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        reset_sockets();
+
+        // libwayland's wl_display_add_socket_auto tries up to 33 sockets.
+        let mut listeners = std::vec::Vec::new();
+        for i in 0..33 {
+            let path = std::format!("/tmp/wayland-{}", i);
+            let l = socket_create(AF_UNIX, 1, 0).expect("listener create");
+            socket_bind_unix(l, path.as_bytes()).expect("bind");
+            socket_listen(l, 4).expect("listen");
+            listeners.push(l);
+        }
+
+        let client = socket_create(AF_UNIX, 1, 0).expect("client create");
+        socket_close(listeners[32]).expect("close last listener");
+        assert_eq!(
+            socket_connect_unix(client, b"/tmp/wayland-32", true),
+            Err(-ECONNREFUSED)
+        );
+        socket_connect_unix(client, b"/tmp/wayland-0", true).expect("connect first");
+
+        let _ = socket_close(client);
+        for l in &listeners[..32] {
+            let _ = socket_close(*l);
+        }
     }
 
     #[test]

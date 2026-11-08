@@ -646,6 +646,88 @@ pub(super) fn mmap_clear_task_regions(task_ptr: *mut task::Task) {
         TASK_VM_OWNER_PID[slot] = task::INVALID_PID;
         TASK_VM_MAPPINGS[slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
     }
+    vm_sync_inode_pins();
+}
+
+/// Inodes on which the VM currently holds one fs open reference.
+pub(super) static mut VM_INODE_PINNED: [bool; fs::VFS_MAX_INODES] = [false; fs::VFS_MAX_INODES];
+
+/// Which inodes some task's region table maps.
+pub(super) fn vm_mapped_inodes(
+    tables: &[[VmMapping; MMAP_MAX_REGIONS_PER_TASK]],
+) -> [bool; fs::VFS_MAX_INODES] {
+    let mut mapped = [false; fs::VFS_MAX_INODES];
+    for table in tables {
+        for region in table.iter() {
+            if !region.is_empty()
+                && region.file_inode != task::USER_FD_NONE
+                && (region.file_inode as usize) < fs::VFS_MAX_INODES
+            {
+                mapped[region.file_inode as usize] = true;
+            }
+        }
+    }
+    mapped
+}
+
+/// Hold one fs open reference per inode that any task maps, so a file that
+/// is unlinked (and closed) while mapped, or the hidden file behind a
+/// `MAP_SHARED | MAP_ANONYMOUS` region, lives exactly as long as its
+/// mappings. Called after every change to the set of mapped files.
+pub(super) fn vm_sync_inode_pins() {
+    let mapped = unsafe { vm_mapped_inodes(&*core::ptr::addr_of!(TASK_VM_MAPPINGS)) };
+    for inode in 0..fs::VFS_MAX_INODES {
+        let pinned = unsafe { VM_INODE_PINNED[inode] };
+        if mapped[inode] && !pinned {
+            fs::inode_open_retain(inode as u16);
+            unsafe { VM_INODE_PINNED[inode] = true };
+        } else if !mapped[inode] && pinned {
+            unsafe { VM_INODE_PINNED[inode] = false };
+            if fs::inode_open_release(inode as u16) {
+                vfs_inode_freed(inode as u16);
+            }
+        }
+    }
+}
+
+/// Temporary open reference on a freshly created hidden file; dropping it
+/// frees the file unless a mapping pinned it meanwhile.
+struct HiddenFileRef(u16);
+
+impl Drop for HiddenFileRef {
+    fn drop(&mut self) {
+        if fs::inode_open_release(self.0) {
+            vfs_inode_freed(self.0);
+        }
+    }
+}
+
+/// Backing object for `MAP_SHARED | MAP_ANONYMOUS`: an unlinked tmpfs file
+/// (in the memfd storage dir) whose pages live in the shared page cache, so
+/// `fork`ed children see the same memory. The returned guard holds the only
+/// reference until `vm_sync_inode_pins` pins the new mapping.
+fn mmap_shared_anon_backing(task_ptr: *mut task::Task, len: u64) -> Result<HiddenFileRef, i64> {
+    memfd_storage_dir_ready()?;
+    let pid = unsafe { (*task_ptr).pid };
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    for _ in 0..MEMFD_CREATE_MAX_RETRIES {
+        let sequence = MEMFD_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = memfd_build_path(pid, sequence, b"shared-anon", &mut path_buf)?;
+        let opened = match fs::open(path, fs::O_CREAT | fs::O_EXCL | fs::O_RDWR, 0o600) {
+            Ok(opened) => opened,
+            Err(fs::EEXIST) => continue,
+            Err(fs::ENOSPC) => return Err(-ENOMEM),
+            Err(err) => return Err(-fs_to_errno(err)),
+        };
+        fs::inode_open_retain(opened.inode);
+        let guard = HiddenFileRef(opened.inode);
+        // Best effort: tmpfs files are size-capped; pages past EOF read as
+        // zeroes and stay coherent through the page cache while mapped.
+        let _ = fs::truncate_to(opened.inode, len);
+        let _ = fs::unlink(path);
+        return Ok(guard);
+    }
+    Err(-EAGAIN)
 }
 
 pub(super) fn mmap_regions_find_free(
@@ -1109,17 +1191,25 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => return err,
     };
 
+    let mut shared_anon: Option<HiddenFileRef> = None;
     let file_src = if is_anon {
-        if is_shared {
-            return -EINVAL;
-        }
         if fd_raw != -1 {
             return -EINVAL;
         }
         if offset != 0 {
             return -EINVAL;
         }
-        None
+        if is_shared {
+            let backing = match mmap_shared_anon_backing(ctx.current, len) {
+                Ok(backing) => backing,
+                Err(err) => return err,
+            };
+            let inode = backing.0;
+            shared_anon = Some(backing);
+            Some((inode, 0, true))
+        } else {
+            None
+        }
     } else {
         if fd_raw < 0 || fd_raw > i32::MAX as i64 {
             return -EBADF;
@@ -1231,6 +1321,10 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             unsafe {
                 TASK_VM_MAPPINGS[slot] = projected_regions;
             }
+            // Pin newly mapped files (and unpin ones a MAP_FIXED replaced)
+            // before the shared-anon creation reference is dropped.
+            vm_sync_inode_pins();
+            drop(shared_anon);
             start as i64
         }
         Err(err) => err,
@@ -1449,6 +1543,7 @@ pub(super) fn sys_munmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     unsafe {
         TASK_VM_MAPPINGS[slot] = next_regions;
     }
+    vm_sync_inode_pins();
     0
 }
 
@@ -1756,7 +1851,7 @@ pub fn terminate_current_user_fault(
     );
 
     let ctx = SyscallContext::new(current);
-    let _ = sys_exit_common(&ctx, 128 + signal::SIGSEGV as i32);
+    let _ = sys_exit_common(&ctx, exit_code_for_signal(signal::SIGSEGV));
     true
 }
 

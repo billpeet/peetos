@@ -377,6 +377,15 @@ pub(super) fn sys_mkdirat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 }
 
+/// Legacy `mkdir(path, mode)`: musl's `mkdir()` uses it on x86_64.
+pub(super) fn sys_mkdir(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let wrapped = SyscallArgs {
+        num: SYS_MKDIRAT,
+        args: [fs::AT_FDCWD as i64 as u64, call.arg(0), call.arg(1), 0, 0, 0],
+    };
+    sys_mkdirat(ctx, &wrapped)
+}
+
 pub(super) fn sys_access_common(ctx: &SyscallContext, dirfd: i32, pathname: u64, mode: u32) -> i64 {
     if !access_mode_is_valid(mode) {
         return -EINVAL;
@@ -961,16 +970,16 @@ pub(super) fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
-    if kind == task::USER_FD_KIND_PIPE {
-        let pipe_stat = LinuxStat {
-            st_dev: 0,
+    if let Some((st_dev, st_mode, st_rdev)) = synthetic_fd_stat_identity(kind) {
+        let synthetic = LinuxStat {
+            st_dev,
             st_ino: inode as u64 + 1,
             st_nlink: 1,
-            st_mode: 0x1000 | 0o600,
+            st_mode,
             st_uid: 0,
             st_gid: 0,
             __pad0: 0,
-            st_rdev: 0,
+            st_rdev,
             st_size: 0,
             st_blksize: 4096,
             st_blocks: 0,
@@ -984,7 +993,7 @@ pub(super) fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         };
         let bytes = unsafe {
             core::slice::from_raw_parts(
-                (&pipe_stat as *const LinuxStat) as *const u8,
+                (&synthetic as *const LinuxStat) as *const u8,
                 core::mem::size_of::<LinuxStat>(),
             )
         };
@@ -1003,6 +1012,30 @@ pub(super) fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     write_stat_to_user(ctx.current, call.arg(1), stat)
 }
 
+/// `fstat` identity for descriptors that are not VFS files:
+/// `(st_dev, st_mode, st_rdev)`. Each kind gets its own pseudo device so
+/// `st_dev`/`st_ino` pairs stay unique (as Linux's pipefs, sockfs and
+/// anon_inode mounts do); `st_ino` is the object id + 1.
+pub(super) fn synthetic_fd_stat_identity(kind: u8) -> Option<(u64, u32, u64)> {
+    const S_IFIFO: u32 = 0o010000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFSOCK: u32 = 0o140000;
+    match kind {
+        task::USER_FD_KIND_PIPE => Some((0, S_IFIFO | 0o600, 0)),
+        task::USER_FD_KIND_SOCKET => Some((0x8, S_IFSOCK | 0o777, 0)),
+        // anon_inode objects: no file type bits, like Linux.
+        task::USER_FD_KIND_EPOLL
+        | task::USER_FD_KIND_EVENTFD
+        | task::USER_FD_KIND_TIMERFD
+        | task::USER_FD_KIND_SIGNALFD => Some((0xd, 0o600, 0)),
+        // /dev/console (5:1) and /dev/ptmx (5:2); pty slaves are 136:N.
+        task::USER_FD_KIND_CONSOLE => Some((0x6, S_IFCHR | 0o620, (5 << 8) | 1)),
+        task::USER_FD_KIND_PTY_MASTER => Some((0x6, S_IFCHR | 0o666, (5 << 8) | 2)),
+        task::USER_FD_KIND_PTY_SLAVE => Some((0x6, S_IFCHR | 0o620, 136 << 8)),
+        _ => None,
+    }
+}
+
 pub(super) fn sys_newfstatat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let flags = call.arg(3) as u32;
     if flags & !AT_EMPTY_PATH != 0 {
@@ -1013,6 +1046,16 @@ pub(super) fn sys_newfstatat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(path) => path,
         Err(err) => return err,
     };
+    let dirfd = call.arg(0) as i32;
+    if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 && dirfd != fs::AT_FDCWD {
+        // fstatat(fd, "", AT_EMPTY_PATH) is fstat(fd) for any descriptor
+        // kind, not just directories.
+        let wrapped = SyscallArgs {
+            num: SYS_FSTAT,
+            args: [dirfd as i64 as u64, call.arg(2), 0, 0, 0, 0],
+        };
+        return sys_fstat(ctx, &wrapped);
+    }
     let dir_inode = match resolve_dir_for_path(ctx, call.arg(0) as i32, path) {
         Ok(inode) => inode,
         Err(err) => return err,
@@ -1086,10 +1129,16 @@ pub(super) fn sys_getdents64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return 0;
     }
 
+    let dev_fd_dir = fs::lookup("/dev/fd") == Ok(inode);
     let mut total = 0usize;
     let mut record = [0u8; 128];
     loop {
-        let entry = match fs::readdir(inode, offset) {
+        let listing = if dev_fd_dir && offset >= DEV_FD_FIRST_OFFSET {
+            Ok(dev_fd_dir_entry(offset, |fd| fd_slot_is_open(ctx.current, fd)))
+        } else {
+            fs::readdir(inode, offset)
+        };
+        let entry = match listing {
             Ok(Some(v)) => v,
             Ok(None) => break,
             Err(err) => {
@@ -1134,6 +1183,50 @@ pub(super) fn sys_getdents64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     total as i64
 }
 
+/// `/dev/fd` offsets 0 and 1 are the real "." and ".." entries; offset
+/// `DEV_FD_FIRST_OFFSET + n` resumes the scan at descriptor `n`.
+pub(super) const DEV_FD_FIRST_OFFSET: u64 = 2;
+
+/// Next `/dev/fd` entry at or after `offset`: one `DT_LNK` entry per open
+/// descriptor of the calling process, named by its number (as Linux's
+/// `/proc/self/fd`, which `/dev/fd` links to). The table is read live, so a
+/// listing includes the descriptor used to read the directory itself.
+pub(super) fn dev_fd_dir_entry(offset: u64, is_open: impl Fn(usize) -> bool) -> Option<fs::DirEntry> {
+    let start = offset.checked_sub(DEV_FD_FIRST_OFFSET)? as usize;
+    let fd = (start..task::MAX_TASK_FDS).find(|&fd| is_open(fd))?;
+    let mut entry = fs::DirEntry {
+        ino: 0x00fd_0000 + fd as u64,
+        next_offset: DEV_FD_FIRST_OFFSET + fd as u64 + 1,
+        d_type: fs::DT_LNK,
+        name_len: 0,
+        name: [0u8; fs::VFS_MAX_NAME],
+    };
+    let mut digits = [0u8; 20];
+    let mut n = fd;
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in 0..len {
+        entry.name[i] = digits[len - 1 - i];
+    }
+    entry.name_len = len;
+    Some(entry)
+}
+
+/// An fs inode was freed (unlinked with no remaining references): drop any
+/// cached pages so a later file reusing the inode slot never sees them, and
+/// flush ext2 metadata.
+pub(super) fn vfs_inode_freed(inode: u16) {
+    vm_page_cache_invalidate_inode(inode);
+    sync_ext2_backing();
+}
+
 pub(super) fn sys_unlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let flags = call.arg(2) as u32;
     if flags & !AT_REMOVEDIR != 0 {
@@ -1148,6 +1241,7 @@ pub(super) fn sys_unlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(inode) => inode,
         Err(err) => return err,
     };
+    let target = fs::lookupat(dir_inode, path).ok();
     let res = if (flags & AT_REMOVEDIR) != 0 {
         fs::rmdirat(dir_inode, path)
     } else {
@@ -1155,7 +1249,11 @@ pub(super) fn sys_unlinkat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
     match res {
         Ok(()) => {
-            sync_ext2_backing();
+            match target {
+                // Freed right away (not kept alive as an open orphan).
+                Some(inode) if fs::stat(inode).is_err() => vfs_inode_freed(inode),
+                _ => sync_ext2_backing(),
+            }
             0
         }
         Err(err) => -fs_to_errno(err),
@@ -1166,6 +1264,15 @@ pub(super) fn sys_unlink(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let compat = SyscallArgs {
         num: SYS_UNLINKAT,
         args: [fs::AT_FDCWD as i64 as u64, call.arg(0), 0, 0, 0, 0],
+    };
+    sys_unlinkat(ctx, &compat)
+}
+
+/// Legacy `rmdir(path)`: `unlinkat(AT_FDCWD, path, AT_REMOVEDIR)`.
+pub(super) fn sys_rmdir(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let compat = SyscallArgs {
+        num: SYS_UNLINKAT,
+        args: [fs::AT_FDCWD as i64 as u64, call.arg(0), AT_REMOVEDIR as u64, 0, 0, 0],
     };
     sys_unlinkat(ctx, &compat)
 }

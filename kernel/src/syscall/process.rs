@@ -217,9 +217,25 @@ pub(super) fn execve_common(
     result
 }
 
+/// Internal `exit_code` flag: the process was killed by signal
+/// `code & 0x7f` rather than calling `exit(code)`. Kept out of the 8-bit
+/// exit-status range so `exit(134)` and death by `SIGABRT` stay distinct.
+pub(super) const EXIT_CODE_KILLED_BY_SIGNAL: i32 = 0x1_0000;
+
+#[inline]
+pub(super) fn exit_code_for_signal(signum: u32) -> i32 {
+    EXIT_CODE_KILLED_BY_SIGNAL | (signum as i32 & 0x7f)
+}
+
+/// Linux `wait4` status word: `WIFEXITED` (`code << 8`) for normal exits,
+/// `WIFSIGNALED` (signal number in the low 7 bits) for signal deaths.
 #[inline]
 pub(super) fn wait_status_from_exit_code(code: i32) -> i32 {
-    (code & 0xFF) << 8
+    if (code & EXIT_CODE_KILLED_BY_SIGNAL) != 0 {
+        code & 0x7f
+    } else {
+        (code & 0xFF) << 8
+    }
 }
 
 pub(super) fn fork_cleanup_child(task_ptr: *mut task::Task) {

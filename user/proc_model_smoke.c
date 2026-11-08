@@ -48,6 +48,16 @@ static int wait_exit_status(pid_t pid) {
     return WEXITSTATUS(status);
 }
 
+/* Wait for `pid` and return the signal that killed it, or -1 if it exited. */
+static int wait_term_signal(pid_t pid) {
+    int status = 0;
+    pid_t got = waitpid(pid, &status, 0);
+    if (got != pid || !WIFSIGNALED(status)) {
+        return -1;
+    }
+    return WTERMSIG(status);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Copy-on-write fork                                                        */
 /* ------------------------------------------------------------------------ */
@@ -428,7 +438,7 @@ static void test_group_exit(void) {
     }
     usleep(10000);
     CHECK(pid > 0 && kill(pid, SIGKILL) == 0, "group exit: kill");
-    CHECK(wait_exit_status(pid) == 128 + SIGKILL, "group exit: SIGKILL ends blocked read");
+    CHECK(wait_term_signal(pid) == SIGKILL, "group exit: SIGKILL ends blocked read");
 }
 
 /* A forked child of a threaded process is single-threaded and works. */
@@ -843,7 +853,7 @@ static void test_socket_waits(void) {
     }
     usleep(20000);
     kill(pid, SIGKILL);
-    CHECK(wait_exit_status(pid) == 128 + SIGKILL, "socket: SIGKILL ends blocked recv");
+    CHECK(wait_term_signal(pid) == SIGKILL, "socket: SIGKILL ends blocked recv");
     close(sv[0]);
     close(sv[1]);
 }

@@ -13,7 +13,9 @@ pub(super) const LOCK_SH: u32 = 1;
 pub(super) const LOCK_EX: u32 = 2;
 pub(super) const LOCK_NB: u32 = 4;
 pub(super) const LOCK_UN: u32 = 8;
-pub(super) const FLOCK_MAX_ENTRIES: usize = 32;
+/// System-wide held `flock` locks. A libwayland compositor holds one lock
+/// per display socket (`wl_display_add_socket_auto` can hold 33).
+pub(super) const FLOCK_MAX_ENTRIES: usize = 128;
 
 /// One held lock. The lock owner is the `(tgid, fd)` pair that acquired it
 /// (Linux ties flock owners to the open file description instead; see the

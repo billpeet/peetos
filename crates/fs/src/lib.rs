@@ -32,7 +32,12 @@ pub use ext2_backend::{Ext2BackendKind, Ext2BlockBackend, Ext2BlockReadFn, Ext2B
 pub const VFS_MAX_PATH: usize = 256;
 pub const VFS_MAX_NAME: usize = 64;
 pub const VFS_MAX_INODES: usize = 256;
-pub const VFS_MAX_CHILDREN: usize = 64;
+/// Entries per directory node. libwayland's `wl_display_add_socket_auto`
+/// alone can create 33 sockets plus 33 lock files in one runtime directory.
+pub const VFS_MAX_CHILDREN: usize = 128;
+/// Entries imported when an ext2 directory is first loaded. Kept at 64 because
+/// the import buffers names on the (16 KiB) kernel stack.
+const EXT2_DIR_IMPORT_MAX: usize = 64;
 pub const TMPFS_MAX_FILE_SIZE: usize = 32 * 1024;
 
 pub const O_RDONLY: u32 = 0x0000;
@@ -250,6 +255,12 @@ struct Inode {
     atime: u64,
     mtime: u64,
     ctime: u64,
+    /// Open file descriptions referencing this node (see `inode_open_retain`).
+    open_refs: u16,
+    /// Unlinked while open: detached from its parent, freed on last release.
+    orphan: bool,
+    /// Orphaned ext2 file whose on-disk inode and blocks are freed on last release.
+    ext2_free_on_release: bool,
 }
 
 impl Inode {
@@ -275,6 +286,9 @@ impl Inode {
             atime: 0,
             mtime: 0,
             ctime: 0,
+            open_refs: 0,
+            orphan: false,
+            ext2_free_on_release: false,
         }
     }
 }
@@ -779,6 +793,9 @@ fn clear_inode(inode: &mut Inode) {
     inode.atime = 0;
     inode.mtime = 0;
     inode.ctime = 0;
+    inode.open_refs = 0;
+    inode.orphan = false;
+    inode.ext2_free_on_release = false;
 }
 
 fn reset(state: &mut VfsState) {
@@ -858,6 +875,8 @@ fn ensure_init(state: &mut VfsState) {
     let _ = create_virtual_file_inner(state, "/dev/tty", NodeBackend::DevTty);
     let _ = create_virtual_file_inner(state, "/dev/ptmx", NodeBackend::DevPtmx);
     let _ = create_virtual_file_inner(state, "/dev/fb0", NodeBackend::DevFramebuffer);
+    // Listing is synthesized per process by the kernel (getdents64).
+    let _ = mkdir_virtual_inner(state, "/dev/fd");
     let _ = mkdir_virtual_inner(state, "/dev/input");
     if let Ok(inode) =
         create_virtual_file_inner(state, "/dev/input/event0", NodeBackend::DevInputEvent)
@@ -3950,11 +3969,11 @@ fn ext2_ensure_dir_children_loaded(state: &mut VfsState, dir: u16) -> Result<(),
         return Err(EIO);
     }
     let mut entry_count = 0usize;
-    let mut entry_ino = [0u32; VFS_MAX_CHILDREN];
-    let mut entry_name_len = [0u8; VFS_MAX_CHILDREN];
-    let mut entry_name = [[0u8; VFS_MAX_NAME]; VFS_MAX_CHILDREN];
+    let mut entry_ino = [0u32; EXT2_DIR_IMPORT_MAX];
+    let mut entry_name_len = [0u8; EXT2_DIR_IMPORT_MAX];
+    let mut entry_name = [[0u8; VFS_MAX_NAME]; EXT2_DIR_IMPORT_MAX];
     ext2_for_each_dir_entry_state(state, &ext2_inode, |child_ino, _ft, child_name| {
-        if entry_count >= VFS_MAX_CHILDREN {
+        if entry_count >= EXT2_DIR_IMPORT_MAX {
             return Err(ENOSPC);
         }
         if child_name.len() >= VFS_MAX_NAME {
@@ -4545,7 +4564,12 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
     let node_mode = inode_mode_for_stat(node);
     let node_uid = node.uid as u32;
     let node_gid = node.gid as u32;
-    let node_nlink = core::cmp::max(1, node.links_count as u32);
+    let node_orphan = node.orphan;
+    let node_nlink = if node_orphan {
+        0
+    } else {
+        core::cmp::max(1, node.links_count as u32)
+    };
     let node_size = node.size as u64;
     let node_atime = node.atime;
     let node_mtime = node.mtime;
@@ -4578,7 +4602,11 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
         stat.mode = ext.mode as u32;
         stat.uid = ext.uid as u32;
         stat.gid = ext.gid as u32;
-        stat.nlink = core::cmp::max(1, ext.links_count as u32);
+        stat.nlink = if node_orphan {
+            0
+        } else {
+            core::cmp::max(1, ext.links_count as u32)
+        };
         stat.size = ext.size as u64;
         stat.blksize = state.ext2_meta.block_size as u32;
         stat.blocks = ext.block_count_512 as u64;
@@ -4654,6 +4682,15 @@ fn unlink_at_inner(
                 child_ext.mtime = now;
                 ext2_write_inode_to_state(state, child_ext2_ino, &child_ext)?;
                 ext2_refresh_alias_nodes(state, child_ext2_ino, &child_ext);
+            } else if state.inodes[child as usize].open_refs > 0 {
+                // Still open: keep the on-disk inode (now with no links)
+                // until the last descriptor is released.
+                child_ext.links_count = 0;
+                let now = fs_time_tick(state) as u32;
+                child_ext.ctime = now;
+                child_ext.mtime = now;
+                ext2_write_inode_to_state(state, child_ext2_ino, &child_ext)?;
+                state.inodes[child as usize].ext2_free_on_release = true;
             } else {
                 ext2_free_inode_blocks(state, &mut child_ext)?;
                 ext2_free_inode(state, journal_handle, child_ext2_ino, false)?;
@@ -4662,9 +4699,40 @@ fn unlink_at_inner(
     }
 
     remove_child(state, parent, child)?;
-    clear_inode(&mut state.inodes[child as usize]);
+    if state.inodes[child as usize].open_refs > 0 {
+        // POSIX: an unlinked file (or removed directory) stays usable through
+        // its open descriptors until the last one is closed.
+        let now = fs_time_tick(state);
+        let node = &mut state.inodes[child as usize];
+        node.orphan = true;
+        node.links_count = 0;
+        node.ctime = now;
+        if remove_dir && node.backend == NodeBackend::Ext2 {
+            // The ext2 directory inode was freed above; serve the empty,
+            // detached directory from the VFS node alone.
+            node.backend = NodeBackend::Tmpfs;
+            node.ext2_ino = 0;
+        }
+    } else {
+        clear_inode(&mut state.inodes[child as usize]);
+    }
     touch_inode_metadata(state, parent, true, true, true);
     Ok(())
+}
+
+/// Free an orphaned node once nothing references it any more.
+fn finalize_orphan(state: &mut VfsState, inode: u16) {
+    let node = &state.inodes[inode as usize];
+    let ext2_ino = node.ext2_ino;
+    if node.backend == NodeBackend::Ext2 && node.ext2_free_on_release && ext2_ino != 0 {
+        let _ = with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_UNLINK, |state| {
+            let journal_handle = ext2_journal::current_handle(state);
+            let mut ext = ext2_read_inode_from_state(state, ext2_ino)?;
+            ext2_free_inode_blocks(state, &mut ext)?;
+            ext2_free_inode(state, journal_handle, ext2_ino, false)
+        });
+    }
+    clear_inode(&mut state.inodes[inode as usize]);
 }
 
 fn is_descendant_of(state: &VfsState, ancestor: u16, node: u16) -> bool {
@@ -5278,6 +5346,50 @@ pub fn lookupat(start: u16, path: &str) -> Result<u16, i64> {
     with_state(|state| {
         ensure_init(state);
         lookup_path_from_inner(state, start, path)
+    })
+}
+
+/// Record one more open file description on `inode`. The kernel calls this
+/// for every descriptor it creates or duplicates, so that `unlink` can keep
+/// the node alive (as an orphan) while it is still open.
+pub fn inode_open_retain(inode: u16) {
+    with_state(|state| {
+        ensure_init(state);
+        if (inode as usize) < VFS_MAX_INODES && state.inodes[inode as usize].used {
+            let node = &mut state.inodes[inode as usize];
+            node.open_refs = node.open_refs.saturating_add(1);
+        }
+    })
+}
+
+/// Drop one reference taken by [`inode_open_retain`]. Frees the node when it
+/// was unlinked and this was the last reference, and returns `true` in that
+/// case (the caller should drop cached pages for the inode and sync ext2).
+pub fn inode_open_release(inode: u16) -> bool {
+    with_state(|state| {
+        ensure_init(state);
+        if (inode as usize) >= VFS_MAX_INODES || !state.inodes[inode as usize].used {
+            return false;
+        }
+        let node = &mut state.inodes[inode as usize];
+        node.open_refs = node.open_refs.saturating_sub(1);
+        if node.open_refs == 0 && node.orphan {
+            finalize_orphan(state, inode);
+            return true;
+        }
+        false
+    })
+}
+
+/// Open references recorded on `inode` (0 for unknown or free nodes).
+pub fn inode_open_refs(inode: u16) -> u16 {
+    with_state(|state| {
+        ensure_init(state);
+        if (inode as usize) < VFS_MAX_INODES && state.inodes[inode as usize].used {
+            state.inodes[inode as usize].open_refs
+        } else {
+            0
+        }
     })
 }
 
@@ -6375,6 +6487,74 @@ mod tests {
         let dir = open("/tmp", O_RDONLY | O_DIRECTORY, 0).expect("directory open should work");
         let err = write(dir.inode, 0, b"bad", false).unwrap_err();
         assert_eq!(err, EISDIR);
+    }
+
+    #[test]
+    fn unlinked_open_file_stays_usable_until_last_release() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let opened = open("/tmp/orphan.txt", O_CREAT | O_RDWR, 0).expect("create");
+        inode_open_retain(opened.inode);
+        inode_open_retain(opened.inode); // a dup
+        write(opened.inode, 0, b"still here", false).expect("write");
+
+        unlink("/tmp/orphan.txt").expect("unlink while open");
+        assert_eq!(lookup("/tmp/orphan.txt"), Err(ENOENT));
+        // The name can be reused immediately for a different file.
+        let other = open("/tmp/orphan.txt", O_CREAT | O_RDWR, 0).expect("recreate");
+        assert_ne!(other.inode, opened.inode);
+
+        let st = stat(opened.inode).expect("fstat orphan");
+        assert_eq!(st.nlink, 0);
+        assert_eq!(st.size, 10);
+        let mut buf = [0u8; 10];
+        assert_eq!(read(opened.inode, 0, &mut buf).unwrap(), 10);
+        assert_eq!(&buf, b"still here");
+        write(opened.inode, 10, b"!", false).expect("write orphan");
+
+        assert!(!inode_open_release(opened.inode));
+        assert!(stat(opened.inode).is_ok());
+        assert!(inode_open_release(opened.inode), "last release frees the orphan");
+        assert_eq!(stat(opened.inode).unwrap_err(), ENOENT);
+        assert_eq!(inode_open_refs(opened.inode), 0);
+    }
+
+    #[test]
+    fn unlink_without_open_refs_frees_immediately() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let opened = open("/tmp/closed.txt", O_CREAT | O_RDWR, 0).expect("create");
+        unlink("/tmp/closed.txt").expect("unlink");
+        assert_eq!(stat(opened.inode).unwrap_err(), ENOENT);
+    }
+
+    #[test]
+    fn tmpfs_directory_holds_more_than_64_entries() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        mkdir("/tmp/many").expect("mkdir");
+        for i in 0..100 {
+            let path = std::format!("/tmp/many/f{}", i);
+            open(&path, O_CREAT | O_RDWR, 0).expect("create entry");
+        }
+        assert!(lookup("/tmp/many/f99").is_ok());
+    }
+
+    #[test]
+    fn devfs_has_empty_fd_directory() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let dir = open("/dev/fd", O_RDONLY | O_DIRECTORY, 0).expect("open /dev/fd");
+        assert_eq!(inode_is_dir(dir.inode), Ok(true));
+        assert_eq!(lookup("/dev/fd"), Ok(dir.inode));
+        // Only "." and "..": the kernel supplies the per-process entries.
+        assert!(readdir(dir.inode, 0).unwrap().is_some());
+        assert!(readdir(dir.inode, 1).unwrap().is_some());
+        assert!(readdir(dir.inode, 2).unwrap().is_none());
     }
 
     #[test]

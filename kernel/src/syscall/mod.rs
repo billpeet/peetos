@@ -101,6 +101,9 @@ const SYS_SELECT: u64 = 23;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
 const SYS_NANOSLEEP: u64 = 35;
+const SYS_GETITIMER: u64 = 36;
+const SYS_ALARM: u64 = 37;
+const SYS_SETITIMER: u64 = 38;
 const SYS_CLONE: u64 = 56;
 const SYS_FORK: u64 = 57;
 const SYS_VFORK: u64 = 58;
@@ -118,6 +121,8 @@ const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
 const SYS_FCHDIR: u64 = 81;
 const SYS_RENAME: u64 = 82;
+const SYS_MKDIR: u64 = 83;
+const SYS_RMDIR: u64 = 84;
 const SYS_LINK: u64 = 86;
 const SYS_UNLINK: u64 = 87;
 const SYS_READLINK: u64 = 89;
@@ -669,6 +674,9 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_nanosleep,
     ),
+    syscall_def(SYS_GETITIMER, "getitimer", SyscallMode::UserTask, sys_getitimer),
+    syscall_def(SYS_ALARM, "alarm", SyscallMode::UserTask, sys_alarm),
+    syscall_def(SYS_SETITIMER, "setitimer", SyscallMode::UserTask, sys_setitimer),
     syscall_def(SYS_PIPE, "pipe", SyscallMode::UserTask, sys_pipe),
     syscall_def(SYS_CLONE, "clone", SyscallMode::UserTask, sys_clone),
     syscall_def(SYS_WAIT4, "wait4", SyscallMode::UserTask, sys_wait4),
@@ -684,6 +692,8 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_CHDIR, "chdir", SyscallMode::UserTask, sys_chdir),
     syscall_def(SYS_FCHDIR, "fchdir", SyscallMode::UserTask, sys_fchdir),
     syscall_def(SYS_RENAME, "rename", SyscallMode::UserTask, sys_rename),
+    syscall_def(SYS_MKDIR, "mkdir", SyscallMode::UserTask, sys_mkdir),
+    syscall_def(SYS_RMDIR, "rmdir", SyscallMode::UserTask, sys_rmdir),
     syscall_def(SYS_LINK, "link", SyscallMode::UserTask, sys_link),
     syscall_def(
         SYS_READLINK,
@@ -1141,7 +1151,7 @@ struct LinuxCmsgHdr {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct LinuxTimeVal {
     tv_sec: i64,
     tv_usec: i64,
@@ -1410,6 +1420,7 @@ pub fn init() {
         for idx in 0..EPOLL_MAX_INSTANCES {
             EPOLL_INSTANCES[idx] = EpollInstance::EMPTY;
         }
+        VM_INODE_PINNED = [false; fs::VFS_MAX_INODES];
     }
     vm_page_cache_reset();
 }

@@ -68,6 +68,10 @@ User `mremap`:
 - Relocation moves the present page-table entries instead of copying, so anonymous memory, page-cache pins (tracked by physical address), and dirty state follow the mapping; if a page-table allocation fails midway, already-moved pages are put back.
 - Growing a shared writable file mapping re-validates the file window, and growth is counted against the per-task mapping budget.
 
+User shared anonymous mappings:
+- `mmap(MAP_SHARED | MAP_ANONYMOUS)` is backed by a hidden tmpfs file created in the memfd storage directory and unlinked at once (`mmap_shared_anon_backing` in `kernel/src/syscall/vm.rs`). Its pages live in the shared VM page cache, so a `fork`ed child sees the same memory.
+- File-backed mappings pin their inode: `vm_sync_inode_pins` keeps one fs open reference per inode that any task maps, so the hidden file (or any regular file unlinked while mapped) is freed exactly when its last mapping goes away.
+
 RAII support:
 - `MappingGuard` unmaps a range on drop (intended for temporary mappings).
 
@@ -77,6 +81,8 @@ Limitations / Simplifications
 - Page-table updates are serialised by `VMM_LOCK`, an interrupt-safe spinlock taken at the public entry points. Internal calls use `*_locked` variants. `switch` and the getters take no lock. Lock order is heap, then VMM, then PMM.
 - TLB shootdown is coarse. Removing or downgrading a present mapping sends an IPI that makes every CPU using that address space (or every CPU, for kernel addresses) flush its whole TLB. Shootdowns are not batched across pages, and there is no PCID or other advanced address-space isolation.
 - `mremap` requires the old range to lie inside one existing mapping, does not support `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and refuses to resize framebuffer mappings.
+- `MAP_SHARED | MAP_ANONYMOUS` regions inherit tmpfs limits: the backing file is capped at 32 KiB, so contents beyond that can be lost if memory-pressure reclaim evicts those pages. Each region uses one VFS node until it is unmapped everywhere.
+- Inode pins are recomputed by scanning every task's region table (64 tasks x 32 regions) after each `mmap`/`munmap`/teardown, which is fine at current sizes but linear.
 
 **Kernel Heap (kmalloc)**
 `kernel/src/memory/heap.rs` is a simple first-fit allocator:
