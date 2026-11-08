@@ -961,6 +961,46 @@ fn resolve_cow_in_locked(target_pml4: PhysAddr, virt: VirtAddr) -> CowResolve {
     CowResolve::Resolved
 }
 
+/// Why [`with_user_page`] could not reach a user page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserPageError {
+    /// The task has no address space (`pml4` is 0).
+    NoAddressSpace,
+    /// The page is not mapped.
+    NotMapped,
+    /// Breaking copy-on-write sharing for a write ran out of memory.
+    NoMemory,
+}
+
+/// Run `access` on the kernel-visible address of the user page at
+/// `page_vaddr`, all under `VMM_LOCK`:
+/// - `pml4_of` reads the address space under the lock (so a concurrent
+///   `execve` that zeroes a sibling's `pml4_phys` before tearing the old
+///   space down is observed);
+/// - for writes, copy-on-write sharing is broken first (writes through the
+///   direct map bypass the hardware write protection COW relies on);
+/// - the translation stays valid for the whole access, because every path
+///   that frees a user frame removes its mapping under this lock first.
+///
+/// This is what makes user copies safe without the big kernel lock.
+pub fn with_user_page<R>(
+    pml4_of: impl FnOnce() -> u64,
+    page_vaddr: VirtAddr,
+    for_write: bool,
+    access: impl FnOnce(*mut u8) -> R,
+) -> Result<R, UserPageError> {
+    let _guard = VMM_LOCK.lock();
+    let pml4 = PhysAddr::new(pml4_of());
+    if pml4.as_u64() == 0 {
+        return Err(UserPageError::NoAddressSpace);
+    }
+    if for_write && resolve_cow_in_locked(pml4, page_vaddr) == CowResolve::NoMemory {
+        return Err(UserPageError::NoMemory);
+    }
+    let phys = get_physical_in_locked(pml4, page_vaddr).ok_or(UserPageError::NotMapped)?;
+    Ok(access(phys.align_down().to_virt().as_u64() as *mut u8))
+}
+
 /// Duplicate the user half of `src_pml4` into `dst_pml4` for `fork`.
 ///
 /// Private pages are shared copy-on-write: both sides map the same frame with

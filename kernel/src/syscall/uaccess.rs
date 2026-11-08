@@ -19,13 +19,20 @@ pub(super) fn user_range_ok(start: u64, len: usize) -> bool {
     end <= USER_CANON_MAX && end < KERNEL_VIRT_BASE
 }
 
+/// Copy between a kernel buffer and `task_ptr`'s user memory, one page at a
+/// time. Each page is translated and copied atomically with respect to
+/// page-table changes (`vmm::with_user_page`), so this is safe without the
+/// big kernel lock.
 pub(super) fn copy_user_bytes(
-    pml4: PhysAddr,
+    task_ptr: *mut task::Task,
     user_addr: u64,
     kernel_buf: *mut u8,
     len: usize,
     to_user: bool,
 ) -> Result<(), i64> {
+    if task_ptr.is_null() {
+        return Err(ESRCH);
+    }
     if len == 0 {
         return Ok(());
     }
@@ -41,31 +48,26 @@ pub(super) fn copy_user_bytes(
         let page_vaddr = vaddr & !(PAGE_SIZE - 1);
         let page_off = (vaddr & (PAGE_SIZE - 1)) as usize;
         let bytes_in_page = cmp::min(remaining, PAGE_SIZE as usize - page_off);
-
-        // Writes go through the physical map, which bypasses the hardware
-        // write-protection COW relies on: break sharing first.
-        if to_user
-            && vmm::resolve_cow_in(pml4, VirtAddr::new(page_vaddr)) == vmm::CowResolve::NoMemory
-        {
-            return Err(ENOMEM);
-        }
-
-        let page_phys = match vmm::get_physical_in(pml4, VirtAddr::new(page_vaddr)) {
-            Some(phys) => phys,
-            None => return Err(EFAULT),
-        };
-
-        let page_ptr = (PhysAddr::new(page_phys.as_u64() + page_off as u64)
-            .to_virt()
-            .as_u64()) as *mut u8;
         let kernel_ptr = unsafe { kernel_buf.add(copied) };
 
-        unsafe {
-            if to_user {
-                ptr::copy_nonoverlapping(kernel_ptr as *const u8, page_ptr, bytes_in_page);
-            } else {
-                ptr::copy_nonoverlapping(page_ptr as *const u8, kernel_ptr, bytes_in_page);
-            }
+        let result = vmm::with_user_page(
+            || unsafe { (*task_ptr).pml4_phys },
+            VirtAddr::new(page_vaddr),
+            to_user,
+            |page| unsafe {
+                let page_ptr = page.add(page_off);
+                if to_user {
+                    ptr::copy_nonoverlapping(kernel_ptr as *const u8, page_ptr, bytes_in_page);
+                } else {
+                    ptr::copy_nonoverlapping(page_ptr as *const u8, kernel_ptr, bytes_in_page);
+                }
+            },
+        );
+        match result {
+            Ok(()) => {}
+            Err(vmm::UserPageError::NoAddressSpace) => return Err(EINVAL),
+            Err(vmm::UserPageError::NotMapped) => return Err(EFAULT),
+            Err(vmm::UserPageError::NoMemory) => return Err(ENOMEM),
         }
 
         copied += bytes_in_page;
@@ -80,14 +82,7 @@ pub(super) fn copy_from_user_task(
     user_src: u64,
     dst: &mut [u8],
 ) -> Result<(), i64> {
-    if task_ptr.is_null() {
-        return Err(ESRCH);
-    }
-    let pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
-    if pml4.as_u64() == 0 {
-        return Err(EINVAL);
-    }
-    copy_user_bytes(pml4, user_src, dst.as_mut_ptr(), dst.len(), false)
+    copy_user_bytes(task_ptr, user_src, dst.as_mut_ptr(), dst.len(), false)
 }
 
 pub(super) fn copy_to_user_task(
@@ -95,14 +90,7 @@ pub(super) fn copy_to_user_task(
     user_dst: u64,
     src: &[u8],
 ) -> Result<(), i64> {
-    if task_ptr.is_null() {
-        return Err(ESRCH);
-    }
-    let pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
-    if pml4.as_u64() == 0 {
-        return Err(EINVAL);
-    }
-    copy_user_bytes(pml4, user_dst, src.as_ptr() as *mut u8, src.len(), true)
+    copy_user_bytes(task_ptr, user_dst, src.as_ptr() as *mut u8, src.len(), true)
 }
 
 pub(super) fn write_struct_to_user<T: Copy>(

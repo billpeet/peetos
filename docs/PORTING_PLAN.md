@@ -163,11 +163,12 @@ current Rust kernel implementation and forward roadmap.
 - Done:
   - the IRQ-safe `IrqSpinLock`,
   - self-locked PMM, heap, VMM and scheduler (run queue, task table, task-owned BKL hand-off),
-  - lock-free `sched_yield`/`getpid`/`gettid`/`getppid`,
+  - lock-free `sched_yield`/`getpid`/`gettid`/`getppid`/`clock_gettime`/`gettimeofday`/`nanosleep`,
+  - user copies made atomic per page under `VMM_LOCK` (stress-tested by the proc smoke's `munmap`-vs-`clock_gettime` race at `-smp 2`),
   - zombies in kernel mode are never preempted.
 - Next:
   - give the VFS, net stack, IPC and syscall globals their own locks,
-  - add per-address-space locking or page pinning so lock-free syscalls can copy to and from user memory (`clock_gettime`, `nanosleep`),
+  - replace the global `VMM_LOCK` with per-address-space locks,
   - shrink the BKL until it can be removed.
 - Move to per-CPU run queues with load balancing (and later affinity).
 - Batch TLB shootdowns per operation (`munmap` ranges, fork COW marking) and consider PCID.

@@ -30,7 +30,12 @@ Limitations / Simplifications
 3. Calls `syscall_handler` with a pointer to the `SyscallFrame` on the kernel stack. `syscall_handler` takes the big kernel lock, dispatches, then disables interrupts and releases the lock (see `docs/smp.md`).
 4. Restores registers and returns via `swapgs` + `sysretq`.
 
-`sched_yield`, `getpid`, `gettid` and `getppid` take a lock-free fast path before step 3. It falls back to the locked dispatcher when a deliverable signal is pending or the task is exiting, and it disables interrupts before returning, so nothing can interrupt between the epilogue's `swapgs` and `sysretq`.
+`sched_yield`, `getpid`, `gettid`, `getppid`, `clock_gettime`, `gettimeofday` and `nanosleep` take a lock-free fast path before step 3.
+- It falls back to the locked dispatcher when a deliverable signal is pending or the task is exiting.
+- It takes the lock only for return-path signal delivery if a signal arrived during the call.
+- It disables interrupts before returning, so nothing can interrupt between the epilogue's `swapgs` and `sysretq`.
+
+User copies are safe without the lock: each page is translated and accessed atomically under `VMM_LOCK` (`vmm::with_user_page`).
 
 `arch_x86_64::syscall::init()` programs per-CPU MSRs, so every AP calls it during bring-up. It leaves the GS bases alone; `percpu::init_cpu` owns them.
 

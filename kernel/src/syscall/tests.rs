@@ -1868,6 +1868,9 @@ fn lock_free_syscalls_are_only_id_and_yield_calls() {
     assert!(is_lock_free_syscall(SYS_GETPID));
     assert!(is_lock_free_syscall(SYS_GETTID));
     assert!(is_lock_free_syscall(SYS_GETPPID));
+    assert!(is_lock_free_syscall(SYS_CLOCK_GETTIME));
+    assert!(is_lock_free_syscall(SYS_GETTIMEOFDAY));
+    assert!(is_lock_free_syscall(SYS_NANOSLEEP));
     // Anything touching user memory or shared kernel state stays locked.
     assert!(!is_lock_free_syscall(SYS_EXECVE));
     assert!(!is_lock_free_syscall(SYS_RT_SIGRETURN));

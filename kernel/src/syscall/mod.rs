@@ -1414,12 +1414,13 @@ pub fn init() {
     vm_page_cache_reset();
 }
 
-/// SYSCALL entry from `syscall_entry` (ring 3, interrupts disabled). Holds
-/// the big kernel lock for the whole call; it is released just before the
-/// SYSRET back to the same task.
+/// SYSCALL entry from `syscall_entry` (ring 3, interrupts disabled).
+/// [`is_lock_free_syscall`] numbers run without the big kernel lock;
+/// everything else holds it for the whole call and releases it just before
+/// the SYSRET back to the same task.
 #[no_mangle]
 pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
-    if let Some(ret) = lock_free_syscall(frame.rax) {
+    if let Some(ret) = lock_free_syscall(frame) {
         return ret;
     }
     crate::bkl::syscall_enter();
@@ -1428,11 +1429,21 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
     ret
 }
 
-/// Syscalls served without the big kernel lock. Each one touches only
-/// state that is fixed for the calling task (its ids) or protected by the
-/// scheduler's own lock, and none touches user memory.
+/// Syscalls served without the big kernel lock. Each touches only state
+/// that is fixed for the calling task (its ids), the scheduler (own lock),
+/// the PIT tick counter (atomic) and its own user memory (copied under
+/// `VMM_LOCK`, see `uaccess::copy_user_bytes`).
 pub(crate) const fn is_lock_free_syscall(nr: u64) -> bool {
-    matches!(nr, SYS_YIELD | SYS_GETPID | SYS_GETTID | SYS_GETPPID)
+    matches!(
+        nr,
+        SYS_YIELD
+            | SYS_GETPID
+            | SYS_GETTID
+            | SYS_GETPPID
+            | SYS_CLOCK_GETTIME
+            | SYS_GETTIMEOFDAY
+            | SYS_NANOSLEEP
+    )
 }
 
 /// Whether returning from a syscall must go through the locked path anyway:
@@ -1446,25 +1457,32 @@ pub(crate) const fn needs_locked_return(sig_pending: u64, signal_blocked: u64, f
 pub(crate) static LOCK_FREE_SYSCALLS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+fn task_needs_locked_return(current: *mut task::Task) -> bool {
+    let (sig_pending, signal_blocked, flags) =
+        unsafe { ((*current).sig_pending, (*current).signal_blocked, (*current).flags) };
+    needs_locked_return(sig_pending, signal_blocked, flags)
+}
+
 /// Fast path for [`is_lock_free_syscall`] numbers. Returns `None` to fall
 /// back to the normal, locked dispatcher.
-fn lock_free_syscall(nr: u64) -> Option<u64> {
+fn lock_free_syscall(frame: &mut SyscallFrame) -> Option<u64> {
+    let nr = frame.rax;
     if !is_lock_free_syscall(nr) {
         return None;
     }
     let current = task::current();
-    if current.is_null() {
+    if current.is_null() || task_needs_locked_return(current) {
         return None;
     }
-    let (sig_pending, signal_blocked, flags) =
-        unsafe { ((*current).sig_pending, (*current).signal_blocked, (*current).flags) };
-    if needs_locked_return(sig_pending, signal_blocked, flags) {
-        return None;
-    }
-    let ret = match nr {
-        SYS_GETPID => unsafe { (*current).tgid as i64 },
-        SYS_GETTID => unsafe { (*current).pid as i64 },
-        SYS_GETPPID => unsafe { (*task::leader_of(current)).ppid as i64 },
+    let ctx = SyscallContext::new(current);
+    let call = call_from_syscall_frame(frame);
+    let result = match nr {
+        SYS_GETPID => sys_getpid(&ctx, &call),
+        SYS_GETTID => sys_gettid(&ctx, &call),
+        SYS_GETPPID => sys_getppid(&ctx, &call),
+        SYS_CLOCK_GETTIME => sys_clock_gettime(&ctx, &call),
+        SYS_GETTIMEOFDAY => sys_gettimeofday(&ctx, &call),
+        SYS_NANOSLEEP => sys_nanosleep(&ctx, &call),
         SYS_YIELD => {
             crate::sched::yield_now();
             0
@@ -1472,11 +1490,25 @@ fn lock_free_syscall(nr: u64) -> Option<u64> {
         _ => return None,
     };
     LOCK_FREE_SYSCALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    // A yield resumes with interrupts enabled. The SYSRET epilogue runs
-    // SWAPGS before SYSRETQ, and an interrupt between the two would enter
-    // the kernel with the user GS base.
+    frame.rax = to_sysret(result);
+
+    if task_needs_locked_return(current) {
+        // A signal arrived meanwhile (e.g. it woke a nanosleep): deliver it
+        // exactly as the locked dispatcher would.
+        crate::bkl::syscall_enter();
+        if let Some(ret) = apply_pending_signals_syscall(frame) {
+            frame.rax = to_sysret(ret);
+        }
+        let ret = frame.rax;
+        crate::bkl::syscall_exit();
+        return Some(ret);
+    }
+
+    // A yield or sleep resumes with interrupts enabled. The SYSRET epilogue
+    // runs SWAPGS before SYSRETQ, and an interrupt between the two would
+    // enter the kernel with the user GS base.
     arch_x86_64::interrupts::disable();
-    Some(to_sysret(ret))
+    Some(frame.rax)
 }
 
 fn syscall_dispatch(frame: &mut SyscallFrame) -> u64 {

@@ -9,11 +9,13 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -846,6 +848,107 @@ static void test_socket_waits(void) {
     close(sv[1]);
 }
 
+/*
+ * Lock-free user copies vs. concurrent munmap (SMP).
+ *
+ * clock_gettime runs without the kernel's big lock and copies its result
+ * into user memory. Reader threads aim it at a page that the main thread
+ * keeps unmapping and remapping at the same address. Every call must either
+ * succeed or fail with EFAULT, and the kernel must survive.
+ */
+#define RACE_READERS 3
+#define RACE_ROUNDS 3000
+
+static volatile int race_stop;
+static void *race_page;
+static long race_ok[RACE_READERS];
+static long race_efault[RACE_READERS];
+static long race_other[RACE_READERS];
+
+static void *race_reader(void *arg) {
+    long idx = (long)arg;
+    while (!race_stop) {
+        long r = syscall(SYS_clock_gettime, CLOCK_MONOTONIC, race_page);
+        if (r == 0) {
+            race_ok[idx]++;
+        } else if (errno == EFAULT) {
+            race_efault[idx]++;
+        } else {
+            race_other[idx]++;
+        }
+    }
+    return NULL;
+}
+
+static void test_uaccess_race(void) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    void *page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(page != MAP_FAILED, "uaccess race: initial mmap");
+    if (page == MAP_FAILED) {
+        return;
+    }
+    memset(page, 0, page_size);
+    race_page = page;
+    race_stop = 0;
+
+    pthread_t readers[RACE_READERS];
+    int started = 0;
+    for (long i = 0; i < RACE_READERS; i++) {
+        if (pthread_create(&readers[i], NULL, race_reader, (void *)i) == 0) {
+            started++;
+        }
+    }
+    CHECK(started == RACE_READERS, "uaccess race: spawn readers");
+
+    /* Wait until every reader is issuing calls before racing them. */
+    for (int spins = 0; spins < 100000; spins++) {
+        int active = 0;
+        for (int i = 0; i < RACE_READERS; i++) {
+            if (race_ok[i] + race_efault[i] + race_other[i] > 0) {
+                active++;
+            }
+        }
+        if (active == started) {
+            break;
+        }
+        sched_yield();
+    }
+
+    int remap_failures = 0;
+    for (int round = 0; round < RACE_ROUNDS; round++) {
+        if (munmap(page, page_size) != 0) {
+            remap_failures++;
+            break;
+        }
+        void *again = mmap(page, page_size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (again != page) {
+            remap_failures++;
+            break;
+        }
+        /* Fault the fresh page in so readers can hit a mapped page too. */
+        ((volatile char *)page)[0] = (char)round;
+    }
+    race_stop = 1;
+    for (int i = 0; i < started; i++) {
+        pthread_join(readers[i], NULL);
+    }
+
+    long ok = 0, efault = 0, other = 0;
+    for (int i = 0; i < RACE_READERS; i++) {
+        ok += race_ok[i];
+        efault += race_efault[i];
+        other += race_other[i];
+    }
+    printf("[proc-smoke] uaccess race: ok=%ld efault=%ld other=%ld remap_failures=%d\n",
+           ok, efault, other, remap_failures);
+    CHECK(remap_failures == 0, "uaccess race: munmap/mmap");
+    CHECK(other == 0, "uaccess race: unexpected clock_gettime error");
+    CHECK(ok > 0, "uaccess race: some copies succeeded");
+    munmap(page, page_size);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc >= 3 && strcmp(argv[1], "--exec-child") == 0) {
@@ -875,6 +978,7 @@ int main(int argc, char **argv) {
     test_cancellation();
     test_exec_from_thread();
     test_socket_waits();
+    test_uaccess_race();
 
     if (failures == 0) {
         printf("[proc-smoke] pass\n");

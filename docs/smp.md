@@ -85,7 +85,16 @@ Big-lock rules:
 - **`bkl::wait_for_interrupt()`** halts without the lock. The boot task's main loop uses it.
 
 Paths that never take the big lock:
-- The syscalls `sched_yield`, `getpid`, `gettid` and `getppid` (`syscall::lock_free_syscall`). They fall back to the locked dispatcher whenever a deliverable signal is pending or the task is exiting, because delivery on return needs the lock.
+- The syscalls `sched_yield`, `getpid`, `gettid`, `getppid`, `clock_gettime`, `gettimeofday` and `nanosleep` (`syscall::lock_free_syscall`).
+  - They fall back to the locked dispatcher when a deliverable signal is pending or the task is exiting on entry.
+  - If a signal arrives during the call (for example, one that wakes a `nanosleep`), they take the lock only for the return-path signal delivery.
+- User-memory copies (`uaccess::copy_user_bytes`). Each page goes through `vmm::with_user_page`, which does all of the following in a single `VMM_LOCK` hold:
+  - reads the task's `pml4_phys`,
+  - breaks COW sharing for writes,
+  - translates the address,
+  - performs the access.
+
+  Every path that frees a user frame removes its mapping under `VMM_LOCK` first, so a concurrent `munmap` either completes before the copy or makes it fail with `EFAULT`. `execve` zeroes a sibling's `pml4_phys` before tearing the old space down, so a preempted copy sees either the intact old space or no address space.
 - The PIT tick: the counter (a fast handler) and `sched::tick`, which runs sleeper wake-ups and the BSP time slice.
 - The LAPIC timer tick and the reschedule IPI (`idt::set_no_entry_lock`).
 - The test and TLB IPIs.
@@ -130,7 +139,7 @@ So timer preemption and task switching continue on every CPU even while another 
 Limitations / Simplifications
 - **Big kernel lock still covers most kernel code.** All other syscalls, device IRQs and exceptions are serialised by it. Kernel code that busy-waits without yielding still holds other syscalls out.
   - Next: give VFS, net and IPC their own locks, then move more syscalls to the lock-free path.
-- **Lock-free syscalls cannot touch user memory yet.** User copies translate one page at a time (`vmm::get_physical_in`) and then write through the direct map. A sibling thread's `munmap` under the big lock could free the page in between, so time queries such as `clock_gettime` stay locked until there is per-address-space locking or page pinning.
+- **User copies hold the global `VMM_LOCK` for each page.** A per-address-space lock would scale better. Copies still do not fault in lazily mapped pages (an untouched anonymous page gives `EFAULT`, as before), and they do not check the PTE's user/write bits.
 - **Zombies in kernel mode are never preempted.** A task that has marked itself a zombie is still running its exit path in the kernel and leaves the CPU voluntarily, so `sched::isr_hook` skips it.
 - **One shared run queue.** No per-CPU queues, no load balancing, no CPU affinity. Tasks migrate freely.
 - **Device IRQs and the PIT go to the BSP only.** There is no IRQ balancing, no MSI/MSI-X, and no `_PRT`/AML evaluation. PCI devices use their legacy ISA line plus MADT overrides.

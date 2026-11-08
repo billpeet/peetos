@@ -18,7 +18,10 @@ trap cleanup EXIT
 make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES=musl-ext2-proc-smoke
 
 set +e
+# Two CPUs so thread checks (including the lock-free uaccess race) really
+# run in parallel.
 timeout 40s qemu-system-x86_64 \
+  -smp 2 \
   -drive id=disk0,file="${IMAGE}",if=none,format=raw \
   -device ich9-ahci,id=ahci \
   -device ide-hd,drive=disk0,bus=ahci.0 \
@@ -50,6 +53,10 @@ if grep -q '\[musl-ext2-proc-smoke\] failures' "${LOG_FILE}"; then
   fail "process-model smoke completed with failures"
 fi
 
+if ! grep -Eq '\[proc-smoke\] uaccess race: ok=[1-9][0-9]* efault=[0-9]+ other=0 remap_failures=0' "${LOG_FILE}"; then
+  fail "lock-free uaccess race check missing or failed"
+fi
+
 if ! grep -q '\[proc-smoke\] pass' "${LOG_FILE}"; then
   fail "process-model smoke did not report userspace pass marker"
 fi
@@ -59,4 +66,5 @@ if ! grep -Eq '\[VMM\] Fork: [1-9][0-9]* pages shared copy-on-write, 0 copied' "
   fail "fork did not share pages copy-on-write"
 fi
 
+grep -a '\[proc-smoke\] uaccess race:' "${LOG_FILE}" || true
 echo "process-model smoke completed successfully."
