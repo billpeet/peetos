@@ -1,7 +1,7 @@
 #[cfg(target_os = "none")]
 use arch_x86_64::idt::{self, InterruptFrame};
 #[cfg(target_os = "none")]
-use arch_x86_64::{pic, port};
+use arch_x86_64::{irq, pic, port};
 
 use crate::sync::SpinLock;
 
@@ -52,8 +52,8 @@ impl DecodedScancode {
 
 #[cfg(target_os = "none")]
 pub fn init() {
-    idt::register_handler(pic::irq_to_vector(pic::IRQ_KEYBOARD), keyboard_irq_handler);
-    pic::unmask_irq(pic::IRQ_KEYBOARD);
+    idt::register_handler(irq::irq_to_vector(pic::IRQ_KEYBOARD), keyboard_irq_handler);
+    irq::unmask(pic::IRQ_KEYBOARD);
 }
 
 #[cfg(not(target_os = "none"))]
@@ -75,7 +75,7 @@ extern "C" fn keyboard_irq_handler(_frame: &mut InterruptFrame) {
         crate::tty::ingest_byte(byte);
     }
 
-    pic::send_eoi(pic::IRQ_KEYBOARD);
+    // EOI is sent by the IDT dispatcher.
 }
 
 fn decode_scancode(state: &mut KeyboardState, scancode: u8) -> DecodedScancode {

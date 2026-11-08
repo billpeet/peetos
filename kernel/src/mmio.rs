@@ -9,6 +9,24 @@ const MMIO_WINDOW_LIMIT: usize = 16;
 static mut MMIO_WINDOW_NEXT: usize = 0;
 
 pub fn map_mmio_window(phys_addr: u64, size: usize) -> Option<*mut u8> {
+    map_window_with_flags(phys_addr, size, vmm::VMM_FLAG_KERNEL_DATA)
+}
+
+/// Map device registers with caching disabled (PCD|PWT), for controllers such
+/// as the LAPIC/IOAPIC whose registers must never be cached even if firmware
+/// MTRRs are misconfigured.
+pub fn map_mmio_window_uncached(phys_addr: u64, size: usize) -> Option<*mut u8> {
+    map_window_with_flags(
+        phys_addr,
+        size,
+        vmm::VMM_FLAG_KERNEL_DATA | vmm::PTE_CACHE_DISABLE | vmm::PTE_WRITE_THROUGH,
+    )
+}
+
+fn map_window_with_flags(phys_addr: u64, size: usize, flags: u64) -> Option<*mut u8> {
+    if size as u64 > MMIO_WINDOW_STRIDE {
+        return None;
+    }
     let window_index = unsafe {
         if MMIO_WINDOW_NEXT >= MMIO_WINDOW_LIMIT {
             return None;
@@ -27,7 +45,7 @@ pub fn map_mmio_window(phys_addr: u64, size: usize) -> Option<*mut u8> {
     for page in 0..page_count {
         let virt = VirtAddr::new(virt_base + page * PAGE_SIZE);
         let phys = PhysAddr::new(phys_base + page * PAGE_SIZE);
-        if vmm::map_page(virt, phys, vmm::VMM_FLAG_KERNEL_DATA) != 0 {
+        if vmm::map_page(virt, phys, flags) != 0 {
             return None;
         }
     }

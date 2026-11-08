@@ -240,3 +240,127 @@ stack_top:                      ; Highest address of stack (initial RSP value)
 ; The kernel is now running in Rust!
 ; See kernel/src/main.rs for what happens next.
 ; ===========================================================================
+
+; ===========================================================================
+; APPLICATION PROCESSOR (AP) TRAMPOLINE
+; ===========================================================================
+;
+; Application processors wake up in 16-bit real mode at the page named by the
+; STARTUP IPI vector. The kernel copies the bytes between ap_trampoline_start
+; and ap_trampoline_end to physical AP_TRAMPOLINE_BASE and fills the data
+; block at AP_DATA before each STARTUP IPI (see kernel/src/smp.rs).
+;
+; Steps: real mode -> 32-bit protected mode (temporary GDT) -> enable PAE,
+; load transitional page tables (identity-maps the low 2 MB and shares the
+; kernel's PML4[511]), set EFER.LME/NXE, enable paging -> 64-bit mode ->
+; jump to ap_high_entry in the higher half, which switches to the real
+; kernel CR3 and calls the Rust ap_rust_entry(cpu_index).
+;
+; The code is position dependent: every address is computed relative to
+; AP_TRAMPOLINE_BASE with the TRAMP() macro. It lives in .rodata because it
+; only ever executes from the low-memory copy.
+; ===========================================================================
+
+AP_TRAMPOLINE_BASE  equ 0x8000
+AP_DATA             equ AP_TRAMPOLINE_BASE + 0xF00
+AP_DATA_PML4        equ AP_DATA + 0x00  ; u32: transitional PML4 (phys, < 4 GB)
+AP_DATA_KERNEL_CR3  equ AP_DATA + 0x08  ; u64: kernel CR3
+AP_DATA_STACK_TOP   equ AP_DATA + 0x10  ; u64: higher-half stack top
+AP_DATA_CPU_INDEX   equ AP_DATA + 0x18  ; u64: logical CPU index
+AP_DATA_CR0         equ AP_DATA + 0x20  ; u32: BSP CR0 (includes PE|PG)
+AP_DATA_CR4         equ AP_DATA + 0x28  ; u32: BSP CR4 (includes PAE)
+AP_DATA_EFER        equ AP_DATA + 0x30  ; u32: EFER bits to set
+
+%define TRAMP(label) ((label) - ap_trampoline_start + AP_TRAMPOLINE_BASE)
+
+extern ap_rust_entry
+global ap_trampoline_start
+global ap_trampoline_end
+
+section .rodata.ap_trampoline progbits alloc noexec nowrite align=16
+align 16
+
+[BITS 16]
+ap_trampoline_start:
+    cli
+    cld
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+
+    lgdt [TRAMP(ap_gdtr)]
+
+    mov eax, cr0
+    or eax, 1                       ; CR0.PE
+    mov cr0, eax
+    jmp dword 0x08:TRAMP(ap_pm32)
+
+[BITS 32]
+ap_pm32:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+
+    mov eax, [AP_DATA_CR4]          ; PAE, OSFXSR, OSXMMEXCPT, ... as on BSP
+    mov cr4, eax
+
+    mov eax, [AP_DATA_PML4]
+    mov cr3, eax
+
+    mov ecx, 0xC0000080             ; IA32_EFER
+    rdmsr
+    or eax, [AP_DATA_EFER]          ; LME (+ NXE, SCE)
+    wrmsr
+
+    mov eax, [AP_DATA_CR0]          ; PG|PE plus the BSP's FPU bits
+    mov cr0, eax
+
+    jmp 0x18:TRAMP(ap_lm64)
+
+[BITS 64]
+ap_lm64:
+    xor eax, eax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov fs, ax
+    mov gs, ax
+
+    fninit
+
+    mov rdi, [AP_DATA_CPU_INDEX]
+    mov rsi, [AP_DATA_KERNEL_CR3]
+    mov rsp, [AP_DATA_STACK_TOP]
+    mov rax, ap_high_entry          ; absolute higher-half address
+    jmp rax
+
+align 16
+ap_gdt:
+    dq 0                            ; 0x00 null
+    dq 0x00CF9A000000FFFF           ; 0x08 32-bit code
+    dq 0x00CF92000000FFFF           ; 0x10 32-bit data
+    dq 0x00AF9A000000FFFF           ; 0x18 64-bit code
+ap_gdt_end:
+
+ap_gdtr:
+    dw ap_gdt_end - ap_gdt - 1
+    dd TRAMP(ap_gdt)
+
+ap_trampoline_end:
+
+; ---------------------------------------------------------------------------
+; ap_high_entry - first higher-half code on an AP
+; rdi = cpu index, rsi = kernel CR3, rsp = per-AP kernel stack (higher half)
+; ---------------------------------------------------------------------------
+section .text
+[BITS 64]
+ap_high_entry:
+    mov cr3, rsi                    ; drop the transitional identity map
+    xor ebp, ebp
+    call ap_rust_entry              ; never returns
+.ap_hang:
+    cli
+    hlt
+    jmp .ap_hang

@@ -7,7 +7,7 @@ use core::ptr;
 #[cfg(target_os = "none")]
 use crate::interrupts;
 #[cfg(target_os = "none")]
-use crate::pic;
+use crate::{irq, lapic};
 
 pub const IDT_ENTRIES: usize = 256;
 
@@ -18,6 +18,10 @@ pub const IDT_GATE_USER: u8 = 0xEE;
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const EXCEPTION_PAGE_FAULT: u8 = 14;
 pub const SYSCALL_VECTOR: u8 = 0x80;
+/// First vector reserved for inter-processor interrupts (LAPIC-delivered).
+pub const IPI_VECTOR_FIRST: u8 = 0xF0;
+/// Number of IPI vectors with installed stubs (`0xF0..0xF4`).
+pub const IPI_VECTOR_COUNT: u8 = 4;
 
 pub type InterruptHandler = extern "C" fn(frame: &mut InterruptFrame);
 pub type PostHandlerHook = fn(frame: &mut InterruptFrame) -> u64;
@@ -228,12 +232,41 @@ pub fn init() {
             );
         }
 
+        let ipis: [unsafe extern "C" fn(); IPI_VECTOR_COUNT as usize] =
+            [apic_vec240, apic_vec241, apic_vec242, apic_vec243];
+        for (i, handler) in ipis.iter().enumerate() {
+            write_entry(
+                idt_ptr,
+                IPI_VECTOR_FIRST + i as u8,
+                *handler as u64,
+                KERNEL_CODE_SELECTOR,
+                IDT_GATE_INTERRUPT,
+            );
+        }
+        write_entry(
+            idt_ptr,
+            lapic::SPURIOUS_VECTOR,
+            apic_vec255 as *const () as u64,
+            KERNEL_CODE_SELECTOR,
+            IDT_GATE_INTERRUPT,
+        );
+
         IDTR.limit = (size_of::<IdtEntry>() * IDT_ENTRIES - 1) as u16;
         IDTR.base = idt_ptr as u64;
 
         lidt(ptr::addr_of!(IDTR));
     }
 }
+
+/// Load the shared IDT on the executing CPU (used by application processors
+/// after the BSP has built it with [`init`]).
+#[cfg(target_os = "none")]
+pub fn load() {
+    unsafe { lidt(ptr::addr_of!(IDTR)) };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn load() {}
 
 #[cfg(not(target_os = "none"))]
 pub fn init() {
@@ -247,24 +280,34 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) -> u64 {
 
     let int_no = unsafe { ptr::read_unaligned(ptr::addr_of!(frame.int_no)) };
     let vector = int_no as usize;
-    let handler = unsafe { HANDLERS[vector] };
-    let mut handled = false;
+    let isa_irq = irq::vector_to_irq(int_no);
 
-    if let Some(handler) = handler {
-        handler(frame);
-        handled = true;
-    }
-
-    if !handled && (32..48).contains(&int_no) {
-        let irq = (int_no - 32) as u8;
-        if !pic::is_spurious(irq) {
-            pic::send_eoi(irq);
+    if let Some(line) = isa_irq {
+        // Spurious legacy PIC IRQ7/IRQ15: no handler, no EOI (the helper
+        // already acknowledges the master for a spurious IRQ15).
+        if irq::is_spurious(line) {
+            return 0;
         }
-        handled = true;
     }
 
-    if !handled && int_no < 32 {
-        default_exception_handler(frame);
+    if vector == lapic::SPURIOUS_VECTOR as usize {
+        // LAPIC spurious interrupts are never acknowledged.
+        return 0;
+    }
+
+    match unsafe { HANDLERS[vector] } {
+        Some(handler) => handler(frame),
+        None if int_no < 32 => default_exception_handler(frame),
+        None => {}
+    }
+
+    // Acknowledge centrally so a handler can never leave the controller
+    // blocked (an unacknowledged LAPIC vector masks every vector at or below
+    // its priority class, including the timer).
+    if let Some(line) = isa_irq {
+        irq::eoi(line);
+    } else if is_ipi_vector(int_no) {
+        lapic::eoi();
     }
 
     if let Some(hook) = unsafe { POST_HANDLER_HOOK } {
@@ -272,6 +315,11 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) -> u64 {
     }
 
     0
+}
+
+#[inline]
+pub const fn is_ipi_vector(vector: u64) -> bool {
+    vector >= IPI_VECTOR_FIRST as u64 && vector < (IPI_VECTOR_FIRST + IPI_VECTOR_COUNT) as u64
 }
 
 #[cfg(target_os = "none")]
@@ -375,6 +423,20 @@ IRQ 13, 45
 IRQ 14, 46
 IRQ 15, 47
 
+.macro APIC_VEC num
+.global apic_vec\num
+apic_vec\num:
+    push 0
+    push \num
+    jmp isr_common_stub
+.endm
+
+APIC_VEC 240
+APIC_VEC 241
+APIC_VEC 242
+APIC_VEC 243
+APIC_VEC 255
+
 isr_common_stub:
     push rax
     push rbx
@@ -472,12 +534,27 @@ extern "C" {
     fn irq13();
     fn irq14();
     fn irq15();
+
+    fn apic_vec240();
+    fn apic_vec241();
+    fn apic_vec242();
+    fn apic_vec243();
+    fn apic_vec255();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::mem::size_of;
+
+    #[test]
+    fn ipi_vector_range() {
+        assert!(!is_ipi_vector(0xEF));
+        assert!(is_ipi_vector(0xF0));
+        assert!(is_ipi_vector(0xF3));
+        assert!(!is_ipi_vector(0xF4));
+        assert!(!is_ipi_vector(0xFF));
+    }
 
     #[test]
     fn idt_struct_sizes() {

@@ -1,7 +1,7 @@
 #[cfg(target_os = "none")]
 use arch_x86_64::idt::{self, InterruptFrame};
 #[cfg(target_os = "none")]
-use arch_x86_64::{interrupts, pic, port};
+use arch_x86_64::{interrupts, irq, pic, port};
 
 #[cfg(target_os = "none")]
 use core::ptr;
@@ -474,7 +474,7 @@ extern "C" fn mouse_irq_handler(_frame: &mut InterruptFrame) {
         let _ = unsafe { port::inb(PS2_DATA_PORT) };
     }
 
-    pic::send_eoi(pic::IRQ_MOUSE);
+    // EOI is sent by the IDT dispatcher.
 }
 
 #[cfg(target_os = "none")]
@@ -493,14 +493,14 @@ fn poll_mouse_packets() {
 
 #[cfg(target_os = "none")]
 pub fn init() {
-    idt::register_handler(pic::irq_to_vector(pic::IRQ_MOUSE), mouse_irq_handler);
+    idt::register_handler(irq::irq_to_vector(pic::IRQ_MOUSE), mouse_irq_handler);
 
     if !initialize_ps2_mouse() {
         crate::serial_println!("[MOUSE] PS/2 init failed");
         return;
     }
 
-    pic::unmask_irq(pic::IRQ_MOUSE);
+    irq::unmask(pic::IRQ_MOUSE);
     initialize_cursor();
     RELATIVE_ENABLED.store(true, Ordering::Release);
 

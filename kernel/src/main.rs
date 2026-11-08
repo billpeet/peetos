@@ -35,6 +35,21 @@ mod sched;
 mod serial;
 mod shm;
 mod signal;
+#[cfg(target_os = "none")]
+mod smp;
+#[cfg(not(target_os = "none"))]
+mod smp {
+    //! Host-test stand-in: the real module links against the AP trampoline
+    //! in `entry.asm`, which only exists in kernel builds.
+    pub fn init() {}
+    pub fn start_aps() {}
+    pub fn ipi_self_test() -> (usize, usize) {
+        (0, 0)
+    }
+    pub fn is_bsp() -> bool {
+        true
+    }
+}
 mod socket;
 mod storage;
 mod sync;
@@ -130,6 +145,12 @@ pub extern "C" fn kmain() -> ! {
     heap::init();
     serial_println!("[KMALLOC] Initialized");
 
+    // Needs the heap/VMM for MMIO mappings; must precede drivers that unmask
+    // IRQs after this point (e1000) and the first interrupts::enable().
+    smp::init();
+    smp::start_aps();
+    smp::ipi_self_test();
+
     let mut pci_devices = [pci::DeviceInfo::EMPTY; PCI_SCAN_LIMIT];
     let pci_summary = pci::enumerate(&mut pci_devices);
     let pci_show = core::cmp::min(PCI_LOG_LIMIT, pci_summary.stored_devices);
@@ -206,7 +227,26 @@ pub extern "C" fn kmain() -> ! {
     interrupts::enable();
 
     #[cfg(feature = "test-exit")]
-    qemu::exit_success();
+    {
+        // Prove the timer IRQ is actually delivered (via the IOAPIC when APIC
+        // mode is active) before reporting success.
+        let start = pit::ticks();
+        let mut spins: u64 = 0;
+        while pit::ticks() < start + 5 && spins < 50_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        let delta = pit::ticks() - start;
+        serial_println!(
+            "[TEST] Timer advanced {} tick(s) via {}",
+            delta,
+            if arch_x86_64::irq::is_apic_mode() { "IOAPIC" } else { "PIC" }
+        );
+        if delta < 5 {
+            qemu::exit_failure();
+        }
+        qemu::exit_success();
+    }
 
     loop {
         net::poll();

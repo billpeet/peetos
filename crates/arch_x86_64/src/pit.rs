@@ -3,9 +3,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "none")]
 use crate::idt::{self, InterruptFrame};
 #[cfg(target_os = "none")]
-use crate::pic;
+use crate::{irq, pic};
 #[cfg(target_os = "none")]
-use crate::port::outb;
+use crate::port::{inb, outb};
 
 pub const PIT_CHANNEL0_DATA: u16 = 0x40;
 pub const PIT_COMMAND: u16 = 0x43;
@@ -14,6 +14,7 @@ pub const PIT_CHANNEL0: u8 = 0 << 6;
 pub const PIT_ACCESS_LOHI: u8 = 3 << 4;
 pub const PIT_MODE2: u8 = 2 << 1;
 pub const PIT_BINARY: u8 = 0;
+pub const PIT_LATCH_CHANNEL0: u8 = 0;
 
 pub const PIT_FREQUENCY: u32 = 1_193_182;
 pub const TIMER_FREQUENCY: u32 = 100;
@@ -33,7 +34,7 @@ extern "C" fn timer_handler(_frame: &mut InterruptFrame) {
     if let Some(hook) = unsafe { TICK_HOOK } {
         hook();
     }
-    pic::send_eoi(pic::IRQ_TIMER);
+    // EOI is sent by the IDT dispatcher.
 }
 
 #[cfg(target_os = "none")]
@@ -47,8 +48,8 @@ pub fn init() {
         outb(PIT_CHANNEL0_DATA, (divisor >> 8) as u8);
     }
 
-    idt::register_handler(pic::irq_to_vector(pic::IRQ_TIMER), timer_handler);
-    pic::unmask_irq(pic::IRQ_TIMER);
+    idt::register_handler(irq::irq_to_vector(pic::IRQ_TIMER), timer_handler);
+    irq::unmask(pic::IRQ_TIMER);
 }
 
 #[cfg(not(target_os = "none"))]
@@ -63,6 +64,46 @@ pub fn set_tick_hook(hook: fn()) {
 
 #[cfg(not(target_os = "none"))]
 pub fn set_tick_hook(_hook: fn()) {}
+
+/// Elapsed PIT input clocks between two channel-0 counter reads, given the
+/// reload value. The counter counts down from `reload` and wraps at most once
+/// between reads when polled faster than one timer period.
+pub const fn counter_elapsed(prev: u16, now: u16, reload: u16) -> u32 {
+    if now <= prev {
+        (prev - now) as u32
+    } else {
+        prev as u32 + (reload - now) as u32
+    }
+}
+
+#[cfg(target_os = "none")]
+fn read_counter() -> u16 {
+    crate::interrupts::without_interrupts(|| unsafe {
+        outb(PIT_COMMAND, PIT_LATCH_CHANNEL0);
+        let lo = inb(PIT_CHANNEL0_DATA) as u16;
+        let hi = inb(PIT_CHANNEL0_DATA) as u16;
+        (hi << 8) | lo
+    })
+}
+
+/// Busy-wait for roughly `us` microseconds by polling the channel-0 counter.
+/// Works with interrupts disabled (unlike [`sleep_ticks`]); requires [`init`].
+#[cfg(target_os = "none")]
+pub fn busy_wait_us(us: u64) {
+    let reload = pit_divisor(TIMER_FREQUENCY);
+    let target = us.saturating_mul(PIT_FREQUENCY as u64) / 1_000_000;
+    let mut elapsed: u64 = 0;
+    let mut prev = read_counter();
+    while elapsed < target {
+        core::hint::spin_loop();
+        let now = read_counter();
+        elapsed += counter_elapsed(prev, now, reload) as u64;
+        prev = now;
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn busy_wait_us(_us: u64) {}
 
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
@@ -99,6 +140,14 @@ pub fn sleep_ms(ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_elapsed_handles_wrap() {
+        assert_eq!(counter_elapsed(1000, 400, 11_931), 600);
+        assert_eq!(counter_elapsed(500, 500, 11_931), 0);
+        // Counter reloaded between reads: 100 clocks to zero, then down from reload.
+        assert_eq!(counter_elapsed(100, 11_900, 11_931), 131);
+    }
 
     #[test]
     fn pit_divisor_matches_reference() {

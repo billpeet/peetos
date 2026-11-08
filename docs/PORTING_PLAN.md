@@ -16,6 +16,13 @@ current Rust kernel implementation and forward roadmap.
 
 - Bootloader handoff, higher-half entry, serial, panic, and exception reporting are in place.
 - CPU setup is in place: GDT/TSS/IDT, PIC/PIT, SYSCALL MSRs, and preemption hooks.
+- SMP phase 1 is in place (`docs/smp.md`):
+  - ACPI MADT discovery.
+  - LAPIC + IOAPIC interrupt delivery, replacing the 8259 PIC when a MADT exists.
+  - INIT/SIPI bring-up of every AP through a real-mode trampoline.
+  - An IPI self-test.
+  - `tests/smoke.sh` boots with `-smp 1` and `-smp 4`, and checks that timer ticks arrive through the IOAPIC.
+  - APs park after check-in; the scheduler still runs only on the BSP.
 - Memory management is in place: typed addresses, bitmap PMM, 4-level VMM, and kernel heap.
 
 ### Process and Syscall Layer
@@ -142,6 +149,14 @@ current Rust kernel implementation and forward roadmap.
 - Add `XSAVE`/AVX state support if userspace workloads need AVX (today only the legacy `FXSAVE` image is managed and `CR4.OSXSAVE` stays off).
 - Finish dynamic-linker/runtime completeness beyond current bootstrap path
   (relocations/symbol resolution and broader compatibility).
+
+### 1a. SMP Phase 2 (Scheduling on All Cores)
+
+- Add per-CPU state via GS base: CPU id, `current` task, idle task, and a per-CPU GDT/TSS with RSP0 (and later IST stacks).
+- Make the scheduler multi-core: either a big kernel lock as a first step, or per-CPU run queues with a global lock and IPI-driven reschedule.
+- Add TLB shootdown IPIs for `munmap`/`mprotect`/COW and address-space teardown.
+- Replace "interrupts off" critical sections in the PMM, heap, VMM, VFS, net, and syscall globals with real locks. That needs an IRQ-safe `SpinLock` that also masks interrupts.
+- Calibrate the LAPIC timer and use it as the per-CPU preemption tick.
 
 ### 2. VM and Memory Policy
 

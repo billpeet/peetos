@@ -42,7 +42,7 @@ Limitations / Simplifications
 - Hard cap of 128 MB managed memory; higher RAM is ignored.
 - E820 is read from fixed bootloader-provided addresses without additional validation.
 - Not SMP-safe; no locking or per-CPU freelists.
-- Only reserves low 1MB and the kernel image range by default.
+- Only reserves low 1MB and the kernel image range by default. SMP bring-up relies on that reservation: it reuses physical `0x8000-0xBFFF` for the AP trampoline and its transitional page tables (see `docs/smp.md`).
 
 **Virtual Memory Manager (VMM)**
 `kernel/src/memory/vmm.rs` manages 4-level x86_64 page tables:

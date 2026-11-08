@@ -1,7 +1,7 @@
 use core::ptr;
 
 use arch_x86_64::addr::PAGE_SIZE;
-use arch_x86_64::{idt, pic};
+use arch_x86_64::{idt, irq};
 use drivers::{e1000 as regs, pci};
 use net::{MacAddr, NetError};
 
@@ -475,8 +475,8 @@ pub fn init(pci_devices: &[pci::DeviceInfo]) {
 
     // Register IRQ handler
     if dev.irq > 0 && dev.irq < 16 {
-        idt::register_handler(32 + dev.irq, e1000_irq_handler);
-        pic::unmask_irq(dev.irq);
+        idt::register_handler(irq::irq_to_vector(dev.irq), e1000_irq_handler);
+        irq::unmask(dev.irq);
         serial_println!("[E1000] Registered IRQ handler for IRQ {}", dev.irq);
     }
 

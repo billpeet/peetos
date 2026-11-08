@@ -201,6 +201,17 @@ pub fn set_tss_base(_base: u64) {
     // No-op for host builds/tests.
 }
 
+/// Load the shared GDT on the executing CPU and reload segment registers.
+/// Used by application processors after the BSP has built it with [`init`].
+/// The TSS is not loaded: the single TSS descriptor belongs to the BSP.
+#[cfg(target_os = "none")]
+pub fn load() {
+    unsafe { load_gdt(ptr::addr_of!(GDTR)) };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn load() {}
+
 #[cfg(target_os = "none")]
 pub fn load_tss() {
     unsafe {

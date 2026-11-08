@@ -32,6 +32,11 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `arch_x86_64` provides port I/O helpers and interrupt enable/disable wrappers.
 - GDT/IDT setup is wired with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, and serial exception reports.
 - PMM/VMM/kernel heap are active.
+- SMP phase 1:
+  - When an ACPI MADT is present, the kernel switches IRQ delivery from the 8259 PIC to the LAPIC/IOAPIC.
+  - It wakes every application processor with INIT/SIPI and checks each one with an IPI self-test.
+  - APs park after check-in; scheduling still happens only on the boot CPU.
+  - See `docs/smp.md`.
 - Tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption).
 - libwayland 1.23.1 (with libffi 3.4.6) is ported as static musl libraries (`make -C wayland`). A dedicated QEMU smoke (`run-wayland-smoke`) runs a libwayland compositor and a separate libwayland client process that connect over `/tmp/wayland-0`, share a sealed memfd `wl_shm` pool, present two frames (growing the pool in between), and exercise `eventfd`, `timerfd`, `signalfd`, `flock`, `fallocate`, `mremap`, and `SO_PEERCRED`. See `docs/wayland.md`.
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
@@ -118,6 +123,7 @@ Notes:
 
 - `make run` now boots the compositor-first GUI demo profile so the current userspace compositor path is the default manual bring-up experience.
 - AHCI disk0 is `build/peetos.img`; AHCI disk1 is `user/sample_ext2_musl.img`.
+- Add `QEMU_SMP=<n>` to any `make run*` target to boot with several virtual CPUs (for example `make run QEMU_SMP=4`). The serial log reports `[SMP] <n> of <n> CPU(s) online`.
 - Use `make run-current` to boot the current image without rebuilding.
 - Use `make run-image` to force rebuild then boot.
 - Use `make run-shell` if you want the older console-first shell profile instead of the GUI demo.

@@ -6,6 +6,8 @@ ASM      := nasm
 LD       := ld
 OBJCOPY  := objcopy
 QEMU     := qemu-system-x86_64
+# Number of virtual CPUs for the `make run*` targets (e.g. `make run QEMU_SMP=4`).
+QEMU_SMP ?= 1
 
 BUILD_DIR := build
 IMAGE     := $(BUILD_DIR)/peetos.img
@@ -521,7 +523,7 @@ image: bootloader kernel
 
 run:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES="$(RUN_ALL_FEATURES)"
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
 		-device ich9-ahci,id=ahci \
 		-device ide-hd,drive=disk0,bus=ahci.0 \
@@ -538,14 +540,14 @@ run-current:
 		echo "ERROR: $(IMAGE) not found. Build it first with 'make image'."; \
 		exit 1; \
 	fi
-	$(QEMU) -drive format=raw,file=$(IMAGE) -serial stdio
+	$(QEMU) -smp $(QEMU_SMP) -drive format=raw,file=$(IMAGE) -serial stdio
 
 run-image: image
-	$(QEMU) -drive format=raw,file=$(IMAGE) -serial stdio
+	$(QEMU) -smp $(QEMU_SMP) -drive format=raw,file=$(IMAGE) -serial stdio
 
 run-tablet:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES="$(strip $(KERNEL_FEATURES) usb-tablet)"
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive format=raw,file=$(IMAGE) \
 		-usb \
 		-device usb-tablet \
@@ -553,7 +555,7 @@ run-tablet:
 
 run-shell:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=musl-ext2-exec
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
 		-device ich9-ahci,id=ahci \
 		-device ide-hd,drive=disk0,bus=ahci.0 \
@@ -563,7 +565,7 @@ run-shell:
 
 run-net-shell:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=musl-ext2-exec
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
 		-device ich9-ahci,id=ahci \
 		-device ide-hd,drive=disk0,bus=ahci.0 \
@@ -575,7 +577,7 @@ run-net-shell:
 
 run-net:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=$(if $(KERNEL_FEATURES),$(KERNEL_FEATURES),)
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive format=raw,file=$(IMAGE) \
 		-netdev user,id=net0 \
 		-device e1000,netdev=net0 \
@@ -583,7 +585,7 @@ run-net:
 
 run-net-smoke:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=net-ping-smoke
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive format=raw,file=$(IMAGE) \
 		-netdev user,id=net0 \
 		-device e1000,netdev=net0 \
@@ -591,7 +593,7 @@ run-net-smoke:
 
 run-net-udp-smoke:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=net-udp-smoke
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive format=raw,file=$(IMAGE) \
 		-netdev user,id=net0 \
 		-device e1000,netdev=net0 \
@@ -599,7 +601,7 @@ run-net-udp-smoke:
 
 run-net-tcp-smoke:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=net-tcp-smoke
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive format=raw,file=$(IMAGE) \
 		-netdev user,id=net0 \
 		-device e1000,netdev=net0 \
@@ -607,7 +609,7 @@ run-net-tcp-smoke:
 
 run-net-socket-smoke:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=net-socket-smoke
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive format=raw,file=$(IMAGE) \
 		-netdev user,id=net0 \
 		-device e1000,netdev=net0 \
@@ -615,7 +617,7 @@ run-net-socket-smoke:
 
 run-shell-smoke:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES=musl-ext2-cmd-smoke
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
 		-device ich9-ahci,id=ahci \
 		-device ide-hd,drive=disk0,bus=ahci.0 \
@@ -652,7 +654,7 @@ run-peet-gui-smoke:
 
 run-peet-shell-demo:
 	$(MAKE) image PROFILE=release KERNEL_FEATURES="compositor-first musl-ext2-peet-shell-demo"
-	$(QEMU) \
+	$(QEMU) -smp $(QEMU_SMP) \
 		-drive id=disk0,file=$(IMAGE),if=none,format=raw \
 		-device ich9-ahci,id=ahci \
 		-device ide-hd,drive=disk0,bus=ahci.0 \

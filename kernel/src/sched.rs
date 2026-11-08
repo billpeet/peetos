@@ -353,6 +353,11 @@ pub fn isr_hook(frame: &mut InterruptFrame) -> u64 {
         if !PREEMPT_PENDING {
             return 0;
         }
+        // Only the BSP schedules. Application processors take IPIs through
+        // the same dispatcher but must never touch scheduler state.
+        if !crate::smp::is_bsp() {
+            return 0;
+        }
         PREEMPT_PENDING = false;
     }
 
