@@ -608,6 +608,15 @@ pub(super) fn sys_readlink(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     sys_readlinkat(ctx, &compat)
 }
 
+/// Legacy `chmod(path, mode)`: `fchmodat(AT_FDCWD, path, mode, 0)`.
+pub(super) fn sys_chmod(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let compat = SyscallArgs {
+        num: SYS_FCHMODAT,
+        args: [fs::AT_FDCWD as i64 as u64, call.arg(0), call.arg(1), 0, 0, 0],
+    };
+    sys_fchmodat(ctx, &compat)
+}
+
 pub(super) fn sys_fchmodat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let dirfd = call.arg(0) as i32;
     let path_ptr = call.arg(1);
@@ -1548,6 +1557,34 @@ pub(super) fn sys_sync(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     }
     sync_ext2_backing_and_checkpoint();
     flush_ext2_backing();
+    0
+}
+
+/// `posix_fadvise` hints (fontconfig and freetype issue them): validated
+/// and ignored, since there is no readahead or page-cache policy to tune.
+pub(super) fn sys_fadvise64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let fd = call.arg(0) as i32;
+    let advice = call.arg(3);
+    let idx = match fd_index(fd) {
+        Ok(i) => i,
+        Err(err) => return err,
+    };
+    if !fd_slot_is_open(ctx.current, idx) {
+        return -EBADF;
+    }
+    let kind = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_kind[idx] };
+    fadvise_result(kind, call.arg(2) as i64, advice)
+}
+
+/// `0` for a valid hint on a regular-file fd; `-ESPIPE` for pipes/sockets
+/// and `-EINVAL` for a negative length or unknown advice, as on Linux.
+pub(super) fn fadvise_result(kind: u8, len: i64, advice: u64) -> i64 {
+    if kind == task::USER_FD_KIND_PIPE || kind == task::USER_FD_KIND_SOCKET {
+        return -ESPIPE;
+    }
+    if len < 0 || advice > 5 {
+        return -EINVAL;
+    }
     0
 }
 

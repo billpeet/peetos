@@ -212,6 +212,7 @@ pub(super) fn execve_common(
     heap::kfree(image.ptr);
     if result.is_ok() {
         mmap_clear_task_regions(ctx.current);
+        mmap_register_user_stack(ctx.current);
         close_cloexec_fds(ctx.current);
     }
     result

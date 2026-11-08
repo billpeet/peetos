@@ -2365,3 +2365,29 @@ fn mprotect_target_classifies_exec_image_and_mmap_ranges() {
     assert_eq!(mprotect_target(arch_x86_64::addr::DIRECT_MAP_BASE, PAGE_SIZE), Err(-EINVAL));
     assert_eq!(mprotect_target(USER_SPACE_END - PAGE_SIZE, 2 * PAGE_SIZE), Err(-EINVAL));
 }
+
+#[test]
+fn user_stack_region_is_8mib_below_stack_top_and_lazy_anonymous() {
+    let r = user_stack_region();
+    assert_eq!(r.end(), user::USER_STACK_TOP);
+    assert_eq!(r.len, 8 * 1024 * 1024);
+    assert_eq!(r.file_inode, task::USER_FD_NONE);
+    assert_eq!(r.prot, PROT_READ | PROT_WRITE);
+    assert!(!r.map_shared);
+    assert!(r.start >= MMAP_BASE_ADDR && r.end() <= USER_SPACE_END);
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    mmap_regions_insert(&mut regions, r).unwrap();
+    let deep = user::USER_STACK_TOP - 7 * 1024 * 1024;
+    assert_eq!(mmap_regions_find_mapping(&regions, deep).map(|m| m.start), Some(r.start));
+    assert!(mmap_regions_find_mapping(&regions, r.start - PAGE_SIZE).is_none(), "below the reserve faults");
+}
+
+#[test]
+fn fadvise_accepts_hints_on_files_and_rejects_pipes_and_bad_args() {
+    assert_eq!(fadvise_result(task::USER_FD_KIND_VFS, 0, 4), 0); // POSIX_FADV_DONTNEED
+    assert_eq!(fadvise_result(task::USER_FD_KIND_VFS, 4096, 2), 0); // SEQUENTIAL
+    assert_eq!(fadvise_result(task::USER_FD_KIND_PIPE, 0, 0), -ESPIPE);
+    assert_eq!(fadvise_result(task::USER_FD_KIND_SOCKET, 0, 0), -ESPIPE);
+    assert_eq!(fadvise_result(task::USER_FD_KIND_VFS, -1, 0), -EINVAL);
+    assert_eq!(fadvise_result(task::USER_FD_KIND_VFS, 0, 6), -EINVAL);
+}

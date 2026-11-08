@@ -103,11 +103,36 @@ if [[ -x "${ROOT_DIR}/user/dynlink_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/libpeetdyn.so" "${ROOT_DIR}/user/libpeetplugin.so" "${STAGE_ROOT}/usr/lib/"
 fi
 
-# Shared builds of the ported libraries (scripts/build_wayland.sh and
-# build_xkbcommon.sh), staged under their sonames for dynamic programs.
-if compgen -G "${ROOT_DIR}/wayland/out/lib/*.so.[0-9]*" >/dev/null; then
+# Shared builds of the ported libraries, staged under their sonames for
+# dynamic programs. With the rendering stack built (scripts/build_render_stack.sh)
+# everything comes from its staged sysroot, plus fontconfig's /etc/fonts, the
+# fonts, and the fc-* tools.
+RENDER_STAGE="${ROOT_DIR}/wayland/out/stage"
+if [[ -d "${RENDER_STAGE}/usr/lib" ]]; then
+  mkdir -p "${STAGE_ROOT}/usr/lib"
+  for lib in "${RENDER_STAGE}"/usr/lib/lib*.so*; do
+    [[ -f "${lib}" && ! -L "${lib}" ]] || continue
+    soname="$(readelf -d "${lib}" 2>/dev/null | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')"
+    [[ -n "${soname}" ]] && cp "${lib}" "${STAGE_ROOT}/usr/lib/${soname}"
+  done
+  if [[ -d "${RENDER_STAGE}/etc/fonts" ]]; then
+    mkdir -p "${STAGE_ROOT}/etc" "${STAGE_ROOT}/usr/share" "${STAGE_ROOT}/var/cache/fontconfig"
+    # conf.d entries are symlinks into /usr/share/fontconfig/conf.avail;
+    # stage them as plain files (dereferenced) along with conf.avail.
+    cp -rL "${RENDER_STAGE}/etc/fonts" "${STAGE_ROOT}/etc/"
+    cp -a "${RENDER_STAGE}/usr/share/fontconfig" "${STAGE_ROOT}/usr/share/"
+    cp -a "${RENDER_STAGE}/usr/share/fonts" "${STAGE_ROOT}/usr/share/"
+    for tool in fc-list fc-match fc-cache; do
+      [[ -x "${RENDER_STAGE}/usr/bin/${tool}" ]] && cp "${RENDER_STAGE}/usr/bin/${tool}" "${STAGE_ROOT}/bin/"
+    done
+  fi
+elif compgen -G "${ROOT_DIR}/wayland/out/lib/*.so.[0-9]*" >/dev/null; then
   mkdir -p "${STAGE_ROOT}/usr/lib"
   cp -L "${ROOT_DIR}"/wayland/out/lib/*.so.[0-9]* "${STAGE_ROOT}/usr/lib/"
+fi
+if [[ -x "${ROOT_DIR}/user/text_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/text_smoke.elf" "${STAGE_ROOT}/bin/text_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/text_smoke"
 fi
 
 if [[ -x "${ROOT_DIR}/user/drm_smoke.elf" ]]; then
@@ -566,6 +591,26 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/unix_rights_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/text_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/text_smoke ] || [ ! -f /etc/fonts/fonts.conf ]; then
+  echo [musl-ext2-text-smoke] missing bin/text_smoke or /etc/fonts/fonts.conf
+  fail=1
+else
+  echo [musl-ext2-text-smoke] fc-list:
+  bin/fc-list : family file || fail=1
+  bin/fc-match monospace || fail=1
+  bin/text_smoke || fail=1
+fi
+
+echo [musl-ext2-text-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-text-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/text_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
 fail=0

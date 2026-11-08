@@ -34,6 +34,7 @@ musl-ext2-wlcomp-smoke = []
 musl-ext2-wayland-demo = []
 musl-ext2-dynlink-smoke = []
 musl-ext2-drm-smoke = []
+musl-ext2-text-smoke = []
 musl-ext2-wayland-tests = []
 musl-ext3-journal-smoke = []
 # Mount the ext2/ext3/ext4 root read-only (QEMU read-only root smoke).

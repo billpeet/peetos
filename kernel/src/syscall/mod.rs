@@ -126,6 +126,8 @@ const SYS_RMDIR: u64 = 84;
 const SYS_LINK: u64 = 86;
 const SYS_UNLINK: u64 = 87;
 const SYS_READLINK: u64 = 89;
+const SYS_CHMOD: u64 = 90;
+const SYS_FADVISE64: u64 = 221;
 const SYS_UMASK: u64 = 95;
 const SYS_GETTIMEOFDAY: u64 = 96;
 const SYS_GETUID: u64 = 102;
@@ -716,6 +718,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_readlink,
     ),
+    syscall_def(SYS_CHMOD, "chmod", SyscallMode::UserTask, sys_chmod),
     syscall_def(
         SYS_GETTIMEOFDAY,
         "gettimeofday",
@@ -737,6 +740,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_GETSID, "getsid", SyscallMode::UserTask, sys_getsid),
     syscall_def(SYS_FCNTL, "fcntl", SyscallMode::UserTask, sys_fcntl),
     syscall_def(SYS_FSYNC, "fsync", SyscallMode::UserTask, sys_fsync),
+    syscall_def(SYS_FADVISE64, "fadvise64", SyscallMode::UserTask, sys_fadvise64),
     syscall_def(SYS_UNLINK, "unlink", SyscallMode::UserTask, sys_unlink),
     syscall_def(
         SYS_ARCH_PRCTL,
@@ -1747,6 +1751,7 @@ use vm::*;
 
 pub(crate) use fd::{fd_object_release, fd_object_retain};
 pub(crate) use vm::vm_page_cache_release_mapped_phys;
+pub(crate) use vm::mmap_register_user_stack;
 pub use vm::{terminate_current_user_fault, try_handle_page_fault};
 
 #[cfg(test)]

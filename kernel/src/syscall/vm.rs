@@ -712,6 +712,30 @@ pub(super) fn mmap_prepare_task_slot(task_ptr: *mut task::Task) -> Option<usize>
     Some(slot)
 }
 
+/// The main-thread stack region: `[USER_STACK_TOP - USER_STACK_RESERVE,
+/// USER_STACK_TOP)`, private anonymous read/write.
+pub(super) fn user_stack_region() -> VmMapping {
+    VmMapping {
+        start: user::USER_STACK_TOP - user::USER_STACK_RESERVE,
+        len: user::USER_STACK_RESERVE,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: false,
+        map_shared_can_write: false,
+    }
+}
+
+/// Register the main-thread stack of a freshly exec'd (or spawned) process
+/// so pages below the eagerly mapped top are populated on demand, up to
+/// `USER_STACK_RESERVE` (8 MiB). Faults below it are segfaults.
+pub(crate) fn mmap_register_user_stack(task_ptr: *mut task::Task) {
+    let Some(slot) = mmap_prepare_task_slot(task_ptr) else {
+        return;
+    };
+    let _ = unsafe { mmap_regions_insert(&mut TASK_VM_MAPPINGS[slot], user_stack_region()) };
+}
+
 pub(super) fn mmap_clear_task_regions(task_ptr: *mut task::Task) {
     let slot = match mmap_task_slot(task_ptr) {
         Some(slot) => slot,

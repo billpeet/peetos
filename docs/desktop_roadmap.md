@@ -75,7 +75,10 @@ later.
 
 ### 3. Software rendering stack
 
-- [ ] pixman, freetype, harfbuzz, fontconfig + fonts, libpng, cairo, pango.
+- [x] pixman, freetype, fontconfig + fonts (DejaVu), and expat. They are
+  built into a staged sysroot with meson, and text is rendered on screen
+  through DRM (`docs/rendering.md`).
+- [ ] harfbuzz (needs the C++ runtime below), libpng, cairo, pango.
 - [ ] A C++ runtime for musl (libc++ or libstdc++), needed by Mesa, Qt and many
   applications.
 - [ ] Mesa with `softpipe` (or `llvmpipe`, which needs LLVM) for EGL/GLES; GTK4
@@ -112,6 +115,8 @@ later.
 1. ~~Dynamic linking end to end (musl loader, a shared library, `dlopen`, TLS).~~ Done.
 2. ~~Lift the platform limits, starting with the VM region-table stack copies.~~ Done.
 3. ~~DRM/KMS minimum: mode setting, dumb buffers, page flips.~~ Done (legacy KMS over the boot framebuffer).
+
+4. fcft + foot (without harfbuzz at first), then the C++ runtime for harfbuzz.
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports.

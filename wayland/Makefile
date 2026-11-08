@@ -14,6 +14,10 @@
 #                              include/xkbcommon/
 #   lib/libdrm.a, libdrm.so.2 libdrm core (xf86drm, xf86drmMode); headers in
 #                              include/ (xf86drm*.h) and include/libdrm/
+#   stage/                     staged /usr + /etc sysroot for meson builds:
+#                              everything above plus expat, freetype,
+#                              fontconfig, pixman and the DejaVu fonts
+#                              (scripts/build_render_stack.sh)
 #   lib/lib*.so.N, lib/lib*.so shared builds of libffi, libwayland-server,
 #                              libwayland-client and libxkbcommon (need
 #                              ../musl/shared from `make -C musl shared`)
@@ -31,13 +35,13 @@ all: build
 fetch:
 	./fetch-wayland.sh
 
-wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src:
+wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src:
 	$(MAKE) fetch
 
 ../musl/shared/lib/libc.so:
 	$(MAKE) -C ../musl shared
 
-build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src ../musl/shared/lib/libc.so
+build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src ../musl/shared/lib/libc.so
 	../scripts/build_wayland.sh \
 		--wayland-src "$(CURDIR)/wayland-src" \
 		--libffi-src "$(CURDIR)/libffi-src" \
@@ -52,12 +56,13 @@ build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src 
 		--libdrm-src "$(CURDIR)/libdrm-src" \
 		--out "$(OUT_DIR)" \
 		--musl-cc "$(MUSL_CC)"
+	../scripts/build_render_stack.sh
 
 clean:
 	rm -rf "$(OUT_DIR)" build
 
 distclean: clean
-	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz
+	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2
 
 info:
 	@echo "OUT_DIR=$(OUT_DIR)"

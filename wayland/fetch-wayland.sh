@@ -5,9 +5,10 @@ usage() {
   cat <<'USAGE'
 Usage: fetch-wayland.sh [options]
 
-Download, verify, and extract pinned libwayland, libffi, wayland-protocols,
-libxkbcommon and libdrm source releases into wayland-src/, libffi-src/,
-wayland-protocols-src/, libxkbcommon-src/ and libdrm-src/.
+Download, verify, and extract the pinned source releases of the PeetOS
+graphics userland into <name>-src/ directories: libwayland, libffi,
+wayland-protocols, libxkbcommon and libdrm, plus the software rendering stack
+(pixman, expat, freetype, fontconfig) and the DejaVu fonts.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -39,6 +40,26 @@ XKBCOMMON_SHA256="65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863b2
 LIBDRM_VERSION="2.4.123"
 LIBDRM_URL="https://dri.freedesktop.org/libdrm/libdrm-${LIBDRM_VERSION}.tar.xz"
 LIBDRM_SHA256="a2b98567a149a74b0f50e91e825f9c0315d86e7be9b74394dae8b298caadb79e"
+
+PIXMAN_VERSION="0.43.4"
+PIXMAN_URL="https://cairographics.org/releases/pixman-${PIXMAN_VERSION}.tar.gz"
+PIXMAN_SHA256="a0624db90180c7ddb79fc7a9151093dc37c646d8c38d3f232f767cf64b85a226"
+
+EXPAT_VERSION="2.6.3"
+EXPAT_URL="https://github.com/libexpat/libexpat/releases/download/R_2_6_3/expat-${EXPAT_VERSION}.tar.xz"
+EXPAT_SHA256="274db254a6979bde5aad404763a704956940e465843f2a9bd9ed7af22e2c0efc"
+
+FREETYPE_VERSION="2.13.3"
+FREETYPE_URL="https://download.savannah.gnu.org/releases/freetype/freetype-${FREETYPE_VERSION}.tar.xz"
+FREETYPE_SHA256="0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289"
+
+FONTCONFIG_VERSION="2.15.0"
+FONTCONFIG_URL="https://www.freedesktop.org/software/fontconfig/release/fontconfig-${FONTCONFIG_VERSION}.tar.xz"
+FONTCONFIG_SHA256="63a0658d0e06e0fa886106452b58ef04f21f58202ea02a94c39de0d3335d7c0e"
+
+DEJAVU_VERSION="2.37"
+DEJAVU_URL="https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-${DEJAVU_VERSION}.tar.bz2"
+DEJAVU_SHA256="fa9ca4d13871dd122f61258a80d01751d603b4d3ee14095d65453b4e846e17d7"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -109,3 +130,13 @@ fetch_one "libxkbcommon ${XKBCOMMON_VERSION}" "${XKBCOMMON_URL}" "${XKBCOMMON_SH
   "${OUTPUT_DIR}/libxkbcommon-src" "libxkbcommon-${XKBCOMMON_VERSION}.tar.xz"
 fetch_one "libdrm ${LIBDRM_VERSION}" "${LIBDRM_URL}" "${LIBDRM_SHA256}" \
   "${OUTPUT_DIR}/libdrm-src" "libdrm-${LIBDRM_VERSION}.tar.xz"
+fetch_one "pixman ${PIXMAN_VERSION}" "${PIXMAN_URL}" "${PIXMAN_SHA256}" \
+  "${OUTPUT_DIR}/pixman-src" "pixman-${PIXMAN_VERSION}.tar.gz"
+fetch_one "expat ${EXPAT_VERSION}" "${EXPAT_URL}" "${EXPAT_SHA256}" \
+  "${OUTPUT_DIR}/expat-src" "expat-${EXPAT_VERSION}.tar.xz"
+fetch_one "freetype ${FREETYPE_VERSION}" "${FREETYPE_URL}" "${FREETYPE_SHA256}" \
+  "${OUTPUT_DIR}/freetype-src" "freetype-${FREETYPE_VERSION}.tar.xz"
+fetch_one "fontconfig ${FONTCONFIG_VERSION}" "${FONTCONFIG_URL}" "${FONTCONFIG_SHA256}" \
+  "${OUTPUT_DIR}/fontconfig-src" "fontconfig-${FONTCONFIG_VERSION}.tar.xz"
+fetch_one "DejaVu fonts ${DEJAVU_VERSION}" "${DEJAVU_URL}" "${DEJAVU_SHA256}" \
+  "${OUTPUT_DIR}/dejavu-src" "dejavu-fonts-ttf-${DEJAVU_VERSION}.tar.bz2"
