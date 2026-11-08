@@ -106,18 +106,27 @@ pub(super) fn sys_nanosleep(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(ticks) => ticks,
         Err(err) => return err,
     };
+    let deadline = pit::ticks().saturating_add(ticks);
     if ticks > 0 {
         crate::sched::sleep(ticks);
     }
 
+    // Woken early by a signal: report the time left, like Linux.
+    let now = pit::ticks();
+    let interrupted = now < deadline && signal::wait_interrupted(ctx.current);
     if call.arg(1) != 0 {
+        let left = if interrupted { deadline - now } else { 0 };
+        let (sec, nsec) = ticks_to_seconds_nanos(left);
         let rem = LinuxTimeSpec {
-            tv_sec: 0,
-            tv_nsec: 0,
+            tv_sec: sec,
+            tv_nsec: nsec,
         };
         if let Err(err) = write_struct_to_user(ctx.current, call.arg(1), &rem) {
             return -err;
         }
+    }
+    if interrupted {
+        return -EINTR;
     }
     0
 }

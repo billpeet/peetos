@@ -8,9 +8,14 @@ pub const ENOSPC: i64 = 28;
 pub const EPIPE: i64 = 32;
 pub const EAGAIN: i64 = 11;
 pub const ENOENT: i64 = 2;
+pub const ETIMEDOUT: i64 = 110;
 
 pub const FUTEX_WAIT: u32 = 0;
 pub const FUTEX_WAKE: u32 = 1;
+pub const FUTEX_REQUEUE: u32 = 3;
+pub const FUTEX_CMP_REQUEUE: u32 = 4;
+pub const FUTEX_WAIT_BITSET: u32 = 9;
+pub const FUTEX_WAKE_BITSET: u32 = 10;
 
 const PIPE_CAPACITY: usize = 1024;
 const IPC_MAX_PIPES: usize = 64;
@@ -206,6 +211,30 @@ fn block_current(reason: &str) {
     }
 }
 
+fn block_current_until(reason: &str, deadline: u64) {
+    #[cfg(not(test))]
+    {
+        crate::sched::block_until(reason, deadline);
+    }
+    #[cfg(test)]
+    {
+        let _ = (reason, deadline);
+    }
+}
+
+#[cfg(not(test))]
+fn now_ticks() -> u64 {
+    arch_x86_64::pit::ticks()
+}
+
+#[cfg(test)]
+static TEST_NOW_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn now_ticks() -> u64 {
+    TEST_NOW_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn wake_task(task: *mut Task) {
     #[cfg(not(test))]
     {
@@ -367,8 +396,8 @@ pub fn pipe_read(
             let mut state = IPC_STATE.lock();
             remove_waiter_locked(&mut state, read_key, task);
         }
-        if crate::signal::must_abort_wait(task) {
-            return Err(EAGAIN);
+        if crate::signal::wait_interrupted(task) {
+            return Err(crate::signal::ERESTARTSYS);
         }
     }
 }
@@ -429,8 +458,12 @@ pub fn pipe_write(
             let mut state = IPC_STATE.lock();
             remove_waiter_locked(&mut state, write_key, task);
         }
-        if crate::signal::must_abort_wait(task) {
-            return Err(EAGAIN);
+        if crate::signal::wait_interrupted(task) {
+            // A partial write still reports the bytes it moved.
+            if written > 0 {
+                return Ok(written);
+            }
+            return Err(crate::signal::ERESTARTSYS);
         }
     }
 
@@ -453,18 +486,101 @@ pub fn pipe_poll_status(pipe_id: u16) -> Result<(bool, bool, bool, bool), i64> {
     Ok((has_data, has_space, read_eof, write_broken))
 }
 
-pub fn futex_wait(task: *mut Task, addr: u64) -> Result<(), i64> {
+/// Drop `task`'s futex waiter entry, wherever a requeue may have moved it.
+/// Returns true if one was still registered (i.e. nobody woke the task).
+fn take_futex_waiter_locked(state: &mut IpcState, task: *mut Task) -> bool {
+    let mut found = false;
+    let mut idx = 0usize;
+    while idx < IPC_MAX_WAITERS {
+        let waiter = &mut state.waiters[idx];
+        if waiter.used
+            && waiter.task == task as usize
+            && (waiter.key >> 56) as u8 == WAIT_KIND_FUTEX
+        {
+            *waiter = Waiter::empty();
+            found = true;
+        }
+        idx += 1;
+    }
+    found
+}
+
+/// Sleep on futex word `addr` until woken, until the PIT tick `deadline`
+/// (if any), or until a signal interrupts the wait.
+///
+/// Errors: `ETIMEDOUT` when the deadline passed; for a signal, `EINTR` on a
+/// timed wait and `ERESTARTSYS` on an untimed one (so `SA_RESTART` handlers
+/// resume the wait transparently). A return without either may be spurious;
+/// callers re-check the futex word, as with Linux.
+pub fn futex_wait(task: *mut Task, addr: u64, deadline: Option<u64>) -> Result<(), i64> {
     let key = futex_key(addr);
     {
         let mut state = IPC_STATE.lock();
         register_waiter_locked(&mut state, key, task)?;
     }
-    block_current("futex-wait");
-    {
+    match deadline {
+        Some(deadline) => block_current_until("futex-wait", deadline),
+        None => block_current("futex-wait"),
+    }
+    let not_woken = {
         let mut state = IPC_STATE.lock();
-        remove_waiter_locked(&mut state, key, task);
+        take_futex_waiter_locked(&mut state, task)
+    };
+    if !not_woken {
+        return Ok(());
+    }
+    if let Some(deadline) = deadline {
+        if now_ticks() >= deadline {
+            return Err(ETIMEDOUT);
+        }
+    }
+    if crate::signal::wait_interrupted(task) {
+        return Err(if deadline.is_some() {
+            crate::signal::EINTR
+        } else {
+            crate::signal::ERESTARTSYS
+        });
     }
     Ok(())
+}
+
+/// FUTEX_REQUEUE: wake up to `nr_wake` waiters on `addr`, then move up to
+/// `nr_requeue` of the remaining waiters to `addr2` without waking them.
+/// Returns the number woken plus the number moved.
+pub fn futex_requeue(addr: u64, addr2: u64, nr_wake: u32, nr_requeue: u32) -> usize {
+    let woke = if nr_wake == 0 {
+        0
+    } else {
+        wake_key(futex_key(addr), nr_wake as usize)
+    };
+    let from = futex_key(addr);
+    let to = futex_key(addr2);
+    let mut moved = 0usize;
+    if from != to {
+        let mut state = IPC_STATE.lock();
+        let mut idx = 0usize;
+        while idx < IPC_MAX_WAITERS && moved < nr_requeue as usize {
+            let waiter = &mut state.waiters[idx];
+            if waiter.used && waiter.key == from {
+                waiter.key = to;
+                moved += 1;
+            }
+            idx += 1;
+        }
+    }
+    woke + moved
+}
+
+/// Number of tasks waiting on futex word `addr` (test helper).
+#[cfg(test)]
+pub fn futex_waiter_count(addr: u64) -> usize {
+    let key = futex_key(addr);
+    let state = IPC_STATE.lock();
+    state
+        .waiters
+        .iter()
+        .filter(|w| w.used && w.key == key)
+        .count()
 }
 
 pub fn futex_wake(addr: u64, count: u32) -> usize {
@@ -583,5 +699,62 @@ mod tests {
         assert_eq!(woke2, 1);
         let woke3 = futex_wake(addr, 1);
         assert_eq!(woke3, 0);
+    }
+
+    #[test]
+    fn futex_requeue_wakes_some_and_moves_the_rest() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let (a, b) = (0x3000u64, 0x4000u64);
+        {
+            let mut state = IPC_STATE.lock();
+            for t in [0x10usize, 0x20, 0x30, 0x40] {
+                register_waiter_locked(&mut state, futex_key(a), t as *mut Task).expect("waiter");
+            }
+        }
+        // Wake one, move two, leave one behind.
+        assert_eq!(futex_requeue(a, b, 1, 2), 3);
+        assert_eq!(futex_waiter_count(a), 1);
+        assert_eq!(futex_waiter_count(b), 2);
+        assert_eq!(futex_wake(b, 8), 2);
+        assert_eq!(futex_wake(a, 8), 1);
+    }
+
+    #[test]
+    fn futex_wait_times_out_and_cleans_up() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let mut t = crate::task::Task::for_test(5);
+        let task = &mut t as *mut Task;
+        let addr = 0x5000u64;
+
+        // Host tests do not block, so the waiter is never woken: past the
+        // deadline that is a timeout.
+        TEST_NOW_TICKS.store(100, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(futex_wait(task, addr, Some(50)), Err(ETIMEDOUT));
+        assert_eq!(futex_waiter_count(addr), 0);
+
+        // Before the deadline (or with none) it is a spurious wakeup.
+        assert_eq!(futex_wait(task, addr, Some(500)), Ok(()));
+        assert_eq!(futex_wait(task, addr, None), Ok(()));
+        assert_eq!(futex_waiter_count(addr), 0);
+        TEST_NOW_TICKS.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn futex_wait_reports_signal_interruption() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let mut t = crate::task::Task::for_test(6);
+        let task = &mut t as *mut Task;
+        crate::signal::send(task, crate::signal::SIGTERM).expect("send");
+        assert_eq!(
+            futex_wait(task, 0x6000, None),
+            Err(crate::signal::ERESTARTSYS)
+        );
+        assert_eq!(
+            futex_wait(task, 0x6000, Some(u64::MAX)),
+            Err(crate::signal::EINTR)
+        );
     }
 }

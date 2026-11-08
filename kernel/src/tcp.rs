@@ -469,6 +469,12 @@ pub fn connect(dst_ip: &Ipv4Addr, dst_port: u16, timeout_ms: u64) -> Result<usiz
             return Err(NetError::Timeout);
         }
 
+        if crate::signal::current_wait_interrupted() {
+            unsafe {
+                CONNECTIONS[idx].reset();
+            }
+            return Err(NetError::Interrupted);
+        }
         crate::e1000::poll();
         check_retransmit(idx);
         arch_x86_64::pit::sleep_ms(1);
@@ -513,6 +519,9 @@ pub fn accept(listen_handle: usize, timeout_ms: u64) -> Result<usize, NetError> 
             return Err(NetError::Timeout);
         }
 
+if crate::signal::current_wait_interrupted() {
+            return Err(NetError::Interrupted);
+        }
         crate::e1000::poll();
         tick();
         arch_x86_64::pit::sleep_ms(1);
@@ -633,6 +642,9 @@ pub fn recv_timeout(
             return Err(NetError::Timeout);
         }
 
+if crate::signal::current_wait_interrupted() {
+            return Err(NetError::Interrupted);
+        }
         crate::e1000::poll();
         tick();
         arch_x86_64::pit::sleep_ms(1);

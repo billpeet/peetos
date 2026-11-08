@@ -91,7 +91,7 @@ Current implemented handlers:
   - `socketpair` baseline for `AF_UNIX` stream pairs
   - `sendmsg`/`recvmsg` baseline payload path for `AF_INET` and `AF_UNIX`
   - `SCM_RIGHTS` ancillary fd passing over `AF_UNIX` stream sockets
-- `futex` (`WAIT`/`WAKE` baseline ops only)
+- `futex` (`WAIT`/`WAKE` with timeouts, `WAIT_BITSET`/`WAKE_BITSET`, `REQUEUE`/`CMP_REQUEUE`)
 - `shmget/shmat/shmdt/shmctl(IPC_RMID)` via baseline in-kernel System V shared-memory segments
 - `access/faccessat/faccessat2` baseline path existence + permission checks
 - `umask(mask)` baseline process umask tracking (used by userspace runtime bring-up)
@@ -176,14 +176,14 @@ Limitations / Simplifications
 - User-mode page faults now resolve non-present `mmap` pages on demand; invalid faults are handled as fatal user faults (SIGSEGV-style exit path), with no `siginfo_t` fault payload/ucontext delivery yet.
 - VM mappings are currently constrained to a dedicated high user range managed by the kernel mmap allocator (used to avoid touching legacy low-memory bootstrap mappings).
 - `brk` still uses simple contiguous growth/shrink and does not yet integrate with full userspace allocator policies (no overcommit accounting, no guard-page policy).
-- `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.
+- `futex` has no `WAKE_OP`, priority-inheritance or robust-list support, and bitsets do not filter wakeups.
 - Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, and no permission enforcement. Attachments are inherited across `fork` and dropped on exit; `execve` does not detach them yet.
 - `execve` is intentionally narrow: `FD_CLOEXEC` teardown is now wired, but there is still no shebang/script loading, bounded `argv`/`envp` vector sizes, and no full Linux signal-reset semantics.
 - `arch_prctl` is intentionally narrow: only `ARCH_SET_FS` and `ARCH_GET_FS` are implemented; GS-base operations return `-EINVAL`.
 - `access`/`faccessat` semantics are baseline-only (no ACLs/capabilities, simplified effective-vs-real ID behavior).
 - Time-related syscalls currently derive from PIT uptime ticks; there is no realtime clock source or wall-clock synchronization.
 - `getcwd` uses bounded in-kernel directory traversal and does not yet have dedicated VFS reverse-path metadata.
-- Signal support remains simplified: delivery is syscall-boundary based and user handlers currently require `SA_RESTORER`; `sigaltstack`, queued RT signal payloads/`siginfo_t`, and full Linux ucontext semantics are not implemented yet.
+- Signal support: delivery is syscall-boundary based and user handlers require `SA_RESTORER`. Frames use the Linux `rt_sigframe` layout (`siginfo_t` + `ucontext_t` + FXSAVE image), signals 1..=64 work, and interrupted waits restart or fail with `EINTR` according to `SA_RESTART`. `sigaltstack` and queued real-time payloads are not implemented. See `docs/process_model.md`.
 - Several Toybox-relevant syscalls are still stubbed and return `-ENOSYS` pending VFS/metadata support (`fchmodat`, `fchownat`, `mknodat`, plus compatibility wrappers `utimes`/`futimesat`).
 
 **Module Layout**
@@ -194,7 +194,7 @@ Limitations / Simplifications
 - `file.rs`: path resolution, `open*`, metadata (`stat*`, `statfs`, `chmod`/`chown`, times), directory operations, `getdents64`, `truncate`/`sync`
 - `io.rs`: `read`/`write`/`readv`/`writev`/`pread64`/`pwrite64`/`lseek`/`copy_file_range`
 - `process.rs`: `fork`/`vfork`/`clone`, `execve`, `wait4`, `exit*`, ids and process groups, `arch_prctl`, `futex`
-- `signals.rs`: `kill`, `rt_sig*`, signal-frame install/restore (including FPU state), pending-signal delivery
+- `signals.rs`: `kill`/`tkill`/`tgkill`, `rt_sig*`, Linux `rt_sigframe` install/restore (including FPU state), pending-signal delivery and syscall restart
 - `ioctl.rs`: console, pty and framebuffer `ioctl`
 - `poll.rs`: `select`/`poll`/`ppoll` and epoll
 - `sockets.rs`: BSD sockets, `sendmsg`/`recvmsg`, `SCM_RIGHTS`

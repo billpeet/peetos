@@ -223,6 +223,8 @@ pub enum NetError {
     PortInUse,
     NoResources,
     ConnectionRefused,
+    /// A blocking wait was interrupted by a signal (or the task is exiting).
+    Interrupted,
 }
 
 #[cfg(test)]

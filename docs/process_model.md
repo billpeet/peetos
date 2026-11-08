@@ -1,8 +1,9 @@
-# Process Model: Copy-on-Write Fork and Thread Groups
+# Process Model: Fork, Threads and Signals
 
-This document covers how PeetOS creates processes and threads: copy-on-write
-`fork`, `clone(CLONE_THREAD)` thread groups (enough for musl pthreads), and
-how threads and processes exit.
+This document covers how PeetOS creates processes and threads (copy-on-write
+`fork` and `clone(CLONE_THREAD)` thread groups, enough for musl pthreads),
+how signals reach them and interrupt blocking syscalls, futex waits, and how
+threads and processes exit.
 
 **Where It Lives**
 - `kernel/src/memory/pmm.rs`: per-frame share counts (`page_share`, `page_is_shared`, refcount-aware `free_page`)
@@ -11,6 +12,7 @@ how threads and processes exit.
 - `kernel/src/syscall.rs`: `clone`/`fork` entry (`validate_clone_args`, `create_fork_child`, `create_thread_child`), exit paths, `wait4`, `kill`/`tkill`/`tgkill`, COW fault handling
 - `kernel/src/signal.rs`: process-directed delivery (`send_to_process`), `must_abort_wait`
 - `kernel/src/shm.rs`: shm inheritance across `fork` (`fork_attachments`)
+- `kernel/src/ipc.rs`: futex waits with deadlines and requeue; `kernel/src/sched.rs`: `block_until`
 - Test: `user/proc_model_smoke.c`, run by `make run-proc-smoke` (`tests/musl_ext2_proc_smoke.sh`)
 
 ## Copy-on-Write Fork
@@ -95,6 +97,48 @@ process (not the thread) as its parent.
   per process, not once per thread.
 - A default "terminate" action, or a fatal fault in any thread, ends the whole
   process.
+- Signals 1..=64 are supported, including the real-time range musl uses
+  internally (32 for timers, 33 for thread cancellation). Masks use the Linux
+  `sigset_t` layout (signal N is bit N-1). Real-time signals are not queued:
+  like classic signals, at most one instance of each is pending.
+- Handlers get a Linux-layout `rt_sigframe`: `siginfo_t` (`si_signo`,
+  `si_code` = `SI_USER` for `kill`, `SI_TKILL` for `tkill`/`tgkill`,
+  `SI_KERNEL` otherwise, and `si_pid`), and a `ucontext_t` with the
+  interrupted registers, signal mask and FXSAVE image. Changes a handler makes
+  to the `ucontext_t` (registers, `uc_sigmask`, FPU state) take effect at
+  `rt_sigreturn`; musl's `pthread_cancel` relies on this.
+- `SA_SIGINFO`, `SA_RESTART`, `SA_NODEFER` and `SA_RESETHAND` are honored.
+- Ignored signals that are not blocked are discarded when sent, as on Linux,
+  so they never wake or interrupt anything.
+
+## Interrupted Syscalls
+
+A signal that will run a handler or terminate the process interrupts blocking
+waits (pipes, tty/pty, input devices, sockets including TCP/UDP/ICMP, futex,
+`wait4`, `nanosleep`, `poll`/`select`/`epoll_wait`). Blocked and ignored
+signals do not. The wait returns the kernel-internal `ERESTARTSYS`, and on the
+way back to user mode:
+- if a handler runs and has `SA_RESTART`, or no handler runs, the syscall is
+  restarted (RIP is rewound over the 2-byte `syscall`/`int 0x80` and RAX gets
+  the syscall number back);
+- if a handler without `SA_RESTART` runs, the syscall fails with `EINTR`.
+
+Timed waits (`nanosleep`, timed futex waits, `poll`/`select`/`epoll_wait`)
+fail with `EINTR` instead of restarting; `nanosleep` reports the time left.
+Pipe writes that already moved data return the partial count.
+
+## Futex
+
+- `FUTEX_WAIT` takes an optional relative timeout and `FUTEX_WAIT_BITSET` an
+  absolute one (CLOCK_MONOTONIC and CLOCK_REALTIME share the PIT tick clock).
+  An expired wait fails with `ETIMEDOUT`; the kernel sleeps the task with a
+  deadline rather than polling.
+- `FUTEX_WAKE_BITSET` wakes like `FUTEX_WAKE`. Bitsets must be non-zero but do
+  not filter wakeups.
+- `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` wake some waiters and move others to
+  a second futex word without waking them.
+- `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME` are accepted. Other
+  operations (`WAKE_OP`, PI futexes) return `-ENOSYS`.
 
 ## Exit and Reaping
 
@@ -117,7 +161,12 @@ process (not the thread) as its parent.
   before its threads (e.g. the main thread called `pthread_exit`) is reaped
   only after the whole group is gone. Exited non-leader threads are freed
   automatically (`reap_exited_threads`) from fork, exit and `wait4` paths.
-- `execve` in a multi-threaded process first terminates the other threads.
+- `execve` in a multi-threaded process terminates the other threads once the
+  new image has been read (earlier failures such as `ENOENT` leave the
+  process untouched). If a non-leader thread calls `execve`, it first takes
+  over the leader's identity, as on Linux: it gets the process id and all
+  process-wide state (including the mmap table), and the old leader becomes
+  an ordinary thread that is terminated with the other siblings.
 
 Limitations / Simplifications
 - Single core only. Fork, COW resolution and thread bookkeeping rely on
@@ -127,20 +176,25 @@ Limitations / Simplifications
   `CLONE_SIGHAND` without `CLONE_THREAD` return `-EINVAL` (except the existing
   `CLONE_VM | CLONE_VFORK` compatibility path, which behaves as a COW fork:
   the parent is not suspended).
-- `execve` from a non-leader thread while other threads are alive returns
-  `-EINVAL`; the kernel does not move the process id to the exec'ing thread.
-- Threads blocked in socket calls (accept/recv/connect loops) do not notice
-  `exit_group` until those calls return on their own; until then the process
-  is not fully exited and cannot be reaped.
 - Signals are only delivered on syscall return, so a CPU-bound thread sees a
-  `kill()` late (process-wide exits still terminate it immediately).
+  `kill()` late (process-wide exits still terminate it immediately). Faults
+  are not delivered as `SIGSEGV`/`SIGBUS` to handlers; they end the process.
 - Pending signals are per thread only; there is no separate shared
-  (process-wide) pending set, and real-time/cancellation signals (32 and up,
-  e.g. musl's `pthread_cancel`) are not supported.
-- `futex` has no timeouts, requeue or robust lists, so timed waits
-  (`pthread_cond_timedwait`, `pthread_mutex_timedlock`) and robust mutexes
-  do not work.
-- `/proc` lists every thread as if it were a process.
+  (process-wide) pending set. Real-time signals are not queued and carry no
+  `sigqueue` payload.
+- `sigaltstack` is not implemented; `SA_ONSTACK` is accepted and ignored.
+- After `rt_sigreturn` through the SYSCALL path, RCX and R11 hold the restored
+  RIP and RFLAGS rather than their saved values (SYSRET returns through those
+  registers). Signals are only delivered at syscall boundaries, where the
+  `syscall` instruction has already clobbered them.
+- Futex bitsets do not filter wakeups, and there is no `FUTEX_WAKE_OP`,
+  priority inheritance or robust-list support (robust mutexes do not recover
+  from an owner's death).
+- Interrupted waits restart from scratch; there is no restart block, so a
+  restarted wait gets its full timeout again (only untimed waits restart).
+- `/proc` has no per-process entries (`/proc/<pid>`, `/proc/self/...` other
+  than the `readlink("/proc/self/exe")` special case), so it cannot be used to
+  list processes or threads.
 - CR0.WP is not set: kernel code that wrote to a user virtual address directly
   (instead of via `copy_user_bytes`) would bypass COW. All current paths use
   the physical map with an explicit COW break.

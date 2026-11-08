@@ -227,8 +227,8 @@ pub fn master_read(
                 state.entries[pty_id as usize].remove_master_waiter(task);
             }
         }
-        if crate::signal::must_abort_wait(task) {
-            return Err(EAGAIN);
+        if crate::signal::wait_interrupted(task) {
+            return Err(crate::signal::ERESTARTSYS);
         }
     }
 }
@@ -397,8 +397,8 @@ pub fn slave_read(
                 state.entries[pty_id as usize].tty.remove_waiter(task);
             }
         }
-        if crate::signal::must_abort_wait(task) {
-            return Err(EAGAIN);
+        if crate::signal::wait_interrupted(task) {
+            return Err(crate::signal::ERESTARTSYS);
         }
     }
 }

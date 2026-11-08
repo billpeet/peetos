@@ -1619,3 +1619,54 @@ fn clone_args_reject_kernel_tid_pointers() {
     };
     assert_eq!(validate_clone_args(&call), Err(-EFAULT));
 }
+
+fn sample_syscall_frame() -> SyscallFrame {
+    SyscallFrame {
+        r15: 15,
+        r14: 14,
+        r13: 13,
+        r12: 12,
+        rbp: 0xb0,
+        rbx: 0xb1,
+        r9: 9,
+        r8: 8,
+        r10: 10,
+        rdx: 0xd0,
+        rsi: 0x51,
+        rdi: 0xd1,
+        rax: 0,
+        r11: 0x246,
+        rcx: 0x40_1002,
+        rsp: 0x7fff_0000,
+    }
+}
+
+#[test]
+fn syscall_frame_gregs_roundtrip_through_ucontext() {
+    let frame = sample_syscall_frame();
+    let gregs = frame.to_gregs();
+    assert_eq!(gregs[REG_RIP], 0x40_1002, "RIP comes from the SYSCALL return address");
+    assert_eq!(gregs[REG_EFL], 0x246);
+    assert_eq!(gregs[REG_RDI], 0xd1);
+
+    // A handler may redirect execution (as musl's cancellation does) and
+    // try to set privileged RFLAGS bits; only user-modifiable bits survive.
+    let mut edited = gregs;
+    edited[REG_RIP] = 0x40_2000;
+    edited[REG_EFL] = 0x3000 | 0x100 | 0x1; // IOPL, TF, CF
+    let mut restored = sample_syscall_frame();
+    restored.load_gregs(&edited);
+    assert_eq!(restored.rcx, 0x40_2000);
+    assert_eq!(restored.r11, 0x202 | 0x1);
+    assert_eq!(restored.rdi, 0xd1);
+    assert_eq!(sanitize_rflags(0), 0x202);
+}
+
+#[test]
+fn restart_rewinds_over_the_syscall_instruction() {
+    let mut frame = sample_syscall_frame();
+    frame.rax = to_sysret(-ERESTARTSYS);
+    restart_syscall(&mut frame, SYS_READ);
+    assert_eq!(frame.rax, SYS_READ);
+    assert_eq!(frame.rcx, 0x40_1000);
+}

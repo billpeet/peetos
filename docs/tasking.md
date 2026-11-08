@@ -87,7 +87,7 @@ Limitations / Simplifications
 - `user_clear_tid` zeroing performs a best-effort futex wake for one waiter at thread exit (`pthread_join`); robust-list semantics are not implemented.
 - FPU/SSE switching is eager: every context switch pays one `FXSAVE` plus one `FXRSTOR`, even for kernel threads that never use the FPU. Lazy switching (`CR0.TS` + `#NM`) is not implemented.
 - Only the legacy 512-byte `FXSAVE` image is managed. `CR4.OSXSAVE`/`XSAVE` is not enabled, so AVX/AVX-512 state cannot be used by userspace at all (CPUID reports OSXSAVE=0, so well-behaved code falls back to SSE).
-- The signal-frame FPU image uses the PeetOS-private frame layout, not Linux's `ucontext_t`/`_fpstate`, so handlers cannot inspect or edit the interrupted FPU state through `ucontext`.
+- Signal frames carry the FXSAVE image through `uc_mcontext.fpregs` (Linux `_fpstate` layout for the legacy area); there is no XSAVE extended-state header.
 - `#XM`/`#MF` floating-point exceptions that userspace unmasks are not translated into `SIGFPE` with `FPE_*` codes.
 - Zombie processes are reaped by `wait4`; exited non-leader threads are reaped automatically. Orphaned children are not reparented to init, so their zombies are only reaped if the original parent waits for them.
 - Run queue operations are protected only by interrupt masking (single-core assumption).

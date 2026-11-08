@@ -559,8 +559,8 @@ pub fn read_device(
                 queue.remove_waiter(task);
             }
         }
-        if crate::signal::must_abort_wait(task) {
-            return Err(EAGAIN);
+        if crate::signal::wait_interrupted(task) {
+            return Err(crate::signal::ERESTARTSYS);
         }
     }
 }

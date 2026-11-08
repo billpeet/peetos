@@ -1,5 +1,5 @@
 use core::cmp;
-use core::mem::{size_of, MaybeUninit};
+use core::mem::{offset_of, size_of, MaybeUninit};
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -38,6 +38,9 @@ const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
 const EINTR: i64 = 4;
+/// Kernel-internal: a wait was interrupted by a signal. Never returned to
+/// userspace; turned into a restart or `EINTR` when signals are delivered.
+const ERESTARTSYS: i64 = signal::ERESTARTSYS;
 const EIO: i64 = 5;
 const ENXIO: i64 = 6;
 const E2BIG: i64 = 7;
@@ -360,8 +363,6 @@ const EXEC_MAX_ENVP: usize = 64;
 const EXEC_MAX_STR_LEN: usize = 256;
 const EXEC_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 const GETCWD_MAX_DEPTH: usize = 32;
-const SIGNAL_FRAME_MAGIC_SYSCALL: u64 = 0x5352_4653_5953_0001;
-const SIGNAL_FRAME_MAGIC_INT80: u64 = 0x5352_4649_3830_0001;
 const UTS_FIELD_LEN: usize = 65;
 const MMAP_MAX_REGIONS_PER_TASK: usize = 32;
 const MMAP_MAX_PAGES_PER_TASK: u64 = 8192;
@@ -1002,6 +1003,9 @@ fn ipc_to_errno(err: i64) -> i64 {
         ipc::EPIPE => EPIPE,
         ipc::EAGAIN => EAGAIN,
         ipc::ENOENT => ENOENT,
+        ipc::ETIMEDOUT => ETIMEDOUT,
+        signal::ERESTARTSYS => ERESTARTSYS,
+        signal::EINTR => EINTR,
         _ => EIO,
     }
 }
@@ -1131,59 +1135,107 @@ struct LinuxSigAction {
     sa_mask: u64,
 }
 
+// Linux x86-64 signal-frame ABI (`asm/sigcontext.h`, `asm/ucontext.h`,
+// `asm-generic/siginfo.h`). Handlers and libc (e.g. musl's thread
+// cancellation) read and edit these structures, so the layout must match.
+
+/// Number of general registers in `mcontext_t.gregs`.
+const NGREG: usize = 23;
+const REG_R8: usize = 0;
+const REG_R9: usize = 1;
+const REG_R10: usize = 2;
+const REG_R11: usize = 3;
+const REG_R12: usize = 4;
+const REG_R13: usize = 5;
+const REG_R14: usize = 6;
+const REG_R15: usize = 7;
+const REG_RDI: usize = 8;
+const REG_RSI: usize = 9;
+const REG_RBP: usize = 10;
+const REG_RBX: usize = 11;
+const REG_RDX: usize = 12;
+const REG_RAX: usize = 13;
+const REG_RCX: usize = 14;
+const REG_RSP: usize = 15;
+const REG_RIP: usize = 16;
+const REG_EFL: usize = 17;
+const REG_CSGSFS: usize = 18;
+
+const SS_DISABLE: i32 = 2;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct UserSignalFrameSyscall {
-    magic: u64,
-    saved_mask: u64,
-    signum: u64,
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    rbp: u64,
-    rbx: u64,
-    r9: u64,
-    r8: u64,
-    r10: u64,
-    rdx: u64,
-    rsi: u64,
-    rdi: u64,
-    rax: u64,
-    r11: u64,
-    rcx: u64,
-    rsp: u64,
-    fpu: FxSaveArea,
+struct LinuxSigInfo {
+    si_signo: i32,
+    si_errno: i32,
+    si_code: i32,
+    _pad0: i32,
+    si_pid: i32,
+    si_uid: u32,
+    _rest: [u64; 13],
+}
+
+impl LinuxSigInfo {
+    fn new(signum: u32, code: i32, sender: i32) -> Self {
+        Self {
+            si_signo: signum as i32,
+            si_errno: 0,
+            si_code: code,
+            _pad0: 0,
+            si_pid: sender,
+            si_uid: 0,
+            _rest: [0; 13],
+        }
+    }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct UserSignalFrameInt80 {
-    magic: u64,
-    saved_mask: u64,
-    signum: u64,
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    r11: u64,
-    r10: u64,
-    r9: u64,
-    r8: u64,
-    rbp: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    rcx: u64,
-    rbx: u64,
-    rax: u64,
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
-    fpu: FxSaveArea,
+struct LinuxStackT {
+    ss_sp: u64,
+    ss_flags: i32,
+    _pad: i32,
+    ss_size: u64,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxMcontext {
+    gregs: [u64; NGREG],
+    /// User address of the FXSAVE image, or 0.
+    fpregs: u64,
+    reserved: [u64; 8],
+}
+
+/// Kernel `struct ucontext` (the kernel sigset is the 8-byte prefix of
+/// libc's larger `uc_sigmask`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxUcontext {
+    uc_flags: u64,
+    uc_link: u64,
+    uc_stack: LinuxStackT,
+    uc_mcontext: LinuxMcontext,
+    uc_sigmask: u64,
+}
+
+/// `struct rt_sigframe`: what RSP points at when a handler starts.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxRtSigFrame {
+    pretcode: u64,
+    uc: LinuxUcontext,
+    info: LinuxSigInfo,
+}
+
+const _: () = {
+    assert!(size_of::<LinuxSigInfo>() == 128);
+    assert!(size_of::<LinuxMcontext>() == 256);
+    assert!(offset_of!(LinuxUcontext, uc_mcontext) == 40);
+    assert!(offset_of!(LinuxUcontext, uc_sigmask) == 296);
+    assert!(offset_of!(LinuxRtSigFrame, uc) == 8);
+    assert!(offset_of!(LinuxRtSigFrame, info) == 312);
+};
 
 impl LinuxStat {
     fn from_fs(stat: fs::FileStat) -> Self {
@@ -1326,15 +1378,16 @@ pub fn init() {
 #[no_mangle]
 pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
     let ctx = SyscallContext::new(task::current());
+    let nr = frame.rax;
     if frame.rax == SYS_RT_SIGRETURN {
         if !ctx.is_user_task() {
             return to_sysret(-EPERM);
         }
-        let restore = restore_user_signal_frame_syscall(ctx.current, frame);
+        let restore = restore_rt_signal_frame(ctx.current, frame);
         if restore < 0 {
             return to_sysret(restore);
         }
-        if let Some(ret) = apply_pending_signals_syscall(frame) {
+        if let Some(ret) = apply_pending_signals_syscall(frame, None) {
             frame.rax = to_sysret(ret);
         }
         return frame.rax;
@@ -1354,7 +1407,7 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
             }
             Err(err) => {
                 frame.rax = to_sysret(err);
-                if let Some(ret) = apply_pending_signals_syscall(frame) {
+                if let Some(ret) = apply_pending_signals_syscall(frame, Some(nr)) {
                     frame.rax = to_sysret(ret);
                 }
                 return frame.rax;
@@ -1371,7 +1424,7 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
                 Ok(req) => req,
                 Err(err) => {
                     frame.rax = to_sysret(err);
-                    if let Some(ret) = apply_pending_signals_syscall(frame) {
+                    if let Some(ret) = apply_pending_signals_syscall(frame, Some(nr)) {
                         frame.rax = to_sysret(ret);
                     }
                     return frame.rax;
@@ -1381,7 +1434,7 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
                 Ok(child_frame) => child_frame,
                 Err(err) => {
                     frame.rax = to_sysret(err);
-                    if let Some(ret) = apply_pending_signals_syscall(frame) {
+                    if let Some(ret) = apply_pending_signals_syscall(frame, Some(nr)) {
                         frame.rax = to_sysret(ret);
                     }
                     return frame.rax;
@@ -1396,7 +1449,7 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
             Ok(pid) => pid,
             Err(err) => err,
         });
-        if let Some(ret) = apply_pending_signals_syscall(frame) {
+        if let Some(ret) = apply_pending_signals_syscall(frame, Some(nr)) {
             frame.rax = to_sysret(ret);
         }
         return frame.rax;
@@ -1404,7 +1457,7 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
 
     let result = dispatch_syscall(call_from_syscall_frame(frame));
     frame.rax = to_sysret(result);
-    if let Some(ret) = apply_pending_signals_syscall(frame) {
+    if let Some(ret) = apply_pending_signals_syscall(frame, Some(nr)) {
         frame.rax = to_sysret(ret);
     }
     frame.rax
@@ -1412,18 +1465,19 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
 
 pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
     let ctx = SyscallContext::new(task::current());
+    let nr = frame.rax;
     if frame.rax == SYS_RT_SIGRETURN {
         frame.rax = if !ctx.is_user_task() {
             to_sysret(-EPERM)
         } else {
-            let restore = restore_user_signal_frame_int80(ctx.current, frame);
+            let restore = restore_rt_signal_frame(ctx.current, frame);
             if restore < 0 {
                 to_sysret(restore)
             } else {
                 frame.rax
             }
         };
-        if let Some(ret) = apply_pending_signals_int80(frame) {
+        if let Some(ret) = apply_pending_signals_int80(frame, None) {
             frame.rax = to_sysret(ret);
         }
         return;
@@ -1443,7 +1497,7 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
                 Err(err) => to_sysret(err),
             }
         };
-        if let Some(ret) = apply_pending_signals_int80(frame) {
+        if let Some(ret) = apply_pending_signals_int80(frame, Some(nr)) {
             frame.rax = to_sysret(ret);
         }
         return;
@@ -1457,7 +1511,7 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
                 Ok(req) => req,
                 Err(err) => {
                     frame.rax = to_sysret(err);
-                    if let Some(ret) = apply_pending_signals_int80(frame) {
+                    if let Some(ret) = apply_pending_signals_int80(frame, Some(nr)) {
                         frame.rax = to_sysret(ret);
                     }
                     return;
@@ -1467,7 +1521,7 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
                 Ok(child_frame) => child_frame,
                 Err(err) => {
                     frame.rax = to_sysret(err);
-                    if let Some(ret) = apply_pending_signals_int80(frame) {
+                    if let Some(ret) = apply_pending_signals_int80(frame, Some(nr)) {
                         frame.rax = to_sysret(ret);
                     }
                     return;
@@ -1486,14 +1540,14 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
                 Err(err) => err,
             })
         };
-        if let Some(ret) = apply_pending_signals_int80(frame) {
+        if let Some(ret) = apply_pending_signals_int80(frame, Some(nr)) {
             frame.rax = to_sysret(ret);
         }
         return;
     }
 
     frame.rax = to_sysret(dispatch_syscall(call_from_int80_frame(frame)));
-    if let Some(ret) = apply_pending_signals_int80(frame) {
+    if let Some(ret) = apply_pending_signals_int80(frame, Some(nr)) {
         frame.rax = to_sysret(ret);
     }
 }

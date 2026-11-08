@@ -39,8 +39,9 @@ This document describes the current baseline IPC/synchronization implementation 
 - `pipe_close()` decrements read/write endpoint counts and wakes blocked peers.
 
 **Futex**
-- `futex_wait(task, addr)` registers a waiter keyed by user address and blocks.
+- `futex_wait(task, addr, deadline)` registers a waiter keyed by user address and blocks, optionally until a PIT-tick deadline (`ETIMEDOUT`). A signal interrupts the wait (`EINTR` when timed, `ERESTARTSYS` otherwise).
 - `futex_wake(addr, count)` wakes up to `count` waiters for that address.
+- `futex_requeue(addr, addr2, nr_wake, nr_requeue)` wakes some waiters and moves others to `addr2`.
 - `remove_task_waiters(task)` removes stale waiters during task teardown.
 
 **Shared Memory (System V Baseline)**
@@ -141,10 +142,10 @@ Limitations / Simplifications
 - Single-core assumptions still apply; synchronization is designed for current non-SMP kernel flow.
 - IPC capacities are static (`IPC_MAX_PIPES`, `IPC_MAX_WAITERS`, fixed pipe buffer size).
 - Pipe semantics are baseline only: `O_NONBLOCK` plus `poll`/`select`/`epoll` integration are now supported, but there is still no `splice`/`tee`.
-- Futex support is limited to `FUTEX_WAIT`/`FUTEX_WAKE` with no timeout, bitset, requeue, priority inheritance, or robust-list handling.
-- Shared memory is a baseline System V subset only: no permission checks, no `IPC_STAT`/`IPC_SET`, no `SHM_REMAP`/`SHM_EXEC`, and no `fork`/`exec` inheritance semantics yet.
+- Futex support covers `WAIT`/`WAKE` (with timeouts), `WAIT_BITSET`/`WAKE_BITSET` (bitsets not used for filtering) and `REQUEUE`/`CMP_REQUEUE`; there is no `WAKE_OP`, priority inheritance or robust-list handling. See `docs/process_model.md`.
+- Shared memory is a baseline System V subset only: no permission checks, no `IPC_STAT`/`IPC_SET`, no `SHM_REMAP`/`SHM_EXEC`. Attachments are inherited by `fork`; `execve` does not detach them yet.
 - `memfd_create` is baseline-only: tmpfs-backed internal-path objects, no sealing (`F_ADD_SEALS`/`F_GET_SEALS`) support yet, no hugepage variants, and per-task shared-buffer object caps (`16`) are enforced.
-- Signal handling is baseline-grade only: delivery is limited to syscall-return boundaries and requires `SA_RESTORER`; no alternate signal stacks, queued realtime signal payloads, `siginfo_t`, or full ucontext semantics are implemented yet.
+- Signal handling: delivery happens at syscall-return boundaries and requires `SA_RESTORER`. Handlers get a Linux `rt_sigframe` (`siginfo_t`, `ucontext_t`), signals 1..=64 are supported, and blocking waits are interrupted with `SA_RESTART`-aware restart. There are no alternate signal stacks or queued real-time payloads. See `docs/process_model.md`.
 - Unix ancillary coverage is baseline-only:
   - `SCM_RIGHTS` is implemented, but `SCM_CREDENTIALS` is not
   - ancillary/data atomicity is simplified for stream sockets

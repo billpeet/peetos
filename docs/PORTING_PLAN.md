@@ -26,6 +26,10 @@ current Rust kernel implementation and forward roadmap.
   `clone(CLONE_THREAD)` thread groups run musl pthreads (mutexes, condvars,
   TLS, join, `tgkill`, process-wide exit). Covered by `make run-proc-smoke`;
   see `docs/process_model.md`.
+- Signals follow the Linux ABI: `rt_sigframe` with `siginfo_t`/`ucontext_t`,
+  signals 1..=64, `SA_RESTART`-aware syscall restart for interrupted waits,
+  futex timeouts and requeue. musl `pthread_cancel`,
+  `pthread_cond_timedwait` and `execve` from any thread work.
 - ELF loading supports `ET_EXEC` + `ET_DYN` bootstrap paths with `PT_INTERP`
   handoff and hardened segment validation.
 - Table-driven syscall dispatch is active across SYSCALL/int80 paths.
@@ -127,9 +131,9 @@ current Rust kernel implementation and forward roadmap.
 
 ### 1. Process and Runtime Semantics
 
-- Finish thread semantics on top of the new thread groups: futex timeouts/requeue/robust lists, a shared process-wide pending-signal set, real-time and cancellation signals, `execve` from non-leader threads, and socket waits that notice `exit_group`.
+- Remaining thread/signal gaps: robust futex lists and `FUTEX_WAKE_OP`, a shared process-wide pending-signal set, queued real-time payloads, `sigaltstack`, and fault delivery as `SIGSEGV`/`SIGBUS` to handlers.
+- Per-process `/proc` entries (`/proc/<pid>/{stat,status,cmdline}`, `/proc/self`, `task/` for threads) so `ps`-style tools work.
 - Harden job-control and controlling-tty behavior beyond current baseline.
-- Expand signal semantics (`sigaltstack`, richer `siginfo_t`/ucontext behavior including a Linux-compatible `_fpstate`, queued RT payloads).
 - Add `XSAVE`/AVX state support if userspace workloads need AVX (today only the legacy `FXSAVE` image is managed and `CR4.OSXSAVE` stays off).
 - Finish dynamic-linker/runtime completeness beyond current bootstrap path
   (relocations/symbol resolution and broader compatibility).

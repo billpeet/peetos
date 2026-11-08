@@ -238,6 +238,9 @@ pub fn socket_recv_timeout(
         if (pit::uptime_ms() - start) >= timeout_ms {
             return Err(NetError::Timeout);
         }
+if crate::signal::current_wait_interrupted() {
+            return Err(NetError::Interrupted);
+        }
         crate::e1000::poll();
         pit::sleep_ms(1);
     }

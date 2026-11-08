@@ -47,6 +47,8 @@ const ENOMEM: i64 = 12;
 const ENOENT: i64 = 2;
 const ENOTDIR: i64 = 20;
 const EINVAL: i64 = 22;
+/// Kernel-internal: wait interrupted by a signal (see `signal::ERESTARTSYS`).
+const ERESTARTSYS: i64 = crate::signal::ERESTARTSYS;
 const EROFS: i64 = 30;
 const ENOTSOCK: i64 = 88;
 const EPROTONOSUPPORT: i64 = 93;
@@ -237,6 +239,7 @@ fn net_to_errno(err: NetError) -> i64 {
         NetError::PortInUse => EADDRINUSE,
         NetError::NoResources => ENOMEM,
         NetError::ConnectionRefused => ECONNREFUSED,
+        NetError::Interrupted => ERESTARTSYS,
     }
 }
 
@@ -615,16 +618,22 @@ fn unix_notify_peer_closed(id: u16) {
     }
 }
 
+/// Let other tasks run while a socket call waits. Returns true when the wait
+/// must end because a signal arrived or the task is exiting; the caller then
+/// fails with `-ERESTARTSYS`.
 #[cfg(not(test))]
 #[inline]
-fn socket_block_yield() {
+fn socket_block_yield() -> bool {
     crate::net::poll();
     crate::sched::yield_now();
+    crate::signal::current_wait_interrupted()
 }
 
 #[cfg(test)]
 #[inline]
-fn socket_block_yield() {}
+fn socket_block_yield() -> bool {
+    false
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -921,7 +930,9 @@ pub fn socket_connect_unix(id: u16, path: &[u8], nonblocking: bool) -> Result<()
             {
                 loop {
                     if listener.unix_accept_q_len as usize >= UNIX_ACCEPT_QUEUE_SIZE {
-                        socket_block_yield();
+                        if socket_block_yield() {
+                            return Err(-ERESTARTSYS);
+                        }
                         let refresh = &mut *sockets.add(listener_idx);
                         if refresh.unix_accept_q_len as usize >= UNIX_ACCEPT_QUEUE_SIZE {
                             continue;
@@ -1067,7 +1078,9 @@ pub fn socket_accept_unix(id: u16, nonblocking: bool) -> Result<u16, i64> {
         }
         #[cfg(not(test))]
         {
-            socket_block_yield();
+            if socket_block_yield() {
+                return Err(-ERESTARTSYS);
+            }
         }
     }
 }
@@ -1178,7 +1191,9 @@ pub fn socket_send_rights(id: u16, fds: &[UnixRightsFd], nonblocking: bool) -> R
                 }
                 #[cfg(not(test))]
                 {
-                    socket_block_yield();
+                    if socket_block_yield() {
+                        return Err(-ERESTARTSYS);
+                    }
                 }
             }
             other => return other,
@@ -1231,7 +1246,9 @@ pub fn socket_send(id: u16, data: &[u8], nonblocking: bool) -> Result<usize, i64
                     }
                     #[cfg(not(test))]
                     {
-                        socket_block_yield();
+                        if socket_block_yield() {
+                            return Err(-ERESTARTSYS);
+                        }
                     }
                 }
                 other => return other,
@@ -1341,7 +1358,9 @@ pub fn socket_recv(id: u16, buf: &mut [u8], nonblocking: bool) -> Result<usize, 
                     }
                     #[cfg(not(test))]
                     {
-                        socket_block_yield();
+                        if socket_block_yield() {
+                            return Err(-ERESTARTSYS);
+                        }
                     }
                 }
                 other => return other,
@@ -1437,7 +1456,9 @@ pub fn socket_recvfrom(
                     }
                     #[cfg(not(test))]
                     {
-                        socket_block_yield();
+                        if socket_block_yield() {
+                            return Err(-ERESTARTSYS);
+                        }
                     }
                 }
                 other => return other.map(|n| (n, Ipv4Addr::ZERO, 0)),

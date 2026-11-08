@@ -26,7 +26,16 @@ pub(super) fn write_sigaction_to_user(
     copy_to_user_task(task_ptr, user_dst, bytes)
 }
 
-pub(super) fn sys_kill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+/// Process id reported as the sender in `siginfo_t`.
+fn sender_pid(ctx: &SyscallContext) -> i32 {
+    if ctx.current.is_null() {
+        0
+    } else {
+        unsafe { (*ctx.current).tgid }
+    }
+}
+
+pub(super) fn sys_kill(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let pid = call.arg(0) as i64;
     let sig = call.arg(1) as i64;
 
@@ -47,7 +56,7 @@ pub(super) fn sys_kill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return 0;
     }
 
-    match signal::send_to_process(target, sig as u32) {
+    match signal::send_to_process_with_info(target, sig as u32, signal::SI_USER, sender_pid(ctx)) {
         Ok(()) => 0,
         Err(err) => -signal_to_errno(err),
     }
@@ -57,8 +66,8 @@ pub(super) fn group_has_live_thread(t: *mut task::Task) -> bool {
     task::live_threads_in_group(unsafe { (*t).tgid }) > 0
 }
 
-/// Send `sig` to one specific thread.
-pub(super) fn signal_thread(target: *mut task::Task, sig: i64) -> i64 {
+/// Send `sig` to one specific thread (tkill/tgkill).
+pub(super) fn signal_thread(ctx: &SyscallContext, target: *mut task::Task, sig: i64) -> i64 {
     if target.is_null() || !task::is_live(target) {
         return -ESRCH;
     }
@@ -68,21 +77,21 @@ pub(super) fn signal_thread(target: *mut task::Task, sig: i64) -> i64 {
     if sig == 0 {
         return 0;
     }
-    match signal::send(target, sig as u32) {
+    match signal::send_with_info(target, sig as u32, signal::SI_TKILL, sender_pid(ctx)) {
         Ok(()) => 0,
         Err(err) => -signal_to_errno(err),
     }
 }
 
-pub(super) fn sys_tkill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+pub(super) fn sys_tkill(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let tid = call.arg(0) as i64;
     if tid <= 0 || tid > i32::MAX as i64 {
         return -EINVAL;
     }
-    signal_thread(task::get_by_pid(tid as i32), call.arg(1) as i64)
+    signal_thread(ctx, task::get_by_pid(tid as i32), call.arg(1) as i64)
 }
 
-pub(super) fn sys_tgkill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+pub(super) fn sys_tgkill(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let tgid = call.arg(0) as i64;
     let tid = call.arg(1) as i64;
     if tgid <= 0 || tid <= 0 || tgid > i32::MAX as i64 || tid > i32::MAX as i64 {
@@ -92,7 +101,7 @@ pub(super) fn sys_tgkill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if target.is_null() || unsafe { (*target).tgid } != tgid as i32 {
         return -ESRCH;
     }
-    signal_thread(target, call.arg(2) as i64)
+    signal_thread(ctx, target, call.arg(2) as i64)
 }
 
 pub(super) fn sys_rt_sigaction(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -176,179 +185,276 @@ pub(super) fn sys_rt_sigreturn(_ctx: &SyscallContext, _call: &SyscallArgs) -> i6
     -ENOSYS
 }
 
-pub(super) fn install_user_signal_frame_syscall(
+// ---------------------------------------------------------------------------
+// Linux-compatible signal frames
+// ---------------------------------------------------------------------------
+
+/// Register state a syscall returns to, abstracted over the SYSCALL and
+/// `int 0x80` entry frames so delivery, `rt_sigreturn` and syscall restart are
+/// written once.
+pub(super) trait UserRegs {
+    fn to_gregs(&self) -> [u64; NGREG];
+    /// Load registers from a (user-controlled) `ucontext`. Segment selectors
+    /// are forced to user values and RFLAGS is sanitized.
+    fn load_gregs(&mut self, gregs: &[u64; NGREG]);
+    fn rip(&self) -> u64;
+    fn set_rip(&mut self, rip: u64);
+    fn result(&self) -> u64;
+    fn set_result(&mut self, value: u64);
+    fn rsp(&self) -> u64;
+    fn enter_handler(&mut self, rip: u64, rsp: u64, args: [u64; 3]);
+}
+
+/// RFLAGS bits a signal handler may change through `uc_mcontext`
+/// (CF, PF, AF, ZF, SF, DF, OF, AC). IF and the reserved bit 1 are forced.
+const USER_RFLAGS_MASK: u64 = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x400 | 0x800 | 0x4_0000;
+
+pub(super) fn sanitize_rflags(rflags: u64) -> u64 {
+    (rflags & USER_RFLAGS_MASK) | 0x202
+}
+
+fn user_csgsfs() -> u64 {
+    (gdt::USER_CS as u64) | ((gdt::USER_DS as u64) << 48)
+}
+
+impl UserRegs for SyscallFrame {
+    fn to_gregs(&self) -> [u64; NGREG] {
+        let mut g = [0u64; NGREG];
+        g[REG_R8] = self.r8;
+        g[REG_R9] = self.r9;
+        g[REG_R10] = self.r10;
+        g[REG_R11] = self.r11;
+        g[REG_R12] = self.r12;
+        g[REG_R13] = self.r13;
+        g[REG_R14] = self.r14;
+        g[REG_R15] = self.r15;
+        g[REG_RDI] = self.rdi;
+        g[REG_RSI] = self.rsi;
+        g[REG_RBP] = self.rbp;
+        g[REG_RBX] = self.rbx;
+        g[REG_RDX] = self.rdx;
+        g[REG_RAX] = self.rax;
+        g[REG_RCX] = self.rcx;
+        g[REG_RSP] = self.rsp;
+        // SYSCALL saved the return address in RCX and RFLAGS in R11.
+        g[REG_RIP] = self.rcx;
+        g[REG_EFL] = self.r11;
+        g[REG_CSGSFS] = user_csgsfs();
+        g
+    }
+
+    fn load_gregs(&mut self, g: &[u64; NGREG]) {
+        self.r8 = g[REG_R8];
+        self.r9 = g[REG_R9];
+        self.r10 = g[REG_R10];
+        self.r12 = g[REG_R12];
+        self.r13 = g[REG_R13];
+        self.r14 = g[REG_R14];
+        self.r15 = g[REG_R15];
+        self.rdi = g[REG_RDI];
+        self.rsi = g[REG_RSI];
+        self.rbp = g[REG_RBP];
+        self.rbx = g[REG_RBX];
+        self.rdx = g[REG_RDX];
+        self.rax = g[REG_RAX];
+        self.rsp = g[REG_RSP];
+        // SYSRET returns through RCX/R11, so their own values cannot be
+        // restored on this path (they are clobbered by `syscall` anyway).
+        self.rcx = g[REG_RIP];
+        self.r11 = sanitize_rflags(g[REG_EFL]);
+    }
+
+    fn rip(&self) -> u64 {
+        self.rcx
+    }
+    fn set_rip(&mut self, rip: u64) {
+        self.rcx = rip;
+    }
+    fn result(&self) -> u64 {
+        self.rax
+    }
+    fn set_result(&mut self, value: u64) {
+        self.rax = value;
+    }
+    fn rsp(&self) -> u64 {
+        self.rsp
+    }
+    fn enter_handler(&mut self, rip: u64, rsp: u64, args: [u64; 3]) {
+        self.rcx = rip;
+        self.rsp = rsp;
+        self.rdi = args[0];
+        self.rsi = args[1];
+        self.rdx = args[2];
+        self.rax = 0;
+    }
+}
+
+impl UserRegs for InterruptFrame {
+    fn to_gregs(&self) -> [u64; NGREG] {
+        let mut g = [0u64; NGREG];
+        g[REG_R8] = self.r8;
+        g[REG_R9] = self.r9;
+        g[REG_R10] = self.r10;
+        g[REG_R11] = self.r11;
+        g[REG_R12] = self.r12;
+        g[REG_R13] = self.r13;
+        g[REG_R14] = self.r14;
+        g[REG_R15] = self.r15;
+        g[REG_RDI] = self.rdi;
+        g[REG_RSI] = self.rsi;
+        g[REG_RBP] = self.rbp;
+        g[REG_RBX] = self.rbx;
+        g[REG_RDX] = self.rdx;
+        g[REG_RAX] = self.rax;
+        g[REG_RCX] = self.rcx;
+        g[REG_RSP] = self.rsp;
+        g[REG_RIP] = self.rip;
+        g[REG_EFL] = self.rflags;
+        g[REG_CSGSFS] = user_csgsfs();
+        g
+    }
+
+    fn load_gregs(&mut self, g: &[u64; NGREG]) {
+        self.r8 = g[REG_R8];
+        self.r9 = g[REG_R9];
+        self.r10 = g[REG_R10];
+        self.r11 = g[REG_R11];
+        self.r12 = g[REG_R12];
+        self.r13 = g[REG_R13];
+        self.r14 = g[REG_R14];
+        self.r15 = g[REG_R15];
+        self.rdi = g[REG_RDI];
+        self.rsi = g[REG_RSI];
+        self.rbp = g[REG_RBP];
+        self.rbx = g[REG_RBX];
+        self.rdx = g[REG_RDX];
+        self.rax = g[REG_RAX];
+        self.rcx = g[REG_RCX];
+        self.rsp = g[REG_RSP];
+        self.rip = g[REG_RIP];
+        self.rflags = sanitize_rflags(g[REG_EFL]);
+        self.cs = gdt::USER_CS as u64;
+        self.ss = gdt::USER_DS as u64;
+    }
+
+    fn rip(&self) -> u64 {
+        self.rip
+    }
+    fn set_rip(&mut self, rip: u64) {
+        self.rip = rip;
+    }
+    fn result(&self) -> u64 {
+        self.rax
+    }
+    fn set_result(&mut self, value: u64) {
+        self.rax = value;
+    }
+    fn rsp(&self) -> u64 {
+        self.rsp
+    }
+    fn enter_handler(&mut self, rip: u64, rsp: u64, args: [u64; 3]) {
+        self.rip = rip;
+        self.rsp = rsp;
+        self.rdi = args[0];
+        self.rsi = args[1];
+        self.rdx = args[2];
+        self.rax = 0;
+    }
+}
+
+/// Bytes below the interrupted stack pointer that the SysV ABI lets leaf
+/// code use without adjusting RSP; the signal frame must not overwrite them.
+const SIGNAL_RED_ZONE: u64 = 128;
+
+/// Push a Linux `rt_sigframe` (return address, `ucontext_t`, `siginfo_t`,
+/// FXSAVE area) on the user stack and redirect `regs` into the handler.
+pub(super) fn install_rt_signal_frame<R: UserRegs>(
     task_ptr: *mut task::Task,
-    frame: &mut SyscallFrame,
+    regs: &mut R,
     delivery: signal::UserDelivery,
 ) -> Result<(), i64> {
-    let frame_size = size_of::<UserSignalFrameSyscall>() as u64;
-    let frame_rsp = frame.rsp.checked_sub(frame_size).ok_or(EFAULT)?;
-    let frame_rsp = align_down(frame_rsp, 16);
-    let return_rsp = frame_rsp
-        .checked_sub(size_of::<u64>() as u64)
-        .ok_or(EFAULT)?;
+    let mut sp = regs.rsp().checked_sub(SIGNAL_RED_ZONE).ok_or(EFAULT)?;
 
-    let signal_frame = UserSignalFrameSyscall {
-        magic: SIGNAL_FRAME_MAGIC_SYSCALL,
-        saved_mask: delivery.saved_mask,
-        signum: delivery.signum as u64,
-        r15: frame.r15,
-        r14: frame.r14,
-        r13: frame.r13,
-        r12: frame.r12,
-        rbp: frame.rbp,
-        rbx: frame.rbx,
-        r9: frame.r9,
-        r8: frame.r8,
-        r10: frame.r10,
-        rdx: frame.rdx,
-        rsi: frame.rsi,
-        rdi: frame.rdi,
-        rax: frame.rax,
-        r11: frame.r11,
-        rcx: frame.rcx,
-        rsp: frame.rsp,
-        fpu: capture_user_fpu(),
+    // FPU/SSE state, 64-byte aligned above the frame (as Linux does).
+    sp = sp.checked_sub(size_of::<FxSaveArea>() as u64).ok_or(EFAULT)?;
+    sp = align_down(sp, 64);
+    let fpstate_addr = sp;
+    write_struct_to_user(task_ptr, fpstate_addr, &capture_user_fpu())?;
+
+    // The frame starts with the return address, so at handler entry
+    // RSP + 8 is 16-byte aligned, exactly as after a `call`.
+    sp = sp.checked_sub(size_of::<LinuxRtSigFrame>() as u64).ok_or(EFAULT)?;
+    sp = align_down(sp, 16).checked_sub(8).ok_or(EFAULT)?;
+    if !user_range_ok(sp, size_of::<LinuxRtSigFrame>()) {
+        return Err(EFAULT);
+    }
+
+    let frame = LinuxRtSigFrame {
+        pretcode: delivery.restorer,
+        uc: LinuxUcontext {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack: LinuxStackT {
+                ss_sp: 0,
+                ss_flags: SS_DISABLE,
+                _pad: 0,
+                ss_size: 0,
+            },
+            uc_mcontext: LinuxMcontext {
+                gregs: regs.to_gregs(),
+                fpregs: fpstate_addr,
+                reserved: [0; 8],
+            },
+            uc_sigmask: delivery.saved_mask,
+        },
+        info: LinuxSigInfo::new(delivery.signum, delivery.code, delivery.sender),
     };
-
-    write_struct_to_user(task_ptr, frame_rsp, &signal_frame)?;
-    write_u64_to_user(task_ptr, return_rsp, delivery.restorer)?;
+    write_struct_to_user(task_ptr, sp, &frame)?;
 
     // Like Linux, the handler starts from a clean FPU/SSE state.
     fpu::reset_current();
-    frame.rcx = delivery.handler;
-    frame.rsp = return_rsp;
-    frame.rdi = delivery.signum as u64;
+    let info_addr = sp + offset_of!(LinuxRtSigFrame, info) as u64;
+    let uc_addr = sp + offset_of!(LinuxRtSigFrame, uc) as u64;
+    regs.enter_handler(
+        delivery.handler,
+        sp,
+        [delivery.signum as u64, info_addr, uc_addr],
+    );
     Ok(())
 }
 
-pub(super) fn install_user_signal_frame_int80(
+/// `rt_sigreturn`: the restorer's `ret` already popped `pretcode`, so the
+/// `ucontext_t` sits at the current user RSP. Registers, the signal mask and
+/// FPU state come back from it, including any edits the handler made.
+pub(super) fn restore_rt_signal_frame<R: UserRegs>(
     task_ptr: *mut task::Task,
-    frame: &mut InterruptFrame,
-    delivery: signal::UserDelivery,
-) -> Result<(), i64> {
-    let frame_size = size_of::<UserSignalFrameInt80>() as u64;
-    let frame_rsp = frame.rsp.checked_sub(frame_size).ok_or(EFAULT)?;
-    let frame_rsp = align_down(frame_rsp, 16);
-    let return_rsp = frame_rsp
-        .checked_sub(size_of::<u64>() as u64)
-        .ok_or(EFAULT)?;
-
-    let signal_frame = UserSignalFrameInt80 {
-        magic: SIGNAL_FRAME_MAGIC_INT80,
-        saved_mask: delivery.saved_mask,
-        signum: delivery.signum as u64,
-        r15: frame.r15,
-        r14: frame.r14,
-        r13: frame.r13,
-        r12: frame.r12,
-        r11: frame.r11,
-        r10: frame.r10,
-        r9: frame.r9,
-        r8: frame.r8,
-        rbp: frame.rbp,
-        rdi: frame.rdi,
-        rsi: frame.rsi,
-        rdx: frame.rdx,
-        rcx: frame.rcx,
-        rbx: frame.rbx,
-        rax: frame.rax,
-        rip: frame.rip,
-        cs: frame.cs,
-        rflags: frame.rflags,
-        rsp: frame.rsp,
-        ss: frame.ss,
-        fpu: capture_user_fpu(),
-    };
-
-    write_struct_to_user(task_ptr, frame_rsp, &signal_frame)?;
-    write_u64_to_user(task_ptr, return_rsp, delivery.restorer)?;
-
-    // Like Linux, the handler starts from a clean FPU/SSE state.
-    fpu::reset_current();
-    frame.rip = delivery.handler;
-    frame.rsp = return_rsp;
-    frame.rdi = delivery.signum as u64;
-    Ok(())
-}
-
-pub(super) fn restore_user_signal_frame_syscall(
-    task_ptr: *mut task::Task,
-    frame: &mut SyscallFrame,
+    regs: &mut R,
 ) -> i64 {
-    let signal_frame = match read_struct_from_user::<UserSignalFrameSyscall>(task_ptr, frame.rsp) {
-        Ok(signal_frame) => signal_frame,
+    let uc = match read_struct_from_user::<LinuxUcontext>(task_ptr, regs.rsp()) {
+        Ok(uc) => uc,
         Err(err) => return -err,
     };
-    if signal_frame.magic != SIGNAL_FRAME_MAGIC_SYSCALL {
-        return -EINVAL;
-    }
-    if !user_range_ok(signal_frame.rsp, 1) || !user_range_ok(signal_frame.rcx, 1) {
+    let gregs = uc.uc_mcontext.gregs;
+    if !user_range_ok(gregs[REG_RSP], 1) || !user_range_ok(gregs[REG_RIP], 1) {
         return -EFAULT;
     }
-    if let Err(err) = signal::restore_mask(task_ptr, signal_frame.saved_mask) {
+    let fpstate = if uc.uc_mcontext.fpregs != 0 {
+        match read_struct_from_user::<FxSaveArea>(task_ptr, uc.uc_mcontext.fpregs) {
+            Ok(area) => Some(area),
+            Err(err) => return -err,
+        }
+    } else {
+        None
+    };
+    if let Err(err) = signal::restore_mask(task_ptr, uc.uc_sigmask) {
         return -signal_to_errno(err);
     }
 
-    frame.r15 = signal_frame.r15;
-    frame.r14 = signal_frame.r14;
-    frame.r13 = signal_frame.r13;
-    frame.r12 = signal_frame.r12;
-    frame.rbp = signal_frame.rbp;
-    frame.rbx = signal_frame.rbx;
-    frame.r9 = signal_frame.r9;
-    frame.r8 = signal_frame.r8;
-    frame.r10 = signal_frame.r10;
-    frame.rdx = signal_frame.rdx;
-    frame.rsi = signal_frame.rsi;
-    frame.rdi = signal_frame.rdi;
-    frame.rax = signal_frame.rax;
-    frame.r11 = signal_frame.r11;
-    frame.rcx = signal_frame.rcx;
-    frame.rsp = signal_frame.rsp;
-    restore_user_fpu(signal_frame.fpu);
-    0
-}
-
-pub(super) fn restore_user_signal_frame_int80(
-    task_ptr: *mut task::Task,
-    frame: &mut InterruptFrame,
-) -> i64 {
-    let signal_frame = match read_struct_from_user::<UserSignalFrameInt80>(task_ptr, frame.rsp) {
-        Ok(signal_frame) => signal_frame,
-        Err(err) => return -err,
-    };
-    if signal_frame.magic != SIGNAL_FRAME_MAGIC_INT80 {
-        return -EINVAL;
+    regs.load_gregs(&gregs);
+    match fpstate {
+        Some(area) => restore_user_fpu(area),
+        None => fpu::reset_current(),
     }
-    if !user_range_ok(signal_frame.rsp, 1) || !user_range_ok(signal_frame.rip, 1) {
-        return -EFAULT;
-    }
-    if let Err(err) = signal::restore_mask(task_ptr, signal_frame.saved_mask) {
-        return -signal_to_errno(err);
-    }
-
-    frame.r15 = signal_frame.r15;
-    frame.r14 = signal_frame.r14;
-    frame.r13 = signal_frame.r13;
-    frame.r12 = signal_frame.r12;
-    frame.r11 = signal_frame.r11;
-    frame.r10 = signal_frame.r10;
-    frame.r9 = signal_frame.r9;
-    frame.r8 = signal_frame.r8;
-    frame.rbp = signal_frame.rbp;
-    frame.rdi = signal_frame.rdi;
-    frame.rsi = signal_frame.rsi;
-    frame.rdx = signal_frame.rdx;
-    frame.rcx = signal_frame.rcx;
-    frame.rbx = signal_frame.rbx;
-    frame.rax = signal_frame.rax;
-    frame.rip = signal_frame.rip;
-    frame.cs = signal_frame.cs;
-    frame.rflags = signal_frame.rflags;
-    frame.rsp = signal_frame.rsp;
-    frame.ss = signal_frame.ss;
-    restore_user_fpu(signal_frame.fpu);
     0
 }
 
@@ -384,7 +490,20 @@ pub(super) fn exit_if_thread_killed(current: *mut task::Task) -> Option<i64> {
     Some(exit_current_thread(&ctx, code))
 }
 
-pub(super) fn apply_pending_signals_syscall(frame: &mut SyscallFrame) -> Option<i64> {
+/// Arrange for the interrupted syscall `nr` to run again when user mode
+/// resumes: rewind over the 2-byte `syscall` / `int 0x80` instruction.
+pub(super) fn restart_syscall<R: UserRegs>(regs: &mut R, nr: u64) {
+    regs.set_result(nr);
+    regs.set_rip(regs.rip().wrapping_sub(2));
+}
+
+/// Deliver pending signals on the way back to user mode.
+///
+/// `nr` is the syscall being completed (None for `rt_sigreturn`). When it
+/// returned `-ERESTARTSYS` (a wait interrupted by a signal), the syscall is
+/// restarted if no handler runs or the handler has `SA_RESTART`, and
+/// otherwise fails with `EINTR`.
+pub(super) fn apply_pending_signals<R: UserRegs>(regs: &mut R, nr: Option<u64>) -> Option<i64> {
     let current = task::current();
     if !can_process_pending_signals(current) {
         return None;
@@ -392,17 +511,35 @@ pub(super) fn apply_pending_signals_syscall(frame: &mut SyscallFrame) -> Option<
     if let Some(ret) = exit_if_thread_killed(current) {
         return Some(ret);
     }
+    let restart_nr = nr.filter(|_| regs.result() == to_sysret(-ERESTARTSYS));
 
     loop {
         match signal::consume_next(current) {
-            signal::DeliveryAction::None => return None,
+            signal::DeliveryAction::None => {
+                if let Some(nr) = restart_nr {
+                    restart_syscall(regs, nr);
+                }
+                return None;
+            }
             signal::DeliveryAction::Ignore => continue,
             signal::DeliveryAction::Terminate(code) => {
+                sys_log!(
+                    "[SIGNAL] tid {} terminated by signal {}",
+                    unsafe { (*current).pid },
+                    code - 128
+                );
                 let ctx = SyscallContext::new(current);
                 return Some(sys_exit_common(&ctx, code));
             }
             signal::DeliveryAction::Handle(delivery) => {
-                if install_user_signal_frame_syscall(current, frame, delivery).is_err() {
+                if let Some(nr) = restart_nr {
+                    if (delivery.flags & signal::SA_RESTART) != 0 {
+                        restart_syscall(regs, nr);
+                    } else {
+                        regs.set_result(to_sysret(-EINTR));
+                    }
+                }
+                if install_rt_signal_frame(current, regs, delivery).is_err() {
                     let ctx = SyscallContext::new(current);
                     return Some(sys_exit_common(&ctx, 128 + signal::SIGSEGV as i32));
                 }
@@ -412,30 +549,16 @@ pub(super) fn apply_pending_signals_syscall(frame: &mut SyscallFrame) -> Option<
     }
 }
 
-pub(super) fn apply_pending_signals_int80(frame: &mut InterruptFrame) -> Option<i64> {
-    let current = task::current();
-    if !can_process_pending_signals(current) {
-        return None;
-    }
-    if let Some(ret) = exit_if_thread_killed(current) {
-        return Some(ret);
-    }
+pub(super) fn apply_pending_signals_syscall(
+    frame: &mut SyscallFrame,
+    nr: Option<u64>,
+) -> Option<i64> {
+    apply_pending_signals(frame, nr)
+}
 
-    loop {
-        match signal::consume_next(current) {
-            signal::DeliveryAction::None => return None,
-            signal::DeliveryAction::Ignore => continue,
-            signal::DeliveryAction::Terminate(code) => {
-                let ctx = SyscallContext::new(current);
-                return Some(sys_exit_common(&ctx, code));
-            }
-            signal::DeliveryAction::Handle(delivery) => {
-                if install_user_signal_frame_int80(current, frame, delivery).is_err() {
-                    let ctx = SyscallContext::new(current);
-                    return Some(sys_exit_common(&ctx, 128 + signal::SIGSEGV as i32));
-                }
-                return None;
-            }
-        }
-    }
+pub(super) fn apply_pending_signals_int80(
+    frame: &mut InterruptFrame,
+    nr: Option<u64>,
+) -> Option<i64> {
+    apply_pending_signals(frame, nr)
 }

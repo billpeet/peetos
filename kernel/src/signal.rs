@@ -3,6 +3,10 @@ use crate::task::{Task, TaskState, SIG_MAX_TASK_SIGNALS};
 pub const EINVAL: i64 = 22;
 pub const ESRCH: i64 = 3;
 pub const ENOSYS: i64 = 38;
+pub const EINTR: i64 = 4;
+/// Kernel-internal errno (positive form): a blocking wait was interrupted by
+/// a signal. The syscall layer restarts the call or turns this into `EINTR`.
+pub const ERESTARTSYS: i64 = 512;
 
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
@@ -34,6 +38,11 @@ pub const SIGWINCH: u32 = 28;
 pub const SIGIO: u32 = 29;
 pub const SIGPWR: u32 = 30;
 pub const SIGSYS: u32 = 31;
+/// First real-time signal number. musl reserves 32..=34 for timers,
+/// thread cancellation and setxid.
+pub const SIGRTMIN: u32 = 32;
+/// Highest valid signal number (`_NSIG - 1`).
+pub const SIGRTMAX: u32 = 64;
 
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
@@ -42,7 +51,17 @@ pub const SIG_BLOCK: i32 = 0;
 pub const SIG_UNBLOCK: i32 = 1;
 pub const SIG_SETMASK: i32 = 2;
 
+pub const SA_SIGINFO: u64 = 0x0000_0004;
 pub const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
+pub const SA_RESTART: u64 = 0x1000_0000;
+pub const SA_NODEFER: u64 = 0x4000_0000;
+pub const SA_RESETHAND: u64 = 0x8000_0000;
+
+/// `si_code` values recorded with a pending signal.
+pub const SI_USER: i32 = 0;
+pub const SI_KERNEL: i32 = 0x80;
+pub const SI_TKILL: i32 = -6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserDelivery {
@@ -50,6 +69,12 @@ pub struct UserDelivery {
     pub handler: u64,
     pub restorer: u64,
     pub saved_mask: u64,
+    /// The handler's `sa_flags` (SA_SIGINFO, SA_RESTART, ...).
+    pub flags: u64,
+    /// `si_code` and sending process for the `siginfo_t` given to SA_SIGINFO
+    /// handlers.
+    pub code: i32,
+    pub sender: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +96,21 @@ pub struct SigAction {
 const SIG_ACTION_TERMINATE: u8 = 0;
 const SIG_ACTION_IGNORE: u8 = 1;
 
-const DEFAULT_ACTIONS: [u8; SIG_MAX_TASK_SIGNALS] = [
+const DEFAULT_ACTIONS: [u8; SIG_MAX_TASK_SIGNALS] = default_actions();
+
+/// Default dispositions: classic signals as listed below; every real-time
+/// signal (32..=64) terminates.
+const fn default_actions() -> [u8; SIG_MAX_TASK_SIGNALS] {
+    let mut out = [SIG_ACTION_TERMINATE; SIG_MAX_TASK_SIGNALS];
+    let mut idx = 0;
+    while idx < CLASSIC_DEFAULT_ACTIONS.len() {
+        out[idx] = CLASSIC_DEFAULT_ACTIONS[idx];
+        idx += 1;
+    }
+    out
+}
+
+const CLASSIC_DEFAULT_ACTIONS: [u8; 32] = [
     SIG_ACTION_TERMINATE, // 0 (unused)
     SIG_ACTION_TERMINATE, // SIGHUP
     SIG_ACTION_TERMINATE, // SIGINT
@@ -106,9 +145,21 @@ const DEFAULT_ACTIONS: [u8; SIG_MAX_TASK_SIGNALS] = [
     SIG_ACTION_TERMINATE, // SIGSYS
 ];
 
+/// Bit for `signum` in a signal set. This is the Linux `sigset_t` layout
+/// (signal N is bit N-1), so masks from userspace are used unchanged.
 #[inline]
-fn signal_bit(signum: u32) -> u64 {
-    1u64 << signum
+pub const fn signal_bit(signum: u32) -> u64 {
+    1u64 << (signum - 1)
+}
+
+#[inline]
+fn pack_info(code: i32, sender: i32) -> u64 {
+    ((code as u32 as u64) << 32) | (sender as u32 as u64)
+}
+
+#[inline]
+fn unpack_info(info: u64) -> (i32, i32) {
+    ((info >> 32) as u32 as i32, info as u32 as i32)
 }
 
 #[inline]
@@ -130,7 +181,23 @@ fn default_action(signum: u32) -> u8 {
     }
 }
 
+/// True when `task`'s process discards `signum`: SIG_IGN, or SIG_DFL with
+/// a default "ignore" action.
+fn is_ignored(task: *mut Task, signum: u32) -> bool {
+    if !can_catch(signum) {
+        return false;
+    }
+    let handler = unsafe { (*crate::task::leader_of(task)).signal_handlers[signum as usize] };
+    handler == SIG_IGN || (handler == SIG_DFL && default_action(signum) == SIG_ACTION_IGNORE)
+}
+
+/// Queue a kernel-generated signal on one thread.
 pub fn send(task: *mut Task, signum: u32) -> Result<(), i64> {
+    send_with_info(task, signum, SI_KERNEL, 0)
+}
+
+/// Queue a signal on one thread, recording its `si_code` and sender.
+pub fn send_with_info(task: *mut Task, signum: u32, code: i32, sender: i32) -> Result<(), i64> {
     if task.is_null() {
         return Err(ESRCH);
     }
@@ -139,6 +206,13 @@ pub fn send(task: *mut Task, signum: u32) -> Result<(), i64> {
     }
 
     unsafe {
+        // Like Linux, an ignored signal that is not blocked is discarded when
+        // it is generated. A blocked one stays pending, because the
+        // disposition may change before it is unblocked.
+        if ((*task).signal_blocked & signal_bit(signum)) == 0 && is_ignored(task, signum) {
+            return Ok(());
+        }
+        (*task).sig_info[signum as usize] = pack_info(code, sender);
         (*task).sig_pending |= signal_bit(signum);
         if ((*task).state == TaskState::Blocked || (*task).state == TaskState::Sleeping)
             && ((*task).signal_blocked & signal_bit(signum)) == 0
@@ -228,30 +302,24 @@ pub fn consume_next(task: *mut Task) -> DeliveryAction {
         return DeliveryAction::None;
     }
 
-    let mut signum = 0u32;
-    let mut candidate = 1u32;
-    while (candidate as usize) < SIG_MAX_TASK_SIGNALS {
-        if (deliverable & signal_bit(candidate)) != 0 {
-            signum = candidate;
-            break;
-        }
-        candidate += 1;
-    }
-    if signum == 0 {
+    // Lowest-numbered deliverable signal first.
+    let signum = deliverable.trailing_zeros() + 1;
+    if !valid_signal(signum) {
         return DeliveryAction::None;
     }
 
     let idx = signum as usize;
     unsafe {
         (*task).sig_pending &= !signal_bit(signum);
-        let handler = (*crate::task::leader_of(task)).signal_handlers[idx];
+        let leader = crate::task::leader_of(task);
+        let handler = (*leader).signal_handlers[idx];
         if handler == SIG_IGN && can_catch(signum) {
             return DeliveryAction::Ignore;
         }
         if handler != SIG_DFL {
-            let flags = (*crate::task::leader_of(task)).signal_flags[idx];
+            let flags = (*leader).signal_flags[idx];
             let restorer = if (flags & SA_RESTORER) != 0 {
-                (*crate::task::leader_of(task)).signal_restorer
+                (*leader).signal_restorer
             } else {
                 0
             };
@@ -260,17 +328,28 @@ pub fn consume_next(task: *mut Task) -> DeliveryAction {
             }
 
             let saved_mask = (*task).signal_blocked;
-            let mut next_mask = saved_mask | (*crate::task::leader_of(task)).signal_mask_saved[idx];
-            next_mask |= signal_bit(signum);
+            let mut next_mask = saved_mask | (*leader).signal_mask_saved[idx];
+            if (flags & SA_NODEFER) == 0 {
+                next_mask |= signal_bit(signum);
+            }
             next_mask &= !signal_bit(SIGKILL);
             next_mask &= !signal_bit(SIGSTOP);
             (*task).signal_blocked = next_mask;
 
+            if (flags & SA_RESETHAND) != 0 {
+                (*leader).signal_handlers[idx] = SIG_DFL;
+                (*leader).signal_flags[idx] &= !SA_SIGINFO;
+            }
+
+            let (code, sender) = unpack_info((*task).sig_info[idx]);
             return DeliveryAction::Handle(UserDelivery {
                 signum,
                 handler,
                 restorer,
                 saved_mask,
+                flags,
+                code,
+                sender,
             });
         }
     }
@@ -323,13 +402,22 @@ fn process_signal_target(task: *mut Task, signum: u32) -> *mut Task {
 /// Send a signal to a whole process (kill(2) semantics): it is queued on one
 /// thread chosen by `process_signal_target`.
 pub fn send_to_process(task: *mut Task, signum: u32) -> Result<(), i64> {
+    send_to_process_with_info(task, signum, SI_KERNEL, 0)
+}
+
+pub fn send_to_process_with_info(
+    task: *mut Task,
+    signum: u32,
+    code: i32,
+    sender: i32,
+) -> Result<(), i64> {
     if task.is_null() {
         return Err(ESRCH);
     }
     if !valid_signal(signum) {
         return Err(EINVAL);
     }
-    send(process_signal_target(task, signum), signum)
+    send_with_info(process_signal_target(task, signum), signum, code, sender)
 }
 
 /// True when a blocked task must give up waiting: it is being killed
@@ -342,6 +430,32 @@ pub fn must_abort_wait(task: *mut Task) -> bool {
         ((*task).flags & crate::task::TASK_FLAG_EXITING) != 0
             || ((*task).sig_pending & signal_bit(SIGKILL)) != 0
     }
+}
+
+/// True when a blocked syscall must stop waiting: the task is dying, or a
+/// signal is pending that will run a handler or terminate the process.
+/// Blocked or ignored signals do not interrupt waits.
+pub fn wait_interrupted(task: *mut Task) -> bool {
+    if must_abort_wait(task) {
+        return true;
+    }
+    if task.is_null() {
+        return false;
+    }
+    let mut deliverable = unsafe { (*task).sig_pending & !(*task).signal_blocked };
+    while deliverable != 0 {
+        let signum = deliverable.trailing_zeros() + 1;
+        deliverable &= deliverable - 1;
+        if valid_signal(signum) && !is_ignored(task, signum) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `wait_interrupted` for the running task.
+pub fn current_wait_interrupted() -> bool {
+    wait_interrupted(crate::task::current())
 }
 
 pub fn send_to_foreground_group(pgid: i32, signum: u32) {
@@ -427,7 +541,7 @@ mod tests {
         let mut t = task::Task::for_test(1);
         let ptr = &mut t as *mut task::Task;
         assert_eq!(send(ptr, 0).unwrap_err(), EINVAL);
-        assert_eq!(send(ptr, 32).unwrap_err(), EINVAL);
+        assert_eq!(send(ptr, 65).unwrap_err(), EINVAL);
     }
 
     #[test]
@@ -463,7 +577,15 @@ mod tests {
             },
         )
         .expect("set ignore");
+        // An unblocked ignored signal is discarded when sent...
         send(ptr, SIGTERM).expect("send");
+        assert_eq!(t.sig_pending, 0);
+        assert_eq!(consume_next(ptr), DeliveryAction::None);
+
+        // ...but a blocked one stays pending and is ignored on unblock.
+        update_mask(ptr, SIG_BLOCK, signal_bit(SIGTERM)).expect("block");
+        send(ptr, SIGTERM).expect("send blocked");
+        update_mask(ptr, SIG_UNBLOCK, signal_bit(SIGTERM)).expect("unblock");
         assert_eq!(consume_next(ptr), DeliveryAction::Ignore);
         assert_eq!(consume_next(ptr), DeliveryAction::None);
     }
@@ -534,6 +656,92 @@ mod tests {
         let mut t = task::Task::for_test(1);
         let ptr = &mut t as *mut task::Task;
         send(ptr, SIGCHLD).expect("send");
-        assert_eq!(consume_next(ptr), DeliveryAction::Ignore);
+        assert_eq!(consume_next(ptr), DeliveryAction::None);
+        assert!(!wait_interrupted(ptr));
+    }
+
+    fn set_handler(ptr: *mut task::Task, signum: u32, flags: u64) {
+        write_action(
+            ptr,
+            signum,
+            SigAction {
+                handler: 0x4000,
+                flags: flags | SA_RESTORER,
+                restorer: 0x5000,
+                mask: 0,
+            },
+        )
+        .expect("set handler");
+    }
+
+    #[test]
+    fn signal_sets_use_linux_bit_layout() {
+        assert_eq!(signal_bit(1), 1);
+        assert_eq!(signal_bit(SIGCHLD), 1 << 16);
+        assert_eq!(signal_bit(SIGRTMAX), 1 << 63);
+        assert!(valid_signal(33));
+        assert!(valid_signal(SIGRTMAX));
+        assert!(!valid_signal(0));
+        assert!(!valid_signal(65));
+    }
+
+    #[test]
+    fn realtime_signals_terminate_by_default_and_can_be_caught() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        let mut t = task::Task::for_test(1);
+        let ptr = &mut t as *mut task::Task;
+        send(ptr, 40).expect("send rt");
+        assert_eq!(consume_next(ptr), DeliveryAction::Terminate(128 + 40));
+
+        set_handler(ptr, 33, SA_SIGINFO | SA_RESTART);
+        send_with_info(ptr, 33, SI_TKILL, 77).expect("send 33");
+        match consume_next(ptr) {
+            DeliveryAction::Handle(d) => {
+                assert_eq!(d.signum, 33);
+                assert_eq!(d.code, SI_TKILL);
+                assert_eq!(d.sender, 77);
+                assert_ne!(d.flags & SA_RESTART, 0);
+                assert_ne!(t.signal_blocked & signal_bit(33), 0);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nodefer_and_resethand_flags() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        let mut t = task::Task::for_test(1);
+        let ptr = &mut t as *mut task::Task;
+        set_handler(ptr, SIGUSR1, SA_NODEFER | SA_RESETHAND);
+        send(ptr, SIGUSR1).expect("send");
+        assert!(matches!(consume_next(ptr), DeliveryAction::Handle(_)));
+        // SA_NODEFER: the signal is not blocked while its handler runs.
+        assert_eq!(t.signal_blocked & signal_bit(SIGUSR1), 0);
+        // SA_RESETHAND: the next one gets the default action.
+        send(&mut t as *mut task::Task, SIGUSR1).expect("send again");
+        assert_eq!(
+            consume_next(&mut t as *mut task::Task),
+            DeliveryAction::Terminate(128 + SIGUSR1 as i32)
+        );
+    }
+
+    #[test]
+    fn waits_are_interrupted_only_by_signals_that_will_act() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        let mut t = task::Task::for_test(1);
+        let ptr = &mut t as *mut task::Task;
+        set_handler(ptr, SIGUSR2, 0);
+
+        update_mask(ptr, SIG_BLOCK, signal_bit(SIGUSR2)).expect("block");
+        send(ptr, SIGUSR2).expect("send blocked");
+        assert!(!wait_interrupted(ptr), "blocked signals do not interrupt");
+
+        update_mask(ptr, SIG_UNBLOCK, signal_bit(SIGUSR2)).expect("unblock");
+        assert!(wait_interrupted(ptr), "a handled signal interrupts");
+
+        let _ = consume_next(ptr);
+        assert!(!wait_interrupted(ptr));
+        send(ptr, SIGTERM).expect("send fatal");
+        assert!(wait_interrupted(ptr), "a fatal signal interrupts");
     }
 }

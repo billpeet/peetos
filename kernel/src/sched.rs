@@ -238,6 +238,11 @@ pub fn block(reason: &str) {
         if CURRENT_TASK.is_null() {
             return;
         }
+        // A signal that arrived before we got here must not be lost by
+        // sleeping: return so the caller's loop notices it.
+        if crate::signal::wait_interrupted(CURRENT_TASK) {
+            return;
+        }
 
         if (*CURRENT_TASK).state != TaskState::Blocked
             && (*CURRENT_TASK).state != TaskState::Sleeping
@@ -291,6 +296,9 @@ pub fn sleep(ticks: u64) {
         if CURRENT_TASK.is_null() {
             return;
         }
+        if crate::signal::wait_interrupted(CURRENT_TASK) {
+            return;
+        }
 
         let wake_time = pit::ticks().saturating_add(ticks);
         (*CURRENT_TASK).sleep_until = wake_time;
@@ -300,6 +308,31 @@ pub fn sleep(ticks: u64) {
             task_name(&*CURRENT_TASK),
             ticks
         );
+    }
+
+    #[cfg(target_os = "none")]
+    unsafe {
+        sched_block_asm();
+    }
+}
+
+/// Block the current task until it is unblocked or the PIT tick count
+/// reaches `deadline`, whichever comes first.
+pub fn block_until(reason: &str, deadline: u64) {
+    if !is_running() {
+        return;
+    }
+
+    unsafe {
+        if CURRENT_TASK.is_null() {
+            return;
+        }
+        if crate::signal::wait_interrupted(CURRENT_TASK) || pit::ticks() >= deadline {
+            return;
+        }
+        (*CURRENT_TASK).sleep_until = deadline;
+        (*CURRENT_TASK).state = TaskState::Sleeping;
+        let _ = reason;
     }
 
     #[cfg(target_os = "none")]

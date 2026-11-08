@@ -317,6 +317,9 @@ pub fn recv_timeout(
             return Err(NetError::Timeout);
         }
 
+if crate::signal::current_wait_interrupted() {
+            return Err(NetError::Interrupted);
+        }
         // Poll NIC to drive packet reception
         crate::e1000::poll();
         arch_x86_64::pit::sleep_ms(1);

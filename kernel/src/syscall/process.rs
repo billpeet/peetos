@@ -95,18 +95,19 @@ pub(super) fn read_exec_image_from_inode(inode: u16) -> Result<ExecImage, i64> {
 }
 
 /// execve replaces the whole process, so the other threads must go first.
-/// Only the thread group leader may exec while other threads are alive (the
-/// kernel does not move the process id to another thread).
+/// A non-leader caller first becomes the leader (taking over the process id
+/// and process-wide state), as on Linux.
 pub(super) fn exec_prepare_thread_group(ctx: &SyscallContext) -> Result<(), i64> {
     let current = ctx.current;
+    let old_leader = task::leader_of(current);
+    if old_leader != current {
+        task::take_over_group_leadership(current);
+        mmap_move_task_regions(old_leader, current);
+    }
     let tgid = unsafe { (*current).tgid };
-    if task::live_threads_in_group(tgid) <= 1 {
-        return Ok(());
+    if task::live_threads_in_group(tgid) > 1 {
+        kill_other_threads(current, 0);
     }
-    if task::leader_of(current) != current {
-        return Err(-EINVAL);
-    }
-    kill_other_threads(current, 0);
     Ok(())
 }
 
@@ -124,7 +125,6 @@ pub(super) fn execve_common(
     if path.len() + 1 > fs::VFS_MAX_PATH {
         return Err(-EINVAL);
     }
-    exec_prepare_thread_group(ctx)?;
 
     let argv_buf_size = size_of::<ExecCString>() * EXEC_MAX_ARGV;
     let argv_buf_ptr = heap::kmalloc(argv_buf_size) as *mut ExecCString;
@@ -198,6 +198,14 @@ pub(super) fn execve_common(
     let execfn_len = path.len();
     path_buf[execfn_len] = 0;
     let execfn = &path_buf[..execfn_len + 1];
+    // Point of no return: the new image was read, so the other threads go
+    // now (failures before this leave the process untouched).
+    if let Err(err) = exec_prepare_thread_group(ctx) {
+        heap::kfree(env_buf_ptr as *mut u8);
+        heap::kfree(argv_buf_ptr as *mut u8);
+        heap::kfree(image.ptr);
+        return Err(err);
+    }
     let result = user::exec_current_image(image.as_slice(), &argv[..argc], &env[..envc], execfn);
     heap::kfree(env_buf_ptr as *mut u8);
     heap::kfree(argv_buf_ptr as *mut u8);
@@ -621,10 +629,16 @@ pub(super) fn sys_futex(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let val = call.arg(2) as u32;
 
     match cmd {
-        ipc::FUTEX_WAIT => {
-            if call.arg(3) != 0 {
+        ipc::FUTEX_WAIT | ipc::FUTEX_WAIT_BITSET => {
+            // Bitsets are accepted but not used to filter wakeups: a zero
+            // mask is invalid, any other mask behaves like "match all".
+            if cmd == ipc::FUTEX_WAIT_BITSET && call.arg(5) as u32 == 0 {
                 return -EINVAL;
             }
+            let deadline = match futex_deadline(ctx, call.arg(3), cmd == ipc::FUTEX_WAIT_BITSET) {
+                Ok(deadline) => deadline,
+                Err(err) => return err,
+            };
             let current = match read_user_u32(ctx.current, uaddr) {
                 Ok(v) => v,
                 Err(err) => return -err,
@@ -632,14 +646,59 @@ pub(super) fn sys_futex(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             if current != val {
                 return -EAGAIN;
             }
-            match ipc::futex_wait(ctx.current, uaddr) {
+            if let Some(deadline) = deadline {
+                if pit::ticks() >= deadline {
+                    return -ETIMEDOUT;
+                }
+            }
+            match ipc::futex_wait(ctx.current, uaddr, deadline) {
                 Ok(()) => 0,
                 Err(err) => -ipc_to_errno(err),
             }
         }
         ipc::FUTEX_WAKE => ipc::futex_wake(uaddr, val) as i64,
-        _ => -EINVAL,
+        ipc::FUTEX_WAKE_BITSET => {
+            if call.arg(5) as u32 == 0 {
+                return -EINVAL;
+            }
+            ipc::futex_wake(uaddr, val) as i64
+        }
+        ipc::FUTEX_REQUEUE | ipc::FUTEX_CMP_REQUEUE => {
+            // The timeout slot carries the requeue limit for these ops.
+            let nr_requeue = call.arg(3) as u32;
+            let uaddr2 = call.arg(4);
+            if !user_range_ok(uaddr2, 4) {
+                return -EFAULT;
+            }
+            if cmd == ipc::FUTEX_CMP_REQUEUE {
+                let current = match read_user_u32(ctx.current, uaddr) {
+                    Ok(v) => v,
+                    Err(err) => return -err,
+                };
+                if current != call.arg(5) as u32 {
+                    return -EAGAIN;
+                }
+            }
+            ipc::futex_requeue(uaddr, uaddr2, val, nr_requeue) as i64
+        }
+        _ => -ENOSYS,
     }
+}
+
+/// Convert a futex timeout argument to an absolute PIT-tick deadline.
+/// FUTEX_WAIT takes a relative timeout; FUTEX_WAIT_BITSET an absolute one
+/// (CLOCK_MONOTONIC and CLOCK_REALTIME share the tick clock here).
+fn futex_deadline(ctx: &SyscallContext, ts_ptr: u64, absolute: bool) -> Result<Option<u64>, i64> {
+    if ts_ptr == 0 {
+        return Ok(None);
+    }
+    let ts = read_struct_from_user::<LinuxTimeSpec>(ctx.current, ts_ptr).map_err(|err| -err)?;
+    let ticks = timespec_to_sleep_ticks(&ts)?;
+    Ok(Some(if absolute {
+        ticks
+    } else {
+        pit::ticks().saturating_add(ticks)
+    }))
 }
 
 pub(super) fn sys_yield(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
@@ -755,8 +814,8 @@ pub(super) fn sys_wait4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         if !crate::sched::is_running() {
             return -EAGAIN;
         }
-        if signal::must_abort_wait(ctx.current) {
-            return -EINTR;
+        if signal::wait_interrupted(ctx.current) {
+            return -ERESTARTSYS;
         }
         crate::sched::yield_now();
     }

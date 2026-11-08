@@ -34,10 +34,10 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - PMM/VMM/kernel heap are active.
 - Tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption).
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
-- `fork` is copy-on-write, and `clone(CLONE_THREAD)` thread groups support musl pthreads (`make run-proc-smoke`; see `docs/process_model.md`).
+- `fork` is copy-on-write, and `clone(CLONE_THREAD)` thread groups support musl pthreads, including `pthread_cancel`, timed waits and `execve` from any thread. Signals use the Linux `rt_sigframe` ABI (signals 1..=64, `siginfo_t`/`ucontext_t`) and interrupt blocking syscalls with `SA_RESTART`-aware restart (`make run-proc-smoke`; see `docs/process_model.md`).
 - ELF loading is hardened (header/segment validation, malformed `PT_INTERP` rejection, RWX rejection, entrypoint checks) with NXE enabled.
 - User bootstrap supports a minimal `PT_INTERP` flow (`AT_ENTRY`/`AT_BASE`) and Linux-style initial stack (`argc`/`argv`/`envp`/`auxv`).
-- Syscall dispatch is table-driven and shared by SYSCALL/int80 paths. Implemented syscalls include file/VFS operations, process control (`fork`/`clone`/`vfork`/`wait4`, threads via `clone(CLONE_THREAD)`, `tkill`/`tgkill`), VM mapping (`mmap`/`mprotect`/`munmap`), IPC (`pipe`/`futex`/`shm*`), signals (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`kill`), and core identity/time/process-group calls.
+- Syscall dispatch is table-driven and shared by SYSCALL/int80 paths. Implemented syscalls include file/VFS operations, process control (`fork`/`clone`/`vfork`/`wait4`, threads via `clone(CLONE_THREAD)`, `tkill`/`tgkill`), VM mapping (`mmap`/`mprotect`/`munmap`), IPC (`pipe`/`futex`/`shm*`), signals (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`kill`/`tkill`/`tgkill`), and core identity/time/process-group calls.
 - Shared-buffer primitive baseline now includes `memfd_create` (tmpfs-backed internal namespace objects with `MFD_CLOEXEC`; sealing flags currently return `-ENOSYS`).
 - Event-loop primitive baseline now includes level-triggered `epoll_create1`/`epoll_ctl`/`epoll_wait` (`EPOLL_CLOEXEC`, `ADD`/`MOD`/`DEL`, timeout wait, `-EINTR` interruption path).
 - Socket coverage includes `AF_INET` networking plus baseline `AF_UNIX` local stream support (`socket`, `socketpair`, pathname `bind`/`connect`/`listen`/`accept`), with `SCM_RIGHTS` fd passing in `sendmsg`/`recvmsg`.
@@ -63,7 +63,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `docs/elf.md` ELF loading and initial userspace image handoff.
 - `docs/syscall.md` SYSCALL/MSR setup and dispatcher behavior.
 - `docs/tasking.md` Task structures, user bootstrap, and scheduler behavior.
-- `docs/process_model.md` Copy-on-write fork, thread groups, and process/thread exit.
+- `docs/process_model.md` Copy-on-write fork, thread groups, signals and syscall restart, futexes, and process/thread exit.
 - `docs/vfs.md` VFS/tmpfs/devfs/procfs/ext2/ext3-journal path and syscall integration.
 - `docs/ipc.md` Synchronization primitives and IPC baseline (`pipe`/`futex`/`shm*`/`signal`).
 - `docs/drivers.md` PCI/storage/input/framebuffer driver status.

@@ -19,7 +19,8 @@ pub const KERNEL_STACK_PAGES: usize = (KERNEL_STACK_SIZE / 4096) as usize;
 pub const MAX_TASKS: usize = 64;
 pub const MAX_TASK_FDS: usize = 32;
 pub const MAX_TASK_SHM_ATTACH: usize = 8;
-pub const SIG_MAX_TASK_SIGNALS: usize = 32;
+/// Signal slots per task: signals 1..=64 (index 0 unused).
+pub const SIG_MAX_TASK_SIGNALS: usize = 65;
 
 pub const TASK_FLAG_KERNEL: u32 = 0x01;
 pub const TASK_FLAG_USER: u32 = 0x02;
@@ -118,6 +119,9 @@ pub struct Task {
     pub(crate) user_shm_size: [u64; MAX_TASK_SHM_ATTACH],
     pub(crate) user_shm_flags: [u32; MAX_TASK_SHM_ATTACH],
     pub(crate) sig_pending: u64,
+    /// Per pending signal: packed `si_code` and sender pid (see
+    /// `signal::send_with_info`).
+    pub(crate) sig_info: [u64; SIG_MAX_TASK_SIGNALS],
     pub(crate) signal_blocked: u64,
     pub(crate) signal_handlers: [u64; SIG_MAX_TASK_SIGNALS],
     pub(crate) signal_flags: [u64; SIG_MAX_TASK_SIGNALS],
@@ -222,6 +226,7 @@ pub fn init() {
             user_shm_size: [0; MAX_TASK_SHM_ATTACH],
             user_shm_flags: [0; MAX_TASK_SHM_ATTACH],
             sig_pending: 0,
+            sig_info: [0; SIG_MAX_TASK_SIGNALS],
             signal_blocked: 0,
             signal_handlers: [0; SIG_MAX_TASK_SIGNALS],
             signal_flags: [0; SIG_MAX_TASK_SIGNALS],
@@ -322,6 +327,7 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.user_shm_size = [0; MAX_TASK_SHM_ATTACH];
         task.user_shm_flags = [0; MAX_TASK_SHM_ATTACH];
         task.sig_pending = 0;
+        task.sig_info = [0; SIG_MAX_TASK_SIGNALS];
         task.signal_blocked = 0;
         task.signal_handlers = [0; SIG_MAX_TASK_SIGNALS];
         task.signal_flags = [0; SIG_MAX_TASK_SIGNALS];
@@ -421,6 +427,89 @@ pub fn join_thread_group(thread: *mut Task, leader: *mut Task) {
         (*thread).ppid = (*leader).ppid;
         (*thread).flags |= TASK_FLAG_THREAD;
     }
+}
+
+/// Make `thread` the leader of its thread group, as Linux does when a
+/// non-leader thread calls `execve`: it takes over the process id and all
+/// process-wide state, and the old leader becomes an ordinary member (with
+/// the exec'ing thread's former id) so it can be terminated like any other
+/// sibling.
+pub fn take_over_group_leadership(thread: *mut Task) {
+    let old = leader_of(thread);
+    if thread.is_null() || old == thread {
+        return;
+    }
+    unsafe {
+        let new = &mut *thread;
+        let prev = &mut *old;
+        let tgid = prev.tgid;
+
+        new.user_fd_kind = prev.user_fd_kind;
+        new.user_fd_inode = prev.user_fd_inode;
+        new.user_fd_offset = prev.user_fd_offset;
+        new.user_fd_flags = prev.user_fd_flags;
+        new.user_cwd_inode = prev.user_cwd_inode;
+        new.user_brk_start = prev.user_brk_start;
+        new.user_brk = prev.user_brk;
+        new.user_shm_id = prev.user_shm_id;
+        new.user_shm_addr = prev.user_shm_addr;
+        new.user_shm_size = prev.user_shm_size;
+        new.user_shm_flags = prev.user_shm_flags;
+        new.signal_handlers = prev.signal_handlers;
+        new.signal_flags = prev.signal_flags;
+        new.signal_mask_saved = prev.signal_mask_saved;
+        new.signal_restorer = prev.signal_restorer;
+        new.user_uid = prev.user_uid;
+        new.user_gid = prev.user_gid;
+        new.pgid = prev.pgid;
+        new.sid = prev.sid;
+        new.ctty_type = prev.ctty_type;
+        new.ctty_id = prev.ctty_id;
+        new.ppid = prev.ppid;
+        new.user_entry = prev.user_entry;
+        new.user_stack_bottom = prev.user_stack_bottom;
+        new.user_stack_top = prev.user_stack_top;
+        new.user_stack_ptr = prev.user_stack_ptr;
+        new.user_argc = prev.user_argc;
+        new.user_argv = prev.user_argv;
+        new.user_envp = prev.user_envp;
+        new.user_auxv = prev.user_auxv;
+        new.user_phdr_addr = prev.user_phdr_addr;
+        new.user_phdr_count = prev.user_phdr_count;
+        new.user_phdr_size = prev.user_phdr_size;
+        new.user_base_addr = prev.user_base_addr;
+        new.user_interp_base = prev.user_interp_base;
+        new.user_is_dynamic = prev.user_is_dynamic;
+
+        // The state now lives on `thread`; leave no second owner behind.
+        prev.user_fd_kind = [USER_FD_KIND_EMPTY; MAX_TASK_FDS];
+        prev.user_fd_inode = [USER_FD_NONE; MAX_TASK_FDS];
+        prev.user_fd_offset = [0; MAX_TASK_FDS];
+        prev.user_fd_flags = [0; MAX_TASK_FDS];
+        prev.user_shm_id = [0; MAX_TASK_SHM_ATTACH];
+        prev.user_shm_addr = [0; MAX_TASK_SHM_ATTACH];
+        prev.user_shm_size = [0; MAX_TASK_SHM_ATTACH];
+        prev.user_shm_flags = [0; MAX_TASK_SHM_ATTACH];
+
+        let old_tid = new.pid;
+        new.pid = tgid;
+        prev.pid = old_tid;
+        new.group_leader = ptr::null_mut();
+        new.flags &= !TASK_FLAG_THREAD;
+        prev.flags |= TASK_FLAG_THREAD;
+
+        for slot in TASK_TABLE.iter() {
+            let t = *slot;
+            if !t.is_null() && t != thread && (*t).tgid == tgid {
+                (*t).group_leader = thread;
+            }
+        }
+    }
+}
+
+/// Index of `task` in the task table.
+pub fn table_slot(task: *mut Task) -> Option<usize> {
+    unsafe { TASK_TABLE.iter().position(|t| *t == task) }
 }
 
 pub fn current() -> *mut Task {
@@ -616,6 +705,7 @@ impl Task {
             user_shm_size: [0; MAX_TASK_SHM_ATTACH],
             user_shm_flags: [0; MAX_TASK_SHM_ATTACH],
             sig_pending: 0,
+            sig_info: [0; SIG_MAX_TASK_SIGNALS],
             signal_blocked: 0,
             signal_handlers: [0; SIG_MAX_TASK_SIGNALS],
             signal_flags: [0; SIG_MAX_TASK_SIGNALS],
@@ -653,5 +743,49 @@ impl Task {
             NEXT_PID = 1;
             TASK_INITIALIZED = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_leader_takes_over_process_identity() {
+        Task::reset_registry_for_test();
+        let mut leader = Task::for_test(10);
+        leader.flags = TASK_FLAG_USER;
+        leader.user_fd_kind[3] = USER_FD_KIND_PIPE;
+        leader.user_fd_inode[3] = 7;
+        leader.ppid = 2;
+        let mut exec_thread = Task::for_test(11);
+        let mut other = Task::for_test(12);
+        let lp = &mut leader as *mut Task;
+        let tp = &mut exec_thread as *mut Task;
+        let op = &mut other as *mut Task;
+        join_thread_group(tp, lp);
+        join_thread_group(op, lp);
+        Task::install_for_test(0, lp);
+        Task::install_for_test(1, tp);
+        Task::install_for_test(2, op);
+
+        take_over_group_leadership(tp);
+
+        unsafe {
+            assert_eq!((*tp).pid, 10, "exec thread takes the process id");
+            assert_eq!((*tp).tgid, 10);
+            assert_eq!((*lp).pid, 11, "old leader takes the thread id");
+            assert!(leader_of(tp) == tp);
+            assert!(leader_of(lp) == tp);
+            assert!(leader_of(op) == tp);
+            assert_eq!((*tp).flags & TASK_FLAG_THREAD, 0);
+            assert_ne!((*lp).flags & TASK_FLAG_THREAD, 0);
+            assert_eq!((*tp).user_fd_kind[3], USER_FD_KIND_PIPE);
+            assert_eq!((*tp).user_fd_inode[3], 7);
+            assert_eq!((*tp).ppid, 2);
+            assert_eq!((*lp).user_fd_kind[3], USER_FD_KIND_EMPTY);
+        }
+        assert!(get_by_pid(10) == tp);
+        Task::reset_registry_for_test();
     }
 }

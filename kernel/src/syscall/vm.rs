@@ -1436,6 +1436,20 @@ pub(super) fn mmap_fault_map_page(
     Ok(())
 }
 
+/// Move the mmap region table from `from`'s task slot to `to`'s, after `to`
+/// took over the process from `from` (see `task::take_over_group_leadership`).
+pub(super) fn mmap_move_task_regions(from: *mut task::Task, to: *mut task::Task) {
+    let (Some(from_slot), Some(to_slot)) = (task::table_slot(from), task::table_slot(to)) else {
+        return;
+    };
+    unsafe {
+        TASK_VM_MAPPINGS[to_slot] = TASK_VM_MAPPINGS[from_slot];
+        TASK_VM_OWNER_PID[to_slot] = (*to).pid;
+        TASK_VM_MAPPINGS[from_slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+        TASK_VM_OWNER_PID[from_slot] = task::INVALID_PID;
+    }
+}
+
 pub(super) fn mmap_clone_task_regions(
     parent: *mut task::Task,
     child: *mut task::Task,

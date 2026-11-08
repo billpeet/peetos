@@ -177,7 +177,7 @@ pub(super) fn do_select(
                 return 0;
             }
         }
-        if signal::must_abort_wait(ctx.current) {
+        if signal::wait_interrupted(ctx.current) {
             return -EINTR;
         }
 
@@ -279,13 +279,6 @@ pub(super) fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16
 }
 
 #[inline]
-pub(super) fn task_has_unblocked_signal(task_ptr: *mut task::Task) -> bool {
-    if task_ptr.is_null() {
-        return false;
-    }
-    unsafe { ((*task_ptr).sig_pending & !(*task_ptr).signal_blocked) != 0 }
-}
-
 pub(super) fn epoll_instance_get_mut(id: u16) -> Result<&'static mut EpollInstance, i64> {
     let idx = id as usize;
     if idx >= EPOLL_MAX_INSTANCES {
@@ -793,7 +786,7 @@ pub(super) fn do_poll(
             }
         }
 
-        if signal::must_abort_wait(ctx.current) {
+        if signal::wait_interrupted(ctx.current) {
             return -EINTR;
         }
         // Drive NIC + TCP tick, then yield
@@ -1015,7 +1008,7 @@ pub(super) fn sys_epoll_wait(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         if deadline == Some(0) {
             return 0;
         }
-        if task_has_unblocked_signal(ctx.current) {
+        if signal::wait_interrupted(ctx.current) {
             return -EINTR;
         }
         if let Some(dl) = deadline {
