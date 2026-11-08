@@ -8,6 +8,7 @@ extern crate std;
 use core::panic::PanicInfo;
 
 mod arp;
+mod bkl;
 mod block;
 mod display_mode;
 mod e1000;
@@ -37,18 +38,31 @@ mod shm;
 mod signal;
 #[cfg(target_os = "none")]
 mod smp;
+#[cfg(all(target_os = "none", feature = "test-exit"))]
+mod smp_test;
 #[cfg(not(target_os = "none"))]
 mod smp {
     //! Host-test stand-in: the real module links against the AP trampoline
     //! in `entry.asm`, which only exists in kernel builds.
     pub fn init() {}
     pub fn start_aps() {}
+    pub fn release_aps() {}
     pub fn ipi_self_test() -> (usize, usize) {
         (0, 0)
     }
-    pub fn is_bsp() -> bool {
-        true
+    pub fn cpu_count() -> usize {
+        1
     }
+    pub fn online_count() -> usize {
+        1
+    }
+    pub fn is_online(index: usize) -> bool {
+        index == 0
+    }
+    pub fn send_resched(_index: usize) {}
+    pub fn note_active_cr3(_cr3: u64) {}
+    pub fn service_tlb_shootdown() {}
+    pub fn tlb_shootdown(_pml4: u64) {}
 }
 mod socket;
 mod storage;
@@ -76,7 +90,7 @@ mod fb_console {
 #[cfg(not(feature = "test-exit"))]
 mod font8x16_vga;
 
-use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall, tss};
+use arch_x86_64::{gdt, idt, interrupts, pic, pit, syscall as arch_syscall};
 use drivers::pci;
 use memory::{heap, pmm, vmm};
 
@@ -108,8 +122,9 @@ pub extern "C" fn kmain() -> ! {
     gdt::init();
     serial_println!("[GDT] Loaded");
 
-    tss::init();
-    serial_println!("[TSS] Loaded");
+    // Per-CPU GDT/TSS and GS base for the BSP (CPU 0).
+    arch_x86_64::percpu::init_cpu(0);
+    serial_println!("[TSS] Loaded (per-CPU area for CPU 0)");
 
     idt::init();
     for vector in 0u8..32u8 {
@@ -207,7 +222,10 @@ pub extern "C" fn kmain() -> ! {
     serial_println!("[PTY] Initialized");
 
     pit::set_tick_hook(sched::tick);
+    idt::set_entry_hook(bkl::interrupt_enter);
+    idt::set_exit_hook(bkl::frame_exit_hook);
     idt::set_post_handler_hook(sched::isr_hook);
+    smp::release_aps();
 
     #[cfg(not(feature = "test-exit"))]
     let init_started = user::spawn_init();
@@ -245,6 +263,10 @@ pub extern "C" fn kmain() -> ! {
         if delta < 5 {
             qemu::exit_failure();
         }
+        let expected = core::cmp::min(smp::online_count() as u32, 2);
+        if smp_test::run() < expected {
+            qemu::exit_failure();
+        }
         qemu::exit_success();
     }
 
@@ -258,9 +280,9 @@ pub extern "C" fn kmain() -> ! {
         mouse::tick();
         #[cfg(any(feature = "musl-ext2-gui-smoke", feature = "musl-ext2-gui-demo"))]
         gui_smoke::tick();
-        unsafe {
-            core::arch::asm!("hlt");
-        }
+        // Idle until the next interrupt without holding the big kernel lock,
+        // so other CPUs can run kernel code meanwhile.
+        bkl::wait_for_interrupt();
     }
 }
 

@@ -13,6 +13,7 @@ pub mod ioapic;
 pub mod irq;
 pub mod lapic;
 pub mod msr;
+pub mod percpu;
 pub mod pic;
 pub mod pit;
 pub mod port;

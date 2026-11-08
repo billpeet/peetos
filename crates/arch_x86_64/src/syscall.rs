@@ -40,9 +40,8 @@ pub fn init() {
         efer |= EFER_SCE | EFER_NXE;
         msr::write(msr::IA32_EFER, efer);
 
-        // Keep GS state well-defined for SWAPGS-based syscall entry.
-        msr::write(msr::IA32_GS_BASE, 0);
-        msr::write(msr::IA32_KERNEL_GS_BASE, 0);
+        // GS bases are owned by `percpu::init_cpu` (GS = per-CPU area in
+        // the kernel, KERNEL_GS_BASE = user GS); SWAPGS flips them.
 
         let star = ((GDT_KERNEL_DS as u64) << 48) | ((GDT_KERNEL_CS as u64) << 32);
         msr::write(msr::IA32_STAR, star);
@@ -78,16 +77,10 @@ pub fn user_fs_base() -> u64 {
     0
 }
 
-#[cfg(target_os = "none")]
+/// User RSP saved by the most recent SYSCALL entry on this CPU.
 #[inline]
 pub fn user_rsp() -> u64 {
-    unsafe { ARCH_X86_64_SYSCALL_USER_RSP }
-}
-
-#[cfg(not(target_os = "none"))]
-#[inline]
-pub fn user_rsp() -> u64 {
-    0
+    crate::percpu::user_rsp()
 }
 
 #[cfg(target_os = "none")]
@@ -96,26 +89,20 @@ extern "C" {
 }
 
 #[cfg(target_os = "none")]
-#[no_mangle]
-static mut ARCH_X86_64_SYSCALL_USER_RSP: u64 = 0;
-
-#[cfg(target_os = "none")]
 core::arch::global_asm!(
     r#"
 .section .text
 .extern syscall_handler
-.extern ARCH_X86_64_TSS_RSP0
-.extern ARCH_X86_64_SYSCALL_USER_RSP
 
 .global syscall_entry
 syscall_entry:
     swapgs
-    mov [rip + ARCH_X86_64_SYSCALL_USER_RSP], rsp
-    mov rsp, [rip + ARCH_X86_64_TSS_RSP0]
+    mov qword ptr gs:[8], rsp
+    mov rsp, qword ptr gs:[16]
     test rsp, rsp
     jz .Lsyscall_no_kstack
 
-    push qword ptr [rip + ARCH_X86_64_SYSCALL_USER_RSP]
+    push qword ptr gs:[8]
     push rcx
     push r11
 

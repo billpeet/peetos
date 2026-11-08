@@ -1153,13 +1153,35 @@ pub(super) fn kill_sibling_thread(t: *mut task::Task, code: i32) {
     }
 }
 
+/// Make every other thread of `current`'s process exit.
+///
+/// A sibling executing on another CPU cannot be torn down in place. It is
+/// kicked with a reschedule IPI, and this CPU briefly drops the big kernel
+/// lock so that CPU can preempt it. The sibling is handled by
+/// [`kill_sibling_thread`] once it is parked or blocked.
 pub(super) fn kill_other_threads(current: *mut task::Task, code: i32) {
     let tgid = unsafe { (*current).tgid };
-    for idx in 0..task::MAX_TASKS {
-        let t = task::get_by_index(idx);
-        if !t.is_null() && t != current && unsafe { (*t).tgid } == tgid {
+    loop {
+        let mut running_elsewhere = false;
+        for idx in 0..task::MAX_TASKS {
+            let t = task::get_by_index(idx);
+            if t.is_null() || t == current || unsafe { (*t).tgid } != tgid {
+                continue;
+            }
+            if crate::sched::running_on_other_cpu(t) {
+                unsafe {
+                    (*t).flags |= task::TASK_FLAG_EXITING;
+                }
+                crate::sched::kick_task(t);
+                running_elsewhere = true;
+                continue;
+            }
             kill_sibling_thread(t, code);
         }
+        if !running_elsewhere {
+            return;
+        }
+        crate::bkl::relax();
     }
 }
 

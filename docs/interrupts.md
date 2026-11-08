@@ -17,7 +17,7 @@ This document summarizes interrupt-related infrastructure in the current kernel,
 
 **Initialization Order (Kernel)**
 1. `gdt::init()`
-2. `tss::init()`
+2. `percpu::init_cpu(0)` (per-CPU GDT copy, TSS and GS base for the BSP)
 3. `idt::init()`
 4. Register default exception handlers for vectors 0..31
 5. Install the `int 0x80` syscall gate and handler
@@ -44,7 +44,7 @@ Limitations / Simplifications
 - `guard()` which returns an RAII `InterruptGuard` that restores the prior IF state on drop.
 
 Limitations / Simplifications
-- Interrupt masking only affects the executing CPU. It is not a lock once other CPUs run kernel code. Today APs are parked (see `docs/smp.md`), so the single-core assumption still holds. There is no nesting counter beyond the saved IF bit.
+- Interrupt masking only affects the executing CPU and is not a lock across CPUs. Cross-CPU exclusion comes from the big kernel lock (`kernel/src/bkl.rs`, see `docs/smp.md`), which every kernel entry takes. There is no nesting counter beyond the saved IF bit.
 - Host-side implementations only simulate IF state for unit tests.
 
 **GDT Layout**
@@ -59,11 +59,11 @@ Limitations / Simplifications
 `gdt::init()` builds the table, loads it with `lgdt`, reloads segment registers, and uses `retfq` to reload CS. A minimal TSS is initialized after GDT load to support ring transitions.
 
 Limitations / Simplifications
-- There is no per-CPU GDT or TSS, and no Interrupt Stack Table (IST) support yet. APs load the shared GDT via `gdt::load()` but never `ltr`.
+- `gdt::init()` builds a template GDT. `percpu::init_cpu()` gives each CPU a copy with its own TSS descriptor, loads it and runs `ltr`. There is no Interrupt Stack Table (IST) support yet.
 - Only `RSP0` is used; no alternate stacks for faults/exceptions.
 
 **TSS**
-`crates/arch_x86_64/src/tss.rs` provides a minimal TSS with `RSP0` support. The scheduler updates `RSP0` on every task switch so that user-to-kernel transitions land on the correct kernel stack.
+`crates/arch_x86_64/src/tss.rs` defines a minimal TSS with `RSP0` support. Each CPU owns one inside its per-CPU area (`percpu.rs`). The scheduler updates the executing CPU's `RSP0` on every task switch (`tss::set_rsp0`), so user-to-kernel transitions land on the correct kernel stack. The same value is mirrored at `gs:[16]` for `syscall_entry`.
 
 Limitations / Simplifications
 - Only `RSP0` is used; IST entries are not configured.
@@ -77,6 +77,15 @@ Limitations / Simplifications
 - A user-accessible `int 0x80` gate for syscalls
 
 `idt::load()` loads the same IDT on an application processor.
+
+Ring-3 transitions: the common stub runs `swapgs` on entry when the saved CS is ring 3. Every exit leaves through `arch_x86_64_frame_exit`, including the scheduler's yield/block/enter paths. That exit path:
+- calls the kernel's frame-exit hook (the BKL release decision) with the frame about to be restored,
+- restores registers,
+- runs `swapgs` again when returning to ring 3, then `iretq`.
+
+Handlers come in two kinds:
+- **Fast handlers** (`register_fast_handler`) run first and must not need kernel locks: the PIT tick counter, the test IPI and the TLB-shootdown IPI. A vector with only a fast handler skips the entry hook, the normal handler and the post hook.
+- **Normal handlers** run after the entry hook (BKL acquire).
 
 The stubs are defined via `global_asm!` and push an interrupt number and error code (dummy for non-error-code exceptions). They save GP registers, call `isr_handler`, restore registers, and `iretq`.
 

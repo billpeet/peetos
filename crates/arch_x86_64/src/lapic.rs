@@ -23,6 +23,13 @@ pub const REG_LVT_TIMER: usize = 0x320;
 pub const REG_LVT_LINT0: usize = 0x350;
 pub const REG_LVT_LINT1: usize = 0x360;
 pub const REG_LVT_ERROR: usize = 0x370;
+pub const REG_TIMER_INITIAL: usize = 0x380;
+pub const REG_TIMER_CURRENT: usize = 0x390;
+pub const REG_TIMER_DIVIDE: usize = 0x3E0;
+
+/// Divide configuration value for "divide by 16".
+pub const TIMER_DIVIDE_16: u32 = 0b0011;
+pub const LVT_TIMER_PERIODIC: u32 = 1 << 17;
 
 pub const SVR_APIC_ENABLE: u32 = 1 << 8;
 pub const LVT_MASKED: u32 = 1 << 16;
@@ -147,6 +154,25 @@ pub fn init_current_cpu() {
 
 #[cfg(not(target_os = "none"))]
 pub fn init_current_cpu() {}
+
+/// Count LAPIC timer ticks (divide-by-16) elapsed during `wait()`.
+/// Leaves the timer stopped and masked.
+pub fn measure_timer(wait: impl FnOnce()) -> u32 {
+    write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
+    write(REG_LVT_TIMER, LVT_MASKED);
+    write(REG_TIMER_INITIAL, u32::MAX);
+    wait();
+    let remaining = read(REG_TIMER_CURRENT);
+    write(REG_TIMER_INITIAL, 0);
+    u32::MAX - remaining
+}
+
+/// Start the executing CPU's LAPIC timer in periodic mode.
+pub fn start_periodic_timer(vector: u8, initial_count: u32) {
+    write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
+    write(REG_LVT_TIMER, LVT_TIMER_PERIODIC | vector as u32);
+    write(REG_TIMER_INITIAL, initial_count);
+}
 
 #[inline]
 pub fn eoi() {

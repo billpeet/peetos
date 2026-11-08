@@ -25,6 +25,12 @@ pub const IPI_VECTOR_COUNT: u8 = 4;
 
 pub type InterruptHandler = extern "C" fn(frame: &mut InterruptFrame);
 pub type PostHandlerHook = fn(frame: &mut InterruptFrame) -> u64;
+/// Runs before a vector's normal handler; the kernel takes its big lock here.
+pub type EntryHook = fn();
+/// Called from assembly with the frame that is about to be restored, after
+/// any stack switch. The kernel drops its big lock here when that frame
+/// returns to ring 3 or to an idle context.
+pub type ExitHook = extern "C" fn(frame: *const InterruptFrame);
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -92,6 +98,14 @@ static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
 static mut IDTR: Idtr = Idtr { limit: 0, base: 0 };
 static mut HANDLERS: [Option<InterruptHandler>; IDT_ENTRIES] = [None; IDT_ENTRIES];
 static mut POST_HANDLER_HOOK: Option<PostHandlerHook> = None;
+/// Handlers that run before the entry hook and must not need kernel locks.
+/// A vector with only a fast handler skips the entry hook, the normal
+/// handler table and the post-handler hook entirely.
+static mut FAST_HANDLERS: [Option<InterruptHandler>; IDT_ENTRIES] = [None; IDT_ENTRIES];
+static mut ENTRY_HOOK: Option<EntryHook> = None;
+#[cfg(target_os = "none")]
+#[no_mangle]
+static mut ARCH_X86_64_EXIT_HOOK: u64 = 0;
 
 static EXCEPTION_NAMES: [&str; 32] = [
     "Divide Error (#DE)",
@@ -174,6 +188,37 @@ pub fn register_handler(vector: u8, handler: InterruptHandler) {
 pub fn set_post_handler_hook(hook: PostHandlerHook) {
     unsafe {
         POST_HANDLER_HOOK = Some(hook);
+    }
+}
+
+/// Register a lock-free handler for `vector` (see `FAST_HANDLERS`).
+pub fn register_fast_handler(vector: u8, handler: InterruptHandler) {
+    unsafe {
+        FAST_HANDLERS[vector as usize] = Some(handler);
+    }
+}
+
+pub fn set_entry_hook(hook: EntryHook) {
+    unsafe {
+        ENTRY_HOOK = Some(hook);
+    }
+}
+
+/// Install the hook every interrupt/scheduler exit path calls before
+/// restoring a frame.
+pub fn set_exit_hook(hook: ExitHook) {
+    #[cfg(target_os = "none")]
+    unsafe {
+        ARCH_X86_64_EXIT_HOOK = hook as usize as u64;
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = hook;
+}
+
+/// True for vectors served only by a fast handler (no kernel lock taken).
+pub fn is_lock_free(vector: u8) -> bool {
+    unsafe {
+        FAST_HANDLERS[vector as usize].is_some() && HANDLERS[vector as usize].is_none()
     }
 }
 
@@ -295,10 +340,19 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) -> u64 {
         return 0;
     }
 
-    match unsafe { HANDLERS[vector] } {
-        Some(handler) => handler(frame),
-        None if int_no < 32 => default_exception_handler(frame),
-        None => {}
+    if let Some(fast) = unsafe { FAST_HANDLERS[vector] } {
+        fast(frame);
+    }
+    let lock_free = is_lock_free(vector as u8);
+    if !lock_free {
+        if let Some(enter) = unsafe { ENTRY_HOOK } {
+            enter();
+        }
+        match unsafe { HANDLERS[vector] } {
+            Some(handler) => handler(frame),
+            None if int_no < 32 => default_exception_handler(frame),
+            None => {}
+        }
     }
 
     // Acknowledge centrally so a handler can never leave the controller
@@ -310,6 +364,9 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) -> u64 {
         lapic::eoi();
     }
 
+    if lock_free {
+        return 0;
+    }
     if let Some(hook) = unsafe { POST_HANDLER_HOOK } {
         return hook(frame);
     }
@@ -438,6 +495,11 @@ APIC_VEC 243
 APIC_VEC 255
 
 isr_common_stub:
+    // Coming from ring 3: switch GS to this CPU's per-CPU area.
+    test byte ptr [rsp + 24], 3
+    jz 1f
+    swapgs
+1:
     push rax
     push rbx
     push rcx
@@ -460,7 +522,19 @@ isr_common_stub:
     jz .no_switch
     mov rsp, rax
 .no_switch:
-
+.global arch_x86_64_frame_exit
+arch_x86_64_frame_exit:
+    // rsp = frame about to be restored (possibly another task's). Let the
+    // kernel release its lock now that the old stack is no longer in use.
+    mov rax, [rip + ARCH_X86_64_EXIT_HOOK]
+    test rax, rax
+    jz 2f
+    mov rdi, rsp
+    mov rbx, rsp
+    and rsp, -16
+    call rax
+    mov rsp, rbx
+2:
     pop r15
     pop r14
     pop r13
@@ -478,6 +552,11 @@ isr_common_stub:
     pop rax
 
     add rsp, 16
+    // Returning to ring 3: restore the user GS base.
+    test byte ptr [rsp + 8], 3
+    jz 3f
+    swapgs
+3:
     iretq
 "#
 );

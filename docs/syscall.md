@@ -25,10 +25,12 @@ Limitations / Simplifications
 
 **Syscall Entry Stub**
 `syscall_entry` is defined via `global_asm!` in `crates/arch_x86_64/src/syscall.rs`. It:
-1. Uses `swapgs` and switches to the current task's kernel stack (tracked via `TSS.rsp0`).
+1. Uses `swapgs` to reach the per-CPU area. It stashes the user RSP at `gs:[8]` and loads the current task's kernel stack from `gs:[16]` (this CPU's RSP0).
 2. Saves user RSP, RCX (return RIP), and R11 (return RFLAGS) plus syscall arguments.
-3. Calls `syscall_handler` with a pointer to the `SyscallFrame` on the kernel stack.
+3. Calls `syscall_handler` with a pointer to the `SyscallFrame` on the kernel stack. `syscall_handler` takes the big kernel lock, dispatches, then disables interrupts and releases the lock (see `docs/smp.md`).
 4. Restores registers and returns via `swapgs` + `sysretq`.
+
+`arch_x86_64::syscall::init()` programs per-CPU MSRs, so every AP calls it during bring-up. It leaves the GS bases alone; `percpu::init_cpu` owns them.
 
 Limitations / Simplifications
 - No SMEP/SMAP toggling yet.

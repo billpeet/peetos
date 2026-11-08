@@ -61,7 +61,9 @@ while (( SECONDS < deadline )); do
     input_injected=1
   fi
 
-  if rg -q '\[gui-smoke\] pass' "${LOG_FILE}"; then
+  # Wait for the init script's completion marker, which follows the
+  # userspace pass marker; stopping at "pass" races the final output.
+  if rg -q '\[musl-ext2-gui-smoke\] done' "${LOG_FILE}"; then
     break
   fi
 

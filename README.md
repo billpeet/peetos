@@ -32,10 +32,11 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `arch_x86_64` provides port I/O helpers and interrupt enable/disable wrappers.
 - GDT/IDT setup is wired with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, and serial exception reports.
 - PMM/VMM/kernel heap are active.
-- SMP phase 1:
+- SMP:
   - When an ACPI MADT is present, the kernel switches IRQ delivery from the 8259 PIC to the LAPIC/IOAPIC.
   - It wakes every application processor with INIT/SIPI and checks each one with an IPI self-test.
-  - APs park after check-in; scheduling still happens only on the boot CPU.
+  - Every CPU runs tasks from a shared run queue. Each CPU has its own GDT/TSS/GS area and LAPIC timer tick, and reschedule and TLB-shootdown IPIs keep them coordinated.
+  - Kernel code is serialised by a big kernel lock, so for now only user-mode work runs in parallel.
   - See `docs/smp.md`.
 - Tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption).
 - libwayland 1.23.1 (with libffi 3.4.6) is ported as static musl libraries (`make -C wayland`). A dedicated QEMU smoke (`run-wayland-smoke`) runs a libwayland compositor and a separate libwayland client process that connect over `/tmp/wayland-0`, share a sealed memfd `wl_shm` pool, present two frames (growing the pool in between), and exercise `eventfd`, `timerfd`, `signalfd`, `flock`, `fallocate`, `mremap`, and `SO_PEERCRED`. See `docs/wayland.md`.

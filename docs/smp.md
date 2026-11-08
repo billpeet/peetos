@@ -1,96 +1,109 @@
 # SMP and APIC
 
 This document covers ACPI MADT discovery, the Local APIC / I/O APIC interrupt
-path, and application-processor (AP) bring-up. This is SMP phase 1: every CPU
-is brought online and can take interrupts, but the scheduler still runs only
-on the bootstrap processor (BSP).
+path, application-processor (AP) bring-up, per-CPU state, and the big kernel
+lock (BKL) that lets every CPU run tasks.
+
+Status:
+- **Phase 1:** every CPU comes online, and IRQs go through the IOAPIC.
+- **Phase 2:** the scheduler runs on every CPU. The kernel is serialised by one big kernel lock owned by a CPU.
 
 **Where It Lives**
-- `crates/arch_x86_64/src/acpi.rs`: RSDP/RSDT/XSDT/MADT parsing, ISA IRQ override resolution (pure, host-tested)
-- `crates/arch_x86_64/src/lapic.rs`: xAPIC MMIO driver (enable, EOI, IPIs)
+- `crates/arch_x86_64/src/acpi.rs`: RSDP/RSDT/XSDT/MADT parsing and ISA IRQ override resolution (pure, host-tested)
+- `crates/arch_x86_64/src/lapic.rs`: xAPIC MMIO driver (enable, EOI, IPIs, timer calibration, periodic timer)
 - `crates/arch_x86_64/src/ioapic.rs`: redirection-table programming
-- `crates/arch_x86_64/src/irq.rs`: controller-neutral ISA IRQ layer (`unmask`/`mask`/`eoi`)
-- `crates/arch_x86_64/src/pit.rs`: `busy_wait_us()` for startup delays with interrupts off
-- `kernel/src/smp.rs`: discovery, APIC switch-over, AP startup, IPI self-test
+- `crates/arch_x86_64/src/irq.rs`: controller-neutral ISA IRQ layer
+- `crates/arch_x86_64/src/percpu.rs`: per-CPU area via GS, plus a GDT and TSS for each CPU
+- `crates/arch_x86_64/src/idt.rs`: `swapgs`-aware entry/exit, fast (lock-free) handlers, entry/exit hooks
+- `kernel/src/bkl.rs`: the big kernel lock
+- `kernel/src/sched.rs`: shared run queue with per-CPU current/idle/preempt state
+- `kernel/src/smp.rs`: discovery, APIC switch-over, AP startup, IPIs, TLB shootdown
+- `kernel/src/smp_test.rs`: `test-exit` scheduler self-test
 - `kernel/arch/x86_64/entry.asm`: real-mode AP trampoline and `ap_high_entry`
 
 **Boot Sequence**
-`kmain` calls these right after the heap is up (interrupts still disabled):
+1. `percpu::init_cpu(0)` runs right after `gdt::init()`. The BSP gets its own GDT copy and TSS, and `GS_BASE` points at its per-CPU slot.
+2. `smp::init()` runs after the heap is up, with interrupts still disabled.
+   - Finds the MADT, maps the IOAPIC(s) and LAPIC uncached, and enables the BSP LAPIC (spurious vector `0xFF`).
+   - Moves ISA IRQ delivery from the 8259 to the IOAPIC, honouring MADT interrupt source overrides. IRQs already unmasked on the PIC stay unmasked.
+   - Without a MADT/IOAPIC the kernel stays on the PIC and on one CPU.
+3. `smp::start_aps()`
+   - Calibrates the LAPIC timer against the PIT (one 10 ms scheduler tick).
+   - Installs the trampoline at physical `0x8000`, with transitional page tables at `0x9000-0xBFFF`.
+   - Starts each AP with INIT, then STARTUP, then STARTUP.
+   - Each AP runs `ap_rust_entry`: per-CPU GDT/TSS/GS, the shared IDT, its own SYSCALL MSRs, and a LAPIC enable. It then parks in `sti; hlt`.
+4. `smp::ipi_self_test()` checks that every AP takes a lock-free test IPI.
+5. After `sched::init()`, `smp::release_aps()` creates an idle task for each AP and releases the APs. Each AP then:
+   - takes the BKL,
+   - starts its periodic LAPIC timer (vector `0xF1`),
+   - enters its idle task through `sched::ap_enter`.
 
-1. `smp::init()`
-   - Finds the RSDP (EBDA first KiB, then `0xE0000-0xFFFFF`), follows the
-     RSDT/XSDT to the MADT, and validates every table checksum.
-   - Maps each IOAPIC and the LAPIC uncached (`PCD|PWT`) via MMIO windows,
-     and registers the IOAPICs (all pins masked).
-   - Enables the BSP LAPIC: spurious vector `0xFF`, TPR 0, timer, LINT0
-     and error LVTs masked, LINT1 set to NMI.
-   - Resolves ISA IRQ 0-15 through MADT interrupt source overrides (QEMU maps
-     IRQ0 to GSI2; IRQ 5/9/10/11 are level-triggered) and calls
-     `irq::switch_to_apic()`. IRQs that drivers had already unmasked on the PIC
-     stay unmasked on the IOAPIC. The 8259 is then fully masked.
-   - If there is no MADT, or no usable IOAPIC, the kernel logs it and stays on
-     the legacy PIC. Nothing else changes.
-2. `smp::start_aps()`
-   - Copies the trampoline to physical `0x8000` and builds transitional page
-     tables at `0x9000-0xBFFF`. They identity-map the low 2 MiB and share the
-     kernel's `PML4[511]`.
-   - Per AP: allocates a 16 KiB stack, writes the trampoline data block
-     (`0x8F00`), and sends INIT, waits 10 ms, then sends up to two STARTUP
-     IPIs with vector `0x08`. It then waits up to 200 ms for check-in.
-   - The AP goes from real mode to protected mode to long mode, using the
-     BSP's CR0/CR4/EFER bits. It jumps to `ap_high_entry`, loads the kernel
-     CR3, and calls `ap_rust_entry`, which loads the shared GDT and IDT,
-     enables its LAPIC, marks itself online, and parks in `sti; hlt`.
-3. `smp::ipi_self_test()` sends one fixed IPI (vector `0xF0`) to each online
-   AP and checks that every AP's handler ran.
+   From then on every CPU picks tasks from the shared run queue.
 
-Expected serial output with `-smp 4`:
-```
-[APIC] IOAPIC id=0 addr=0xfec00000 gsi=0..23
-[APIC] LAPIC id=0 at 0xfee00000; 15 ISA IRQ(s) routed via IOAPIC, PIC disabled
-[APIC] Timer IRQ0 -> GSI 2
-[SMP] MADT lists 4 CPU(s)
-[SMP] CPU 1 online (APIC id 1)
-...
-[SMP] 4 of 4 CPU(s) online
-[SMP] IPI self-test: 3/3 AP(s) responded
-```
+**Per-CPU State**
+- `PerCpu` (GS-relative) holds the self pointer, the SYSCALL user-RSP scratch, RSP0, the CPU index, the CPU's GDT and its TSS.
+- Ring-3 transitions:
+  - `syscall_entry` runs `swapgs` and switches to `gs:[16]` (RSP0) instead of using globals.
+  - The ISR stubs run `swapgs` when the saved CS is ring 3, and again before an `iretq` back to ring 3.
+- The scheduler keeps `current`, `idle` and `preempt_pending` for each CPU. `sched::current_task()` and `task::current()` therefore return the executing CPU's task.
+- `smp` tracks each CPU's online flag, APIC id, active CR3, and pending TLB-flush flag.
 
-**Interrupt Vectors**
-- `0x20-0x2F`: ISA IRQ 0-15. The vector is the same under the PIC and the IOAPIC, so drivers register with `irq::irq_to_vector(irq)` either way.
-- `0x80`: `int 0x80` syscall gate.
-- `0xF0-0xF3`: IPI vectors with installed stubs. `0xF0` is the self-test IPI.
-- `0xFF`: LAPIC spurious vector. It is never acknowledged.
+**Big Kernel Lock**
+The lock is owned by a CPU, not a task. It is a FIFO ticket lock: a plain test-and-set lock starved waiters whenever the owner released and immediately re-acquired.
+- **Acquire** whenever this CPU enters the kernel without owning the lock:
+  - SYSCALL (`bkl::syscall_enter`),
+  - any interrupt or exception that is not lock-free (IDT entry hook),
+  - explicit waits.
 
-The IDT dispatcher (`idt::isr_handler`) sends the EOI for every IRQ and IPI
-vector after the handler runs. Drivers must not send their own EOI. An
-unacknowledged LAPIC vector blocks every vector in its priority class or
-below, including the timer. Before this change the e1000 handler never sent
-an EOI at all.
+  Re-acquiring on the owning CPU is a no-op. The CPU waits for its ticket with interrupts disabled, so a nested interrupt cannot take a second ticket. While it waits it services TLB-shootdown requests.
+- **Keep** the lock across kernel-to-kernel context switches.
+- **Release** only in `arch_x86_64_frame_exit`, after `rsp` has moved to the frame being restored, and only when that frame returns to ring 3 or enters an idle task. Until the CPU has left the old stack, no other CPU can pick the previous task off the run queue. The SYSCALL return path releases in `bkl::syscall_exit`, with interrupts disabled first.
+- **`bkl::relax()`** releases and re-queues. `sched::yield_now()` calls it after every yield, because busy-wait loops (`wait4`, `poll`, futex retries) otherwise spin forever while the task they wait for sits on another CPU, waiting for the lock.
+- **`bkl::wait_for_interrupt()`** halts without the lock. The boot task's main loop uses it.
+- **Lock-free paths:**
+  - The PIT tick counter (a fast handler, so `ticks()` advances even while an AP holds the lock).
+  - The test and TLB IPIs.
+  - The idle loop.
 
-**Scheduler Interaction**
-- Only the BSP schedules. The PIT (IRQ0) and all device IRQs are routed to the BSP.
-- `sched::isr_hook` returns early on an AP (`smp::is_bsp()` compares LAPIC ids), so an IPI taken on an AP never touches the run queue or `CURRENT_TASK`.
-- APs do not allocate, print, or take locks after check-in.
+**IPIs and Timers**
+- `0xF0` test (lock-free).
+- `0xF1` per-CPU LAPIC timer tick on APs, which calls `sched::tick_local()`.
+- `0xF2` TLB shootdown (lock-free).
+- `0xF3` reschedule.
+- The PIT stays the global clock on the BSP. `sched::tick()` wakes sleepers and runs the BSP's time slice.
+- When a task becomes ready, `sched` sends a reschedule IPI to one idle CPU.
+
+**TLB Shootdown**
+- Every VMM path that removes or downgrades a present mapping goes through `vmm::invalidate_in` or `flush_in`.
+- These flush locally when the address space is live here (or the address is in the kernel half). They then call `smp::tlb_shootdown()`, which targets:
+  - all online CPUs for kernel addresses,
+  - only CPUs whose active CR3 matches, for user addresses.
+- Targets flush their whole TLB (CR3 reload; no global pages are used) and acknowledge. The initiator holds the BKL and waits.
+- Brand-new mappings over non-present entries need no shootdown.
+
+**Threads on Other CPUs**
+- `exit_group`/`execve` (`kill_other_threads`) handle a sibling thread that is running on another CPU:
+  - flag it `EXITING`,
+  - kick its CPU with a reschedule IPI,
+  - `relax()` until the sibling is parked or blocked, then finish it as before.
+- The scheduler never picks an `EXITING` task parked in user mode, so a kicked sibling cannot be resumed while its killer waits.
 
 **Running**
-- `make test` runs `tests/smoke.sh`, which boots the `test-exit` kernel twice:
-  - With `-smp 1` it checks the uniprocessor APIC path.
-  - With `-smp 4` it checks that all CPUs come online and the IPI self-test passes.
-  - Both runs check that the PIT ticks through the IOAPIC.
+- `make test` runs `tests/smoke.sh`, which boots the `test-exit` kernel at `-smp 1` and at `-smp 4`. The 4-CPU run checks that:
+  - all CPUs come online,
+  - the IPI self-test passes,
+  - the scheduler is running on 4 CPUs,
+  - kernel worker threads were scheduled on at least two different CPUs.
 - `make run QEMU_SMP=4` (or any `run*` target) boots with several CPUs.
 
 Limitations / Simplifications
-- **The scheduler is BSP-only.** APs park in `hlt` after check-in. Running tasks on them needs:
-  - per-CPU state (GS base, `current` task, idle task, TSS/RSP0)
-  - a per-CPU or locked run queue
-  - TLB shootdown IPIs
-  - an audit of the many `static mut` globals and the code that relies on "interrupts off means exclusive". Today those include the PMM, heap and VMM; see their docs.
-- **No per-CPU GDT/TSS.** APs load the shared GDT without `ltr`, so they cannot enter ring 3 yet.
-- **xAPIC MMIO only.** There is no x2APIC mode. CPUs with APIC ids above 255 are skipped, and at most `MAX_CPUS` (16) CPUs are tracked.
-- **ISA IRQs only.** PCI devices work only through their legacy ISA IRQ line plus MADT overrides. There is no `_PRT`/AML evaluation and no MSI/MSI-X. All routes target the BSP; there is no IRQ balancing.
-- **IMCR not programmed.** The IMCR (ports `0x22/0x23`) is not programmed for old chipsets that boot in PIC mode. This doesn't matter on QEMU or modern hardware.
-- **PIT is still the system timer.** The LAPIC timer is masked and not calibrated.
-- **Fixed low-memory pages.** The trampoline uses fixed pages `0x8000-0xBFFF`. This relies on the PMM reserving the low 1 MiB and on nothing else using that range after boot. AP stacks come from the kernel heap and are never freed, even if an AP fails to start.
-- **Time-based startup.** AP startup waits are delays measured with the PIT, not acknowledgements. A CPU that misses the 200 ms window is reported and skipped.
-- **Direct-map limit.** ACPI tables above the 128 MiB direct map are reached through an MMIO window. Each such lookup uses up one of the 16 windows.
+- **One big lock.** All kernel execution is serialised, so only user-mode work runs in parallel. Kernel code that busy-waits without yielding holds everyone else out, and a kernel thread that never blocks keeps its CPU's hold on the lock. The next step is per-subsystem locks.
+- **One shared run queue.** No per-CPU queues, no load balancing, no CPU affinity. Tasks migrate freely.
+- **Device IRQs and the PIT go to the BSP only.** There is no IRQ balancing, no MSI/MSI-X, and no `_PRT`/AML evaluation. PCI devices use their legacy ISA line plus MADT overrides.
+- **Signals reach running tasks late.** A signal sent to a task running in user mode on another CPU is only noticed at that task's next syscall, which matches the single-core delivery point. Only `exit_group`/`execve` actively kick remote siblings.
+- **Coarse TLB shootdowns.** Each one flushes the target's whole TLB and is sent once per invalidated page, with no batching or PCID.
+- **No IST stacks.** The per-CPU TSS has only RSP0.
+- **xAPIC MMIO only.** No x2APIC. APIC ids above 255 are skipped, and at most `MAX_CPUS` (16) CPUs are tracked.
+- **LAPIC timer calibrated once.** It is measured against the PIT on the BSP and assumed identical on all CPUs.
+- **Fixed low-memory pages.** The trampoline and its tables use fixed pages `0x8000-0xBFFF`. AP startup stacks come from the heap and are abandoned once the AP enters its idle task.
+- **IMCR not programmed.** Not needed on QEMU or modern hardware.

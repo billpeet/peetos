@@ -55,7 +55,11 @@ run_qemu() {
 
 run_qemu 1
 grep -q "\[SMP\] 1 CPU online (uniprocessor)" "${LOG_FILE}"
+grep -q "\[TEST\] SMP scheduler: 8/8 workers finished on 1 CPU(s)" "${LOG_FILE}"
 
 run_qemu 4
 grep -q "\[SMP\] 4 of 4 CPU(s) online" "${LOG_FILE}"
 grep -q "\[SMP\] IPI self-test: 3/3 AP(s) responded" "${LOG_FILE}"
+grep -q "\[SMP\] Scheduler running on 4 CPU(s)" "${LOG_FILE}"
+# Kernel worker threads must actually be scheduled on more than one CPU.
+grep -Eq "\[TEST\] SMP scheduler: 8/8 workers finished on [2-4] CPU\(s\)" "${LOG_FILE}"

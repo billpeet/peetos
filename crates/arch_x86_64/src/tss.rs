@@ -1,6 +1,5 @@
 use core::mem::size_of;
 
-use crate::gdt;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -23,7 +22,7 @@ pub struct Tss {
 }
 
 impl Tss {
-    const fn zero() -> Self {
+    pub(crate) const fn zero() -> Self {
         Self {
             _reserved0: 0,
             rsp0: 0,
@@ -42,27 +41,15 @@ impl Tss {
             iopb_offset: size_of::<Tss>() as u16,
         }
     }
-}
 
-static mut TSS: Tss = Tss::zero();
-#[cfg(target_os = "none")]
-#[no_mangle]
-static mut ARCH_X86_64_TSS_RSP0: u64 = 0;
-
-pub fn init() {
-    let tss_addr = &raw const TSS as *const Tss as u64;
-    gdt::set_tss_base(tss_addr);
-    gdt::load_tss();
-}
-
-pub fn set_rsp0(rsp0: u64) {
-    unsafe {
-        TSS.rsp0 = rsp0;
-        #[cfg(target_os = "none")]
-        {
-            ARCH_X86_64_TSS_RSP0 = rsp0;
-        }
+    pub(crate) fn set_rsp0(&mut self, rsp0: u64) {
+        self.rsp0 = rsp0;
     }
+}
+
+/// Set RSP0 in the executing CPU's TSS (see `percpu`).
+pub fn set_rsp0(rsp0: u64) {
+    crate::percpu::set_rsp0(rsp0);
 }
 
 #[cfg(test)]

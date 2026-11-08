@@ -74,7 +74,7 @@ impl GdtEntry {
     }
 }
 
-#[cfg(any(target_os = "none", test))]
+#[cfg(test)]
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct GdtTssEntry {
@@ -184,33 +184,36 @@ pub fn init() {
     // No-op for host builds/tests.
 }
 
+/// Raw copy of the template GDT built by [`init`]. Per-CPU GDTs start from
+/// this and then install their own TSS descriptor.
 #[cfg(target_os = "none")]
-pub fn set_tss_base(base: u64) {
+pub fn template() -> [u64; GDT_ENTRIES] {
+    let mut out = [0u64; GDT_ENTRIES];
     unsafe {
-        let tss_desc = (ptr::addr_of_mut!(GDT) as *mut GdtEntry).add(5) as *mut GdtTssEntry;
-        (*tss_desc).base_low = (base & 0xFFFF) as u16;
-        (*tss_desc).base_mid = ((base >> 16) & 0xFF) as u8;
-        (*tss_desc).base_mid2 = ((base >> 24) & 0xFF) as u8;
-        (*tss_desc).base_high = ((base >> 32) & 0xFFFFFFFF) as u32;
-        (*tss_desc).reserved = 0;
+        ptr::copy_nonoverlapping(
+            ptr::addr_of!(GDT) as *const u64,
+            out.as_mut_ptr(),
+            GDT_ENTRIES,
+        );
     }
+    out
 }
 
 #[cfg(not(target_os = "none"))]
-pub fn set_tss_base(_base: u64) {
-    // No-op for host builds/tests.
+pub fn template() -> [u64; GDT_ENTRIES] {
+    [0; GDT_ENTRIES]
 }
 
-/// Load the shared GDT on the executing CPU and reload segment registers.
-/// Used by application processors after the BSP has built it with [`init`].
-/// The TSS is not loaded: the single TSS descriptor belongs to the BSP.
+/// Load a GDT of `entries` descriptors at `base` on the executing CPU and
+/// reload the segment registers. The table must stay alive forever.
 #[cfg(target_os = "none")]
-pub fn load() {
-    unsafe { load_gdt(ptr::addr_of!(GDTR)) };
+pub fn load_table(base: u64, entries: usize) {
+    let gdtr = Gdtr {
+        limit: (size_of::<GdtEntry>() * entries - 1) as u16,
+        base,
+    };
+    unsafe { load_gdt(&gdtr) };
 }
-
-#[cfg(not(target_os = "none"))]
-pub fn load() {}
 
 #[cfg(target_os = "none")]
 pub fn load_tss() {

@@ -28,9 +28,15 @@ pub const fn pit_divisor(freq: u32) -> u16 {
     (PIT_FREQUENCY / freq) as u16
 }
 
+/// Lock-free part of IRQ0: advance the tick counter before the kernel takes
+/// any lock, so code waiting on `ticks()` on another CPU always progresses.
+#[cfg(target_os = "none")]
+extern "C" fn timer_fast_handler(_frame: &mut InterruptFrame) {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
 #[cfg(target_os = "none")]
 extern "C" fn timer_handler(_frame: &mut InterruptFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
     if let Some(hook) = unsafe { TICK_HOOK } {
         hook();
     }
@@ -48,6 +54,7 @@ pub fn init() {
         outb(PIT_CHANNEL0_DATA, (divisor >> 8) as u8);
     }
 
+    idt::register_fast_handler(irq::irq_to_vector(pic::IRQ_TIMER), timer_fast_handler);
     idt::register_handler(irq::irq_to_vector(pic::IRQ_TIMER), timer_handler);
     irq::unmask(pic::IRQ_TIMER);
 }

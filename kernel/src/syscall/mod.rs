@@ -1414,8 +1414,18 @@ pub fn init() {
     vm_page_cache_reset();
 }
 
+/// SYSCALL entry from `syscall_entry` (ring 3, interrupts disabled). Holds
+/// the big kernel lock for the whole call; it is released just before the
+/// SYSRET back to the same task.
 #[no_mangle]
 pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
+    crate::bkl::syscall_enter();
+    let ret = syscall_dispatch(frame);
+    crate::bkl::syscall_exit();
+    ret
+}
+
+fn syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
     let ctx = SyscallContext::new(task::current());
     let nr = frame.rax;
     if frame.rax == SYS_RT_SIGRETURN {

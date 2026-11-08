@@ -1,27 +1,30 @@
-//! APIC bring-up and application-processor (AP) startup.
+//! APIC bring-up, application-processor (AP) startup, and cross-CPU IPIs.
 //!
-//! Boot flow (all on the BSP, interrupts disabled):
+//! Boot flow (BSP, interrupts disabled, BSP owns the big kernel lock):
 //! 1. [`init`] finds the ACPI MADT, maps the LAPIC and IOAPIC(s), enables the
 //!    BSP's LAPIC and moves legacy ISA IRQ delivery from the 8259 PIC to the
-//!    IOAPIC. Without a usable MADT the kernel stays on the PIC.
-//! 2. [`start_aps`] copies the real-mode trampoline from `entry.asm` to
-//!    `AP_TRAMPOLINE_PHYS`, then wakes each AP with INIT + STARTUP IPIs.
-//!    APs load the shared GDT/IDT, enable their LAPIC and park in `hlt`
-//!    with interrupts enabled so they can take IPIs.
-//! 3. [`ipi_self_test`] sends a fixed IPI to every parked AP and waits for
-//!    each one to acknowledge it, proving per-CPU interrupt delivery works.
+//!    IOAPIC. Without a usable MADT the kernel stays on the PIC (and on one
+//!    CPU).
+//! 2. [`start_aps`] calibrates the LAPIC timer, copies the real-mode
+//!    trampoline from `entry.asm` to `AP_TRAMPOLINE_PHYS`, then wakes each AP
+//!    with INIT + STARTUP IPIs. Each AP loads its per-CPU GDT/TSS/GS area, the
+//!    shared IDT and its SYSCALL MSRs, enables its LAPIC and parks in `hlt`.
+//! 3. [`ipi_self_test`] sends a lock-free test IPI to every parked AP.
+//! 4. After the scheduler is up, [`release_aps`] gives every AP an idle task
+//!    and lets it enter the scheduler (`sched::ap_enter`). From then on every
+//!    CPU runs tasks, serialised in the kernel by the big kernel lock.
 //!
-//! The scheduler still runs only on the BSP. APs never touch scheduler state;
-//! `sched::isr_hook` ignores interrupts taken on an AP.
+//! IPI vectors: `0xF0` test (lock-free), `0xF1` LAPIC timer tick, `0xF2` TLB
+//! shootdown (lock-free), `0xF3` reschedule.
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use arch_x86_64::acpi::{self, IsaRoute, MadtInfo, MAX_CPUS};
 use arch_x86_64::addr::{KERNEL_VIRT_BASE, PAGE_SIZE};
 use arch_x86_64::idt::{self, InterruptFrame};
 use arch_x86_64::irq::{self, ISA_IRQ_COUNT};
-use arch_x86_64::{gdt, interrupts, ioapic, lapic, pit};
+use arch_x86_64::{interrupts, ioapic, lapic, percpu, pit, syscall as arch_syscall};
 
 use crate::memory::{heap, vmm};
 use crate::mmio;
@@ -55,8 +58,18 @@ const AP_STACK_SIZE: usize = 16 * 1024;
 const AP_START_TIMEOUT_US: u64 = 200_000;
 const IPI_TEST_TIMEOUT_US: u64 = 100_000;
 
-/// IPI vector used by [`ipi_self_test`].
+/// IPI vector used by [`ipi_self_test`] (lock-free).
 pub const IPI_VECTOR_TEST: u8 = idt::IPI_VECTOR_FIRST;
+/// Per-CPU LAPIC timer tick on APs (takes the BKL).
+pub const IPI_VECTOR_TIMER: u8 = idt::IPI_VECTOR_FIRST + 1;
+/// TLB shootdown (lock-free).
+pub const IPI_VECTOR_TLB: u8 = idt::IPI_VECTOR_FIRST + 2;
+/// Reschedule: wakes a CPU so the scheduler hook runs (takes the BKL).
+pub const IPI_VECTOR_RESCHED: u8 = idt::IPI_VECTOR_FIRST + 3;
+
+/// How long to wait for every target to acknowledge a TLB shootdown before
+/// complaining (in spin iterations; this should never trigger).
+const TLB_SHOOTDOWN_SPIN_WARN: u64 = 100_000_000;
 
 const EFER_SCE: u64 = 1 << 0;
 const EFER_LME: u64 = 1 << 8;
@@ -74,6 +87,10 @@ struct CpuSlot {
     apic_id: AtomicU32,
     online: AtomicBool,
     ipi_count: AtomicU32,
+    /// CR3 currently loaded on this CPU (targets user-address shootdowns).
+    active_cr3: AtomicU64,
+    /// Set by a shootdown initiator; the target flushes and clears it.
+    tlb_flush_pending: AtomicBool,
 }
 
 impl CpuSlot {
@@ -82,6 +99,8 @@ impl CpuSlot {
             apic_id: AtomicU32::new(0),
             online: AtomicBool::new(false),
             ipi_count: AtomicU32::new(0),
+            active_cr3: AtomicU64::new(0),
+            tlb_flush_pending: AtomicBool::new(false),
         }
     }
 }
@@ -95,6 +114,10 @@ static APIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set by an AP once it is running Rust code; cleared by the BSP before
 /// each startup attempt.
 static AP_CHECKIN: AtomicBool = AtomicBool::new(false);
+/// Set by [`release_aps`] once APs may enter the scheduler.
+static AP_GO: AtomicBool = AtomicBool::new(false);
+/// LAPIC timer initial count for one scheduler tick (divide-by-16).
+static TIMER_INITIAL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 pub fn apic_active() -> bool {
     APIC_ACTIVE.load(Ordering::Acquire)
@@ -108,23 +131,102 @@ pub fn online_count() -> usize {
     ONLINE_COUNT.load(Ordering::Acquire)
 }
 
-/// True on the bootstrap processor (and always true before APIC init).
-#[inline]
-pub fn is_bsp() -> bool {
-    !apic_active() || lapic::id() == BSP_APIC_ID.load(Ordering::Relaxed)
+pub fn is_online(index: usize) -> bool {
+    index < MAX_CPUS && CPUS[index].online.load(Ordering::Acquire)
 }
 
-/// Logical index of the executing CPU (0 = BSP).
-pub fn current_cpu_index() -> usize {
-    if !apic_active() {
-        return 0;
+fn send_ipi_to(index: usize, vector: u8) {
+    let apic_id = CPUS[index].apic_id.load(Ordering::Relaxed);
+    interrupts::without_interrupts(|| {
+        lapic::send_ipi(apic_id, lapic::icr_fixed(vector));
+    });
+}
+
+/// Ask CPU `index` to run the scheduler hook (no-op when it is offline).
+pub fn send_resched(index: usize) {
+    if apic_active() && is_online(index) && index != percpu::current_index() {
+        send_ipi_to(index, IPI_VECTOR_RESCHED);
     }
-    let id = lapic::id();
-    let count = cpu_count();
-    CPUS[..count]
-        .iter()
-        .position(|c| c.apic_id.load(Ordering::Relaxed) == id)
-        .unwrap_or(0)
+}
+
+/// Record the CR3 just loaded on this CPU.
+pub fn note_active_cr3(cr3: u64) {
+    CPUS[percpu::current_index()]
+        .active_cr3
+        .store(cr3, Ordering::Release);
+}
+
+fn flush_local_tlb() {
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr3",
+            "mov cr3, {tmp}",
+            tmp = out(reg) _,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Perform a pending TLB flush for this CPU, if one was requested. Called
+/// from the TLB IPI and from every BKL spin loop.
+pub fn service_tlb_shootdown() {
+    let slot = &CPUS[percpu::current_index()];
+    if slot.tlb_flush_pending.load(Ordering::Acquire) {
+        flush_local_tlb();
+        slot.tlb_flush_pending.store(false, Ordering::Release);
+    }
+}
+
+extern "C" fn tlb_ipi_handler(_frame: &mut InterruptFrame) {
+    service_tlb_shootdown();
+}
+
+extern "C" fn timer_ipi_handler(_frame: &mut InterruptFrame) {
+    crate::sched::tick_local();
+}
+
+extern "C" fn resched_ipi_handler(_frame: &mut InterruptFrame) {
+    // Nothing to do here: the post-handler scheduler hook does the work.
+}
+
+/// Make other CPUs drop stale TLB entries for address space `pml4`
+/// (`0` = kernel mapping: every online CPU). Waits until every target has
+/// flushed. Must be called with the BKL held (one initiator at a time).
+pub fn tlb_shootdown(pml4: u64) {
+    if online_count() <= 1 {
+        return;
+    }
+    let me = percpu::current_index();
+    let mut targets = [false; MAX_CPUS];
+    let mut any = false;
+    for index in 0..cpu_count() {
+        if index == me || !is_online(index) {
+            continue;
+        }
+        if pml4 != 0 && CPUS[index].active_cr3.load(Ordering::Acquire) != pml4 {
+            continue;
+        }
+        targets[index] = true;
+        any = true;
+        CPUS[index].tlb_flush_pending.store(true, Ordering::Release);
+        send_ipi_to(index, IPI_VECTOR_TLB);
+    }
+    if !any {
+        return;
+    }
+    let mut spins: u64 = 0;
+    loop {
+        let waiting = (0..cpu_count())
+            .any(|i| targets[i] && CPUS[i].tlb_flush_pending.load(Ordering::Acquire));
+        if !waiting {
+            return;
+        }
+        spins += 1;
+        if spins == TLB_SHOOTDOWN_SPIN_WARN {
+            serial_println!("[SMP] WARNING: TLB shootdown still waiting");
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Borrow `len` bytes of physical memory. Low memory comes straight from the
@@ -401,7 +503,16 @@ pub fn start_aps() {
         serial_println!("[SMP] 1 CPU online (uniprocessor)");
         return;
     }
-    idt::register_handler(IPI_VECTOR_TEST, test_ipi_handler);
+    idt::register_fast_handler(IPI_VECTOR_TEST, test_ipi_handler);
+    idt::register_fast_handler(IPI_VECTOR_TLB, tlb_ipi_handler);
+    idt::register_handler(IPI_VECTOR_TIMER, timer_ipi_handler);
+    idt::register_handler(IPI_VECTOR_RESCHED, resched_ipi_handler);
+
+    // One scheduler tick of LAPIC timer counts, measured against the PIT.
+    let tick_us = 1_000_000 / pit::TIMER_FREQUENCY as u64;
+    let counts = lapic::measure_timer(|| pit::busy_wait_us(tick_us));
+    TIMER_INITIAL_COUNT.store(counts.max(1), Ordering::Release);
+    serial_println!("[APIC] LAPIC timer: {} counts per {} us tick", counts, tick_us);
 
     let kernel_cr3 = vmm::get_kernel_pml4().as_u64();
     if !interrupts::without_interrupts(|| install_trampoline(kernel_cr3)) {
@@ -421,7 +532,7 @@ pub fn start_aps() {
 }
 
 extern "C" fn test_ipi_handler(_frame: &mut InterruptFrame) {
-    let index = current_cpu_index();
+    let index = percpu::current_index();
     CPUS[index].ipi_count.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -465,26 +576,59 @@ pub fn ipi_self_test() -> (usize, usize) {
     (got, expected)
 }
 
+/// Let every online AP enter the scheduler. Call on the BSP after
+/// `sched::init`, with the BKL held. Each AP gets its own idle task.
+pub fn release_aps() {
+    if online_count() <= 1 {
+        return;
+    }
+    let mut released = 0;
+    for index in 1..cpu_count() {
+        if is_online(index) {
+            if crate::sched::create_idle(index) {
+                released += 1;
+            } else {
+                serial_println!("[SMP] No idle task for CPU {}; leaving it parked", index);
+                CPUS[index].online.store(false, Ordering::Release);
+                ONLINE_COUNT.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+    AP_GO.store(true, Ordering::Release);
+    for index in 1..cpu_count() {
+        if is_online(index) {
+            send_ipi_to(index, IPI_VECTOR_RESCHED);
+        }
+    }
+    serial_println!("[SMP] Scheduler running on {} CPU(s)", released + 1);
+}
+
 /// First Rust code on an AP, called from `ap_high_entry` in `entry.asm`
 /// with the kernel CR3 loaded and a private stack.
 #[no_mangle]
 pub extern "C" fn ap_rust_entry(cpu_index: u64) -> ! {
     AP_CHECKIN.store(true, Ordering::Release);
-
-    gdt::load();
-    idt::load();
-    lapic::init_current_cpu();
-
     let index = cpu_index as usize;
-    if index < MAX_CPUS {
-        CPUS[index].online.store(true, Ordering::Release);
-    }
 
-    // Park. Interrupts are enabled so the AP can receive IPIs; no device IRQ
-    // is routed here and the scheduler ignores APs (see sched::isr_hook).
-    loop {
+    percpu::init_cpu(index);
+    idt::load();
+    arch_syscall::init();
+    lapic::init_current_cpu();
+    note_active_cr3(vmm::get_kernel_pml4().as_u64());
+
+    CPUS[index].online.store(true, Ordering::Release);
+
+    // Park until the BSP releases us. Interrupts are enabled so test, TLB and
+    // reschedule IPIs are taken; the scheduler hook ignores this CPU until
+    // it has a current task.
+    while !AP_GO.load(Ordering::Acquire) {
         unsafe {
             core::arch::asm!("sti; hlt", options(nomem, nostack));
         }
     }
+
+    interrupts::disable();
+    crate::bkl::acquire();
+    lapic::start_periodic_timer(IPI_VECTOR_TIMER, TIMER_INITIAL_COUNT.load(Ordering::Acquire));
+    crate::sched::ap_enter(index)
 }

@@ -90,4 +90,4 @@ Limitations / Simplifications
 - Signal frames carry the FXSAVE image through `uc_mcontext.fpregs` (Linux `_fpstate` layout for the legacy area); there is no XSAVE extended-state header.
 - `#XM`/`#MF` floating-point exceptions that userspace unmasks are not translated into `SIGFPE` with `FPE_*` codes.
 - Zombie processes are reaped by `wait4`; exited non-leader threads are reaped automatically. Orphaned children are not reparented to init, so their zombies are only reaped if the original parent waits for them.
-- Run queue operations are protected only by interrupt masking (single-core assumption). This still holds with SMP phase 1: application processors are brought online but park in `hlt`, and `sched::isr_hook` ignores interrupts taken on them (see `docs/smp.md`).
+- The scheduler runs on every CPU with one shared run queue and per-CPU current/idle/preempt state. All scheduler state is protected by the big kernel lock, not by fine-grained locks (see `docs/smp.md`). There are no per-CPU run queues, no load balancing and no affinity.

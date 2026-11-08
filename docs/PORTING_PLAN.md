@@ -16,13 +16,19 @@ current Rust kernel implementation and forward roadmap.
 
 - Bootloader handoff, higher-half entry, serial, panic, and exception reporting are in place.
 - CPU setup is in place: GDT/TSS/IDT, PIC/PIT, SYSCALL MSRs, and preemption hooks.
-- SMP phase 1 is in place (`docs/smp.md`):
+- SMP phases 1 and 2 are in place (`docs/smp.md`):
   - ACPI MADT discovery.
   - LAPIC + IOAPIC interrupt delivery, replacing the 8259 PIC when a MADT exists.
   - INIT/SIPI bring-up of every AP through a real-mode trampoline.
   - An IPI self-test.
   - `tests/smoke.sh` boots with `-smp 1` and `-smp 4`, and checks that timer ticks arrive through the IOAPIC.
-  - APs park after check-in; the scheduler still runs only on the BSP.
+  - Every CPU runs tasks. This uses:
+    - per-CPU GS/GDT/TSS,
+    - a shared run queue with per-CPU current/idle,
+    - a LAPIC timer tick on the APs,
+    - reschedule and TLB-shootdown IPIs.
+  - All kernel execution is serialised by a big kernel lock (FIFO ticket lock, owned by a CPU).
+  - `tests/smoke.sh` checks that kernel threads run on more than one CPU, and the userspace suites pass at `-smp 4`.
 - Memory management is in place: typed addresses, bitmap PMM, 4-level VMM, and kernel heap.
 
 ### Process and Syscall Layer
@@ -150,13 +156,13 @@ current Rust kernel implementation and forward roadmap.
 - Finish dynamic-linker/runtime completeness beyond current bootstrap path
   (relocations/symbol resolution and broader compatibility).
 
-### 1a. SMP Phase 2 (Scheduling on All Cores)
+### 1a. SMP Phase 3 (Breaking Up the Big Kernel Lock)
 
-- Add per-CPU state via GS base: CPU id, `current` task, idle task, and a per-CPU GDT/TSS with RSP0 (and later IST stacks).
-- Make the scheduler multi-core: either a big kernel lock as a first step, or per-CPU run queues with a global lock and IPI-driven reschedule.
-- Add TLB shootdown IPIs for `munmap`/`mprotect`/COW and address-space teardown.
-- Replace "interrupts off" critical sections in the PMM, heap, VMM, VFS, net, and syscall globals with real locks. That needs an IRQ-safe `SpinLock` that also masks interrupts.
-- Calibrate the LAPIC timer and use it as the per-CPU preemption tick.
+- Add an IRQ-safe `SpinLock` that masks interrupts, then give the PMM, heap, VMM, run queue, VFS, net stack and syscall globals their own locks. Shrink the BKL until it can be removed.
+- Move to per-CPU run queues with load balancing (and later affinity).
+- Batch TLB shootdowns per operation (`munmap` ranges, fork COW marking) and consider PCID.
+- Deliver signals to tasks running in user mode on another CPU promptly (kick them with a reschedule IPI).
+- Route device IRQs to more than the BSP, and add IST stacks for #DF/NMI.
 
 ### 2. VM and Memory Policy
 

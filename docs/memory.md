@@ -41,7 +41,7 @@ Public API:
 Limitations / Simplifications
 - Hard cap of 128 MB managed memory; higher RAM is ignored.
 - E820 is read from fixed bootloader-provided addresses without additional validation.
-- Not SMP-safe; no locking or per-CPU freelists.
+- No lock of its own and no per-CPU freelists. It relies on the big kernel lock (`docs/smp.md`) for cross-CPU exclusion.
 - Only reserves low 1MB and the kernel image range by default. SMP bring-up relies on that reservation: it reuses physical `0x8000-0xBFFF` for the AP trampoline and its transitional page tables (see `docs/smp.md`).
 
 **Virtual Memory Manager (VMM)**
@@ -74,7 +74,7 @@ RAII support:
 Limitations / Simplifications
 - Only 4 KB mappings are created; large pages are detected but not allocated.
 - Page table allocation is simple and not reference-counted; `destroy_address_space` only frees the PML4. Data frames carry a 16-bit PMM share count for copy-on-write; page-table frames are never shared.
-- No TLB shootdown across CPUs, PCID, or advanced address-space isolation features.
+- TLB shootdown is coarse. Removing or downgrading a present mapping sends an IPI that makes every CPU using that address space (or every CPU, for kernel addresses) flush its whole TLB. Shootdowns are not batched across pages, and there is no PCID or other advanced address-space isolation.
 - `mremap` requires the old range to lie inside one existing mapping, does not support `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and refuses to resize framebuffer mappings.
 
 **Kernel Heap (kmalloc)**
@@ -88,7 +88,7 @@ Block layout:
 - Free list is sorted by address and coalesced on free.
 
 Limitations / Simplifications
-- Single global heap with no locking; not safe for concurrent allocations.
+- Single global heap with no lock of its own. It relies on the big kernel lock for cross-CPU exclusion.
 - Fixed 64 MB heap range with no guard pages or shrinking.
 - First-fit allocator only; no slabs, per-size caches, or fragmentation mitigation beyond coalescing.
 

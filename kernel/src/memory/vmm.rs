@@ -224,6 +224,33 @@ pub fn flush_tlb() {
 #[cfg(not(target_os = "none"))]
 pub fn flush_tlb() {}
 
+/// Start of the shared kernel half of every address space.
+const KERNEL_HALF_START: u64 = 0xFFFF_8000_0000_0000;
+
+fn is_active_here(pml4: PhysAddr) -> bool {
+    (read_cr3() & PTE_ADDR_MASK) == pml4.as_u64()
+}
+
+/// Invalidate `virt` in address space `pml4` on every CPU that may cache it:
+/// locally when `pml4` is live here (or `virt` is a kernel address), and on
+/// other CPUs via a TLB-shootdown IPI (kernel addresses: all CPUs; user
+/// addresses: CPUs whose active CR3 is `pml4`).
+fn invalidate_in(pml4: PhysAddr, virt: VirtAddr) {
+    let kernel_half = virt.as_u64() >= KERNEL_HALF_START;
+    if kernel_half || is_active_here(pml4) {
+        invalidate_page(virt);
+    }
+    crate::smp::tlb_shootdown(if kernel_half { 0 } else { pml4.as_u64() });
+}
+
+/// Flush every TLB entry of address space `pml4`, on all CPUs using it.
+fn flush_in(pml4: PhysAddr) {
+    if is_active_here(pml4) {
+        flush_tlb();
+    }
+    crate::smp::tlb_shootdown(pml4.as_u64());
+}
+
 pub fn init() {
     serial_println!("[VMM] Initializing virtual memory manager...");
 
@@ -294,6 +321,8 @@ pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
             pt_idx,
             phys.as_u64() | (flags & PTE_FLAGS_MASK) | PTE_PRESENT,
         );
+        invalidate_in(pml4, virt);
+        return 0;
     } else {
         write_pte(
             pt,
@@ -338,7 +367,7 @@ pub fn unmap_page(virt: VirtAddr) -> i32 {
 
     if (pdpt_entry & PTE_LARGE) != 0 {
         write_pte(pdpt, pdpt_idx, 0);
-        invalidate_page(virt);
+        invalidate_in(pml4, virt);
         return 0;
     }
 
@@ -350,7 +379,7 @@ pub fn unmap_page(virt: VirtAddr) -> i32 {
 
     if (pd_entry & PTE_LARGE) != 0 {
         write_pte(pd, pd_idx, 0);
-        invalidate_page(virt);
+        invalidate_in(pml4, virt);
         return 0;
     }
 
@@ -364,7 +393,7 @@ pub fn unmap_page(virt: VirtAddr) -> i32 {
     unsafe {
         MAPPED_PAGES = MAPPED_PAGES.saturating_sub(1);
     }
-    invalidate_page(virt);
+    invalidate_in(pml4, virt);
     0
 }
 
@@ -515,7 +544,7 @@ pub fn set_flags(virt: VirtAddr, flags: u64) -> i32 {
     let phys = pte_addr(pt_entry).as_u64();
     write_pte(pt, pt_idx, phys | (flags & PTE_FLAGS_MASK) | PTE_PRESENT);
 
-    invalidate_page(virt);
+    invalidate_in(pml4, virt);
     0
 }
 
@@ -537,6 +566,7 @@ pub fn switch(target_pml4: PhysAddr) {
     if current != target.as_u64() {
         write_cr3(target.as_u64());
     }
+    crate::smp::note_active_cr3(target.as_u64());
 }
 
 pub fn create_address_space() -> PhysAddr {
@@ -674,14 +704,16 @@ pub fn map_page_in(target_pml4: PhysAddr, virt: VirtAddr, phys: PhysAddr, flags:
         return -1;
     }
 
+    let existing = read_pte(pt, pt_idx);
     write_pte(
         pt,
         pt_idx,
         phys.as_u64() | (flags & PTE_FLAGS_MASK) | PTE_PRESENT,
     );
 
-    let current = read_cr3() & PTE_ADDR_MASK;
-    if current == pml4.as_u64() {
+    if pte_present(existing) {
+        invalidate_in(pml4, virt);
+    } else if is_active_here(pml4) {
         invalidate_page(virt);
     }
 
@@ -720,7 +752,7 @@ pub fn unmap_page_in(target_pml4: PhysAddr, virt: VirtAddr) -> i32 {
 
     if (pdpt_entry & PTE_LARGE) != 0 {
         write_pte(pdpt, pdpt_idx, 0);
-        invalidate_page(virt);
+        invalidate_in(pml4, virt);
         return 0;
     }
 
@@ -732,7 +764,7 @@ pub fn unmap_page_in(target_pml4: PhysAddr, virt: VirtAddr) -> i32 {
 
     if (pd_entry & PTE_LARGE) != 0 {
         write_pte(pd, pd_idx, 0);
-        invalidate_page(virt);
+        invalidate_in(pml4, virt);
         return 0;
     }
 
@@ -744,10 +776,7 @@ pub fn unmap_page_in(target_pml4: PhysAddr, virt: VirtAddr) -> i32 {
 
     write_pte(pt, pt_idx, 0);
 
-    let current = read_cr3() & PTE_ADDR_MASK;
-    if current == pml4.as_u64() {
-        invalidate_page(virt);
-    }
+    invalidate_in(pml4, virt);
 
     0
 }
@@ -866,9 +895,7 @@ pub fn resolve_cow_in(target_pml4: PhysAddr, virt: VirtAddr) -> CowResolve {
         }
     };
     write_pte(pt, idx, new_pte);
-    if (read_cr3() & PTE_ADDR_MASK) == pml4.as_u64() {
-        invalidate_page(virt);
-    }
+    invalidate_in(pml4, virt);
     CowResolve::Resolved
 }
 
@@ -981,9 +1008,7 @@ pub fn clone_user_space(
     }
 
     // Parent PTEs may have lost their write bit; drop stale TLB entries.
-    if (read_cr3() & PTE_ADDR_MASK) == src_pml4.as_u64() {
-        flush_tlb();
-    }
+    flush_in(src_pml4);
 
     serial_println!(
         "[VMM] Fork: {} pages shared copy-on-write, {} copied",
