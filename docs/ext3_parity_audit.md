@@ -93,7 +93,7 @@ Representative tests:
 - `ext2_ordered_mode_public_metadata_mutator_reserves_bounded_credits`
 - `ext3_stock_image_mounts_with_default_feature_set`
 - `ext3_htree_directory_reads_linearly`
-- `ext3_htree_insert_clears_index_flag_and_persists`
+- `ext3_htree_insert_keeps_index_and_persists`
 - `ext3_xattr_block_is_counted_and_released_on_unlink`
 - `ext3_shared_xattr_block_only_drops_refcount`
 - `ext3_fast_symlink_reads_inline_target_and_unlinks_without_freeing_blocks`
@@ -286,11 +286,11 @@ All of the above are in `crates/fs/src/lib.rs` test module.
     the fields the kernel owns.
   - `RESIZE_INO`: reserved GDT blocks are pre-marked in the bitmaps and the
     resize inode is never modified; the kernel does not resize.
-  - `DIR_INDEX`: htree directories are scanned linearly. The first insert
-    clears `EXT2_INDEX_FL` via a dedicated flag-clear helper, so later inode
-    writes from stale in-memory copies cannot restore it. Linear insertion may
-    overwrite dx interior data, which is safe once the flag is gone. Removes
-    keep the index, as Linux does.
+  - `DIR_INDEX`: htree indexes are used for lookups and maintained on insert
+    (leaf and node splits, second-level growth, conversion of full one-block
+    directories; ext4 compat plan M4). An index the code cannot use is
+    dropped (`EXT2_INDEX_FL` cleared through a dedicated helper) before a
+    linear insert, as Linux does.
   - `LARGE_FILE`: `i_size_high` is parsed; `stat` reports 64-bit sizes for
     regular files; reads return `EOVERFLOW` and writes/truncates `EFBIG` for
     files that do not fit in 32 bits. Unlink still frees the full block tree.
@@ -477,8 +477,6 @@ All of the above are in `crates/fs/src/lib.rs` test module.
 - Stock ext3 images mount, but support for some features is partial:
   - xattrs are preserved/released, not exposed (`getxattr`/`setxattr` absent),
     and POSIX ACLs stored in them are not enforced.
-  - htree indexes are dropped on the first insert rather than maintained, so
-    large directories degrade to linear lookups until `e2fsck -D`.
   - files over 4 GiB are read-only-by-refusal (no 64-bit I/O path).
 - `IMAGIC_INODES`, `DIR_PREALLOC`, and all ext4-era bits (extents, flex_bg,
   64bit, metadata_csum, huge_file, ...) are still rejected.
@@ -584,17 +582,17 @@ to something materially closer to full ext3 parity.
    - Done for the stock `mke2fs -t ext3` set (`ext_attr`, `resize_inode`,
      `dir_index`, `large_file`), validated against a real mkfs image plus
      `e2fsck -fn` after kernel-side mutation.
-   - Remaining: maintain htree indexes on insert, expose xattrs, 64-bit file
-     I/O, and only then consider anything beyond the ext3 matrix.
+   - htree indexes are maintained on insert (ext4 compat plan M4).
+   - Remaining: expose xattrs, 64-bit file I/O.
 
 11. Done: `INCOMPAT_RECOVER` tracks live journal contents and `s_sequence`
     follows JBD semantics (section 8); checkpoint-after-reuse and shared-block
     snapshot loss are fixed (section 9); journal writes are ordered by write
     barriers and transactions can span several descriptor blocks (section 10).
     Commit checksums, journal feature validation, and a QEMU crash/recovery
-    smoke are done (section 11). Remaining hardening: maintaining htree
-    indexes, exposing xattrs, 64-bit file I/O, and a JBD-style per-transaction
-    size cap.
+    smoke are done (section 11); htree maintenance is done (ext4 compat plan
+    M4). Remaining hardening: exposing xattrs, 64-bit file I/O, and a
+    JBD-style per-transaction size cap.
 
 ## Historical Comparison (`peetos_c`)
 

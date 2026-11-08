@@ -311,9 +311,7 @@ kernel-written csum-v3 journals.
   recovery) into a clean filesystem with the committed file present; and
   `tests/musl_ext4_csum_journal_smoke.sh` runs the QEMU SIGKILL/recovery smoke
   on a stock ext4 root.
-- **Gaps.** htree index blocks are still never written: inserting into an
-  indexed directory clears `INDEX_FL` (M4), and `dx_tail` checksums on index
-  blocks are neither verified nor produced. xattr blocks are never created or edited beyond
+- **Gaps.** htree index blocks were not written yet (done in M4). xattr blocks are never created or edited beyond
   refcount drops. There is no `s_kbytes_written`/`s_wtime`-style superblock
   bookkeeping.
 
@@ -327,6 +325,52 @@ directories are usable.
 
 Exit: a directory with thousands of entries keeps a valid index (`e2fsck -fn`
 reports no rehash needed) and lookups use it.
+
+**Status: done.**
+- **Hashes** (`crates/fs/src/ext2_htree.rs`). `legacy`, `half_md4` and `tea`,
+  each with signed or unsigned name bytes (`s_flags`), seeded by
+  `s_hash_seed`, checked against e2fsprogs `debugfs dx_hash` output.
+- **Lookup.** Indexed directories are searched through the index (dx root,
+  then a dx node when `indirect_levels` is 1, then one leaf plus any
+  hash-collision continuation leaves). Index blocks are validated like
+  Linux's `dx_probe` (root info, count/limit, block range); an index that
+  fails validation is treated as linear, while a `dx_tail` checksum
+  mismatch returns `EIO`. Unlinks find their leaf the same way.
+- **Insert.** Entries go into the leaf for their hash. A full leaf is split
+  at about half its size in hash order (the upper half moves to a new
+  block, with the collision bit set when the split falls inside a run of
+  equal hashes). A full index block is split into a new dx node, and a full
+  root moves its entries into a new node and gains a level, up to two levels
+  (Linux without `largedir`). A full one-block directory on a `dir_index`
+  filesystem becomes an index (`make_indexed_dir`), with the root using
+  `s_def_hash_version`. `metadata_csum` filesystems get `dx_tail` checksums
+  on every index block change, and directory leaf tails on every leaf.
+- **VFS.** The node table and each directory's child list grow on demand
+  (`VFS_MAX_INODES` = 32768 live nodes; there is no per-directory cap any
+  more), tmpfs data lives on the heap instead of in every node, and names
+  may be 255 bytes. ext2-family path lookups import only the named entry
+  (through the index); `readdir` imports the rest. `rmdir` checks emptiness
+  on disk. `getcwd` and the console status line build paths from parent
+  links instead of scanning directories from `/`, and `getdents64` records
+  fit 255-byte names.
+- **Tests.** Hash vectors for all six variants; 3000 entries on the stock
+  ext4 image (index built from a one-block directory, a third unlinked, all
+  checksums valid, remount lookups read one leaf each and stay lazy, a
+  255-byte name); 700 links with 200-byte names on 1 KiB ext3 blocks grow a
+  second index level and split dx nodes; all six hash variants build indexes
+  from names with bytes >= 0x80. `tests/ext3_fsck.sh` runs `e2fsck -fn` on
+  each of these, plus 2112 recovered crash points of inserts that split
+  htree leaves. The QEMU journal smokes (ext3, ext4, stock ext4) sync a
+  1500-entry directory before the crash; `debugfs htree` sees an index after
+  e2fsck replay, and the recovered kernel resolves and lists every entry.
+- **Gaps.** Three-level indexes (`largedir`) are not supported (the feature
+  is still rejected at mount). Leaves are never merged and the index never
+  shrinks after unlinks, as on Linux. `readdir` returns entries in creation
+  order of the VFS list, not hash order, and fully imports the directory.
+  VFS nodes are never evicted: every name looked up or listed since mount
+  stays in memory until unlink or unmount, so `VFS_MAX_INODES` bounds the
+  files touched per mount. Full paths are still limited to `VFS_MAX_PATH`
+  (256 bytes).
 
 ### M5 - Hardening and remaining semantics
 
@@ -351,9 +395,8 @@ reports no rehash needed) and lookups use it.
 
 ## Limitations / Simplifications
 
-- M0-M3 are implemented (stock ext4 mounts read-write); M4 and M5 are not
-  started. Large directories are still limited by `VFS_MAX_CHILDREN` and lose
-  their htree index on insert.
+- M0-M4 are implemented (stock ext4 mounts read-write, htree indexes are
+  maintained); M5 is not started.
 - The milestone list deliberately excludes the out-of-scope features listed
   above; images using them will keep failing to mount with `EINVAL`.
 - 32-bit block numbers remain an internal limit (filesystems below 16 TiB at

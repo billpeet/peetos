@@ -6,7 +6,9 @@ use super::{
     ext2_recalc_inode_block_count_512_state, ext2_write_inode_to_state, read_u16_le,
     read_u32_le, write_u16_le, write_u32_le, Ext2JournalHandle, FileType, VfsState, EINVAL, EIO,
     ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK,
+    EXT2_FEATURE_COMPAT_DIR_INDEX, Ext2Inode,
 };
+use super::ext2_htree::{self, DxError};
 
 fn ext2_dirent_file_type(file_type: FileType) -> u8 {
     match file_type {
@@ -62,7 +64,7 @@ pub(super) fn ext2_add_dir_entry(
     name: &[u8],
     child_type: FileType,
 ) -> Result<(), i64> {
-    if name.is_empty() || name.len() >= 255 {
+    if name.is_empty() || name.len() > 255 {
         return Err(ENAMETOOLONG);
     }
 
@@ -71,11 +73,19 @@ pub(super) fn ext2_add_dir_entry(
     if ext2_mode_to_filetype(parent.mode) != Some(FileType::Directory) {
         return Err(ENOTDIR);
     }
+    let ft = ext2_dirent_file_type(child_type);
+    let mut dx_fallback = false;
     if (parent.flags & EXT2_INDEX_FL) != 0 {
-        // Linear insertion can overwrite htree interior/root data (stored in
-        // dirents with inode 0 or in the ".." record's slack). Drop the index
-        // first, as Linux does when it falls back to linear mode, so nothing
-        // trusts the stale tree afterwards; e2fsck -D can rebuild it.
+        match ext2_htree::dx_add_entry(state, journal_handle, &mut parent, child_ino, name, ft) {
+            Ok(()) => return Ok(()),
+            Err(DxError::Io(err)) => return Err(err),
+            Err(DxError::Unusable) => {}
+        }
+        // An index this code cannot use (unknown hash, deeper than two
+        // levels, damaged): linear insertion could overwrite its interior
+        // data (dirents with inode 0, the ".." record's slack), so drop the
+        // index first, as Linux does when it falls back to linear mode.
+        dx_fallback = true;
         ext2_clear_inode_flags_state(state, parent_ino, EXT2_INDEX_FL)?;
         parent.flags &= !EXT2_INDEX_FL;
         // metadata_csum: the former index blocks become leaf blocks and need
@@ -97,6 +107,29 @@ pub(super) fn ext2_add_dir_entry(
     let mut idx = 0usize;
     while idx < max_blocks {
         let block_no = ext2_data_block_for_logical_index_state(state, &parent, idx)?;
+        if block_no == 0
+            && idx == 1
+            && scan_blocks == 1
+            && !dx_fallback
+            && (meta.feature_compat & EXT2_FEATURE_COMPAT_DIR_INDEX) != 0
+        {
+            // A full one-block directory becomes an htree instead of growing
+            // linearly (ext4_add_entry -> make_indexed_dir).
+            if ext2_htree::make_indexed_dir(state, journal_handle, &mut parent)? {
+                return match ext2_htree::dx_add_entry(
+                    state,
+                    journal_handle,
+                    &mut parent,
+                    child_ino,
+                    name,
+                    ft,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(DxError::Io(err)) => Err(err),
+                    Err(DxError::Unusable) => Err(EIO),
+                };
+            }
+        }
         if block_no == 0 {
             let new_block = ext2_ensure_data_block(
                 state,
@@ -184,8 +217,18 @@ pub(super) fn ext2_remove_dir_entry(
         return Err(ENOTDIR);
     }
 
+    if (parent.flags & EXT2_INDEX_FL) != 0 {
+        match ext2_htree::dx_find(state, &parent, name) {
+            Ok(Some(hit)) => {
+                return remove_in_block(state, &parent, hit.block, name)?.ok_or(EIO);
+            }
+            Ok(None) => return Err(ENOENT),
+            Err(DxError::Io(err)) => return Err(err),
+            Err(DxError::Unusable) => {}
+        }
+    }
+
     let block_count = ext2_logical_blocks_for_size(&meta, parent.size as usize)?;
-    let tail = ext2_dir_tail_len(state);
     let mut idx = 0usize;
     while idx < block_count {
         let block_no = ext2_data_block_for_logical_index_state(state, &parent, idx)?;
@@ -193,7 +236,23 @@ pub(super) fn ext2_remove_dir_entry(
         if block_no == 0 {
             continue;
         }
+        if let Some(ino) = remove_in_block(state, &parent, block_no, name)? {
+            return Ok(ino);
+        }
+    }
 
+    Err(ENOENT)
+}
+
+/// Removes `name` from one directory block, if it is there.
+fn remove_in_block(
+    state: &mut VfsState,
+    parent: &Ext2Inode,
+    block_no: u32,
+    name: &[u8],
+) -> Result<Option<u32>, i64> {
+    let tail = ext2_dir_tail_len(state);
+    {
         let mut removed = None;
         let block_has_tail: bool;
         {
@@ -244,15 +303,44 @@ pub(super) fn ext2_remove_dir_entry(
 
         if let Some(ino) = removed {
             if block_has_tail {
-                ext2_dir_block_finish(state, &parent, block_no)?;
+                ext2_dir_block_finish(state, parent, block_no)?;
             } else {
                 ext2_mark_dirty_block(state, block_no)?;
             }
-            return Ok(ino);
+            return Ok(Some(ino));
         }
     }
+    Ok(None)
+}
 
-    Err(ENOENT)
+/// Finds `name` in directory `dir_ino`: `(inode, dirent file type)`. Uses
+/// the htree index when the directory has a usable one, so only the leaf
+/// for the name's hash is read; otherwise scans every block.
+pub(super) fn ext2_dir_lookup(
+    state: &mut VfsState,
+    dir_ino: u32,
+    name: &[u8],
+) -> Result<Option<(u32, u8)>, i64> {
+    let dir = ext2_read_inode_from_state(state, dir_ino)?;
+    if ext2_mode_to_filetype(dir.mode) != Some(FileType::Directory) {
+        return Err(ENOTDIR);
+    }
+    if (dir.flags & EXT2_INDEX_FL) != 0 {
+        match ext2_htree::dx_find(state, &dir, name) {
+            Ok(Some(hit)) => return Ok(Some((hit.ino, hit.file_type))),
+            Ok(None) => return Ok(None),
+            Err(DxError::Io(err)) => return Err(err),
+            Err(DxError::Unusable) => {}
+        }
+    }
+    let mut found = None;
+    ext2_for_each_dir_entry_state(state, &dir, |ino, ft, entry| {
+        if found.is_none() && entry == name {
+            found = Some((ino, ft));
+        }
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 pub(super) fn ext2_directory_is_empty(state: &mut VfsState, ino: u32) -> Result<bool, i64> {

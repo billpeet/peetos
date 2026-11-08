@@ -172,6 +172,9 @@ e2fsck -fn "${LINUX_IMG}" > "${WORK_DIR}/linux_check.txt" 2>&1 \
   || { cat "${WORK_DIR}/linux_check.txt" >&2; fail "filesystem not clean after e2fsck recovery"; }
 debugfs -R "cat /jsmoke/baseline" "${LINUX_IMG}" 2>/dev/null | grep -q "file baseline line 63" \
   || fail "synced baseline missing after e2fsck recovery"
+# The synced 1500-entry directory is an htree (Linux-format index).
+debugfs -R "htree /jsmoke/big" "${LINUX_IMG}" 2>/dev/null | grep -q "Root node dump" \
+  || fail "large directory was not indexed"
 
 # Kernel-side recovery: boot the crashed image again.
 boot_until "${LOG2}" "[ext3-journal-smoke] done" 60 || fail "boot 2 did not finish verification"
@@ -180,6 +183,8 @@ if grep -aq "\[ext3-journal-smoke\] failures" "${LOG2}"; then
   fail "boot 2 found damaged files after kernel journal recovery"
 fi
 grep -aE "\[ext3-journal-smoke\] verified [0-9]+ surviving files" "${LOG2}" >&2 || true
+grep -aq "\[ext3-journal-smoke\] bigdir verified" "${LOG2}" \
+  || fail "boot 2 did not verify the large directory"
 if grep -aq "\[EXT4\] .* mismatch" "${LOG1}" "${LOG2}"; then
   fail "kernel reported a checksum mismatch"
 fi

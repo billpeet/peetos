@@ -33,7 +33,7 @@ pub fn mount_ext2_block_backend_with_options(
             return Err(ENOTDIR);
         }
 
-        if mount_inode != ROOT_INODE && state.inodes[mount_inode as usize].child_count != 0 {
+        if mount_inode != ROOT_INODE && !state.inodes[mount_inode as usize].children.is_empty() {
             return Err(EEXIST);
         }
 

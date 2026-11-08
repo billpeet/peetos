@@ -376,7 +376,6 @@ const EXEC_MAX_ARGV: usize = 64;
 const EXEC_MAX_ENVP: usize = 64;
 const EXEC_MAX_STR_LEN: usize = 256;
 const EXEC_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
-const GETCWD_MAX_DEPTH: usize = 32;
 const UTS_FIELD_LEN: usize = 65;
 const MMAP_MAX_REGIONS_PER_TASK: usize = 32;
 const MMAP_MAX_PAGES_PER_TASK: u64 = 8192;

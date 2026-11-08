@@ -83,7 +83,7 @@ On initialization, the kernel creates:
   - Feature acceptance covers the stock `mke2fs -t ext3` feature set: compat `HAS_JOURNAL`/`EXT_ATTR`/`RESIZE_INO`/`DIR_INDEX`, incompat `FILETYPE`/`RECOVER`/`JOURNAL_DEV`, and ro-compat `SPARSE_SUPER`/`LARGE_FILE`. Everything else (for example `DIR_PREALLOC`, `IMAGIC_INODES`, and all ext4 incompat bits) is rejected with `EINVAL`.
   - `EXT_ATTR`: an inode's external xattr block (`i_file_acl`) is counted in `i_blocks` (truncate and rewrite keep it charged) and released on final unlink (refcount decremented, block freed at zero). In-inode xattrs in 256-byte inodes are preserved. Xattr contents are never read or written (no `getxattr`/`setxattr`).
   - `RESIZE_INO`: reserved GDT blocks are already marked in-use in the block bitmaps and the resize inode (7) is never touched. The kernel never resizes the filesystem.
-  - `DIR_INDEX`: htree-indexed directories are read with a linear scan, which works because htree interior blocks look like empty dirents. The first entry insert into an indexed directory clears `EXT2_INDEX_FL`, so the stale index is never trusted again (`e2fsck -D` can rebuild it). Removes leave the index intact, matching Linux.
+  - `DIR_INDEX`: htree indexes (`crates/fs/src/ext2_htree.rs`) are used for name lookups and unlinks and maintained on insert: leaf splits, dx node splits, and growth to a second index level; a full one-block directory becomes an index. All three Linux name hashes (`legacy`, `half_md4`, `tea`, signed or unsigned) are supported, and `metadata_csum` filesystems get `dx_tail` checksums. An index this code cannot use (for example a three-level `largedir` index) is dropped before a linear insert, as Linux does.
   - `LARGE_FILE`: `stat` reports the full 64-bit size of regular files that use `i_size_high`. Because the in-memory size paths are 32-bit, reading such a file returns `EOVERFLOW` and writing or truncating it returns `EFBIG`. Unlinking it frees its whole block tree.
   - Fast symlinks (target shorter than 60 bytes stored inline in `i_block`) are read inline and freed without touching the block bitmap. Short targets created by `symlinkat` are now written as fast symlinks, as Linux does and as `e2fsck` requires; longer targets use a data block.
   - For journaled mounts, dirty-block flushes now emit runtime journal descriptor/data/commit records before checkpointing home blocks.
@@ -94,7 +94,7 @@ On initialization, the kernel creates:
   - Block-backed ext2 now uses sparse per-block residency and dirty tracking: blocks are loaded into cache on first access, and uncached blocks are never allocated in RAM up front.
   - Block cache residency is bounded by a configurable block cap, with CLOCK eviction and dirty-block write-back on dirty victim eviction.
   - Dirty-pressure flushing runs opportunistically when dirty/cached ratio crosses the configured threshold, reducing write burst size at sync points.
-  - Ext2 directory children are now populated lazily per directory (first path lookup/readdir) instead of recursively importing the full tree at mount.
+  - Ext2 directory children are imported lazily: a path lookup imports only the named entry (found through the htree index when there is one), and `readdir` imports the rest of the directory. Nothing is imported at mount.
   - When ext2 is mounted from a block device, mutating VFS syscalls enqueue best-effort dirty-run updates through the kernel block write-back cache (`block::write_cached`) using contiguous changed ext2 blocks from explicit per-block dirty tracking.
   - `sync`/`fsync` request a flush of the ext2 backing device's cached dirty block entries.
 
@@ -123,7 +123,7 @@ On initialization, the kernel creates:
 - User stdio (`fd 0/1/2`) is pre-seeded as console descriptors, and each user task tracks a cwd inode (currently rooted at `/`).
 
 Limitations / Simplifications
-- VFS storage model remains static-capacity and single-address-space.
+- VFS nodes live in a table that grows on demand up to `VFS_MAX_INODES` (32768) live nodes; nodes are never evicted, so every ext2 name looked up or listed since mount stays in memory until it is unlinked or the filesystem unmounted. Directories have no child cap; names may be 255 bytes; full paths are limited to `VFS_MAX_PATH` (256 bytes).
 - Synchronization is a single global fs lock; no finer-grained inode/dentry locking yet.
 - Metadata plumbing exists (`mode`/`uid`/`gid`/timestamps), but full POSIX permission policy and ownership-changing syscalls (`chmod`/`chown`) are not implemented yet.
 - `rename` currently behaves as no-replace (`EEXIST` if destination exists) rather than full Linux overwrite semantics.
@@ -132,9 +132,9 @@ Limitations / Simplifications
 - Console input path is baseline-only: canonical line mode with basic backspace editing and newline commit; no `termios`, raw mode, job control, or pty support.
 - ext2 importer is intentionally minimal: regular files/directories only, and imported file size is still capped by `TMPFS_MAX_FILE_SIZE`.
 - Regular files larger than 4 GiB (non-zero `i_size_high`) are visible and unlinkable but refuse read/write/truncate. In-memory VFS node sizes (and therefore `SEEK_END`) still carry only the low 32 bits.
-- htree directories lose their index on the first insert; lookups are always linear scans. Directories are also still limited to `VFS_MAX_CHILDREN` entries in the VFS layer.
+- htree: no three-level (`largedir`) indexes; leaves are never merged after unlinks (as on Linux); `readdir` lists in VFS order (not hash order) and imports the whole directory.
 - Extended attributes are preserved and released but not exposed to userspace, and POSIX ACLs stored in xattrs are not enforced.
-- ext4 htree index blocks are never written: inserting into an indexed directory clears `INDEX_FL` (adding leaf checksum tails), and `dx_tail` checksums are not verified (M4 in `docs/ext4_compat_plan.md`). `stat` omits nanoseconds and `crtime`. Extent changes rewrite the inode's whole extent tree (fine for today's small files), and new inodes get zero `crtime`/nanoseconds.
+- ext4: `stat` omits nanoseconds and `crtime`. Extent changes rewrite the inode's whole extent tree (fine for today's small files), and new inodes get zero `crtime`/nanoseconds.
 - Journal bring-up is still incomplete: mount-time recovery replay is wired for internal journals, replay/revoke ordering now handles wrapped transaction IDs, runtime dirty-block flushes are journaled with multi-block transaction batching, runtime transaction placement rotates through the journal ring with wrap support, committed transactions now use deferred checkpointing with runtime revoke-block emission before home-block writeback, and runtime journal I/O faults now trigger fail-fast aborted state. Fuller JBD compatibility (for example richer transaction state/credit handling and complete ext3 mode semantics) remains pending.
 - Block-backed ext2 sync uses a page-sized block write-back cache. On journaled (ext3) mounts every mutating syscall *commits* a journal transaction (ordered data, then a write barrier, then the commit record, settled by a barrier before the syscall returns), while checkpointing to home locations happens on `sync`/`fsync` or when log space runs out, as in ext3. On plain ext2 mounts durability comes only from `sync`/`fsync`, which drain the block cache and flush the drive's write cache.
 - Journal commits carry JBD2 `COMPAT_CHECKSUM` CRC32s (enabled on mount when the log is empty), and journals with JBD2 incompat features other than `REVOKE` are refused.

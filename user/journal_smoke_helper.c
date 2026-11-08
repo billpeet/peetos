@@ -1,15 +1,20 @@
 /* ext3 journal crash/recovery workload (musl-ext3-journal-smoke).
  *
- *   journal_workload write   - boot 1: sync a baseline file, then write files
- *                              in small chunks until the kernel has committed
- *                              (but not checkpointed) journal transactions,
- *                              announce the crash point and wait to be killed.
+ *   journal_workload write   - boot 1: sync a baseline file and a directory
+ *                              of BIG_COUNT hard links (large enough to need
+ *                              an htree index), then write files in small
+ *                              chunks until the kernel has committed (but not
+ *                              checkpointed) journal transactions, announce
+ *                              the crash point and wait to be killed.
  *   journal_workload verify  - boot 2: after kernel journal recovery, the
  *                              baseline must be intact and every surviving
  *                              file must be a byte-exact prefix of what was
  *                              written (writes are not atomic across
  *                              write() calls, but must never be garbage).
+ *                              Every big-directory name must resolve, and
+ *                              getdents64 must list them all.
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -21,6 +26,7 @@
 #define LINES_PER_FILE 64
 #define CHUNK 512
 #define MAX_CONTENT (LINES_PER_FILE * 96)
+#define BIG_COUNT 1500
 
 static void say(const char *msg) {
     write(1, msg, strlen(msg));
@@ -84,6 +90,67 @@ static long read_file(const char *path, char *out, size_t cap) {
     return (long)total;
 }
 
+static void big_name(int n, char *out, size_t cap) {
+    snprintf(out, cap, "jsmoke/big/entry_%05d_with_a_longer_name", n);
+}
+
+static int write_bigdir(void) {
+    char path[96];
+    if (mkdirat(AT_FDCWD, "jsmoke/big", 0755) != 0 && errno != EEXIST) {
+        say_errno("mkdir", "jsmoke/big");
+        return -1;
+    }
+    if (write_file("jsmoke/big/hub", "hub\n", 4) != 0) {
+        return -1;
+    }
+    for (int n = 0; n < BIG_COUNT; n++) {
+        big_name(n, path, sizeof(path));
+        if (linkat(AT_FDCWD, "jsmoke/big/hub", AT_FDCWD, path, 0) != 0) {
+            say_errno("link", path);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int verify_bigdir(void) {
+    char path[96];
+    char msg[128];
+    struct stat st;
+    for (int n = 0; n < BIG_COUNT; n++) {
+        big_name(n, path, sizeof(path));
+        if (stat(path, &st) != 0) {
+            say_errno("stat", path);
+            return -1;
+        }
+    }
+    if (stat("jsmoke/big/hub", &st) != 0 || st.st_nlink != BIG_COUNT + 1) {
+        say("[ext3-journal-smoke] FAIL bigdir hub link count\n");
+        return -1;
+    }
+    DIR *dir = opendir("jsmoke/big");
+    if (!dir) {
+        say_errno("opendir", "jsmoke/big");
+        return -1;
+    }
+    int listed = 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) {
+            listed++;
+        }
+    }
+    closedir(dir);
+    if (listed != BIG_COUNT + 1) {
+        snprintf(msg, sizeof(msg), "[ext3-journal-smoke] FAIL bigdir lists %d entries\n", listed);
+        say(msg);
+        return -1;
+    }
+    snprintf(msg, sizeof(msg), "[ext3-journal-smoke] bigdir verified %d entries\n", listed);
+    say(msg);
+    return 0;
+}
+
 static void wait_for_kill(void) {
     for (;;) {
         sleep(60);
@@ -102,6 +169,10 @@ static int do_write(void) {
     size_t len = gen("baseline", content);
     if (write_file("jsmoke/baseline", content, len) != 0) {
         say("[ext3-journal-smoke] FAIL cannot write baseline\n");
+        return 1;
+    }
+    if (write_bigdir() != 0) {
+        say("[ext3-journal-smoke] FAIL cannot fill bigdir\n");
         return 1;
     }
     sync();
@@ -135,6 +206,9 @@ static int do_verify(void) {
     long got = read_file("jsmoke/baseline", actual, sizeof(actual));
     if (got != (long)len || memcmp(actual, expected, len) != 0) {
         say("[ext3-journal-smoke] FAIL baseline damaged after recovery\n");
+        fail = 1;
+    }
+    if (verify_bigdir() != 0) {
         fail = 1;
     }
 

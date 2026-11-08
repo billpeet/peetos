@@ -7,6 +7,7 @@ mod ext2_api;
 mod ext2_bmap;
 mod ext2_backend;
 mod ext2_dir;
+mod ext2_htree;
 mod ext2_journal;
 mod ext2_sync;
 mod ext4_csum;
@@ -41,9 +42,12 @@ pub use ext2_backend::{
 };
 
 pub const VFS_MAX_PATH: usize = 256;
-pub const VFS_MAX_NAME: usize = 64;
-pub const VFS_MAX_INODES: usize = 256;
-pub const VFS_MAX_CHILDREN: usize = 64;
+/// Name buffer size: names up to 255 bytes, as ext2/ext3/ext4 allow.
+pub const VFS_MAX_NAME: usize = 256;
+/// Upper bound on live VFS nodes (the table grows on demand; handles are
+/// `u16`). ext2-family directories are imported lazily, so this bounds the
+/// files touched since mount, not the size of the filesystem.
+pub const VFS_MAX_INODES: usize = 32768;
 pub const TMPFS_MAX_FILE_SIZE: usize = 32 * 1024;
 
 pub const O_RDONLY: u32 = 0x0000;
@@ -135,8 +139,10 @@ const EXT2_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
 // - EXT_ATTR: xattr blocks are counted in i_blocks and released on delete.
 // - RESIZE_INO: reserved GDT blocks are already marked in-use in the bitmaps,
 //   and the kernel never resizes, so the reservation is preserved untouched.
-// - DIR_INDEX: htree directories are read linearly; the first entry insert
-//   clears EXT2_INDEX_FL so the stale index is never trusted afterwards.
+// - DIR_INDEX: htree indexes are used for lookups and maintained on insert
+//   (ext2_htree.rs); a full one-block directory is converted to an index.
+//   An index this code cannot use falls back to linear mode (INDEX_FL is
+//   cleared first, as Linux does).
 // DIR_PREALLOC and IMAGIC_INODES remain rejected.
 const EXT2_FEATURE_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_COMPAT_HAS_JOURNAL
     | EXT2_FEATURE_COMPAT_EXT_ATTR
@@ -297,7 +303,6 @@ impl DirEntry {
     }
 }
 
-#[derive(Clone, Copy)]
 struct Inode {
     used: bool,
     file_type: FileType,
@@ -306,9 +311,10 @@ struct Inode {
     name: [u8; VFS_MAX_NAME],
     name_len: u8,
     size: u32,
-    child_count: u8,
-    children: [u16; VFS_MAX_CHILDREN],
-    data: [u8; TMPFS_MAX_FILE_SIZE],
+    /// Child nodes in creation order (readdir offsets index this list).
+    children: Vec<u16>,
+    /// tmpfs file contents / symlink target (at least `size` bytes).
+    data: Vec<u8>,
     ext2_ino: u32,
     dev_id: u16,
     ext2_children_loaded: bool,
@@ -331,9 +337,8 @@ impl Inode {
             name: [0; VFS_MAX_NAME],
             name_len: 0,
             size: 0,
-            child_count: 0,
-            children: [0; VFS_MAX_CHILDREN],
-            data: [0; TMPFS_MAX_FILE_SIZE],
+            children: Vec::new(),
+            data: Vec::new(),
             ext2_ino: 0,
             dev_id: 0,
             ext2_children_loaded: false,
@@ -590,7 +595,7 @@ struct Ext2JournalCommittedTx {
 
 struct VfsState {
     initialized: bool,
-    inodes: [Inode; VFS_MAX_INODES],
+    inodes: Vec<Inode>,
     proc_uptime_ticks: u64,
     proc_total_bytes: u64,
     proc_free_bytes: u64,
@@ -628,7 +633,7 @@ impl VfsState {
     const fn new() -> Self {
         Self {
             initialized: false,
-            inodes: [Inode::empty(); VFS_MAX_INODES],
+            inodes: Vec::new(),
             proc_uptime_ticks: 0,
             proc_total_bytes: 0,
             proc_free_bytes: 0,
@@ -713,6 +718,12 @@ struct Ext2Meta {
     ext4_read_only: bool,
     journal_inode: u32,
     journal_dev: u32,
+    /// `s_hash_seed` (htree name hash seed, four LE words).
+    hash_seed: [u32; 4],
+    /// `s_def_hash_version` for newly indexed directories.
+    def_hash_version: u8,
+    /// `s_flags` selects unsigned-char name hashing.
+    hash_unsigned: bool,
 }
 
 impl Ext2Meta {
@@ -734,6 +745,9 @@ impl Ext2Meta {
             ext4_read_only: false,
             journal_inode: 0,
             journal_dev: 0,
+            hash_seed: [0; 4],
+            def_hash_version: 0,
+            hash_unsigned: false,
         }
     }
 }
@@ -782,7 +796,7 @@ fn touch_inode_metadata(
     modify: bool,
     change: bool,
 ) {
-    if (inode as usize) >= VFS_MAX_INODES {
+    if (inode as usize) >= state.inodes.len() {
         return;
     }
     let now = fs_time_tick(state);
@@ -895,9 +909,8 @@ fn clear_inode(inode: &mut Inode) {
     inode.name.fill(0);
     inode.name_len = 0;
     inode.size = 0;
-    inode.child_count = 0;
-    inode.children.fill(0);
-    inode.data.fill(0);
+    inode.children = Vec::new();
+    inode.data = Vec::new();
     inode.ext2_ino = 0;
     inode.dev_id = 0;
     inode.ext2_children_loaded = false;
@@ -911,9 +924,7 @@ fn clear_inode(inode: &mut Inode) {
 }
 
 fn reset(state: &mut VfsState) {
-    for slot in state.inodes.iter_mut() {
-        clear_inode(slot);
-    }
+    state.inodes = Vec::new();
     state.proc_uptime_ticks = 0;
     state.proc_total_bytes = 0;
     state.proc_free_bytes = 0;
@@ -936,6 +947,9 @@ fn reset(state: &mut VfsState) {
 }
 
 fn setup_root(state: &mut VfsState) {
+    if state.inodes.is_empty() {
+        state.inodes.push(Inode::empty());
+    }
     let root = &mut state.inodes[ROOT_INODE as usize];
     clear_inode(root);
     root.used = true;
@@ -1051,7 +1065,7 @@ fn is_root_pseudo_mount_name(name: &[u8]) -> bool {
 fn find_child(state: &VfsState, dir: u16, name: &[u8]) -> Option<u16> {
     let inode = &state.inodes[dir as usize];
     let mut idx = 0usize;
-    while idx < inode.child_count as usize {
+    while idx < inode.children.len() {
         let child = inode.children[idx];
         let child_inode = &state.inodes[child as usize];
         if child_inode.used && name_eq(child_inode, name) {
@@ -1062,9 +1076,37 @@ fn find_child(state: &VfsState, dir: u16, name: &[u8]) -> Option<u16> {
     None
 }
 
+/// Child `name` of `dir`. For an ext2-family directory whose children are
+/// not all imported yet, only that name is looked up on disk (through the
+/// htree index when the directory has one) and imported.
 fn find_child_loaded(state: &mut VfsState, dir: u16, name: &[u8]) -> Result<Option<u16>, i64> {
-    ext2_ensure_dir_children_loaded(state, dir)?;
-    Ok(find_child(state, dir, name))
+    if let Some(child) = find_child(state, dir, name) {
+        return Ok(Some(child));
+    }
+    let (backend, file_type, loaded, dir_ino) = {
+        let node = &state.inodes[dir as usize];
+        (node.backend, node.file_type, node.ext2_children_loaded, node.ext2_ino)
+    };
+    if !state.ext2_mounted
+        || backend != NodeBackend::Ext2
+        || file_type != FileType::Directory
+        || loaded
+    {
+        return Ok(None);
+    }
+    if dir_ino == 0 {
+        return Err(EIO);
+    }
+    if name.is_empty() || name == b"." || name == b".." || name.len() >= VFS_MAX_NAME {
+        return Ok(None);
+    }
+    match ext2_dir::ext2_dir_lookup(state, dir_ino, name)? {
+        Some((ino, _)) => {
+            ext2_import_node(state, dir, name, ino, false)?;
+            Ok(find_child(state, dir, name))
+        }
+        None => Ok(None),
+    }
 }
 
 fn add_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
@@ -1072,20 +1114,15 @@ fn add_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
     if parent.file_type != FileType::Directory {
         return Err(ENOTDIR);
     }
-    if parent.child_count as usize >= VFS_MAX_CHILDREN {
-        return Err(ENOSPC);
-    }
-
-    let slot = parent.child_count as usize;
-    parent.children[slot] = child;
-    parent.child_count = parent.child_count.saturating_add(1);
+    parent.children.try_reserve(1).map_err(|_| ENOSPC)?;
+    parent.children.push(child);
     Ok(())
 }
 
 fn two_inodes_mut(state: &mut VfsState, left: u16, right: u16) -> Option<(&mut Inode, &mut Inode)> {
     let left = left as usize;
     let right = right as usize;
-    if left >= VFS_MAX_INODES || right >= VFS_MAX_INODES || left == right {
+    if left >= state.inodes.len() || right >= state.inodes.len() || left == right {
         return None;
     }
 
@@ -1099,31 +1136,20 @@ fn two_inodes_mut(state: &mut VfsState, left: u16, right: u16) -> Option<(&mut I
 }
 
 fn remove_child(state: &mut VfsState, dir: u16, child: u16) -> Result<(), i64> {
-    if (dir as usize) >= VFS_MAX_INODES {
+    if (dir as usize) >= state.inodes.len() {
         return Err(ENOENT);
     }
     let parent = &mut state.inodes[dir as usize];
     if parent.file_type != FileType::Directory {
         return Err(ENOTDIR);
     }
-
-    let mut idx = 0usize;
-    while idx < parent.child_count as usize {
-        if parent.children[idx] == child {
-            let mut move_idx = idx + 1;
-            while move_idx < parent.child_count as usize {
-                parent.children[move_idx - 1] = parent.children[move_idx];
-                move_idx += 1;
-            }
-            let last = parent.child_count.saturating_sub(1) as usize;
-            parent.children[last] = 0;
-            parent.child_count = parent.child_count.saturating_sub(1);
-            return Ok(());
+    match parent.children.iter().position(|&c| c == child) {
+        Some(idx) => {
+            parent.children.remove(idx);
+            Ok(())
         }
-        idx += 1;
+        None => Err(ENOENT),
     }
-
-    Err(ENOENT)
 }
 
 fn alloc_inode(
@@ -1138,8 +1164,18 @@ fn alloc_inode(
     }
 
     let mut slot = 1usize;
-    while slot < VFS_MAX_INODES {
-        if !state.inodes[slot].used {
+    while slot < state.inodes.len() && state.inodes[slot].used {
+        slot += 1;
+    }
+    if slot == state.inodes.len() {
+        if slot >= VFS_MAX_INODES {
+            return Err(ENOSPC);
+        }
+        state.inodes.try_reserve(1).map_err(|_| ENOSPC)?;
+        state.inodes.push(Inode::empty());
+    }
+    {
+        {
             let now = fs_time_tick(state);
             let inode = &mut state.inodes[slot];
             clear_inode(inode);
@@ -1168,23 +1204,13 @@ fn alloc_inode(
             inode.atime = now;
             inode.mtime = now;
             inode.ctime = now;
-            return Ok(slot as u16);
+            Ok(slot as u16)
         }
-        slot += 1;
     }
-
-    Err(ENOSPC)
 }
 
 fn has_free_vfs_inode(state: &VfsState) -> bool {
-    let mut slot = 1usize;
-    while slot < VFS_MAX_INODES {
-        if !state.inodes[slot].used {
-            return true;
-        }
-        slot += 1;
-    }
-    false
+    state.inodes.len() < VFS_MAX_INODES || state.inodes.iter().skip(1).any(|n| !n.used)
 }
 
 fn next_component(
@@ -1257,7 +1283,7 @@ fn lookup_path_from_inner(state: &mut VfsState, start: u16, path: &str) -> Resul
     let absolute = bytes[0] == b'/';
     let mut cursor = if absolute { 1usize } else { 0usize };
     let mut current = if absolute { ROOT_INODE } else { start };
-    if current as usize >= VFS_MAX_INODES || !state.inodes[current as usize].used {
+    if current as usize >= state.inodes.len() || !state.inodes[current as usize].used {
         return Err(ENOENT);
     }
     let mut name = [0u8; VFS_MAX_NAME];
@@ -1311,7 +1337,7 @@ fn resolve_parent_from_inner(
     let absolute = bytes[0] == b'/';
     let mut cursor = if absolute { 1usize } else { 0usize };
     let mut current = if absolute { ROOT_INODE } else { start };
-    if current as usize >= VFS_MAX_INODES || !state.inodes[current as usize].used {
+    if current as usize >= state.inodes.len() || !state.inodes[current as usize].used {
         return Err(ENOENT);
     }
     let mut component = [0u8; VFS_MAX_NAME];
@@ -1385,9 +1411,6 @@ fn create_regular_at_inner(state: &mut VfsState, start: u16, path: &str) -> Resu
             if state.inodes[parent as usize].ext2_ino == 0 {
                 return Err(EIO);
             }
-            if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
-                return Err(ENOSPC);
-            }
             if !has_free_vfs_inode(state) {
                 return Err(ENOSPC);
             }
@@ -1445,9 +1468,6 @@ fn mkdir_at_inner(state: &mut VfsState, start: u16, path: &str) -> Result<(), i6
         return with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_MKDIR, |state| {
             if state.inodes[parent as usize].ext2_ino == 0 {
                 return Err(EIO);
-            }
-            if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
-                return Err(ENOSPC);
             }
             if !has_free_vfs_inode(state) {
                 return Err(ENOSPC);
@@ -1813,6 +1833,17 @@ fn ext2_parse_layout_with_len(
     };
 
     let desc_size = ext2_desc_size_from_superblock(image, feature_incompat)?;
+    let mut hash_seed = [0u32; 4];
+    let mut def_hash_version = ext2_htree::DX_HASH_HALF_MD4;
+    let mut hash_unsigned = false;
+    if image.len() >= sb + 0x164 {
+        for (i, word) in hash_seed.iter_mut().enumerate() {
+            *word = read_u32_le(image, sb + 0xEC + i * 4)?;
+        }
+        def_hash_version = image[sb + 0xFC];
+        let flags = read_u32_le(image, sb + 0x160)?;
+        hash_unsigned = (flags & ext2_htree::EXT2_FLAGS_UNSIGNED_HASH) != 0;
+    }
     let gdt_size = (group_count as usize)
         .checked_mul(desc_size)
         .ok_or(EIO)?;
@@ -1841,6 +1872,9 @@ fn ext2_parse_layout_with_len(
         ext4_read_only: false,
         journal_inode,
         journal_dev,
+        hash_seed,
+        def_hash_version,
+        hash_unsigned,
     })
 }
 
@@ -3538,6 +3572,18 @@ fn ext2_dir_links_dec(meta: &Ext2Meta, links: u16) -> u16 {
 /// Clears `mask` from the on-disk `i_flags` of `ino`. Kept separate from
 /// `ext2_write_inode_to_state` so stale in-memory inode copies can never
 /// resurrect a cleared flag.
+fn ext2_set_inode_flags_state(state: &mut VfsState, ino: u32, mask: u32) -> Result<(), i64> {
+    let meta = state.ext2_meta;
+    let inode_offset = ext2_inode_offset_in_state(state, &meta, ino)?;
+    ext2_ensure_range_resident(state, inode_offset, meta.inode_size)?;
+    let flags = ext2_read_u32_state(state, inode_offset + 32)?;
+    if (flags & mask) != mask {
+        ext2_write_u32_state(state, inode_offset + 32, flags | mask)?;
+        ext2_update_inode_csum(state, ino)?;
+    }
+    Ok(())
+}
+
 fn ext2_clear_inode_flags_state(state: &mut VfsState, ino: u32, mask: u32) -> Result<(), i64> {
     let meta = state.ext2_meta;
     let inode_offset = ext2_inode_offset_in_state(state, &meta, ino)?;
@@ -3663,7 +3709,7 @@ fn ext2_read_inode_from_state(state: &mut VfsState, ino: u32) -> Result<Ext2Inod
 
 fn ext2_refresh_alias_nodes(state: &mut VfsState, ext2_ino: u32, inode: &Ext2Inode) {
     let mut idx = 0usize;
-    while idx < VFS_MAX_INODES {
+    while idx < state.inodes.len() {
         let node = &mut state.inodes[idx];
         if node.used && node.backend == NodeBackend::Ext2 && node.ext2_ino == ext2_ino {
             node.size = inode.size;
@@ -4412,10 +4458,20 @@ where
                 let block = ext2_block_slice_state(state, block_num)?;
                 ext4_csum::dir_leaf_csum_ok(seed, block)?
             };
-            // `None`: htree interior/root block (dx_tail, verified in M4).
             if ok == Some(false) {
                 ext2_report(state, "directory block checksum", block_num as u64);
                 return Err(EIO);
+            }
+            // No leaf tail: an htree root/node block carries a dx_tail.
+            if ok.is_none() && (inode.flags & EXT2_INDEX_FL) != 0 {
+                let dx_ok = {
+                    let block = ext2_block_slice_state(state, block_num)?;
+                    ext2_htree::dx_csum_ok(seed, block)
+                };
+                if dx_ok == Some(false) {
+                    ext2_report(state, "htree index checksum", block_num as u64);
+                    return Err(EIO);
+                }
             }
         }
         let block = ext2_block_slice_state(state, block_num)?;
@@ -4747,6 +4803,7 @@ fn ext2_import_node(
     parent: u16,
     name: &[u8],
     inode_num: u32,
+    check_dup: bool,
 ) -> Result<(), i64> {
     if name.is_empty() {
         return Ok(());
@@ -4757,7 +4814,7 @@ fn ext2_import_node(
     if name.len() >= VFS_MAX_NAME {
         return Err(ENAMETOOLONG);
     }
-    if find_child(state, parent, name).is_some() {
+    if check_dup && find_child(state, parent, name).is_some() {
         return Ok(());
     }
 
@@ -4787,7 +4844,7 @@ fn ext2_import_node(
 }
 
 fn ext2_ensure_dir_children_loaded(state: &mut VfsState, dir: u16) -> Result<(), i64> {
-    if !state.ext2_mounted || (dir as usize) >= VFS_MAX_INODES {
+    if !state.ext2_mounted || (dir as usize) >= state.inodes.len() {
         return Ok(());
     }
 
@@ -4815,28 +4872,33 @@ fn ext2_ensure_dir_children_loaded(state: &mut VfsState, dir: u16) -> Result<(),
     if ext2_mode_to_filetype(ext2_inode.mode) != Some(FileType::Directory) {
         return Err(EIO);
     }
-    let mut entry_count = 0usize;
-    let mut entry_ino = [0u32; VFS_MAX_CHILDREN];
-    let mut entry_name_len = [0u8; VFS_MAX_CHILDREN];
-    let mut entry_name = [[0u8; VFS_MAX_NAME]; VFS_MAX_CHILDREN];
+    // (inode, name offset, name length) into one name buffer.
+    let mut entries: Vec<(u32, usize, usize)> = Vec::new();
+    let mut names: Vec<u8> = Vec::new();
     ext2_for_each_dir_entry_state(state, &ext2_inode, |child_ino, _ft, child_name| {
-        if entry_count >= VFS_MAX_CHILDREN {
-            return Err(ENOSPC);
+        if child_name == b"." || child_name == b".." {
+            return Ok(());
         }
         if child_name.len() >= VFS_MAX_NAME {
             return Err(ENAMETOOLONG);
         }
-        entry_ino[entry_count] = child_ino;
-        entry_name_len[entry_count] = child_name.len() as u8;
-        entry_name[entry_count][..child_name.len()].copy_from_slice(child_name);
-        entry_count += 1;
+        entries.try_reserve(1).map_err(|_| ENOSPC)?;
+        names.try_reserve(child_name.len()).map_err(|_| ENOSPC)?;
+        entries.push((child_ino, names.len(), child_name.len()));
+        names.extend_from_slice(child_name);
         Ok(())
     })?;
-    let mut idx = 0usize;
-    while idx < entry_count {
-        let name_len = entry_name_len[idx] as usize;
-        ext2_import_node(state, dir, &entry_name[idx][..name_len], entry_ino[idx])?;
-        idx += 1;
+    // Names imported earlier by single lookups (or tmpfs overlays at the
+    // root) are already children; skip the duplicate check otherwise.
+    let check_dup = !state.inodes[dir as usize].children.is_empty();
+    if !check_dup {
+        state.inodes[dir as usize]
+            .children
+            .try_reserve(entries.len())
+            .map_err(|_| ENOSPC)?;
+    }
+    for &(child_ino, off, len) in entries.iter() {
+        ext2_import_node(state, dir, &names[off..off + len], child_ino, check_dup)?;
     }
 
     let node_ref = &mut state.inodes[dir as usize];
@@ -4853,41 +4915,24 @@ fn ext2_ensure_dir_children_loaded(state: &mut VfsState, dir: u16) -> Result<(),
 }
 
 fn clear_inode_subtree(state: &mut VfsState, inode: u16) {
-    let mut children = [0u16; VFS_MAX_CHILDREN];
-    let child_count = state.inodes[inode as usize].child_count as usize;
-
-    let mut idx = 0usize;
-    while idx < child_count {
-        children[idx] = state.inodes[inode as usize].children[idx];
-        idx += 1;
-    }
-
-    idx = 0;
-    while idx < child_count {
-        let child = children[idx];
-        if (child as usize) < VFS_MAX_INODES && state.inodes[child as usize].used {
+    let children = core::mem::take(&mut state.inodes[inode as usize].children);
+    for &child in children.iter() {
+        if (child as usize) < state.inodes.len() && state.inodes[child as usize].used {
             clear_inode_subtree(state, child);
         }
-        idx += 1;
     }
 
     clear_inode(&mut state.inodes[inode as usize]);
 }
 
 fn prune_root_overlays_after_ext2_mount(state: &mut VfsState) {
-    let mut children = [0u16; VFS_MAX_CHILDREN];
-    let child_count = state.inodes[ROOT_INODE as usize].child_count as usize;
+    let children = state.inodes[ROOT_INODE as usize].children.clone();
+    let child_count = children.len();
 
     let mut idx = 0usize;
     while idx < child_count {
-        children[idx] = state.inodes[ROOT_INODE as usize].children[idx];
-        idx += 1;
-    }
-
-    idx = 0;
-    while idx < child_count {
         let child = children[idx];
-        if (child as usize) >= VFS_MAX_INODES {
+        if (child as usize) >= state.inodes.len() {
             idx += 1;
             continue;
         }
@@ -4917,30 +4962,18 @@ fn prune_root_overlays_after_ext2_mount(state: &mut VfsState) {
 }
 
 fn rollback_ext2_mount_import(state: &mut VfsState, mount_inode: u16) {
-    let mut children = [0u16; VFS_MAX_CHILDREN];
-    let child_count = state.inodes[mount_inode as usize].child_count as usize;
-
-    let mut idx = 0usize;
-    while idx < child_count {
-        children[idx] = state.inodes[mount_inode as usize].children[idx];
-        idx += 1;
-    }
-
-    idx = 0;
-    while idx < child_count {
-        let child = children[idx];
-        if (child as usize) < VFS_MAX_INODES && state.inodes[child as usize].used {
+    let children = core::mem::take(&mut state.inodes[mount_inode as usize].children);
+    for &child in children.iter() {
+        if (child as usize) < state.inodes.len() && state.inodes[child as usize].used {
             clear_inode_subtree(state, child);
         }
-        idx += 1;
     }
 
     let mount = &mut state.inodes[mount_inode as usize];
     mount.backend = NodeBackend::Tmpfs;
     mount.ext2_ino = 0;
     mount.ext2_children_loaded = true;
-    mount.child_count = 0;
-    mount.children = [0; VFS_MAX_CHILDREN];
+    mount.children = Vec::new();
     mount.size = 0;
     mount.links_count = 2;
 
@@ -5432,7 +5465,7 @@ fn dir_entry_at_offset(
     inode: u16,
     offset: u64,
 ) -> Result<Option<DirEntry>, i64> {
-    if (inode as usize) >= VFS_MAX_INODES {
+    if (inode as usize) >= state.inodes.len() {
         return Err(ENOENT);
     }
     let node = &state.inodes[inode as usize];
@@ -5468,7 +5501,7 @@ fn dir_entry_at_offset(
         }
         _ => {
             let idx = (offset - 2) as usize;
-            if idx >= node.child_count as usize {
+            if idx >= node.children.len() {
                 return Ok(None);
             }
             let child = node.children[idx];
@@ -5487,7 +5520,7 @@ fn dir_entry_at_offset(
 }
 
 fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
-    if (inode as usize) >= VFS_MAX_INODES {
+    if (inode as usize) >= state.inodes.len() {
         return Err(ENOENT);
     }
     let node = &state.inodes[inode as usize];
@@ -5563,13 +5596,20 @@ fn unlink_at_inner(
 
     let child_ref = &state.inodes[child as usize];
     let child_file_type = child_ref.file_type;
-    let child_child_count = child_ref.child_count;
+    let child_child_count = child_ref.children.len();
     let child_ext2_ino = child_ref.ext2_ino;
     if remove_dir {
         if child_file_type != FileType::Directory {
             return Err(ENOTDIR);
         }
         if child_child_count != 0 {
+            return Err(ENOTEMPTY);
+        }
+        // ext2 children are imported lazily: the disk is authoritative.
+        if parent_backend == NodeBackend::Ext2
+            && child_ext2_ino != 0
+            && !ext2_directory_is_empty(state, child_ext2_ino)?
+        {
             return Err(ENOTEMPTY);
         }
     } else if child_file_type == FileType::Directory {
@@ -5787,9 +5827,6 @@ fn link_at_inner(
     if !backend_mutable(state, old_backend) {
         return Err(EROFS);
     }
-    if state.inodes[new_parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
-        return Err(ENOSPC);
-    }
     if !has_free_vfs_inode(state) {
         return Err(ENOSPC);
     }
@@ -5808,7 +5845,9 @@ fn link_at_inner(
                 old.ctime = now;
 
                 link.size = old_size as u32;
-                link.data[..old_size].copy_from_slice(&old.data[..old_size]);
+                link.data = Vec::new();
+                link.data.try_reserve_exact(old_size).map_err(|_| ENOSPC)?;
+                link.data.extend_from_slice(&old.data[..old_size]);
                 link.mode = old_mode;
                 link.uid = old_uid;
                 link.gid = old_gid;
@@ -5913,9 +5952,6 @@ fn symlink_at_inner(
     if !backend_mutable(state, parent_backend) {
         return Err(EROFS);
     }
-    if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
-        return Err(ENOSPC);
-    }
     if !has_free_vfs_inode(state) {
         return Err(ENOSPC);
     }
@@ -5935,7 +5971,8 @@ fn symlink_at_inner(
             {
                 let node = &mut state.inodes[inode as usize];
                 node.size = target_bytes.len() as u32;
-                node.data[..target_bytes.len()].copy_from_slice(target_bytes);
+                node.data.try_reserve_exact(target_bytes.len()).map_err(|_| ENOSPC)?;
+                node.data.extend_from_slice(target_bytes);
             }
             add_child(state, parent, inode)?;
             touch_inode_metadata(state, parent, true, true, true);
@@ -6075,7 +6112,7 @@ fn readlink_at_inner(
 }
 
 fn set_times_inner(state: &mut VfsState, inode: u16, atime: u64, mtime: u64) -> Result<(), i64> {
-    if inode as usize >= VFS_MAX_INODES {
+    if inode as usize >= state.inodes.len() {
         return Err(ENOENT);
     }
     if !state.inodes[inode as usize].used {
@@ -6114,7 +6151,7 @@ fn set_times_inner(state: &mut VfsState, inode: u16, atime: u64, mtime: u64) -> 
 }
 
 fn chmod_inner(state: &mut VfsState, inode: u16, mode: u16) -> Result<(), i64> {
-    if inode as usize >= VFS_MAX_INODES {
+    if inode as usize >= state.inodes.len() {
         return Err(ENOENT);
     }
     if !state.inodes[inode as usize].used {
@@ -6153,7 +6190,7 @@ fn chmod_inner(state: &mut VfsState, inode: u16, mode: u16) -> Result<(), i64> {
 }
 
 fn chown_inner(state: &mut VfsState, inode: u16, uid: u32, gid: u32) -> Result<(), i64> {
-    if inode as usize >= VFS_MAX_INODES {
+    if inode as usize >= state.inodes.len() {
         return Err(ENOENT);
     }
     if !state.inodes[inode as usize].used {
@@ -6243,10 +6280,56 @@ pub fn lookupat(start: u16, path: &str) -> Result<u16, i64> {
     })
 }
 
+/// Absolute path of `inode`, built from the VFS parent links (no directory
+/// scan, so it never imports large ext2 directories). `ENOENT` for a node
+/// that no longer exists, `ENAMETOOLONG` when `out` is too small.
+pub fn inode_path(inode: u16, out: &mut [u8]) -> Result<usize, i64> {
+    with_state(|state| {
+        ensure_init(state);
+        if (inode as usize) >= state.inodes.len() || !state.inodes[inode as usize].used {
+            return Err(ENOENT);
+        }
+        // Collect the chain leaf -> root, then emit it root -> leaf.
+        let mut chain: Vec<u16> = Vec::new();
+        let mut cur = inode;
+        while cur != ROOT_INODE {
+            if chain.len() > VFS_MAX_PATH {
+                return Err(ENOENT);
+            }
+            chain.try_reserve(1).map_err(|_| ENOSPC)?;
+            chain.push(cur);
+            let node = &state.inodes[cur as usize];
+            if !node.used || (node.parent as usize) >= state.inodes.len() {
+                return Err(ENOENT);
+            }
+            cur = node.parent;
+        }
+        if chain.is_empty() {
+            if out.is_empty() {
+                return Err(ENAMETOOLONG);
+            }
+            out[0] = b'/';
+            return Ok(1);
+        }
+        let mut len = 0usize;
+        for &node_idx in chain.iter().rev() {
+            let node = &state.inodes[node_idx as usize];
+            let name = &node.name[..node.name_len as usize];
+            if len + 1 + name.len() > out.len() {
+                return Err(ENAMETOOLONG);
+            }
+            out[len] = b'/';
+            out[len + 1..len + 1 + name.len()].copy_from_slice(name);
+            len += 1 + name.len();
+        }
+        Ok(len)
+    })
+}
+
 pub fn inode_is_dir(inode: u16) -> Result<bool, i64> {
     with_state(|state| {
         ensure_init(state);
-        if (inode as usize) >= VFS_MAX_INODES || !state.inodes[inode as usize].used {
+        if (inode as usize) >= state.inodes.len() || !state.inodes[inode as usize].used {
             return Err(ENOENT);
         }
         Ok(state.inodes[inode as usize].file_type == FileType::Directory)
@@ -6393,7 +6476,7 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
     with_state(|state| {
         ensure_init(state);
 
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return Err(ENOENT);
         }
 
@@ -6459,7 +6542,7 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
     with_state(|state| {
         ensure_init(state);
 
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return Err(ENOENT);
         }
 
@@ -6500,18 +6583,20 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
                     });
                 }
 
-                let current_size = node_ref.size as usize;
-                if start > current_size {
-                    node_ref.data[current_size..start].fill(0);
-                }
-
                 let remaining = TMPFS_MAX_FILE_SIZE - start;
                 if remaining == 0 {
                     return Err(ENOSPC);
                 }
 
                 let count = core::cmp::min(src.len(), remaining);
-                node_ref.data[start..start + count].copy_from_slice(&src[..count]);
+                // `data` holds exactly `size` bytes; a gap reads as zeros.
+                let end = start + count;
+                if end > node_ref.data.len() {
+                    let grow = end - node_ref.data.len();
+                    node_ref.data.try_reserve(grow).map_err(|_| ENOSPC)?;
+                    node_ref.data.resize(end, 0);
+                }
+                node_ref.data[start..end].copy_from_slice(&src[..count]);
 
                 start += count;
                 if start > node_ref.size as usize {
@@ -6571,7 +6656,7 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
     with_state(|state| {
         ensure_init(state);
 
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return Err(ENOENT);
         }
 
@@ -6667,7 +6752,7 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
     with_state(|state| {
         ensure_init(state);
 
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return Err(ENOENT);
         }
 
@@ -6710,7 +6795,7 @@ pub fn truncate(inode: u16) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
 
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return Err(ENOENT);
         }
         let (used, file_type, backend, ext2_ino) = {
@@ -6730,7 +6815,7 @@ pub fn truncate(inode: u16) -> Result<(), i64> {
         match backend {
             NodeBackend::Tmpfs => {
                 state.inodes[inode as usize].size = 0;
-                state.inodes[inode as usize].data.fill(0);
+                state.inodes[inode as usize].data = Vec::new();
                 touch_inode_metadata(state, inode, false, true, true);
             }
             NodeBackend::Ext2 => {
@@ -6766,7 +6851,7 @@ pub fn truncate_to(inode: u16, length: u64) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
 
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return Err(ENOENT);
         }
         let (used, file_type, backend, ext2_ino) = {
@@ -6790,12 +6875,11 @@ pub fn truncate_to(inode: u16, length: u64) -> Result<(), i64> {
                     return Err(ENOSPC);
                 }
                 let node = &mut state.inodes[inode as usize];
-                let old_size = node.size as usize;
-                if new_len < old_size {
-                    node.data[new_len..old_size].fill(0);
-                } else if new_len > old_size {
-                    node.data[old_size..new_len].fill(0);
+                if new_len > node.data.len() {
+                    let grow = new_len - node.data.len();
+                    node.data.try_reserve(grow).map_err(|_| ENOSPC)?;
                 }
+                node.data.resize(new_len, 0);
                 node.size = new_len as u32;
                 touch_inode_metadata(state, inode, false, true, true);
             }
@@ -6828,7 +6912,7 @@ pub fn truncate_to(inode: u16, length: u64) -> Result<(), i64> {
 
 pub fn inode_backend_is_ext2(inode: u16) -> bool {
     with_state(|state| {
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return false;
         }
         state.inodes[inode as usize].backend == NodeBackend::Ext2
@@ -6838,7 +6922,7 @@ pub fn inode_backend_is_ext2(inode: u16) -> bool {
 pub fn inode_is_framebuffer(inode: u16) -> bool {
     with_state(|state| {
         ensure_init(state);
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return false;
         }
         let node = &state.inodes[inode as usize];
@@ -6849,7 +6933,7 @@ pub fn inode_is_framebuffer(inode: u16) -> bool {
 pub fn inode_input_device_id(inode: u16) -> Option<u16> {
     with_state(|state| {
         ensure_init(state);
-        if inode as usize >= VFS_MAX_INODES {
+        if inode as usize >= state.inodes.len() {
             return None;
         }
         let node = &state.inodes[inode as usize];
@@ -7554,16 +7638,26 @@ mod tests {
 
         with_state(|state| {
             let root = &state.inodes[ext2_root as usize];
-            assert_eq!(root.child_count, 0);
+            assert_eq!(root.children.len(), 0);
             assert!(!root.ext2_children_loaded);
         });
 
+        // A path lookup imports only the named entry...
         let _ = open("/mnt/ext2/hello.txt", O_RDONLY, 0).expect("open ext2 file");
         with_state(|state| {
             let root = &state.inodes[ext2_root as usize];
-            assert!(root.ext2_children_loaded);
-            assert!(root.child_count > 0);
+            assert!(!root.ext2_children_loaded);
+            assert_eq!(root.children.len(), 1);
         });
+        // ...readdir imports the rest, without duplicating it.
+        let listed = count_dir_entries("/mnt/ext2");
+        with_state(|state| {
+            let root = &state.inodes[ext2_root as usize];
+            assert!(root.ext2_children_loaded);
+            assert_eq!(root.children.len(), listed);
+        });
+        let _ = open("/mnt/ext2/hello.txt", O_RDONLY, 0).expect("reopen ext2 file");
+        assert_eq!(count_dir_entries("/mnt/ext2"), listed);
     }
 
     #[test]
@@ -9655,7 +9749,7 @@ mod tests {
         let ext2_root = lookup("/mnt/ext2").expect("lookup ext2 root");
         with_state(|state| {
             let root = &state.inodes[ext2_root as usize];
-            assert_eq!(root.child_count, 0);
+            assert_eq!(root.children.len(), 0);
             assert!(!root.ext2_children_loaded);
         });
 
@@ -9666,8 +9760,8 @@ mod tests {
         assert!(ctx.reads > reads_after_mount);
         with_state(|state| {
             let root = &state.inodes[ext2_root as usize];
-            assert!(root.ext2_children_loaded);
-            assert!(root.child_count > 0);
+            assert!(!root.ext2_children_loaded, "lookups import single entries");
+            assert_eq!(root.children.len(), 1);
         });
     }
 
@@ -10084,7 +10178,7 @@ mod tests {
     }
 
     #[test]
-    fn ext3_htree_insert_clears_index_flag_and_persists() {
+    fn ext3_htree_insert_keeps_index_and_persists() {
         let _guard = TEST_LOCK.lock().expect("lock should work");
         init();
         let _ctx = mount_sample_ext3();
@@ -10094,8 +10188,12 @@ mod tests {
         let _ = write(created.inode, 0, b"new", false).expect("write new entry");
 
         let (_, bigdir) = ext2_raw_inode_for_path("/mnt/ext2/bigdir");
-        assert_eq!(bigdir.flags & EXT2_INDEX_FL, 0, "insert must drop the stale htree index");
+        assert_ne!(bigdir.flags & EXT2_INDEX_FL, 0, "insert must keep the htree index");
 
+        // Export is not a crash snapshot: apply the journal first so replay
+        // at the next mount cannot bring back older committed copies.
+        flush_ext2_dirty_blocks().expect("commit");
+        checkpoint_ext2_journal().expect("checkpoint");
         let mut exported = std::vec![0u8; SAMPLE_EXT3.len()];
         let image_len = export_ext2_image(&mut exported).expect("export");
         init();
@@ -10826,6 +10924,41 @@ mod tests {
     }
 
     fn crash_at_every_write(base: &[u8], dump_env: &str) {
+        fn workload() {
+            let created = open("/mnt/ext2/sub/crash_v", O_CREAT | O_RDWR, 0).expect("create");
+            let _ = write(created.inode, 0, CRASH_PAYLOAD, false).expect("write");
+            unlink("/mnt/ext2/xattr_block.txt").expect("unlink");
+            mkdir("/mnt/ext2/sub/crash_vdir").expect("mkdir");
+        }
+        fn check(t: usize, keep: usize) {
+            match open("/mnt/ext2/sub/crash_v", O_RDONLY, 0) {
+                Ok(opened) => {
+                    let mut buf = [0u8; 64];
+                    let n = read(opened.inode, 0, &mut buf).expect("read crash_v");
+                    assert!(
+                        n == 0 || &buf[..n] == CRASH_PAYLOAD,
+                        "t={t} keep={keep}: torn file contents {:?}",
+                        &buf[..n]
+                    );
+                    let ino = stat(opened.inode).unwrap().ino as u32;
+                    assert!(ext2_inode_in_use(ino), "t={t} keep={keep}: inode not in bitmap");
+                }
+                Err(err) => assert_eq!(err, ENOENT, "t={t} keep={keep}"),
+            }
+        }
+        crash_at_every_write_with(base, dump_env, workload, check);
+    }
+
+    const CRASH_PAYLOAD: &[u8] = b"crash-consistent payload";
+
+    /// Runs `workload` on a reordering write cache, then for every crash
+    /// point recovers the image and runs `check(t, keep)` on it.
+    fn crash_at_every_write_with(
+        base: &[u8],
+        dump_env: &str,
+        workload: fn(),
+        check: fn(usize, usize),
+    ) {
         init();
         let mut vctx = std::boxed::Box::new(VolatileCtx {
             current: std::vec::Vec::from(base),
@@ -10839,11 +10972,7 @@ mod tests {
         })
         .expect("volatile backend");
         mount_ext2_block_backend("/mnt/ext2", base.len(), &base[..4096]).expect("mount volatile");
-        let payload = b"crash-consistent payload";
-        let created = open("/mnt/ext2/sub/crash_v", O_CREAT | O_RDWR, 0).expect("create");
-        let _ = write(created.inode, 0, payload, false).expect("write");
-        unlink("/mnt/ext2/xattr_block.txt").expect("unlink");
-        mkdir("/mnt/ext2/sub/crash_vdir").expect("mkdir");
+        workload();
         flush_ext2_dirty_blocks().expect("flush");
         checkpoint_ext2_journal().expect("checkpoint");
         let events = std::mem::take(&mut vctx.events);
@@ -10864,20 +10993,7 @@ mod tests {
                 let crashed = volatile_crash_image(base, &events, t, keep);
                 init();
                 let ctx = mount_ext2_backend_image(&crashed, 4096);
-                match open("/mnt/ext2/sub/crash_v", O_RDONLY, 0) {
-                    Ok(opened) => {
-                        let mut buf = [0u8; 64];
-                        let n = read(opened.inode, 0, &mut buf).expect("read crash_v");
-                        assert!(
-                            n == 0 || &buf[..n] == payload,
-                            "t={t} keep={keep}: torn file contents {:?}",
-                            &buf[..n]
-                        );
-                        let ino = stat(opened.inode).unwrap().ino as u32;
-                        assert!(ext2_inode_in_use(ino), "t={t} keep={keep}: inode not in bitmap");
-                    }
-                    Err(err) => assert_eq!(err, ENOENT, "t={t} keep={keep}"),
-                }
+                check(t, keep);
                 if let Some(dir) = &dump_dir {
                     std::fs::write(std::format!("{dir}/crash_{t:04}_{keep:03}.img"), &ctx.image)
                         .expect("dump recovered image");
@@ -11595,6 +11711,259 @@ mod tests {
         assert_eq!(open("/mnt/ext2/large.bin", O_RDONLY, 0).unwrap_err(), ENOENT);
     }
 
+
+    // ---- M4: htree maintenance and large directories ----
+
+    /// Root block of an indexed directory: (hash version, indirect levels,
+    /// root entry count).
+    fn htree_root_info(path: &str) -> (u8, u8, u16) {
+        let (_, dir) = ext2_raw_inode_for_path(path);
+        assert_ne!(dir.flags & EXT2_INDEX_FL, 0, "{path} should be indexed");
+        with_state(|state| {
+            let phys = ext2_data_block_for_logical_index_state(state, &dir, 0).unwrap();
+            let blk = ext2_block_slice_state(state, phys).unwrap();
+            (blk[0x1C], blk[0x1E], read_u16_le(blk, 0x22).unwrap())
+        })
+    }
+
+    fn padded_name(prefix: &str, i: usize, len: usize) -> std::string::String {
+        let mut name = std::format!("{prefix}{i:05}_");
+        while name.len() < len {
+            name.push((b'a' + (name.len() % 26) as u8) as char);
+        }
+        name
+    }
+
+    /// Fills `dir` with `count` hard links to one file (directory entries
+    /// without using up inodes), names `padded_name(prefix, i, len)`.
+    fn fill_with_links(dir: &str, prefix: &str, count: usize, len: usize) {
+        let hub = std::format!("{dir}/hub");
+        let opened = open(&hub, O_CREAT | O_RDWR, 0).expect("create hub");
+        let _ = write(opened.inode, 0, b"hub", false).expect("write hub");
+        for i in 0..count {
+            let name = std::format!("{dir}/{}", padded_name(prefix, i, len));
+            linkat(root_inode(), &hub, root_inode(), &name)
+                .unwrap_or_else(|e| panic!("link {i} ({name}): {e}"));
+        }
+    }
+
+    /// Thousands of entries in a new directory on the stock ext4 image: the
+    /// one-block directory becomes an htree, leaves split, every checksum
+    /// (including dx_tail) stays valid, lookups after remount read one leaf
+    /// each, and e2fsck can check the result (PEETOS_EXT4_HTREE_FSCK_IMAGE).
+    #[test]
+    fn ext4_large_directory_keeps_a_valid_htree() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext4();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+        mkdir("/mnt/ext2/huge").unwrap();
+        const N: usize = 3000;
+        fill_with_links("/mnt/ext2/huge", "link_", N, 40);
+        let (version, levels, leaves) = htree_root_info("/mnt/ext2/huge");
+        assert_eq!(version, ext2_htree::DX_HASH_HALF_MD4, "s_def_hash_version");
+        assert_eq!(levels, 0);
+        assert!(leaves > 10, "{leaves} leaves");
+        for i in (0..N).step_by(3) {
+            unlink(&std::format!("/mnt/ext2/huge/{}", padded_name("link_", i, 40))).unwrap();
+        }
+        // A 255-byte name (VFS names are no longer capped at 63 bytes); the
+        // full path would exceed VFS_MAX_PATH, so go relative to the dir.
+        let long = padded_name("long_", 0, 255);
+        let huge_dir = lookup("/mnt/ext2/huge").unwrap();
+        let opened = openat(huge_dir, &long, O_CREAT | O_RDWR, 0).unwrap();
+        let _ = write(opened.inode, 0, b"long name", false).unwrap();
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        let synced = ctx.image.clone();
+        ext4_verify_all_checksums(&synced);
+        if let Ok(path) = std::env::var("PEETOS_EXT4_HTREE_FSCK_IMAGE") {
+            std::fs::write(&path, &synced).expect("write fsck image");
+        }
+
+        init();
+        let _ctx2 = mount_ext2_backend_image(&synced, 4096);
+        ext2_htree::DX_LEAF_READS.with(|c| c.set(0));
+        for i in (0..N).step_by(7) {
+            let name = std::format!("/mnt/ext2/huge/{}", padded_name("link_", i, 40));
+            match lookup(&name) {
+                Ok(_) => assert_ne!(i % 3, 0, "{name} was unlinked"),
+                Err(err) => {
+                    assert_eq!(err, ENOENT);
+                    assert_eq!(i % 3, 0, "{name} lost");
+                }
+            }
+        }
+        let lookups = (0..N).step_by(7).count();
+        let reads = ext2_htree::DX_LEAF_READS.with(|c| c.get());
+        assert!(reads >= lookups && reads <= lookups + 8, "{reads} leaf reads for {lookups} lookups");
+        with_state(|state| {
+            let huge = lookup_path_inner(state, "/mnt/ext2/huge").unwrap();
+            assert!(!state.inodes[huge as usize].ext2_children_loaded, "lookups stayed lazy");
+        });
+        let reopened = openat(lookup("/mnt/ext2/huge").unwrap(), &long, O_RDONLY, 0).unwrap();
+        let mut buf = [0u8; 16];
+        let n = read(reopened.inode, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"long name");
+        // hub + the 2/3 of the links that remain + the long name.
+        assert_eq!(count_dir_entries("/mnt/ext2/huge"), 1 + (N - (N + 2) / 3) + 1);
+        let hub = stat(lookup("/mnt/ext2/huge/hub").unwrap()).unwrap();
+        assert_eq!(hub.nlink as usize, 1 + N - (N + 2) / 3);
+    }
+
+    /// 1 KiB blocks and 200-byte names fill the 124-entry dx root: the index
+    /// grows a second level (dx nodes), and nodes split as it keeps growing.
+    /// Exported for e2fsck as PEETOS_EXT3_HTREE_FSCK_IMAGE.
+    #[test]
+    fn ext3_htree_grows_a_second_index_level() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+        mkdir("/mnt/ext2/deep").unwrap();
+        const N: usize = 700;
+        fill_with_links("/mnt/ext2/deep", "deep_", N, 200);
+        let (_, levels, root_count) = htree_root_info("/mnt/ext2/deep");
+        assert_eq!(levels, 1, "index should have grown a level");
+        assert!(root_count >= 2, "dx nodes should have split ({root_count} root entries)");
+        for i in (0..N).step_by(5) {
+            unlink(&std::format!("/mnt/ext2/deep/{}", padded_name("deep_", i, 200))).unwrap();
+        }
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        let synced = ctx.image.clone();
+        if let Ok(path) = std::env::var("PEETOS_EXT3_HTREE_FSCK_IMAGE") {
+            std::fs::write(&path, &synced).expect("write fsck image");
+        }
+        init();
+        let _ctx2 = mount_ext2_backend_image(&synced, 4096);
+        for i in 0..N {
+            let name = std::format!("/mnt/ext2/deep/{}", padded_name("deep_", i, 200));
+            assert_eq!(lookup(&name).is_ok(), i % 5 != 0, "{name}");
+        }
+        assert_eq!(count_dir_entries("/mnt/ext2/deep"), 1 + N - N / 5);
+    }
+
+    /// Every hash flavour (legacy/half_md4/tea, signed and unsigned name
+    /// bytes) for new indexes, with names using bytes >= 0x80. Images go to
+    /// PEETOS_HTREE_HASH_FSCK_DIR for e2fsck, which recomputes the hashes.
+    #[test]
+    fn htree_hash_variants_index_high_byte_names() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        let dump_dir = std::env::var("PEETOS_HTREE_HASH_FSCK_DIR").ok();
+        for version in [ext2_htree::DX_HASH_LEGACY, ext2_htree::DX_HASH_HALF_MD4, ext2_htree::DX_HASH_TEA] {
+            for unsigned in [false, true] {
+                let mut image = std::vec::Vec::from(SAMPLE_EXT3);
+                let sb = EXT2_SUPERBLOCK_OFFSET;
+                image[sb + 0xFC] = version;
+                let mut flags = read_u32_le(&image, sb + 0x160).unwrap();
+                flags &= !(ext2_htree::EXT2_FLAGS_SIGNED_HASH | ext2_htree::EXT2_FLAGS_UNSIGNED_HASH);
+                flags |= if unsigned {
+                    ext2_htree::EXT2_FLAGS_UNSIGNED_HASH
+                } else {
+                    ext2_htree::EXT2_FLAGS_SIGNED_HASH
+                };
+                image[sb + 0x160..sb + 0x164].copy_from_slice(&flags.to_le_bytes());
+                init();
+                let ctx = mount_ext2_backend_image(&image, 4096);
+                mkdir("/mnt/ext2/hashed").unwrap();
+                let hub = open("/mnt/ext2/hashed/hub", O_CREAT | O_RDWR, 0).unwrap();
+                let _ = write(hub.inode, 0, b"h", false).unwrap();
+                let mut names = std::vec::Vec::new();
+                for i in 0..120usize {
+                    // UTF-8 names whose bytes include 0xC3/0xA9 etc.
+                    let name = std::format!("h\u{e9}ll\u{f6}_{i:03}_\u{263a}_padding_padding");
+                    linkat(root_inode(), "/mnt/ext2/hashed/hub", root_inode(), &std::format!("/mnt/ext2/hashed/{name}")).unwrap();
+                    names.push(name);
+                }
+                let (root_version, _, _) = htree_root_info("/mnt/ext2/hashed");
+                assert_eq!(root_version, version);
+                flush_ext2_dirty_blocks().unwrap();
+                checkpoint_ext2_journal().unwrap();
+                let synced = ctx.image.clone();
+                if let Some(dir) = &dump_dir {
+                    std::fs::write(std::format!("{dir}/hash_{version}_{}.img", unsigned as u8), &synced)
+                        .expect("write hash image");
+                }
+                init();
+                let _ctx2 = mount_ext2_backend_image(&synced, 4096);
+                ext2_htree::DX_LEAF_READS.with(|c| c.set(0));
+                for name in &names {
+                    lookup(&std::format!("/mnt/ext2/hashed/{name}")).unwrap();
+                }
+                assert!(ext2_htree::DX_LEAF_READS.with(|c| c.get()) >= names.len());
+            }
+        }
+    }
+
+    #[test]
+    fn inode_path_follows_parent_links_without_loading_directories() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext4();
+        let mut buf = [0u8; VFS_MAX_PATH];
+        let nested = lookup("/mnt/ext2/sub/nested.txt").unwrap();
+        let n = inode_path(nested, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"/mnt/ext2/sub/nested.txt");
+        let n = inode_path(root_inode(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"/");
+        assert_eq!(inode_path(nested, &mut buf[..8]), Err(ENAMETOOLONG));
+        with_state(|state| {
+            let sub = lookup_path_inner(state, "/mnt/ext2/sub").unwrap();
+            assert!(!state.inodes[sub as usize].ext2_children_loaded);
+        });
+        unlink("/mnt/ext2/sub/nested.txt").unwrap();
+        assert_eq!(inode_path(nested, &mut buf), Err(ENOENT));
+    }
+
+    #[test]
+    fn htree_rmdir_of_lazily_loaded_directory_checks_the_disk() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext4();
+        // "sub" has entries on disk but none imported yet.
+        assert_eq!(rmdir("/mnt/ext2/sub"), Err(ENOTEMPTY));
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        let image = ctx.image.clone();
+        init();
+        let _ctx2 = mount_ext2_backend_image(&image, 4096);
+        assert!(count_dir_entries("/mnt/ext2/sub") > 0, "rmdir must not remove entries");
+    }
+
+    /// Crash points while inserts split htree leaves on the stock image.
+    #[test]
+    fn ext4_htree_split_crash_points_stay_consistent() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        fn workload() {
+            fill_with_links("/mnt/ext2/bigdir", "crash_", 70, 60);
+        }
+        fn check(t: usize, keep: usize) {
+            for i in 0..62usize {
+                if i == 0 {
+                    continue;
+                }
+                lookup(&std::format!("/mnt/ext2/bigdir/{}", bigdir_name(i)))
+                    .unwrap_or_else(|e| panic!("t={t} keep={keep}: entry {i} lost ({e})"));
+            }
+            let mut present = 0usize;
+            for i in 0..70usize {
+                if lookup(&std::format!("/mnt/ext2/bigdir/{}", padded_name("crash_", i, 60))).is_ok() {
+                    present += 1;
+                }
+            }
+            if let Ok(hub) = lookup("/mnt/ext2/bigdir/hub") {
+                assert_eq!(stat(hub).unwrap().nlink as usize, 1 + present, "t={t} keep={keep}");
+            } else {
+                assert_eq!(present, 0, "t={t} keep={keep}");
+            }
+        }
+        crash_at_every_write_with(SAMPLE_EXT4, "PEETOS_EXT4_HTREE_CRASH_DIR", workload, check);
+        let (_, levels, leaves) = htree_root_info("/mnt/ext2/bigdir");
+        assert_eq!(levels, 0);
+        assert!(leaves >= 3, "the workload should split a leaf ({leaves} leaves)");
+    }
+
     // ---- ext4 M3: metadata_csum read-write (stock ext4) ----
 
     /// Leaf blocks of an extent-mapped inode (depth 0 or 1), from raw bytes.
@@ -11677,7 +12046,14 @@ mod tests {
                     let indexed = (flags & EXT2_INDEX_FL) != 0;
                     match ok {
                         Some(valid) => assert!(valid, "dir inode {ino} block {block} checksum"),
-                        None => assert!(indexed, "dir inode {ino} block {block} lacks a tail"),
+                        None => {
+                            assert!(indexed, "dir inode {ino} block {block} lacks a tail");
+                            assert_eq!(
+                                ext2_htree::dx_csum_ok(seed, ext4_block(image, &meta, block)),
+                                Some(true),
+                                "dir inode {ino} index block {block} dx_tail"
+                            );
+                        }
                     }
                 }
             }

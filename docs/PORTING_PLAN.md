@@ -70,8 +70,8 @@ current Rust kernel implementation and forward roadmap.
   and revoke handling, with baseline runtime journal abort-on-I/O-fault state.
 - Images formatted with stock `mke2fs -t ext3` defaults now mount read-write:
   `ext_attr`, `resize_inode`, `dir_index`, and `large_file` are accepted, each
-  with explicit handling (xattr block accounting and release, linear htree reads
-  with the index dropped on insert, and refusal of >4 GiB file I/O). Fast
+  with explicit handling (xattr block accounting and release, maintained htree
+  indexes, and refusal of >4 GiB file I/O). Fast
   symlinks are read and created inline. `tests/ext3_fsck.sh` requires
   `e2fsck -fn` to stay clean after kernel-side mutations of a stock ext3 image.
 - Ordered-journal fixes: freeing a block dirtied in the same transaction now
@@ -238,7 +238,11 @@ current Rust kernel implementation and forward roadmap.
   M3 is done: stock `mkfs.ext4` images (`metadata_csum`) mount read-write
   with crc32c checksums maintained on every metadata write and a JBD2
   csum-v3/64bit journal that `e2fsck` replays; read-only is now a mount
-  option. Next: M4 (htree maintenance, lifting `VFS_MAX_CHILDREN`).
+  option.
+  M4 is done: htree indexes are used for lookups and maintained on insert
+  (all Linux hashes, leaf/node splits, two levels, `dx_tail` checksums), and
+  the VFS node/child tables grow on demand with lazy single-name ext2
+  imports, so directories with thousands of entries work.
 - Add additional filesystem support (for example FAT-family support) as needed.
 - Improve durability guarantees around writeback scheduling and crash handling.
 

@@ -133,91 +133,6 @@ pub(super) fn lookup_inode_for_at_path(
     }
 }
 
-#[inline]
-pub(super) fn path_component_is_dot(name: &[u8]) -> bool {
-    name.len() == 1 && name[0] == b'.'
-}
-
-#[inline]
-pub(super) fn path_component_is_dotdot(name: &[u8]) -> bool {
-    name.len() == 2 && name[0] == b'.' && name[1] == b'.'
-}
-
-pub(super) fn find_inode_path_from(
-    dir_inode: u16,
-    target_inode: u16,
-    current_len: usize,
-    depth: usize,
-    path_buf: &mut [u8; fs::VFS_MAX_PATH],
-) -> Result<Option<usize>, i64> {
-    if dir_inode == target_inode {
-        return Ok(Some(current_len));
-    }
-    if depth >= GETCWD_MAX_DEPTH {
-        return Ok(None);
-    }
-
-    let mut offset = 0u64;
-    loop {
-        let entry = match fs::readdir(dir_inode, offset) {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(err) => return Err(-fs_to_errno(err)),
-        };
-        offset = entry.next_offset;
-        if entry.name_len == 0 {
-            continue;
-        }
-        let name = &entry.name[..entry.name_len];
-        if path_component_is_dot(name) || path_component_is_dotdot(name) {
-            continue;
-        }
-        let name_str = match core::str::from_utf8(name) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let child_inode = match fs::lookupat(dir_inode, name_str) {
-            Ok(inode) => inode,
-            Err(_) => continue,
-        };
-
-        let next_len;
-        if current_len == 0 {
-            if 1 + name.len() >= path_buf.len() {
-                continue;
-            }
-            path_buf[0] = b'/';
-            path_buf[1..1 + name.len()].copy_from_slice(name);
-            next_len = 1 + name.len();
-        } else {
-            if current_len + 1 + name.len() >= path_buf.len() {
-                continue;
-            }
-            path_buf[current_len] = b'/';
-            path_buf[current_len + 1..current_len + 1 + name.len()].copy_from_slice(name);
-            next_len = current_len + 1 + name.len();
-        }
-
-        if child_inode == target_inode {
-            return Ok(Some(next_len));
-        }
-
-        match fs::inode_is_dir(child_inode) {
-            Ok(true) => {
-                if let Some(found_len) =
-                    find_inode_path_from(child_inode, target_inode, next_len, depth + 1, path_buf)?
-                {
-                    return Ok(Some(found_len));
-                }
-            }
-            Ok(false) => {}
-            Err(_) => {}
-        }
-    }
-
-    Ok(None)
-}
-
 pub(super) fn build_cwd_path(
     task_ptr: *mut task::Task,
     path_buf: &mut [u8; fs::VFS_MAX_PATH],
@@ -230,10 +145,9 @@ pub(super) fn build_cwd_path(
         path_buf[0] = b'/';
         return Ok(1);
     }
-    match find_inode_path_from(fs::root_inode(), cwd, 0, 0, path_buf)? {
-        Some(len) => Ok(len),
-        None => Err(-ENOENT),
-    }
+    // Leave room for the NUL terminator getcwd appends.
+    let max = path_buf.len() - 1;
+    fs::inode_path(cwd, &mut path_buf[..max]).map_err(|err| -fs_to_errno(err))
 }
 
 pub(super) fn refresh_procfs_runtime() {
@@ -1093,7 +1007,8 @@ pub(super) fn sys_getdents64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     let mut total = 0usize;
-    let mut record = [0u8; 128];
+    // 19-byte header + up to 255 name bytes + NUL, 8-byte aligned.
+    let mut record = [0u8; 288];
     loop {
         let entry = match fs::readdir(inode, offset) {
             Ok(Some(v)) => v,

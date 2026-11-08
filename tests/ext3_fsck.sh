@@ -276,3 +276,60 @@ if [[ "${checked}" -eq 0 ]]; then
   exit 1
 fi
 echo "[ext3-fsck] ${checked} recovered metadata_csum crash-point images are e2fsck clean"
+
+# htree maintenance (M4): kernel-built indexes must pass e2fsck's htree
+# checks (hash order per leaf, counts/limits, dx_tail checksums).
+for spec in "PEETOS_EXT4_HTREE_FSCK_IMAGE:ext4_large_directory_keeps_a_valid_htree:ext4_htree.img" \
+            "PEETOS_EXT3_HTREE_FSCK_IMAGE:ext3_htree_grows_a_second_index_level:ext3_htree.img"; do
+  IFS=: read -r env_name test_name img_name <<< "${spec}"
+  img="${WORK_DIR}/${img_name}"
+  env "${env_name}=${img}" cargo test -p fs --target "${HOST}" --quiet -- --exact "tests::${test_name}"
+  if [[ ! -s "${img}" ]]; then
+    echo "[ext3-fsck] ${test_name} did not export an image" >&2
+    exit 1
+  fi
+  if ! e2fsck -fn "${img}" >"${img}.fsck" 2>&1; then
+    echo "[ext3-fsck] e2fsck rejected the kernel-built htree in ${img_name}" >&2
+    cat "${img}.fsck" >&2
+    exit 1
+  fi
+done
+echo "[ext3-fsck] e2fsck clean on kernel-built htree directories (ext4 csum, ext3 two-level)"
+
+HASH_DIR="${WORK_DIR}/htree_hashes"
+mkdir -p "${HASH_DIR}"
+PEETOS_HTREE_HASH_FSCK_DIR="${HASH_DIR}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::htree_hash_variants_index_high_byte_names
+checked=0
+for img in "${HASH_DIR}"/*.img; do
+  if ! e2fsck -fn "${img}" >"${img}.fsck" 2>&1; then
+    echo "[ext3-fsck] e2fsck disagrees with the kernel's hash for $(basename "${img}")" >&2
+    cat "${img}.fsck" >&2
+    exit 1
+  fi
+  checked=$((checked + 1))
+done
+if [[ "${checked}" -ne 6 ]]; then
+  echo "[ext3-fsck] expected 6 hash-variant images, got ${checked}" >&2
+  exit 1
+fi
+echo "[ext3-fsck] e2fsck accepts all 6 htree hash variants"
+
+HTREE_CRASH_DIR="${WORK_DIR}/htree_crash_points"
+mkdir -p "${HTREE_CRASH_DIR}"
+PEETOS_EXT4_HTREE_CRASH_DIR="${HTREE_CRASH_DIR}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::ext4_htree_split_crash_points_stay_consistent
+checked=0
+for img in "${HTREE_CRASH_DIR}"/*.img; do
+  if ! e2fsck -fn "${img}" >"${img}.fsck" 2>&1; then
+    echo "[ext3-fsck] inconsistent htree after recovery: $(basename "${img}")" >&2
+    cat "${img}.fsck" >&2
+    exit 1
+  fi
+  checked=$((checked + 1))
+done
+if [[ "${checked}" -eq 0 ]]; then
+  echo "[ext3-fsck] htree crash-point test produced no images" >&2
+  exit 1
+fi
+echo "[ext3-fsck] ${checked} recovered htree-split crash-point images are e2fsck clean"
