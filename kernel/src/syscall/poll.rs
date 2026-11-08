@@ -808,7 +808,6 @@ pub(super) fn sys_ppoll(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let fds_ptr = call.arg(0);
     let nfds = call.arg(1) as usize;
     let tspec_ptr = call.arg(2);
-    // arg3 = sigmask (ignored)
 
     let deadline = if tspec_ptr == 0 {
         None // block indefinitely
@@ -827,6 +826,9 @@ pub(super) fn sys_ppoll(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
     };
 
+    if let Err(err) = install_wait_sigmask(ctx, call.arg(3), call.arg(4)) {
+        return err;
+    }
     do_poll(ctx, fds_ptr, nfds, deadline)
 }
 
@@ -1032,9 +1034,22 @@ pub(super) fn sys_epoll_wait(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 }
 
 pub(super) fn sys_epoll_pwait(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
-    let sigmask = call.arg(4);
-    if sigmask != 0 {
-        return -ENOSYS;
+    if let Err(err) = install_wait_sigmask(ctx, call.arg(4), call.arg(5)) {
+        return err;
     }
     sys_epoll_wait(ctx, call)
+}
+
+/// For `epoll_pwait`/`ppoll`: replace the signal mask for the duration of
+/// the wait (restored on syscall exit or via the signal frame).
+pub(super) fn install_wait_sigmask(ctx: &SyscallContext, sigmask_ptr: u64, sigsetsize: u64) -> Result<(), i64> {
+    if sigmask_ptr == 0 {
+        return Ok(());
+    }
+    if sigsetsize != 8 {
+        return Err(-EINVAL);
+    }
+    let mask = read_u64_from_user(ctx.current, sigmask_ptr).map_err(|e| -e)?;
+    signal::set_temporary_mask(ctx.current, mask);
+    Ok(())
 }

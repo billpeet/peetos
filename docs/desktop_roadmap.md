@@ -96,8 +96,9 @@ later.
 
 ### 5. Desktop shell and core applications
 
-- [ ] **foot** terminal: the best first real application (pixman, fcft/freetype,
-  fontconfig, xkbcommon).
+- [x] **foot** terminal: foot 1.18.1 with fcft 3.1.8 runs under `peetwl`
+  (`make run-foot-smoke`, see `docs/rendering.md`). It still lacks harfbuzz
+  shaping and terminfo.
 - [ ] Panel/taskbar and launcher (for example waybar or sfwbar, fuzzel or wofi).
 - [ ] GTK3/4 (GLib, GObject, gdk-pixbuf, libepoxy), unlocking a file manager
   (Thunar, PCManFM), a text editor and settings applications.
@@ -116,10 +117,11 @@ later.
 2. ~~Lift the platform limits, starting with the VM region-table stack copies.~~ Done.
 3. ~~DRM/KMS minimum: mode setting, dumb buffers, page flips.~~ Done (legacy KMS over the boot framebuffer).
 
-4. fcft + foot (without harfbuzz at first), then the C++ runtime for harfbuzz.
+4. ~~fcft + foot (without harfbuzz at first)~~ Done. Next: the C++ runtime for harfbuzz.
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
-shell, before the much larger wlroots and GTK ports.
+shell, before the much larger wlroots and GTK ports. *(Reached: foot renders
+text with fcft and the shell inside it receives typed input.)*
 
 ## Risks and Dependencies
 

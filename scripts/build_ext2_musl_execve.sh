@@ -130,6 +130,11 @@ elif compgen -G "${ROOT_DIR}/wayland/out/lib/*.so.[0-9]*" >/dev/null; then
   mkdir -p "${STAGE_ROOT}/usr/lib"
   cp -L "${ROOT_DIR}"/wayland/out/lib/*.so.[0-9]* "${STAGE_ROOT}/usr/lib/"
 fi
+if [[ -x "${RENDER_STAGE}/usr/bin/foot" ]]; then
+  cp "${RENDER_STAGE}/usr/bin/foot" "${STAGE_ROOT}/bin/foot"
+  mkdir -p "${STAGE_ROOT}/etc/xdg/foot"
+  cp "${RENDER_STAGE}/etc/xdg/foot/foot.ini" "${STAGE_ROOT}/etc/xdg/foot/" 2>/dev/null || true
+fi
 if [[ -x "${ROOT_DIR}/user/text_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/text_smoke.elf" "${STAGE_ROOT}/bin/text_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/text_smoke"
@@ -591,6 +596,42 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/unix_rights_smoke.sh"
+
+# Runs inside foot: proves the terminal shows output and passes keyboard
+# input through its pty to the shell.
+cat > "${STAGE_ROOT}/bin/foot_child.sh" <<'EOS'
+echo "[foot-child] started TERM=$TERM" > /dev/console
+echo "Hello from foot on PeetOS!"
+echo "fcft + fontconfig + freetype + pixman, under peetwl via DRM/KMS"
+echo
+ls /
+echo
+printf 'type a line: '
+echo "[foot-child] prompt shown" > /dev/console
+line=$(head -n 1)
+echo "you typed: $line"
+echo "[foot-child] got $line" > /dev/console
+sleep 1
+EOS
+
+cat > "${STAGE_ROOT}/bin/foot_smoke.sh" <<'EOS'
+fail=0
+export LANG=C.UTF-8 HOME=/tmp
+
+if [ ! -x bin/peetwl ] || [ ! -x bin/foot ]; then
+  echo [musl-ext2-foot-smoke] missing bin/peetwl or bin/foot
+  fail=1
+else
+  bin/peetwl --smoke \
+    --client "/mnt/ext2/bin/foot -e /mnt/ext2/bin/toybox sh /mnt/ext2/bin/foot_child.sh" || fail=1
+fi
+
+echo [musl-ext2-foot-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-foot-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/foot_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/text_smoke.sh" <<'EOS'
 fail=0

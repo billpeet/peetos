@@ -71,6 +71,20 @@ impl PtyEntry {
         true
     }
 
+    /// Push one byte of program output (written to the slave) with output
+    /// processing (ONLCR).
+    /// All or nothing: false if the buffer cannot take the processed bytes.
+    fn master_buf_push_output(&mut self, byte: u8) -> bool {
+        let (bytes, n) = tty::output_bytes(&self.tty.termios, byte);
+        if self.master_len as usize + n > PTY_BUF_SIZE {
+            return false;
+        }
+        for &b in &bytes[..n] {
+            self.master_buf_push_byte(b);
+        }
+        true
+    }
+
     fn master_buf_pop(&mut self, out: &mut [u8]) -> usize {
         if out.is_empty() || self.master_len == 0 {
             return 0;
@@ -280,6 +294,7 @@ pub fn master_write(
         // Push echo output to master_buf so master can read it
         for i in 0..echo_count {
             let len = echo_lens[i] as usize;
+            // Echo is already terminal-ready (newlines echo as CR LF).
             for j in 0..len {
                 entry.master_buf_push_byte(echo_bufs[i][j]);
             }
@@ -429,7 +444,7 @@ pub fn slave_write(
         }
 
         for &byte in data {
-            if !entry.master_buf_push_byte(byte) {
+            if !entry.master_buf_push_output(byte) {
                 if nonblocking {
                     if written == 0 {
                         return Err(EAGAIN);
@@ -720,6 +735,31 @@ mod tests {
         let mut out = [0u8; 32];
         let n = master_read(ptr::null_mut(), id, &mut out, false).expect("master read");
         assert_eq!(&out[..n], b"output data");
+
+        slave_close(id);
+        master_close(id);
+    }
+
+    #[test]
+    fn slave_output_translates_newlines_with_onlcr() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let id = pty_alloc().expect("alloc");
+        unlock(id);
+        slave_open(id).expect("slave open");
+
+        slave_write(ptr::null_mut(), id, b"a\nb", false).expect("slave write");
+        let mut out = [0u8; 32];
+        let n = master_read(ptr::null_mut(), id, &mut out, false).expect("master read");
+        assert_eq!(&out[..n], b"a\r\nb");
+
+        // Raw output (OPOST off) passes newlines through untouched.
+        let mut raw = get_termios(id);
+        raw.c_oflag = 0;
+        set_termios(id, &raw);
+        slave_write(ptr::null_mut(), id, b"c\n", false).expect("slave write");
+        let n = master_read(ptr::null_mut(), id, &mut out, false).expect("master read");
+        assert_eq!(&out[..n], b"c\n");
 
         slave_close(id);
         master_close(id);

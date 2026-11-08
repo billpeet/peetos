@@ -8,7 +8,8 @@ Usage: fetch-wayland.sh [options]
 Download, verify, and extract the pinned source releases of the PeetOS
 graphics userland into <name>-src/ directories: libwayland, libffi,
 wayland-protocols, libxkbcommon and libdrm, plus the software rendering stack
-(pixman, expat, freetype, fontconfig) and the DejaVu fonts.
+(pixman, expat, freetype, fontconfig), the DejaVu fonts, and tllist, fcft
+and the foot terminal.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -60,6 +61,18 @@ FONTCONFIG_SHA256="63a0658d0e06e0fa886106452b58ef04f21f58202ea02a94c39de0d3335d7
 DEJAVU_VERSION="2.37"
 DEJAVU_URL="https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-${DEJAVU_VERSION}.tar.bz2"
 DEJAVU_SHA256="fa9ca4d13871dd122f61258a80d01751d603b4d3ee14095d65453b4e846e17d7"
+
+TLLIST_VERSION="1.1.0"
+TLLIST_URL="https://codeberg.org/dnkl/tllist/archive/${TLLIST_VERSION}.tar.gz"
+TLLIST_SHA256="0e7b7094a02550dd80b7243bcffc3671550b0f1d8ba625e4dff52517827d5d23"
+
+FCFT_VERSION="3.1.8"
+FCFT_URL="https://codeberg.org/dnkl/fcft/archive/${FCFT_VERSION}.tar.gz"
+FCFT_SHA256="7000c018597e5a0a9435d924320e63f1c45654fa83bf3ffe150b174131158dbc"
+
+FOOT_VERSION="1.18.1"
+FOOT_URL="https://codeberg.org/dnkl/foot/archive/${FOOT_VERSION}.tar.gz"
+FOOT_SHA256="f1438298117b1346405f175e8a052ba9828a610e061971cc8dde9153939344c5"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -140,3 +153,9 @@ fetch_one "fontconfig ${FONTCONFIG_VERSION}" "${FONTCONFIG_URL}" "${FONTCONFIG_S
   "${OUTPUT_DIR}/fontconfig-src" "fontconfig-${FONTCONFIG_VERSION}.tar.xz"
 fetch_one "DejaVu fonts ${DEJAVU_VERSION}" "${DEJAVU_URL}" "${DEJAVU_SHA256}" \
   "${OUTPUT_DIR}/dejavu-src" "dejavu-fonts-ttf-${DEJAVU_VERSION}.tar.bz2"
+fetch_one "tllist ${TLLIST_VERSION}" "${TLLIST_URL}" "${TLLIST_SHA256}" \
+  "${OUTPUT_DIR}/tllist-src" "tllist-${TLLIST_VERSION}.tar.gz"
+fetch_one "fcft ${FCFT_VERSION}" "${FCFT_URL}" "${FCFT_SHA256}" \
+  "${OUTPUT_DIR}/fcft-src" "fcft-${FCFT_VERSION}.tar.gz"
+fetch_one "foot ${FOOT_VERSION}" "${FOOT_URL}" "${FOOT_SHA256}" \
+  "${OUTPUT_DIR}/foot-src" "foot-${FOOT_VERSION}.tar.gz"

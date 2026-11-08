@@ -36,6 +36,21 @@ pub struct LinuxTermios {
     pub c_cc: [u8; 19],
 }
 
+pub const OFLAG_OPOST: u32 = 0o0000001;
+pub const OFLAG_ONLCR: u32 = 0o0000004;
+
+/// Output processing for one byte written towards the terminal (program
+/// output on a pty slave, or echo): with `OPOST | ONLCR`, `\n` becomes
+/// `\r\n`, as on Linux. Returns the bytes and how many to use.
+pub fn output_bytes(tio: &LinuxTermios, byte: u8) -> ([u8; 2], usize) {
+    let onlcr = (tio.c_oflag & OFLAG_OPOST) != 0 && (tio.c_oflag & OFLAG_ONLCR) != 0;
+    if byte == b'\n' && onlcr {
+        ([b'\r', b'\n'], 2)
+    } else {
+        ([byte, 0], 1)
+    }
+}
+
 pub fn default_termios() -> LinuxTermios {
     let mut tio = LinuxTermios {
         c_iflag: 0,
@@ -47,7 +62,7 @@ pub fn default_termios() -> LinuxTermios {
     };
 
     tio.c_iflag = 0o0000400 | 0o0002000; // ICRNL | IXON
-    tio.c_oflag = 0o0000001 | 0o0000004; // OPOST | ONLCR
+    tio.c_oflag = OFLAG_OPOST | OFLAG_ONLCR;
     tio.c_cflag = 0o0000060 | 0o0000400 | 0o0000600 | 0o0040000; // CS8 | CREAD | B38400 | CLOCAL
     tio.c_lflag = LFLAG_ISIG | LFLAG_ICANON | LFLAG_ECHO | LFLAG_ECHOE | LFLAG_ECHOK;
     tio.c_cc[0] = 3; // VINTR

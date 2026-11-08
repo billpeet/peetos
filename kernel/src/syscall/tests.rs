@@ -1033,7 +1033,7 @@ fn epoll_create1_validates_flags_and_installs_fd() {
 }
 
 #[test]
-fn epoll_pwait_supports_null_sigmask_compat_only() {
+fn epoll_pwait_validates_its_sigmask() {
     let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
     reset_epoll_for_test();
 
@@ -1046,11 +1046,21 @@ fn epoll_pwait_supports_null_sigmask_compat_only() {
     };
     assert_eq!(sys_epoll_pwait(&ctx, &null_sigmask), -EINVAL);
 
-    let masked = SyscallArgs {
+    // A sigmask is now honoured: a bad sigset size or an unreadable pointer
+    // fails before the mask changes.
+    let bad_size = SyscallArgs {
+        num: SYS_EPOLL_PWAIT,
+        args: [0, 1, 1, 0, 0x1000, 4],
+    };
+    assert_eq!(sys_epoll_pwait(&ctx, &bad_size), -EINVAL);
+    let unreadable = SyscallArgs {
         num: SYS_EPOLL_PWAIT,
         args: [0, 1, 1, 0, 0x1000, 8],
     };
-    assert_eq!(sys_epoll_pwait(&ctx, &masked), -ENOSYS);
+    // (A host test task has no address space, so the copy fails with EINVAL.)
+    let r = sys_epoll_pwait(&ctx, &unreadable);
+    assert!(r == -EFAULT || r == -EINVAL, "got {r}");
+    assert!(!task.restore_sigmask);
 }
 
 #[test]
@@ -2390,4 +2400,34 @@ fn fadvise_accepts_hints_on_files_and_rejects_pipes_and_bad_args() {
     assert_eq!(fadvise_result(task::USER_FD_KIND_SOCKET, 0, 0), -ESPIPE);
     assert_eq!(fadvise_result(task::USER_FD_KIND_VFS, -1, 0), -EINVAL);
     assert_eq!(fadvise_result(task::USER_FD_KIND_VFS, 0, 6), -EINVAL);
+}
+
+#[test]
+fn prctl_flags_and_membarrier_query() {
+    assert_eq!(prctl_flag_result(PR_SET_PDEATHSIG, 9), 0);
+    assert_eq!(prctl_flag_result(PR_SET_PDEATHSIG, 65), -EINVAL);
+    assert_eq!(prctl_flag_result(PR_GET_DUMPABLE, 0), 1);
+    assert_eq!(prctl_flag_result(PR_SET_NO_NEW_PRIVS, 1), 0);
+    assert_eq!(prctl_flag_result(9999, 0), -EINVAL);
+    assert_eq!(membarrier_result(0), 0);
+    assert_eq!(membarrier_result(16), -EINVAL);
+}
+
+#[test]
+fn temporary_sigmask_restores_on_exit_or_through_the_frame() {
+    let mut t = task::Task::for_test(77);
+    let tp: *mut task::Task = &mut t;
+    let usr1 = crate::signal::signal_bit(10);
+    t.signal_blocked = usr1;
+    // epoll_pwait with an empty mask: SIGUSR1 deliverable during the wait.
+    crate::signal::set_temporary_mask(tp, 0);
+    assert_eq!(t.signal_blocked, 0);
+    assert!(t.restore_sigmask && t.saved_sigmask == usr1);
+    // Nested install keeps the original saved mask.
+    crate::signal::set_temporary_mask(tp, 0);
+    assert_eq!(t.saved_sigmask, usr1);
+    // No signal delivered: syscall exit restores the original.
+    crate::signal::restore_temporary_mask(tp);
+    assert_eq!(t.signal_blocked, usr1);
+    assert!(!t.restore_sigmask);
 }

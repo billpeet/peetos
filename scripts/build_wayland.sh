@@ -19,6 +19,7 @@ PROTOCOLS_SRC="${ROOT_DIR}/wayland/wayland-protocols-src"
 # is compiled into libwlprotocols.a, with client/server headers installed.
 PROTOCOL_XMLS=(
   stable/xdg-shell/xdg-shell.xml
+  unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
 )
 OUT="${ROOT_DIR}/wayland/out"
 MUSL_CC="${MUSL_CC:-${ROOT_DIR}/musl/sysroot/bin/musl-gcc}"
@@ -169,6 +170,17 @@ link_shared libwayland-server.so.0 "${COMMON[@]}" \
   "${O}/wayland-server.o" "${O}/wayland-shm.o" "${O}/event-loop.o" -lffi
 link_shared libwayland-client.so.0 "${COMMON[@]}" "${O}/wayland-client.o" -lffi
 
+# libwayland-cursor: xcursor theme loading with built-in fallback cursors
+# (cursor-data.h), so clients get a pointer image even with no theme installed.
+CSRC="${WAYLAND_SRC}/cursor"
+for f in wayland-cursor os-compatibility xcursor; do
+  "${MUSL_CC}" "${CFLAGS[@]}" -I"${CSRC}" -DICONDIR='"/usr/share/icons"' -c "${CSRC}/${f}.c" -o "${O}/cursor-${f}.o"
+done
+CURSOR_OBJS=("${O}/cursor-wayland-cursor.o" "${O}/cursor-os-compatibility.o" "${O}/cursor-xcursor.o")
+rm -f "${OUT}/lib/libwayland-cursor.a"
+ar rcs "${OUT}/lib/libwayland-cursor.a" "${CURSOR_OBJS[@]}"
+link_shared libwayland-cursor.so.0 "${CURSOR_OBJS[@]}" -lwayland-client
+
 # --- wayland-protocols ---------------------------------------------------------
 echo "[wayland] generating wayland-protocols code"
 PROTO_OBJS=()
@@ -189,6 +201,7 @@ rm -f "${OUT}/lib/libwlprotocols.a"
 ar rcs "${OUT}/lib/libwlprotocols.a" "${PROTO_OBJS[@]}"
 
 # --- headers -----------------------------------------------------------------
+cp "${WAYLAND_SRC}/cursor/wayland-cursor.h" "${OUT}/include/"
 cp "${WSRC}/wayland-util.h" \
    "${WSRC}/wayland-client.h" "${WSRC}/wayland-client-core.h" \
    "${WSRC}/wayland-server.h" "${WSRC}/wayland-server-core.h" \

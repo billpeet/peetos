@@ -90,7 +90,15 @@ make run-wayland-smoke   # or: tests/musl_ext2_wayland_smoke.sh
 **peetwl Compositor**
 `user/peetwl.c` is the PeetOS Wayland compositor, built on libwayland-server:
 - Output: DRM/KMS by default (`docs/drm.md`). It composites into a back buffer, copies the frame into one of two dumb buffers and page-flips to it, then sends frame callbacks when the flip-complete event arrives (60 Hz pacing). With `--fbdev`, or when `/dev/dri/card0` is unusable, it maps `/dev/fb0` instead and copies the damaged rectangle at most every 16 ms, with frame callbacks after each repaint.
-- Globals: `wl_compositor` v4, `wl_shm` (XRGB8888/ARGB8888), `wl_seat` v5 (pointer + keyboard), `wl_output` v3, `xdg_wm_base` v6.
+- Globals:
+  - `wl_compositor` v4 and `wl_shm` (XRGB8888/ARGB8888);
+  - `wl_subcompositor` v1;
+  - `wl_data_device_manager` v3;
+  - `wl_seat` v5 (pointer and keyboard) and `wl_output` v3;
+  - `xdg_wm_base` v6 and `zxdg_decoration_manager_v1` v1.
+- Subsurfaces are drawn above their parent with alpha blending (premultiplied ARGB) and nest. Their commits apply at once (desynchronized semantics), and `place_above`/`place_below` are accepted but stacking stays in creation order.
+- `zxdg_toplevel_decoration_v1` always answers `server_side`, so clients such as foot leave the title bar and border to `peetwl`.
+- `wl_data_device_manager`: data sources and devices can be created, but there is no clipboard transfer yet. `set_selection` cancels the source, and drags are cancelled.
 - xdg-shell: toplevels get an initial configure, must `ack_configure` before attaching a buffer, and receive `activated` state changes on focus. `xdg_toplevel.move` starts an interactive move. Popups are created and immediately dismissed (`popup_done`); positioners are accepted and ignored.
 - Window management: new toplevels are cascaded and focused. Server-side decorations (title bar with the toplevel title, focus-coloured border, close box) are drawn by the compositor. Clicking raises and focuses a window, dragging the title bar moves it, and the close box sends `xdg_toplevel.close`.
 - Input: reads `/dev/input/event0` (keyboard) and `/dev/input/event1` (relative PS/2 or absolute tablet pointer), draws a software cursor, does pointer hit-testing for `wl_pointer` enter/leave/motion/button/frame, and delivers keys with an XKB keymap and xkb_state-tracked modifiers (see Keyboard Keymaps).
@@ -102,6 +110,7 @@ Running it:
 ```bash
 make run-wayland-demo   # interactive: three wl-demo windows in a QEMU window (usb-tablet pointer)
 make run-wlcomp-smoke   # automated: tests/musl_ext2_wlcomp_smoke.sh
+make run-foot-smoke     # automated: the foot terminal under peetwl (see docs/rendering.md)
 ```
 The automated smoke boots the `compositor-first musl-ext2-wlcomp-smoke` profile with two clients and drives it from `scripts/wlcomp_smoke_driver.py` through the QEMU monitor, injecting real PS/2 input (`mouse_move`, `mouse_button`, `sendkey`) and checking the screen with `screendump`:
 1. both windows show their colours, and the focused/unfocused title bar colours are right

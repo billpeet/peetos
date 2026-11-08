@@ -49,6 +49,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <xkbcommon/xkbcommon.h>
+#include "xdg-decoration-unstable-v1-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
 
 #include "font8x8.h"
@@ -132,8 +133,19 @@ struct surface {
     uint32_t *pixels; /* committed content, owned */
     int width;
     int height;
+    int has_alpha;
 
     struct xdg_surface_state *xdg;
+    struct subsurface *sub;   /* role: wl_subsurface of another surface */
+    struct wl_list children;  /* struct subsurface.link, bottom to top */
+};
+
+struct subsurface {
+    struct wl_resource *resource;
+    struct surface *surface;
+    struct surface *parent;
+    struct wl_list link; /* parent->children */
+    int x, y;
 };
 
 struct xdg_surface_state {
@@ -329,6 +341,56 @@ static void draw_text(struct server *srv, int x, int y, const char *text, int ma
     }
 }
 
+/* The toplevel a surface belongs to, following wl_subsurface parents. */
+static struct toplevel *surface_toplevel(struct surface *s) {
+    for (int depth = 0; s != NULL && depth < 16; depth++) {
+        if (s->xdg != NULL && s->xdg->toplevel != NULL) {
+            return s->xdg->toplevel;
+        }
+        s = s->sub != NULL ? s->sub->parent : NULL;
+    }
+    return NULL;
+}
+
+/* Draw the subsurfaces of `parent` (origin ox, oy on screen), alpha
+ * blending premultiplied ARGB content, then their own children. */
+static void draw_children(struct server *srv, struct surface *parent, int ox, int oy, struct box clip,
+                          int depth) {
+    if (depth > 8) {
+        return;
+    }
+    struct subsurface *sub;
+    wl_list_for_each(sub, &parent->children, link) {
+        struct surface *cs = sub->surface;
+        if (cs->pixels == NULL) {
+            continue;
+        }
+        int cx = ox + sub->x, cy = oy + sub->y;
+        struct box area = {cx, cy, cs->width, cs->height};
+        if (clip_box(&area, clip)) {
+            for (int y = area.y; y < area.y + area.h; y++) {
+                const uint32_t *src = cs->pixels + (size_t)(y - cy) * cs->width + (area.x - cx);
+                uint32_t *dst = srv->back + (size_t)y * srv->width + area.x;
+                for (int x = 0; x < area.w; x++) {
+                    uint32_t sp = src[x];
+                    uint32_t a = cs->has_alpha ? sp >> 24 : 255;
+                    if (a == 255) {
+                        dst[x] = sp;
+                    } else if (a != 0) {
+                        uint32_t dp = dst[x], inv = 255 - a, out = 0;
+                        for (int sh = 0; sh < 24; sh += 8) {
+                            uint32_t c = ((sp >> sh) & 0xff) + (((dp >> sh) & 0xff) * inv + 127) / 255;
+                            out |= (c > 255 ? 255 : c) << sh;
+                        }
+                        dst[x] = out;
+                    }
+                }
+            }
+        }
+        draw_children(srv, cs, cx, cy, clip, depth + 1);
+    }
+}
+
 static void draw_toplevel(struct server *srv, struct toplevel *top, struct box clip) {
     struct surface *s = top->xdg->surface;
     int focused = srv->keyboard_focus == s;
@@ -349,14 +411,14 @@ static void draw_toplevel(struct server *srv, struct toplevel *top, struct box c
     }
 
     struct box content = {top->x, top->y, s->width, s->height};
-    if (!clip_box(&content, clip)) {
-        return;
+    if (clip_box(&content, clip)) {
+        for (int y = content.y; y < content.y + content.h; y++) {
+            const uint32_t *src = s->pixels + (size_t)(y - top->y) * s->width + (content.x - top->x);
+            uint32_t *dst = srv->back + (size_t)y * srv->width + content.x;
+            memcpy(dst, src, (size_t)content.w * 4);
+        }
     }
-    for (int y = content.y; y < content.y + content.h; y++) {
-        const uint32_t *src = s->pixels + (size_t)(y - top->y) * s->width + (content.x - top->x);
-        uint32_t *dst = srv->back + (size_t)y * srv->width + content.x;
-        memcpy(dst, src, (size_t)content.w * 4);
-    }
+    draw_children(srv, s, top->x, top->y, clip, 0);
 }
 
 /* Arrow cursor: 1 = black outline, 2 = white fill. */
@@ -901,6 +963,7 @@ static int copy_buffer(struct surface *s, struct wl_resource *buffer) {
     if (format != WL_SHM_FORMAT_XRGB8888 && format != WL_SHM_FORMAT_ARGB8888) {
         return -1;
     }
+    s->has_alpha = format == WL_SHM_FORMAT_ARGB8888;
     int w = wl_shm_buffer_get_width(shm);
     int h = wl_shm_buffer_get_height(shm);
     int stride = wl_shm_buffer_get_stride(shm);
@@ -927,6 +990,33 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     struct surface *s = wl_resource_get_user_data(r);
     struct server *srv = s->srv;
     struct toplevel *top = (s->xdg != NULL) ? s->xdg->toplevel : NULL;
+
+    if (s->sub != NULL) {
+        /* Subsurfaces apply their state at once (desynchronized semantics). */
+        struct toplevel *root = surface_toplevel(s);
+        wl_list_insert_list(srv->frame_callbacks.prev, &s->pending_frames);
+        wl_list_init(&s->pending_frames);
+        if (s->pending_buffer_set) {
+            struct wl_resource *buffer = s->pending_buffer;
+            s->pending_buffer = NULL;
+            s->pending_buffer_set = 0;
+            if (buffer == NULL) {
+                free(s->pixels);
+                s->pixels = NULL;
+            } else if (copy_buffer(s, buffer) == 0) {
+                wl_buffer_send_release(buffer);
+            } else {
+                wl_resource_post_error(r, WL_SHM_ERROR_INVALID_FORMAT,
+                                       "unsupported buffer (need XRGB8888/ARGB8888 wl_shm)");
+                return;
+            }
+        }
+        if (root != NULL) {
+            damage_toplevel(srv, root);
+        }
+        schedule_repaint(srv);
+        return;
+    }
 
     wl_list_insert_list(srv->frame_callbacks.prev, &s->pending_frames);
     wl_list_init(&s->pending_frames);
@@ -1015,9 +1105,218 @@ static void surface_resource_destroyed(struct wl_resource *r) {
     wl_resource_for_each_safe(cb, tmp, &s->pending_frames) {
         wl_resource_destroy(cb);
     }
+    struct toplevel *root = surface_toplevel(s);
+    if (root != NULL && root->mapped) {
+        damage_toplevel(srv, root);
+    }
+    if (s->sub != NULL) {
+        s->sub->surface = NULL;
+        if (s->sub->parent != NULL) {
+            wl_list_remove(&s->sub->link);
+            wl_list_init(&s->sub->link);
+            s->sub->parent = NULL;
+        }
+    }
+    struct subsurface *child, *ctmp;
+    wl_list_for_each_safe(child, ctmp, &s->children, link) {
+        wl_list_remove(&child->link);
+        wl_list_init(&child->link);
+        child->parent = NULL;
+    }
     wl_list_remove(&s->link);
     free(s->pixels);
     free(s);
+}
+
+/* ------------------------------------------------------------------ */
+/* wl_subcompositor                                                    */
+/* ------------------------------------------------------------------ */
+
+static void subsurface_damage_root(struct subsurface *sub) {
+    struct toplevel *root = sub->parent != NULL ? surface_toplevel(sub->parent) : NULL;
+    if (root != NULL && sub->surface != NULL) {
+        damage_toplevel(sub->surface->srv, root);
+        schedule_repaint(sub->surface->srv);
+    }
+}
+
+static void subsurface_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
+    wl_resource_destroy(r);
+}
+
+static void subsurface_set_position(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y) {
+    (void)c;
+    struct subsurface *sub = wl_resource_get_user_data(r);
+    subsurface_damage_root(sub);
+    sub->x = x;
+    sub->y = y;
+    subsurface_damage_root(sub);
+}
+
+/* place_above/place_below: keep the sibling order simple (newest on top). */
+static void subsurface_place(struct wl_client *c, struct wl_resource *r, struct wl_resource *sibling) {
+    (void)c;
+    (void)sibling;
+    subsurface_damage_root(wl_resource_get_user_data(r));
+}
+
+static void subsurface_noop(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
+    (void)r;
+}
+
+static const struct wl_subsurface_interface subsurface_impl = {
+    .destroy = subsurface_destroy,
+    .set_position = subsurface_set_position,
+    .place_above = subsurface_place,
+    .place_below = subsurface_place,
+    .set_sync = subsurface_noop,
+    .set_desync = subsurface_noop,
+};
+
+static void subsurface_resource_destroyed(struct wl_resource *r) {
+    struct subsurface *sub = wl_resource_get_user_data(r);
+    subsurface_damage_root(sub);
+    if (sub->parent != NULL) {
+        wl_list_remove(&sub->link);
+    }
+    if (sub->surface != NULL) {
+        sub->surface->sub = NULL;
+    }
+    free(sub);
+}
+
+static void subcompositor_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
+    wl_resource_destroy(r);
+}
+
+static void subcompositor_get_subsurface(struct wl_client *c, struct wl_resource *r, uint32_t id,
+                                         struct wl_resource *surface_res, struct wl_resource *parent_res) {
+    struct surface *s = wl_resource_get_user_data(surface_res);
+    struct surface *parent = wl_resource_get_user_data(parent_res);
+    if (s == parent || s->sub != NULL || s->xdg != NULL) {
+        wl_resource_post_error(r, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, "surface already has a role");
+        return;
+    }
+    struct subsurface *sub = calloc(1, sizeof(*sub));
+    struct wl_resource *res = wl_resource_create(c, &wl_subsurface_interface, 1, id);
+    if (sub == NULL || res == NULL) {
+        free(sub);
+        wl_client_post_no_memory(c);
+        return;
+    }
+    sub->resource = res;
+    sub->surface = s;
+    sub->parent = parent;
+    wl_list_insert(parent->children.prev, &sub->link);
+    s->sub = sub;
+    wl_resource_set_implementation(res, &subsurface_impl, sub, subsurface_resource_destroyed);
+}
+
+static const struct wl_subcompositor_interface subcompositor_impl = {
+    .destroy = subcompositor_destroy,
+    .get_subsurface = subcompositor_get_subsurface,
+};
+
+static void bind_subcompositor(struct wl_client *c, void *data, uint32_t version, uint32_t id) {
+    struct wl_resource *res = wl_resource_create(c, &wl_subcompositor_interface, version, id);
+    if (res == NULL) {
+        wl_client_post_no_memory(c);
+        return;
+    }
+    wl_resource_set_implementation(res, &subcompositor_impl, data, NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* wl_data_device_manager (clipboard): objects exist, no transfers yet */
+/* ------------------------------------------------------------------ */
+
+static void data_offer_str(struct wl_client *c, struct wl_resource *r, const char *s) {
+    (void)c;
+    (void)r;
+    (void)s;
+}
+
+static void data_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
+    wl_resource_destroy(r);
+}
+
+static void data_source_set_actions(struct wl_client *c, struct wl_resource *r, uint32_t actions) {
+    (void)c;
+    (void)r;
+    (void)actions;
+}
+
+static const struct wl_data_source_interface data_source_impl = {
+    .offer = data_offer_str,
+    .destroy = data_destroy,
+    .set_actions = data_source_set_actions,
+};
+
+static void data_device_start_drag(struct wl_client *c, struct wl_resource *r, struct wl_resource *source,
+                                   struct wl_resource *origin, struct wl_resource *icon, uint32_t serial) {
+    (void)c;
+    (void)r;
+    (void)origin;
+    (void)icon;
+    (void)serial;
+    if (source != NULL) {
+        wl_data_source_send_cancelled(source);
+    }
+}
+
+static void data_device_set_selection(struct wl_client *c, struct wl_resource *r,
+                                      struct wl_resource *source, uint32_t serial) {
+    (void)c;
+    (void)r;
+    (void)serial;
+    if (source != NULL) {
+        /* No other clients can receive it yet; tell the source it lost. */
+        wl_data_source_send_cancelled(source);
+    }
+}
+
+static const struct wl_data_device_interface data_device_impl = {
+    .start_drag = data_device_start_drag,
+    .set_selection = data_device_set_selection,
+    .release = data_destroy,
+};
+
+static void ddm_create_data_source(struct wl_client *c, struct wl_resource *r, uint32_t id) {
+    struct wl_resource *res = wl_resource_create(c, &wl_data_source_interface, wl_resource_get_version(r), id);
+    if (res == NULL) {
+        wl_client_post_no_memory(c);
+        return;
+    }
+    wl_resource_set_implementation(res, &data_source_impl, NULL, NULL);
+}
+
+static void ddm_get_data_device(struct wl_client *c, struct wl_resource *r, uint32_t id,
+                                struct wl_resource *seat) {
+    (void)seat;
+    struct wl_resource *res = wl_resource_create(c, &wl_data_device_interface, wl_resource_get_version(r), id);
+    if (res == NULL) {
+        wl_client_post_no_memory(c);
+        return;
+    }
+    wl_resource_set_implementation(res, &data_device_impl, NULL, NULL);
+}
+
+static const struct wl_data_device_manager_interface ddm_impl = {
+    .create_data_source = ddm_create_data_source,
+    .get_data_device = ddm_get_data_device,
+};
+
+static void bind_data_device_manager(struct wl_client *c, void *data, uint32_t version, uint32_t id) {
+    struct wl_resource *res = wl_resource_create(c, &wl_data_device_manager_interface, version, id);
+    if (res == NULL) {
+        wl_client_post_no_memory(c);
+        return;
+    }
+    wl_resource_set_implementation(res, &ddm_impl, data, NULL);
 }
 
 static void region_destroy(struct wl_client *c, struct wl_resource *r) {
@@ -1054,6 +1353,7 @@ static void compositor_create_surface(struct wl_client *c, struct wl_resource *r
     s->srv = srv;
     s->resource = res;
     wl_list_init(&s->pending_frames);
+    wl_list_init(&s->children);
     wl_list_insert(&srv->surfaces, &s->link);
     wl_resource_set_implementation(res, &surface_impl, s, surface_resource_destroyed);
 }
@@ -1490,6 +1790,65 @@ static const struct xdg_wm_base_interface wm_base_impl = {
     .pong = wm_base_pong,
 };
 
+/* zxdg_decoration_manager_v1: peetwl always draws the title bar and border,
+ * so every toplevel is told to use server-side decorations. */
+static void decoration_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
+    wl_resource_destroy(r);
+}
+
+static void decoration_set_mode(struct wl_client *c, struct wl_resource *r, uint32_t mode) {
+    (void)c;
+    (void)mode;
+    struct toplevel *top = wl_resource_get_user_data(r);
+    zxdg_toplevel_decoration_v1_send_configure(r, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    if (top != NULL && top->xdg != NULL && top->xdg->configure_sent && top->xdg->surface != NULL) {
+        send_toplevel_configure(top->xdg->surface->srv, top);
+    }
+}
+
+static void decoration_unset_mode(struct wl_client *c, struct wl_resource *r) {
+    decoration_set_mode(c, r, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+}
+
+static const struct zxdg_toplevel_decoration_v1_interface decoration_impl = {
+    .destroy = decoration_destroy,
+    .set_mode = decoration_set_mode,
+    .unset_mode = decoration_unset_mode,
+};
+
+static void decoration_manager_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
+    wl_resource_destroy(r);
+}
+
+static void decoration_manager_get(struct wl_client *c, struct wl_resource *r, uint32_t id,
+                                   struct wl_resource *toplevel_res) {
+    struct toplevel *top = wl_resource_get_user_data(toplevel_res);
+    struct wl_resource *res =
+        wl_resource_create(c, &zxdg_toplevel_decoration_v1_interface, wl_resource_get_version(r), id);
+    if (res == NULL) {
+        wl_client_post_no_memory(c);
+        return;
+    }
+    wl_resource_set_implementation(res, &decoration_impl, top, NULL);
+    zxdg_toplevel_decoration_v1_send_configure(res, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+}
+
+static const struct zxdg_decoration_manager_v1_interface decoration_manager_impl = {
+    .destroy = decoration_manager_destroy,
+    .get_toplevel_decoration = decoration_manager_get,
+};
+
+static void bind_decoration_manager(struct wl_client *c, void *data, uint32_t version, uint32_t id) {
+    struct wl_resource *res = wl_resource_create(c, &zxdg_decoration_manager_v1_interface, version, id);
+    if (res == NULL) {
+        wl_client_post_no_memory(c);
+        return;
+    }
+    wl_resource_set_implementation(res, &decoration_manager_impl, data, NULL);
+}
+
 static void bind_wm_base(struct wl_client *c, void *data, uint32_t version, uint32_t id) {
     struct wl_resource *res = wl_resource_create(c, &xdg_wm_base_interface, version, id);
     if (res == NULL) {
@@ -1925,6 +2284,9 @@ int main(int argc, char **argv) {
     wl_global_create(srv.display, &wl_seat_interface, 5, &srv, bind_seat);
     wl_global_create(srv.display, &wl_output_interface, 3, &srv, bind_output);
     wl_global_create(srv.display, &xdg_wm_base_interface, 6, &srv, bind_wm_base);
+    wl_global_create(srv.display, &wl_subcompositor_interface, 1, &srv, bind_subcompositor);
+    wl_global_create(srv.display, &wl_data_device_manager_interface, 3, &srv, bind_data_device_manager);
+    wl_global_create(srv.display, &zxdg_decoration_manager_v1_interface, 1, &srv, bind_decoration_manager);
 
     srv.repaint_timer = wl_event_loop_add_timer(srv.loop, on_repaint_timer, &srv);
     if (srv.use_drm) {

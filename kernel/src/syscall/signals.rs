@@ -516,6 +516,7 @@ pub(super) fn apply_pending_signals<R: UserRegs>(regs: &mut R, nr: Option<u64>) 
     loop {
         match signal::consume_next(current) {
             signal::DeliveryAction::None => {
+                signal::restore_temporary_mask(current);
                 if let Some(nr) = restart_nr {
                     restart_syscall(regs, nr);
                 }

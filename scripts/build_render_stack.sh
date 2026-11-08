@@ -75,6 +75,7 @@ EOF
 pc libffi 3.4.6 "-lffi" "" ""
 pc wayland-client 1.23.1 "-lwayland-client" "" "libffi"
 pc wayland-server 1.23.1 "-lwayland-server" "" "libffi"
+pc wayland-cursor 1.23.1 "-lwayland-cursor" "" "wayland-client"
 pc xkbcommon 1.7.0 "-lxkbcommon" "" ""
 pc libdrm 2.4.123 "-ldrm" "-I\${includedir}/libdrm" ""
 cat > "${STAGE}/usr/share/pkgconfig/wayland-protocols.pc" <<'EOF'

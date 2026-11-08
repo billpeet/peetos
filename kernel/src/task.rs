@@ -134,6 +134,12 @@ pub struct Task {
     /// `signal::send_with_info`).
     pub(crate) sig_info: [u64; SIG_MAX_TASK_SIGNALS],
     pub(crate) signal_blocked: u64,
+    /// Mask to put back after a syscall that temporarily replaced
+    /// `signal_blocked` (`epoll_pwait`, `ppoll`), like Linux's
+    /// `TIF_RESTORE_SIGMASK`: restored on syscall exit, or saved into the
+    /// signal frame when a signal is delivered under the temporary mask.
+    pub(crate) saved_sigmask: u64,
+    pub(crate) restore_sigmask: bool,
     pub(crate) signal_handlers: [u64; SIG_MAX_TASK_SIGNALS],
     pub(crate) signal_flags: [u64; SIG_MAX_TASK_SIGNALS],
     pub(crate) signal_mask_saved: [u64; SIG_MAX_TASK_SIGNALS],
@@ -247,6 +253,8 @@ pub fn init() {
             sig_pending: 0,
             sig_info: [0; SIG_MAX_TASK_SIGNALS],
             signal_blocked: 0,
+            saved_sigmask: 0,
+            restore_sigmask: false,
             signal_handlers: [0; SIG_MAX_TASK_SIGNALS],
             signal_flags: [0; SIG_MAX_TASK_SIGNALS],
             signal_mask_saved: [0; SIG_MAX_TASK_SIGNALS],
@@ -351,6 +359,8 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.sig_pending = 0;
         task.sig_info = [0; SIG_MAX_TASK_SIGNALS];
         task.signal_blocked = 0;
+        task.saved_sigmask = 0;
+        task.restore_sigmask = false;
         task.signal_handlers = [0; SIG_MAX_TASK_SIGNALS];
         task.signal_flags = [0; SIG_MAX_TASK_SIGNALS];
         task.signal_mask_saved = [0; SIG_MAX_TASK_SIGNALS];
@@ -759,6 +769,8 @@ impl Task {
             sig_pending: 0,
             sig_info: [0; SIG_MAX_TASK_SIGNALS],
             signal_blocked: 0,
+            saved_sigmask: 0,
+            restore_sigmask: false,
             signal_handlers: [0; SIG_MAX_TASK_SIGNALS],
             signal_flags: [0; SIG_MAX_TASK_SIGNALS],
             signal_mask_saved: [0; SIG_MAX_TASK_SIGNALS],

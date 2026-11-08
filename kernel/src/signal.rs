@@ -223,6 +223,35 @@ pub fn send_with_info(task: *mut Task, signum: u32, code: i32, sender: i32) -> R
     Ok(())
 }
 
+/// Install `mask` for the rest of a syscall (`epoll_pwait`, `ppoll`). The
+/// original mask comes back on syscall exit (`restore_temporary_mask`) or,
+/// if a signal is delivered first, through its frame on `rt_sigreturn`.
+pub fn set_temporary_mask(task: *mut Task, mask: u64) {
+    if task.is_null() {
+        return;
+    }
+    unsafe {
+        if !(*task).restore_sigmask {
+            (*task).saved_sigmask = (*task).signal_blocked;
+            (*task).restore_sigmask = true;
+        }
+        (*task).signal_blocked = mask & !(signal_bit(SIGKILL) | signal_bit(SIGSTOP));
+    }
+}
+
+/// Put back the mask saved by `set_temporary_mask` (no signal was delivered).
+pub fn restore_temporary_mask(task: *mut Task) {
+    if task.is_null() {
+        return;
+    }
+    unsafe {
+        if (*task).restore_sigmask {
+            (*task).signal_blocked = (*task).saved_sigmask;
+            (*task).restore_sigmask = false;
+        }
+    }
+}
+
 pub fn current_mask(task: *mut Task) -> u64 {
     if task.is_null() {
         return 0;
@@ -327,8 +356,16 @@ pub fn consume_next(task: *mut Task) -> DeliveryAction {
                 return DeliveryAction::Terminate(128 + signum as i32);
             }
 
-            let saved_mask = (*task).signal_blocked;
-            let mut next_mask = saved_mask | (*leader).signal_mask_saved[idx];
+            // The handler runs with the current (possibly temporary) mask
+            // plus sa_mask; the frame records the mask to restore, which is
+            // the original one if a syscall installed a temporary mask.
+            let saved_mask = if (*task).restore_sigmask {
+                (*task).restore_sigmask = false;
+                (*task).saved_sigmask
+            } else {
+                (*task).signal_blocked
+            };
+            let mut next_mask = (*task).signal_blocked | (*leader).signal_mask_saved[idx];
             if (flags & SA_NODEFER) == 0 {
                 next_mask |= signal_bit(signum);
             }

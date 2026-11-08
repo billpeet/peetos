@@ -38,8 +38,8 @@ rm -rf "${BUILD}"
 mkdir -p "${BUILD}/gen" "${BUILD}/obj" "${OUT}/lib" "${OUT}/include/libdrm" \
   "${OUT}/include/linux" "${OUT}/include/asm"
 
-cp "${ROOT_DIR}/wayland/peetos/uapi/linux/types.h" "${OUT}/include/linux/types.h"
-cp "${ROOT_DIR}/wayland/peetos/uapi/asm/ioctl.h" "${OUT}/include/asm/ioctl.h"
+# Linux uapi headers musl lacks: small shims plus vendored input-event-codes.h.
+cp -r "${ROOT_DIR}/wayland/peetos/uapi/." "${OUT}/include/"
 cp "${ROOT_DIR}/wayland/peetos/libdrm-config.h" "${BUILD}/gen/config.h"
 python3 "${SRC}/gen_table_fourcc.py" "${SRC}/include/drm/drm_fourcc.h" \
   "${BUILD}/gen/generated_static_table_fourcc.h"

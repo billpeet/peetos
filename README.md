@@ -44,6 +44,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - Dynamically linked programs run through musl's loader (`/lib/ld-musl-x86_64.so.1`), with shared libraries, `dlopen` and TLS in shared objects: `make -C musl shared` builds the shared libc and `make run-dynlink-smoke` tests it (see `docs/elf.md`). libwayland, libffi and libxkbcommon are built as shared libraries too, and `peetwl`/`wl_demo` link against them. The plan toward a full desktop is in `docs/desktop_roadmap.md`.
 - `/dev/dri/card0` is a minimal DRM/KMS device over the boot framebuffer: legacy mode setting, dumb buffers, page flips with events, PRIME. libdrm is ported, and `peetwl` presents through it. Test it with `make run-drm-smoke`; see `docs/drm.md`.
 - A software rendering stack (pixman, freetype, fontconfig with DejaVu fonts) is ported as shared libraries. `make run-text-smoke` renders anti-aliased text on screen through DRM; see `docs/rendering.md`.
+- The foot terminal runs under `peetwl`, with fcft/freetype text and a shell inside it: `make run-foot-smoke` (see `docs/rendering.md`).
 - The kernel manages up to 4 GiB of RAM through a direct map of physical memory; give QEMU more with `-m` (the dynamic-linking smoke uses 512 MiB). Per process there are 256 VM region slots and a 256 MiB mapping budget. System-wide, there are 256 tasks and 256 sockets, and memfd objects can be up to 256 MiB.
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
 - `fork` is copy-on-write, and `clone(CLONE_THREAD)` thread groups support musl pthreads, including `pthread_cancel`, timed waits and `execve` from any thread. Signals use the Linux `rt_sigframe` ABI (signals 1..=64, `siginfo_t`/`ucontext_t`) and interrupt blocking syscalls with `SA_RESTART`-aware restart (`make run-proc-smoke`; see `docs/process_model.md`).
@@ -219,6 +220,7 @@ make run-wayland-demo
 make run-dynlink-smoke
 make run-drm-smoke
 make run-text-smoke
+make run-foot-smoke
 make run-gui-smoke
 make run-gui-demo
 ```

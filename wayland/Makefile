@@ -17,7 +17,8 @@
 #   stage/                     staged /usr + /etc sysroot for meson builds:
 #                              everything above plus expat, freetype,
 #                              fontconfig, pixman and the DejaVu fonts
-#                              (scripts/build_render_stack.sh)
+#                              (scripts/build_render_stack.sh), then
+#                              tllist, fcft and foot (scripts/build_foot.sh)
 #   lib/lib*.so.N, lib/lib*.so shared builds of libffi, libwayland-server,
 #                              libwayland-client and libxkbcommon (need
 #                              ../musl/shared from `make -C musl shared`)
@@ -35,13 +36,13 @@ all: build
 fetch:
 	./fetch-wayland.sh
 
-wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src:
+wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src tllist-src fcft-src foot-src:
 	$(MAKE) fetch
 
 ../musl/shared/lib/libc.so:
 	$(MAKE) -C ../musl shared
 
-build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src ../musl/shared/lib/libc.so
+build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src tllist-src fcft-src foot-src ../musl/shared/lib/libc.so
 	../scripts/build_wayland.sh \
 		--wayland-src "$(CURDIR)/wayland-src" \
 		--libffi-src "$(CURDIR)/libffi-src" \
@@ -57,12 +58,13 @@ build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src 
 		--out "$(OUT_DIR)" \
 		--musl-cc "$(MUSL_CC)"
 	../scripts/build_render_stack.sh
+	../scripts/build_foot.sh
 
 clean:
 	rm -rf "$(OUT_DIR)" build
 
 distclean: clean
-	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2
+	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src tllist-src fcft-src foot-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2 tllist-*.tar.gz fcft-*.tar.gz foot-*.tar.gz
 
 info:
 	@echo "OUT_DIR=$(OUT_DIR)"

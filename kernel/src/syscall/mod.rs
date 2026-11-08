@@ -143,7 +143,9 @@ const SYS_SHMDT: u64 = 67;
 const SYS_GETPPID: u64 = 110;
 const SYS_SETSID: u64 = 112;
 const SYS_GETSID: u64 = 124;
+const SYS_PRCTL: u64 = 157;
 const SYS_ARCH_PRCTL: u64 = 158;
+const SYS_MEMBARRIER: u64 = 324;
 const SYS_GETTID: u64 = 186;
 const SYS_TKILL: u64 = 200;
 const SYS_TGKILL: u64 = 234;
@@ -394,9 +396,11 @@ const UTS_FIELD_LEN: usize = 65;
 /// `RegionScratch`, and everything else works on `TASK_VM_MAPPINGS` in place
 /// (borrow with `task_regions`, copy slots with `region_table_copy`).
 const MMAP_MAX_REGIONS_PER_TASK: usize = 256;
-/// Per-process mmap budget (256 MiB). A guard against runaway mappings, not
-/// an accounting of physical memory; the PMM can manage up to 4 GiB.
-const MMAP_MAX_PAGES_PER_TASK: u64 = 65536;
+/// Per-process mmap budget (4 GiB of address space). Mappings are populated
+/// lazily, so this bounds virtual reservations (foot maps a sparse 512 MiB
+/// pool, and the compositor maps it again through wl_shm), not physical
+/// memory, which the PMM limits.
+const MMAP_MAX_PAGES_PER_TASK: u64 = 1 << 20;
 const VM_PAGE_CACHE_MAX_PAGES: usize = 1024;
 const USER_VM_RECLAIM_TARGET_PAGES: usize = 16;
 const MEMFD_MAX_BUFFERS_PER_TASK: usize = 16;
@@ -741,6 +745,8 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_FCNTL, "fcntl", SyscallMode::UserTask, sys_fcntl),
     syscall_def(SYS_FSYNC, "fsync", SyscallMode::UserTask, sys_fsync),
     syscall_def(SYS_FADVISE64, "fadvise64", SyscallMode::UserTask, sys_fadvise64),
+    syscall_def(SYS_PRCTL, "prctl", SyscallMode::UserTask, sys_prctl),
+    syscall_def(SYS_MEMBARRIER, "membarrier", SyscallMode::UserTask, sys_membarrier),
     syscall_def(SYS_UNLINK, "unlink", SyscallMode::UserTask, sys_unlink),
     syscall_def(
         SYS_ARCH_PRCTL,

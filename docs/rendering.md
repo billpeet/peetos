@@ -31,7 +31,30 @@ curl -LO https://ftp.gnu.org/gnu/gperf/gperf-3.1.tar.gz && tar xf gperf-3.1.tar.
   - pixman uses its default x86_64 SIMD paths (SSE2/SSSE3), with no tests, demos, GTK or libpng.
 - **Ext2 image.** The image builder copies every staged shared library into `/usr/lib` under its soname. It also adds `/etc/fonts` (with the `conf.d` symlinks resolved to plain files), `/usr/share/fontconfig`, `/usr/share/fonts`, an empty `/var/cache/fontconfig`, and `fc-list`/`fc-match`/`fc-cache` in `/bin`.
 
-**Kernel work it needed**
+**foot**
+foot 1.18.1 runs under `peetwl`. That is the roadmap's first milestone: a real terminal emulator with fonts and a shell.
+- `scripts/build_foot.sh` (run by `make -C wayland` after the rendering stack) builds tllist 1.1.0, fcft 3.1.8 and foot with meson against the stage:
+  - fcft without harfbuzz, utf8proc or SVG glyphs;
+  - foot without terminfo, docs, themes, grapheme clustering or utmp.
+- foot looks `wayland-scanner` up as a native dependency. The script writes a build-machine `wayland-scanner.pc` pointing at the host scanner and passes it with `-Dbuild.pkg_config_path`.
+- libwayland-cursor (with its built-in fallback cursors) is now built by `scripts/build_wayland.sh`. `<linux/input-event-codes.h>` is vendored in `wayland/peetos/uapi/linux/` (a Linux uapi header under the syscall-note exception), and the whole uapi shim directory is installed with libdrm.
+- The ext2 image ships `/bin/foot` and `/etc/xdg/foot/foot.ini`.
+- `make run-foot-smoke` (part of `make test`) boots the `compositor-first musl-ext2-foot-smoke` profile. It runs `peetwl --smoke --client "foot -e toybox sh foot_child.sh"`. `scripts/foot_smoke_driver.py` then:
+  - waits for foot's window;
+  - checks the screendump shows `peetwl`'s focused title bar and terminal text;
+  - types `hello` with real PS/2 key presses;
+  - waits for the shell inside foot to report the line on the serial console.
+
+  The runner also requires DRM page flips. Screenshots go to `$FOOT_SHOTS` when set.
+
+**Kernel work foot needed**
+- **`epoll_pwait` and `ppoll` honour their signal mask.** It is installed for the wait and restored on syscall exit, or saved in the signal frame when a signal is delivered under it, like Linux's `TIF_RESTORE_SIGMASK`. foot's event loop depends on this (it unblocks SIGCHLD only while waiting). Before, `epoll_pwait` with a mask returned `ENOSYS` and `ppoll` ignored it.
+- **pty output processing.** `OPOST | ONLCR` turns `\n` written to a pty slave into `\r\n`, so terminal output starts each line at column 0.
+- **`prctl(2)`.** `PR_SET_NAME`/`PR_GET_NAME` work, and the death-signal, dumpable, subreaper and no-new-privs flags are accepted without effect.
+- **`membarrier(2)`.** Only `MEMBARRIER_CMD_QUERY` is supported, reporting no commands, so musl uses its fallback.
+- **Larger sparse limits.** memfd/shmem objects can be up to 1 GiB (sparse) and the per-process mapping budget is 4 GiB of address space. foot sizes its pool at 512 MiB and maps all of it, and the compositor maps it again.
+
+**Kernel work the rendering stack needed**
 - **8 MiB main-thread stack.** User stacks were a fixed 32 KiB, and fontconfig and freetype overflowed them. The stack is now a lazily populated private anonymous VM region, `[USER_STACK_TOP - 8 MiB, USER_STACK_TOP)`, registered at exec and at the initial `init` spawn. Only the top 32 KiB (argv, envp, auxv) is mapped eagerly.
 - **`chmod(2)`** (legacy syscall 90, as `fchmodat(AT_FDCWD, ...)`). fontconfig uses it on its cache directory.
 - **`fadvise64(2)`** hints are validated and ignored.
@@ -46,6 +69,8 @@ curl -LO https://ftp.gnu.org/gnu/gperf/gperf-3.1.tar.gz && tar xf gperf-3.1.tar.
 The runner saves a QEMU screendump of the frame to `build/text_smoke.png`.
 
 Limitations / Simplifications
+- foot runs without text shaping (no harfbuzz), grapheme clustering (no utf8proc) or terminfo. Toybox's shell has no line editing or job control, and there is no clipboard transfer through `peetwl`. `fallocate(PUNCH_HOLE)` is not supported, so foot disables its scrolling-by-offset optimization and redraws instead.
+- There is no interactive foot session target yet (only the automated smoke).
 - No harfbuzz yet. It needs a C++ runtime, which musl does not provide, so there is no complex-script shaping, and fcft/foot will build without it at first. libpng, cairo and pango are not ported yet.
 - Only two fonts (DejaVu Sans and DejaVu Sans Mono) are staged. There is no fontconfig cache built ahead of time: the first `FcInit` in each process scans the font directory, which is fast with two fonts but grows with more.
 - The stage seeds pkg-config files by hand for the libraries built outside meson. Their versions and flags are hard-coded in `scripts/build_render_stack.sh`.

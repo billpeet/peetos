@@ -421,3 +421,93 @@ pub(super) fn sys_sysinfo(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => -err,
     }
 }
+
+pub(super) const PR_SET_PDEATHSIG: u64 = 1;
+pub(super) const PR_GET_PDEATHSIG: u64 = 2;
+pub(super) const PR_GET_DUMPABLE: u64 = 3;
+pub(super) const PR_SET_DUMPABLE: u64 = 4;
+pub(super) const PR_SET_NAME: u64 = 15;
+pub(super) const PR_GET_NAME: u64 = 16;
+pub(super) const PR_SET_CHILD_SUBREAPER: u64 = 36;
+pub(super) const PR_SET_NO_NEW_PRIVS: u64 = 38;
+
+/// `prctl(2)`: thread names, plus flags that are accepted without effect
+/// (death signal, dumpable, subreaper, no_new_privs); anything else is
+/// `EINVAL`, as for an unknown option on Linux.
+pub(super) fn sys_prctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let option = call.arg(0);
+    let arg2 = call.arg(1);
+    match option {
+        PR_SET_NAME => {
+            let mut name = [0u8; 16];
+            if let Err(e) = copy_from_user_task(ctx.current, arg2, &mut name[..15]) {
+                return -e;
+            }
+            let len = name.iter().position(|&b| b == 0).unwrap_or(15);
+            unsafe {
+                let task_name = &mut (*ctx.current).name;
+                task_name.fill(0);
+                task_name[..len].copy_from_slice(&name[..len]);
+            }
+            0
+        }
+        PR_GET_NAME => {
+            let mut name = [0u8; 16];
+            unsafe {
+                let task_name = &(*ctx.current).name;
+                let len = task_name.iter().position(|&b| b == 0).unwrap_or(task_name.len()).min(15);
+                name[..len].copy_from_slice(&task_name[..len]);
+            }
+            match copy_to_user_task(ctx.current, arg2, &name) {
+                Ok(()) => 0,
+                Err(e) => -e,
+            }
+        }
+        _ => prctl_flag_result(option, arg2),
+    }
+}
+
+/// Result for the prctl options that only take or report a flag.
+pub(super) fn prctl_flag_result(option: u64, arg2: u64) -> i64 {
+    match option {
+        PR_SET_PDEATHSIG => {
+            if arg2 > 64 {
+                -EINVAL
+            } else {
+                0
+            }
+        }
+        PR_GET_DUMPABLE => 1,
+        PR_SET_DUMPABLE => {
+            if arg2 > 1 {
+                -EINVAL
+            } else {
+                0
+            }
+        }
+        PR_SET_CHILD_SUBREAPER => 0,
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 {
+                -EINVAL
+            } else {
+                0
+            }
+        }
+        PR_GET_PDEATHSIG => -EINVAL, // needs a user pointer; handled as unsupported
+        _ => -EINVAL,
+    }
+}
+
+/// `membarrier(2)`: only `MEMBARRIER_CMD_QUERY`, reporting no supported
+/// commands, so musl uses its signal-based fallback.
+pub(super) fn sys_membarrier(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    membarrier_result(call.arg(0))
+}
+
+pub(super) fn membarrier_result(cmd: u64) -> i64 {
+    if cmd == 0 {
+        0
+    } else {
+        -EINVAL
+    }
+}
