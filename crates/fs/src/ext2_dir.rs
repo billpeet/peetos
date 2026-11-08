@@ -1,5 +1,6 @@
 use super::{
-    ext2_block_slice_mut_state, ext2_clear_inode_flags_state, EXT2_INDEX_FL, ext2_data_block_for_logical_index_state, ext2_ensure_data_block,
+    ext2_block_slice_mut_state, ext2_clear_inode_flags_state, ext2_dir_add_missing_tails,
+    ext2_dir_block_finish, ext2_dir_tail_len, EXT2_INDEX_FL, ext2_data_block_for_logical_index_state, ext2_ensure_data_block,
     ext2_for_each_dir_entry_state, ext2_logical_blocks_for_size, ext2_mark_dirty_block,
     ext2_max_addressable_file_size, ext2_mode_to_filetype, ext2_read_inode_from_state,
     ext2_recalc_inode_block_count_512_state, ext2_write_inode_to_state, read_u16_le,
@@ -77,7 +78,11 @@ pub(super) fn ext2_add_dir_entry(
         // trusts the stale tree afterwards; e2fsck -D can rebuild it.
         ext2_clear_inode_flags_state(state, parent_ino, EXT2_INDEX_FL)?;
         parent.flags &= !EXT2_INDEX_FL;
+        // metadata_csum: the former index blocks become leaf blocks and need
+        // checksum tails.
+        ext2_dir_add_missing_tails(state, &parent)?;
     }
+    let tail = ext2_dir_tail_len(state);
 
     let needed = ext2_dirent_len(name.len());
     let scan_blocks = ext2_logical_blocks_for_size(&meta, parent.size as usize)?;
@@ -103,9 +108,9 @@ pub(super) fn ext2_add_dir_entry(
             {
                 let blk = ext2_block_slice_mut_state(state, new_block)?;
                 blk.fill(0);
-                ext2_write_dirent(blk, 0, child_ino, meta.block_size, child_type, name)?;
+                ext2_write_dirent(blk, 0, child_ino, meta.block_size - tail, child_type, name)?;
             }
-            ext2_mark_dirty_block(state, new_block)?;
+            ext2_dir_block_finish(state, &parent, new_block)?;
 
             let min_size = ((idx + 1) * meta.block_size) as u32;
             if parent.size < min_size {
@@ -120,11 +125,12 @@ pub(super) fn ext2_add_dir_entry(
             let mut inserted = false;
             {
                 let blk = ext2_block_slice_mut_state(state, block_no)?;
+                let usable = blk.len() - tail;
                 let mut pos = 0usize;
-                while pos + 8 <= blk.len() {
+                while pos + 8 <= usable {
                     let entry_ino = read_u32_le(blk, pos)?;
                     let rec_len = read_u16_le(blk, pos + 4)? as usize;
-                    if rec_len < 8 || (rec_len & 0x3) != 0 || pos + rec_len > blk.len() {
+                    if rec_len < 8 || (rec_len & 0x3) != 0 || pos + rec_len > usable {
                         return Err(EIO);
                     }
 
@@ -152,7 +158,7 @@ pub(super) fn ext2_add_dir_entry(
             }
 
             if inserted {
-                ext2_mark_dirty_block(state, block_no)?;
+                ext2_dir_block_finish(state, &parent, block_no)?;
                 return Ok(());
             }
         }
@@ -179,6 +185,7 @@ pub(super) fn ext2_remove_dir_entry(
     }
 
     let block_count = ext2_logical_blocks_for_size(&meta, parent.size as usize)?;
+    let tail = ext2_dir_tail_len(state);
     let mut idx = 0usize;
     while idx < block_count {
         let block_no = ext2_data_block_for_logical_index_state(state, &parent, idx)?;
@@ -188,18 +195,27 @@ pub(super) fn ext2_remove_dir_entry(
         }
 
         let mut removed = None;
+        let block_has_tail: bool;
         {
             let blk = ext2_block_slice_mut_state(state, block_no)?;
+            // htree index blocks have no tail dirent; their single fake entry
+            // spans the block, so scanning to the full end is safe there.
+            let usable = if tail != 0 && read_u16_le(blk, blk.len() - 8)? as usize == 12 {
+                blk.len() - tail
+            } else {
+                blk.len()
+            };
+            block_has_tail = usable != blk.len();
             let mut pos = 0usize;
             let mut prev_pos = None;
             let mut prev_rec_len = 0usize;
 
-            while pos + 8 <= blk.len() {
+            while pos + 8 <= usable {
                 let inode_no = read_u32_le(blk, pos)?;
                 let rec_len = read_u16_le(blk, pos + 4)? as usize;
                 let name_len = blk[pos + 6] as usize;
 
-                if rec_len < 8 || (rec_len & 0x3) != 0 || pos + rec_len > blk.len() {
+                if rec_len < 8 || (rec_len & 0x3) != 0 || pos + rec_len > usable {
                     return Err(EIO);
                 }
 
@@ -227,7 +243,11 @@ pub(super) fn ext2_remove_dir_entry(
         }
 
         if let Some(ino) = removed {
-            ext2_mark_dirty_block(state, block_no)?;
+            if block_has_tail {
+                ext2_dir_block_finish(state, &parent, block_no)?;
+            } else {
+                ext2_mark_dirty_block(state, block_no)?;
+            }
             return Ok(ino);
         }
     }

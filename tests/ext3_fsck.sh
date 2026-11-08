@@ -209,3 +209,70 @@ if [[ "${checked}" -eq 0 ]]; then
   exit 1
 fi
 echo "[ext3-fsck] ${checked} recovered ext4 crash-point images are e2fsck clean"
+
+# ext4 metadata_csum writes (M3) on the stock user/sample_ext4.img: inode,
+# descriptor, bitmap, extent, directory-tail and superblock checksums.
+EXT4_CSUM_IMG="${WORK_DIR}/ext4_csum_mutated.img"
+PEETOS_EXT4_CSUM_FSCK_IMAGE="${EXT4_CSUM_IMG}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::ext4_csum_mutations_keep_every_checksum_valid
+if [[ ! -s "${EXT4_CSUM_IMG}" ]]; then
+  echo "[ext3-fsck] ext4 metadata_csum mutation test did not export an image" >&2
+  exit 1
+fi
+if ! e2fsck -fn "${EXT4_CSUM_IMG}"; then
+  echo "[ext3-fsck] e2fsck reported problems in the kernel-written metadata_csum image" >&2
+  exit 1
+fi
+echo "[ext3-fsck] e2fsck clean on kernel-written stock ext4 (metadata_csum)"
+
+# Kernel-written JBD2 csum-v3 + 64bit transactions, left unrecovered: e2fsck's
+# jbd2 recovery must accept every tag, descriptor and commit checksum.
+EXT4_CSUM_CRASH_IMG="${WORK_DIR}/ext4_csum_crashed.img"
+PEETOS_EXT4_CSUM_CRASH_IMAGE="${EXT4_CSUM_CRASH_IMG}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::ext4_csum_crash_image_replays_kernel_written_v3_journal
+if ! dumpe2fs -h "${EXT4_CSUM_CRASH_IMG}" 2>/dev/null | grep -q needs_recovery; then
+  echo "[ext3-fsck] ext4 csum crash image is missing needs_recovery" >&2
+  exit 1
+fi
+if ! dumpe2fs -h "${EXT4_CSUM_CRASH_IMG}" 2>/dev/null | grep -i "journal features" \
+  | grep -q journal_checksum_v3; then
+  echo "[ext3-fsck] ext4 csum crash image journal is not csum v3" >&2
+  exit 1
+fi
+set +e
+e2fsck -fy "${EXT4_CSUM_CRASH_IMG}" >"${WORK_DIR}/ext4_csum_replay.fsck" 2>&1
+replay_rc=$?
+set -e
+if [[ "${replay_rc}" -gt 1 ]]; then
+  echo "[ext3-fsck] e2fsck could not replay the kernel's csum-v3 journal (rc=${replay_rc})" >&2
+  cat "${WORK_DIR}/ext4_csum_replay.fsck" >&2
+  exit 1
+fi
+if ! e2fsck -fn "${EXT4_CSUM_CRASH_IMG}"; then
+  echo "[ext3-fsck] ext4 image not clean after e2fsck replayed the csum-v3 journal" >&2
+  exit 1
+fi
+if [[ "$(debugfs -R "cat /sub/crash_csum" "${EXT4_CSUM_CRASH_IMG}" 2>/dev/null)" != "survives crash" ]]; then
+  echo "[ext3-fsck] e2fsck replay lost the committed csum-v3 transaction" >&2
+  exit 1
+fi
+echo "[ext3-fsck] e2fsck replays kernel-written csum-v3 transactions cleanly"
+
+EXT4_CSUM_CRASH_DIR="${WORK_DIR}/ext4_csum_crash_points"
+mkdir -p "${EXT4_CSUM_CRASH_DIR}"
+PEETOS_EXT4_CSUM_CRASH_DIR="${EXT4_CSUM_CRASH_DIR}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::ext4_csum_crash_at_every_write_with_reordering_cache_stays_consistent
+checked=0
+for img in "${EXT4_CSUM_CRASH_DIR}"/*.img; do
+  if ! e2fsck -fn "${img}" >"${img}.fsck" 2>&1; then
+    echo "[ext3-fsck] inconsistent metadata_csum filesystem after recovery: $(basename "${img}")" >&2
+    cat "${img}.fsck" >&2
+    exit 1
+  fi
+  checked=$((checked + 1))
+done
+if [[ "${checked}" -eq 0 ]]; then
+  echo "[ext3-fsck] ext4 metadata_csum crash-point test produced no images" >&2
+  exit 1
+fi
+echo "[ext3-fsck] ${checked} recovered metadata_csum crash-point images are e2fsck clean"

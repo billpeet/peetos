@@ -43,7 +43,10 @@ for tool in debugfs mke2fs e2fsck dumpe2fs; do
   command -v "${tool}" >/dev/null 2>&1 || fail "${tool} not found; install e2fsprogs"
 done
 
-make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES=musl-ext3-journal-smoke
+# ext2-ro-root: the kernel mounts the root with the read-only option (stock
+# ext4 is writable since M3, so read-only is now a mount option, not a
+# feature gate).
+make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES="musl-ext3-journal-smoke ext2-ro-root"
 
 STAGE="${WORK_DIR}/root"
 mkdir -p "${STAGE}"

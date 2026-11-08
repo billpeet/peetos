@@ -235,6 +235,10 @@ current Rust kernel implementation and forward roadmap.
   writes, lazy group init, crc16 descriptors, ext4 inode layout), checked by
   `e2fsck`, the crash-point suite, and a QEMU crash/recovery smoke on an
   ext4 root.
+  M3 is done: stock `mkfs.ext4` images (`metadata_csum`) mount read-write
+  with crc32c checksums maintained on every metadata write and a JBD2
+  csum-v3/64bit journal that `e2fsck` replays; read-only is now a mount
+  option. Next: M4 (htree maintenance, lifting `VFS_MAX_CHILDREN`).
 - Add additional filesystem support (for example FAT-family support) as needed.
 - Improve durability guarantees around writeback scheduling and crash handling.
 

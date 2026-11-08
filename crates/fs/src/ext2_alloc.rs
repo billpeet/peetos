@@ -64,6 +64,7 @@ pub(super) fn ext2_alloc_block_goal(
                 |state| super::ext2_init_block_bitmap(state, &meta, group),
             )?;
         }
+        super::ext2_verify_group_bitmaps(state, &meta, group)?;
         let bitmap_block = ext2_group_block_bitmap_block_state(state, &meta, group)?;
         let mut found = None;
 
@@ -207,6 +208,7 @@ pub(super) fn ext2_alloc_inode(
                 |state| super::ext2_init_inode_bitmap(state, &meta, group),
             )?;
         }
+        super::ext2_verify_group_bitmaps(state, &meta, group)?;
         let bitmap_block = ext2_group_inode_bitmap_block_state(state, &meta, group)?;
         let mut found = None;
 
@@ -390,7 +392,7 @@ pub(super) fn ext2_write_inode_to_state(
         i += 1;
     }
 
-    Ok(())
+    super::ext2_update_inode_csum(state, ino)
 }
 
 pub(super) fn indirect_ensure_block(

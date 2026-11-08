@@ -271,6 +271,52 @@ Exit: full mutation, crash-point, and QEMU journal smoke suites on the stock
 fixture; `e2fsck -fn` clean, including after `e2fsck -fy` replay of
 kernel-written csum-v3 journals.
 
+**Status: done.**
+- **Read-write gating.** No supported feature forces a read-only mount any
+  more: stock `mke2fs -t ext4` images (`metadata_csum`, optionally
+  `metadata_csum_seed`) mount read-write. Read-only is now a mount option
+  (`mount_ext2_block_backend_with_options(.., read_only)`, kernel feature
+  `ext2-ro-root`), used by the M1 read-only smoke and tests.
+- **Checksummed writes.** Every metadata write refreshes its checksum: inode
+  csum lo/hi after each inode write; descriptor crc32c plus block/inode
+  bitmap checksums (lo/hi with 64-byte descriptors) after each descriptor or
+  bitmap change, including lazily initialized `BLOCK_UNINIT`/`INODE_UNINIT`
+  groups; extent tree block tails; directory leaf tails (the 12-byte `0xDE`
+  dirent) on every add/remove/`..` rewrite, with tails added to former htree
+  blocks when `INDEX_FL` is cleared; xattr block checksums when a shared
+  block's refcount drops; and `s_checksum` on every home write of the
+  superblock block *and* on its journaled copy (Linux recovery replays the
+  copy verbatim and then re-reads the superblock). New inodes get a random
+  `i_generation`, which seeds their per-inode checksums.
+- **Journal.** Read-write mounts of a `metadata_csum` filesystem switch the
+  journal to JBD2 `CSUM_V3` with `64BIT` tags (16-byte tags, descriptor and
+  revoke block tails, commit block crc32c, journal superblock checksum), as
+  Linux does; other journals keep v1 `COMPAT_CHECKSUM`. A journal that is
+  already v2/v3 keeps its format, so an ext3 journal switched to v3 gets v3
+  transactions. Recovery now treats a data-block checksum failure as fatal
+  only once the transaction's commit block is found: an uncommitted tail (a
+  crash before the logged blocks were durable) ends the log, as in jbd2.
+- **Fixes found on the way.** Renaming a directory across parents rewrote
+  `..` in `i_block[0]` instead of the directory's first mapped block (wrong
+  for extent directories).
+- **Tests.** The stock image mounts read-write with a v3/64bit journal; a
+  mutation mix (extent growth to depth 1, cross-parent directory rename, fast
+  and slow symlinks, xattr and 5 GiB file unlinks, truncate, htree insert,
+  `BLOCK_UNINIT` group use) leaves every superblock, descriptor, bitmap,
+  inode, extent and directory checksum valid, remounts, and is `e2fsck -fn`
+  clean; the debugfs-written csum-v3 journal fixture replays and then takes
+  writes; the reordering-cache crash test runs on the stock image (~244
+  recovered crash points, all `e2fsck` clean); an unrecovered crash image of
+  kernel-written v3 transactions is replayed by `e2fsck -fy` (Linux jbd2
+  recovery) into a clean filesystem with the committed file present; and
+  `tests/musl_ext4_csum_journal_smoke.sh` runs the QEMU SIGKILL/recovery smoke
+  on a stock ext4 root.
+- **Gaps.** htree index blocks are still never written: inserting into an
+  indexed directory clears `INDEX_FL` (M4), and `dx_tail` checksums on index
+  blocks are neither verified nor produced. xattr blocks are never created or edited beyond
+  refcount drops. There is no `s_kbytes_written`/`s_wtime`-style superblock
+  bookkeeping.
+
 ### M4 - Directory index maintenance
 
 Insert into htree directories instead of dropping `INDEX_FL`: `half_md4`
@@ -305,8 +351,9 @@ reports no rehash needed) and lookups use it.
 
 ## Limitations / Simplifications
 
-- This is a plan, not an implementation: none of the features above are
-  accepted yet, and stock ext4 images are still rejected at mount.
+- M0-M3 are implemented (stock ext4 mounts read-write); M4 and M5 are not
+  started. Large directories are still limited by `VFS_MAX_CHILDREN` and lose
+  their htree index on insert.
 - The milestone list deliberately excludes the out-of-scope features listed
   above; images using them will keep failing to mount with `EINVAL`.
 - 32-bit block numbers remain an internal limit (filesystems below 16 TiB at

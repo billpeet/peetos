@@ -4,7 +4,9 @@
 #  1. Convert a copy of the runtime musl image to ext3 (tune2fs -j), or with
 #     PEETOS_JOURNAL_SMOKE_FS=ext4 rebuild it as writable ext4 (mke2fs -t
 #     ext4 -O ^metadata_csum,uninit_bg: extents, 64bit, flex_bg, lazy-init
-#     groups, crc16 descriptor checksums; docs/ext4_compat_plan.md M2).
+#     groups, crc16 descriptor checksums; docs/ext4_compat_plan.md M2), or
+#     with PEETOS_JOURNAL_SMOKE_FS=ext4-csum as stock mke2fs -t ext4
+#     (metadata_csum; the kernel switches the journal to JBD2 csum v3, M3).
 #  2. Boot 1: bin/journal_smoke.sh syncs a baseline file, writes files until
 #     dirty-pressure commits sit uncheckpointed in the journal, and prints a
 #     crash point. QEMU is SIGKILLed there: everything still in the PeetOS
@@ -24,6 +26,11 @@ EXT2_IMG="${ROOT_DIR}/user/sample_ext2_musl.img"
 WORK_DIR="$(mktemp -d)"
 EXT3_IMG="${WORK_DIR}/ext3.img"
 FS_KIND="${PEETOS_JOURNAL_SMOKE_FS:-ext3}"
+case "${FS_KIND}" in
+  ext3) MOUNT_NAME=ext3 ;;
+  ext4|ext4-csum) MOUNT_NAME=ext4 ;;
+  *) echo "[journal-smoke] unknown PEETOS_JOURNAL_SMOKE_FS=${FS_KIND}" >&2; exit 1 ;;
+esac
 LOG1="${WORK_DIR}/boot1.log"
 LOG2="${WORK_DIR}/boot2.log"
 
@@ -56,15 +63,26 @@ done
 
 make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES=musl-ext3-journal-smoke
 
-if [[ "${FS_KIND}" == "ext4" ]]; then
-  # Rebuild the runtime image's contents as writable ext4 (no metadata_csum).
+if [[ "${MOUNT_NAME}" == "ext4" ]]; then
+  # Rebuild the runtime image's contents as ext4: stock features for
+  # ext4-csum, without metadata_csum (crc16 descriptors) for ext4.
+  mkfs_opts=(-O ^metadata_csum,uninit_bg)
+  if [[ "${FS_KIND}" == "ext4-csum" ]]; then
+    mkfs_opts=()
+  fi
   STAGE="${WORK_DIR}/stage"
   mkdir -p "${STAGE}"
   debugfs -R "rdump / ${STAGE}" "${EXT2_IMG}" >/dev/null 2>&1 || true
   [[ -x "${STAGE}/bin/toybox" ]] || fail "rdump did not recover bin/toybox"
   payload_kib="$(du -sk "${STAGE}" | awk '{print $1}')"
-  mke2fs -q -t ext4 -F -O ^metadata_csum,uninit_bg -L PEETOS_EXT4 -d "${STAGE}"     "${EXT3_IMG}" $((payload_kib * 2 + 16384))
-  dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "filesystem features" | grep -q extent     || fail "mke2fs did not produce an ext4 image"
+  mke2fs -q -t ext4 -F "${mkfs_opts[@]}" -L PEETOS_EXT4 -d "${STAGE}" \
+    "${EXT3_IMG}" $((payload_kib * 2 + 16384))
+  dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "filesystem features" | grep -q extent \
+    || fail "mke2fs did not produce an ext4 image"
+  if [[ "${FS_KIND}" == "ext4-csum" ]]; then
+    dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "filesystem features" | grep -q metadata_csum \
+      || fail "mke2fs did not produce a metadata_csum image"
+  fi
 else
   # Grow the runtime image so a 1 MiB journal fits, then add the journal.
   cp "${EXT2_IMG}" "${EXT3_IMG}"
@@ -112,7 +130,8 @@ boot_until() {
 
 boot_until "${LOG1}" "[ext3-journal-smoke] crash-point" 60 \
   || fail "boot 1 never reached the crash point"
-grep -aq "\[VFS\] Mounted ${FS_KIND} from block dev1" "${LOG1}"   || fail "boot 1 did not mount the image as ${FS_KIND}"
+grep -aq "\[VFS\] Mounted ${MOUNT_NAME} from block dev1" "${LOG1}" \
+  || fail "boot 1 did not mount the image as ${MOUNT_NAME}"
 if grep -aq "read-only" <(grep -a "\[VFS\] Mounted" "${LOG1}"); then
   fail "boot 1 mounted the root read-only"
 fi
@@ -132,6 +151,10 @@ dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "filesystem features" | grep -q 
   || fail "crashed image has no needs_recovery flag (nothing left in the journal)"
 dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "journal features" | grep -q journal_checksum \
   || fail "kernel did not enable journal_checksum"
+if [[ "${FS_KIND}" == "ext4-csum" ]]; then
+  dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "journal features" | grep -q journal_checksum_v3 \
+    || fail "kernel did not switch the journal to csum v3"
+fi
 
 # Linux-side recovery of the AHCI-written journal, on a copy.
 LINUX_IMG="${WORK_DIR}/linux_recovered.img"
@@ -157,6 +180,9 @@ if grep -aq "\[ext3-journal-smoke\] failures" "${LOG2}"; then
   fail "boot 2 found damaged files after kernel journal recovery"
 fi
 grep -aE "\[ext3-journal-smoke\] verified [0-9]+ surviving files" "${LOG2}" >&2 || true
+if grep -aq "\[EXT4\] .* mismatch" "${LOG1}" "${LOG2}"; then
+  fail "kernel reported a checksum mismatch"
+fi
 
 e2fsck -fn "${EXT3_IMG}" > "${WORK_DIR}/kernel_check.txt" 2>&1 \
   || { cat "${WORK_DIR}/kernel_check.txt" >&2; fail "filesystem not clean after kernel recovery"; }

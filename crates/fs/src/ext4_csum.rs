@@ -283,6 +283,35 @@ impl Ext4Csum {
         }
     }
 
+    /// Raw crc32c of a block bitmap (blocks_per_group / 8 bytes).
+    pub(super) fn block_bitmap_csum(&self, bitmap: &[u8]) -> Result<u32, i64> {
+        let bytes = (self.blocks_per_group / 8) as usize;
+        Ok(crc32c(self.seed, bitmap.get(..bytes).ok_or(EIO)?))
+    }
+
+    /// Raw crc32c of an inode bitmap (inodes_per_group / 8 bytes).
+    pub(super) fn inode_bitmap_csum(&self, bitmap: &[u8]) -> Result<u32, i64> {
+        let bytes = (self.inodes_per_group / 8) as usize;
+        Ok(crc32c(self.seed, bitmap.get(..bytes).ok_or(EIO)?))
+    }
+
+    /// Whether `i_checksum_hi` exists for this raw inode (with extra_isize).
+    pub(super) fn inode_has_checksum_hi(&self, raw: &[u8]) -> Result<bool, i64> {
+        self.checksum_hi_fits(raw)
+    }
+
+    /// External xattr block checksum: crc32c(seed, le64 block number, block
+    /// with `h_checksum` (offset 0x10) zeroed).
+    pub(super) fn xattr_block_csum(&self, block_nr: u64, block: &[u8]) -> Result<u32, i64> {
+        if block.len() < 0x20 {
+            return Err(EIO);
+        }
+        let mut crc = crc32c(self.seed, &block_nr.to_le_bytes());
+        crc = crc32c(crc, &block[..0x10]);
+        crc = crc32c(crc, &[0, 0, 0, 0]);
+        Ok(crc32c(crc, &block[0x14..]))
+    }
+
     /// Block bitmap checksum (crc32c over blocks_per_group / 8 bytes).
     pub(super) fn block_bitmap_ok(&self, desc: &[u8], bitmap: &[u8]) -> Result<bool, i64> {
         self.bitmap_ok(

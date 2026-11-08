@@ -13,6 +13,18 @@ pub fn mount_ext2_block_backend(
     image_len: usize,
     head: &[u8],
 ) -> Result<(), i64> {
+    mount_ext2_block_backend_with_options(mount_path, image_len, head, false)
+}
+
+/// Like `mount_ext2_block_backend`, with a read-only option (Linux `ro`):
+/// every VFS mutation returns `EROFS` and the journal superblock is left
+/// alone; journal recovery still runs at mount, as on Linux.
+pub fn mount_ext2_block_backend_with_options(
+    mount_path: &str,
+    image_len: usize,
+    head: &[u8],
+    read_only: bool,
+) -> Result<(), i64> {
     with_state(|state| {
         ensure_init(state);
 
@@ -63,7 +75,7 @@ pub fn mount_ext2_block_backend(
         state.ext2_meta = meta;
         state.ext2_mounted = true;
         state.ext2_mount_inode = mount_inode;
-        state.ext2_read_only = meta.ext4_read_only;
+        state.ext2_read_only = read_only || meta.ext4_read_only;
         state.ext4_csum = None;
         ext2_reset_dirty_tracking(state)?;
         let resident_len = (head_len / meta.block_size) * meta.block_size;
@@ -206,8 +218,8 @@ pub fn ext2_fs_name() -> &'static str {
     })
 }
 
-/// True when the mounted ext2-family filesystem is read-only (ext4 images
-/// until write support lands, docs/ext4_compat_plan.md).
+/// True when the mounted ext2-family filesystem is read-only (the `ro`
+/// mount option, or features that are not writable).
 pub fn ext2_mount_read_only() -> bool {
     with_state(|state| {
         ensure_init(state);
