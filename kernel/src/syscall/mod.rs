@@ -383,11 +383,15 @@ const EXEC_MAX_STR_LEN: usize = 256;
 const EXEC_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 const UTS_FIELD_LEN: usize = 65;
 /// Region slots per task. Adjacent compatible regions are merged on insert
-/// (see `mmap_regions_insert`), so this bounds distinct mappings, not mmap
-/// calls. Keep it small: several syscall paths copy a whole table onto the
-/// 16 KiB kernel stack (32 slots x 32 bytes = 1 KiB per copy); 128 slots
-/// overflowed the stack in `mmap`.
-const MMAP_MAX_REGIONS_PER_TASK: usize = 32;
+/// and after mprotect (see `mmap_regions_insert`/`mmap_regions_coalesce`), so
+/// this bounds distinct mappings, not mmap calls. Each shared library takes
+/// several (one per segment with distinct protection).
+///
+/// A table is 8 KiB (256 x 32 bytes), half the 16 KiB kernel stack, so it
+/// must never be copied onto the stack: transactional updates use a heap
+/// `RegionScratch`, and everything else works on `TASK_VM_MAPPINGS` in place
+/// (borrow with `task_regions`, copy slots with `region_table_copy`).
+const MMAP_MAX_REGIONS_PER_TASK: usize = 256;
 const MMAP_MAX_PAGES_PER_TASK: u64 = 8192;
 const VM_PAGE_CACHE_MAX_PAGES: usize = 1024;
 const USER_VM_RECLAIM_TARGET_PAGES: usize = 16;
@@ -444,8 +448,13 @@ static mut UNKNOWN_SYSCALL_LOG_COUNT: u32 = 0;
 static PROCESS_UMASK: AtomicU32 = AtomicU32::new(0o022);
 static MEMFD_COUNTER: AtomicU32 = AtomicU32::new(1);
 static mut TASK_VM_OWNER_PID: [i32; task::MAX_TASKS] = [task::INVALID_PID; task::MAX_TASKS];
-static mut TASK_VM_MAPPINGS: [[VmMapping; MMAP_MAX_REGIONS_PER_TASK]; task::MAX_TASKS] =
-    [[VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK]; task::MAX_TASKS];
+/// One task's VM region table.
+type RegionTable = [VmMapping; MMAP_MAX_REGIONS_PER_TASK];
+
+/// Zero-initialised so the 512 KiB array lands in .bss rather than in the
+/// kernel image (`VmMapping::EMPTY` is not all-zero). An all-zero entry has
+/// `len == 0`, so it is already empty; `init()` refills with `EMPTY` anyway.
+static mut TASK_VM_MAPPINGS: [RegionTable; task::MAX_TASKS] = unsafe { core::mem::zeroed() };
 #[derive(Clone, Copy)]
 struct VmPageCacheEntry {
     inode: u16,
@@ -1419,7 +1428,7 @@ pub fn init() {
         UNKNOWN_SYSCALL_LOG_COUNT = 0;
         for idx in 0..task::MAX_TASKS {
             TASK_VM_OWNER_PID[idx] = task::INVALID_PID;
-            TASK_VM_MAPPINGS[idx] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+            TASK_VM_MAPPINGS[idx].fill(VmMapping::EMPTY);
         }
         for idx in 0..EPOLL_MAX_INSTANCES {
             EPOLL_INSTANCES[idx] = EpollInstance::EMPTY;

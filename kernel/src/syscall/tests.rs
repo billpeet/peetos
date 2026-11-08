@@ -2178,7 +2178,7 @@ fn full_region_table_rejects_unmergeable_insert_without_changes() {
         mmap_regions_insert(&mut regions, anon_region(base + i * 4 * PAGE_SIZE, 1)).unwrap();
     }
     let before = regions;
-    let far = anon_region(base + 1000 * PAGE_SIZE, 1);
+    let far = anon_region(base + (MMAP_MAX_REGIONS_PER_TASK as u64 * 4 + 64) * PAGE_SIZE, 1);
     assert_eq!(mmap_regions_insert(&mut regions, far), Err(-ENOMEM));
     assert_eq!(regions, before, "failed insert must not modify the table");
     // A region adjacent to an existing one still fits by merging.
@@ -2186,9 +2186,128 @@ fn full_region_table_rejects_unmergeable_insert_without_changes() {
 }
 
 #[test]
-fn region_table_copies_stay_small() {
-    // Syscall paths copy whole tables onto the 16 KiB kernel stack.
-    assert!(core::mem::size_of::<[VmMapping; MMAP_MAX_REGIONS_PER_TASK]>() <= 1024);
+fn region_table_size_budget() {
+    // Tables live in a static array and heap scratch copies, never on the
+    // 16 KiB kernel stack; keep one table at most half a stack anyway.
+    assert!(core::mem::size_of::<RegionTable>() <= 8192);
+    assert!(MMAP_MAX_REGIONS_PER_TASK >= 256);
+}
+
+fn used_regions(regions: &RegionTable) -> usize {
+    regions.iter().filter(|r| !r.is_empty()).count()
+}
+
+/// Fill every slot with one-page regions separated by gaps (no merging).
+fn fill_region_table(regions: &mut RegionTable, base: u64) {
+    for i in 0..MMAP_MAX_REGIONS_PER_TASK as u64 {
+        mmap_regions_insert(regions, anon_region(base + i * 4 * PAGE_SIZE, 1)).unwrap();
+    }
+}
+
+#[test]
+fn region_scratch_copies_and_drops() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    fill_region_table(&mut regions, 0x5_0000_0000);
+    let mut scratch = RegionScratch::copy_of(&regions).expect("scratch alloc");
+    assert_eq!(*scratch, regions);
+    mmap_regions_unmap_range(&mut scratch, 0x5_0000_0000, 0x5_0000_0000 + PAGE_SIZE).unwrap();
+    assert_eq!(used_regions(&scratch), MMAP_MAX_REGIONS_PER_TASK - 1);
+    assert_eq!(used_regions(&regions), MMAP_MAX_REGIONS_PER_TASK, "source unchanged");
+}
+
+#[test]
+fn unmap_hole_in_full_table_fails_without_changes() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x6_0000_0000u64;
+    for i in 0..MMAP_MAX_REGIONS_PER_TASK as u64 {
+        mmap_regions_insert(&mut regions, anon_region(base + i * 8 * PAGE_SIZE, 3)).unwrap();
+    }
+    let before = regions;
+    // Punching a hole in the middle of a region needs a free slot.
+    assert_eq!(
+        mmap_regions_unmap_range(&mut regions, base + PAGE_SIZE, base + 2 * PAGE_SIZE),
+        Err(-ENOMEM)
+    );
+    assert_eq!(regions, before);
+    // Trimming an end needs none.
+    mmap_regions_unmap_range(&mut regions, base, base + PAGE_SIZE).unwrap();
+}
+
+#[test]
+fn mprotect_split_then_restore_merges_back() {
+    // RELRO-style: protect the middle of a mapping, then restore it.
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x7_0000_0000u64;
+    mmap_regions_insert(&mut regions, anon_region(base, 3)).unwrap();
+    mmap_regions_protect_range(&mut regions, base + PAGE_SIZE, base + 2 * PAGE_SIZE, PROT_READ)
+        .unwrap();
+    assert_eq!(used_regions(&regions), 3);
+    mmap_regions_protect_range(
+        &mut regions,
+        base + PAGE_SIZE,
+        base + 2 * PAGE_SIZE,
+        PROT_READ | PROT_WRITE,
+    )
+    .unwrap();
+    assert_eq!(used_regions(&regions), 1);
+    let only = regions.iter().find(|r| !r.is_empty()).unwrap();
+    assert_eq!((only.start, only.len), (base, 3 * PAGE_SIZE));
+}
+
+#[test]
+fn mprotect_on_full_table_fails_without_changes_unless_no_split() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x8_0000_0000u64;
+    for i in 0..MMAP_MAX_REGIONS_PER_TASK as u64 {
+        mmap_regions_insert(&mut regions, anon_region(base + i * 8 * PAGE_SIZE, 3)).unwrap();
+    }
+    let before = regions;
+    assert_eq!(
+        mmap_regions_protect_range(&mut regions, base + PAGE_SIZE, base + 2 * PAGE_SIZE, PROT_READ),
+        Err(-ENOMEM)
+    );
+    assert_eq!(regions, before);
+    // Same protection: nothing to split, so it succeeds on a full table.
+    mmap_regions_protect_range(
+        &mut regions,
+        base + PAGE_SIZE,
+        base + 2 * PAGE_SIZE,
+        PROT_READ | PROT_WRITE,
+    )
+    .unwrap();
+    assert_eq!(regions, before);
+    // Whole region: no split either.
+    mmap_regions_protect_range(&mut regions, base, base + 3 * PAGE_SIZE, PROT_READ).unwrap();
+    assert_eq!(used_regions(&regions), MMAP_MAX_REGIONS_PER_TASK);
+}
+
+#[test]
+fn mprotect_rejects_unmapped_and_disallowed_ranges_without_changes() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x9_0000_0000u64;
+    mmap_regions_insert(&mut regions, anon_region(base, 2)).unwrap();
+    let mut shared_ro = anon_region(base + 2 * PAGE_SIZE, 2);
+    shared_ro.prot = PROT_READ;
+    shared_ro.map_shared = true;
+    shared_ro.file_inode = 5;
+    mmap_regions_insert(&mut regions, shared_ro).unwrap();
+    let before = regions;
+    // Gap after the mapping.
+    assert_eq!(
+        mmap_regions_protect_range(&mut regions, base, base + 6 * PAGE_SIZE, PROT_READ),
+        Err(-ENOMEM)
+    );
+    // Writable over a read-only shared file mapping, spanning both regions.
+    assert_eq!(
+        mmap_regions_protect_range(
+            &mut regions,
+            base + PAGE_SIZE,
+            base + 3 * PAGE_SIZE,
+            PROT_READ | PROT_WRITE
+        ),
+        Err(-EINVAL)
+    );
+    assert_eq!(regions, before);
 }
 
 #[test]

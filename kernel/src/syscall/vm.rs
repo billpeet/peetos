@@ -540,7 +540,7 @@ pub(super) fn unmap_user_pages_in_regions(
     pml4: PhysAddr,
     start: u64,
     end: u64,
-    regions: Option<&[VmMapping; MMAP_MAX_REGIONS_PER_TASK]>,
+    regions: Option<&RegionTable>,
 ) {
     let mut addr = start;
     while addr < end {
@@ -624,6 +624,81 @@ pub(super) fn mmap_task_slot(task_ptr: *mut task::Task) -> Option<usize> {
     None
 }
 
+/// An all-empty table, for borrowing when a task has no slot.
+pub(super) static EMPTY_REGION_TABLE: RegionTable = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+
+/// Heap copy of a region table for transactional updates: build the new
+/// table here, and `commit` it only once every step has succeeded. Tables are
+/// too big for the 16 KiB kernel stack (see `MMAP_MAX_REGIONS_PER_TASK`).
+pub(super) struct RegionScratch(*mut RegionTable);
+
+impl RegionScratch {
+    pub(super) fn copy_of(src: &RegionTable) -> Result<Self, i64> {
+        let ptr = region_scratch_alloc();
+        if ptr.is_null() {
+            return Err(-ENOMEM);
+        }
+        unsafe { ptr::copy_nonoverlapping(src as *const RegionTable, ptr, 1) };
+        Ok(Self(ptr))
+    }
+
+    /// Install this table as task slot `slot`'s.
+    pub(super) fn commit(&self, slot: usize) {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.0 as *const RegionTable,
+                ptr::addr_of_mut!(TASK_VM_MAPPINGS[slot]),
+                1,
+            );
+        }
+    }
+}
+
+impl core::ops::Deref for RegionScratch {
+    type Target = RegionTable;
+    fn deref(&self) -> &RegionTable {
+        unsafe { &*self.0 }
+    }
+}
+
+impl core::ops::DerefMut for RegionScratch {
+    fn deref_mut(&mut self) -> &mut RegionTable {
+        unsafe { &mut *self.0 }
+    }
+}
+
+impl Drop for RegionScratch {
+    fn drop(&mut self) {
+        region_scratch_free(self.0);
+    }
+}
+
+#[cfg(not(test))]
+fn region_scratch_alloc() -> *mut RegionTable {
+    crate::memory::heap::kmalloc(core::mem::size_of::<RegionTable>()) as *mut RegionTable
+}
+
+#[cfg(not(test))]
+fn region_scratch_free(ptr: *mut RegionTable) {
+    crate::memory::heap::kfree(ptr as *mut u8);
+}
+
+#[cfg(test)]
+fn region_scratch_alloc() -> *mut RegionTable {
+    unsafe { std::alloc::alloc(core::alloc::Layout::new::<RegionTable>()) as *mut RegionTable }
+}
+
+#[cfg(test)]
+fn region_scratch_free(ptr: *mut RegionTable) {
+    unsafe { std::alloc::dealloc(ptr as *mut u8, core::alloc::Layout::new::<RegionTable>()) }
+}
+
+/// Borrow task slot `slot`'s live table without copying it.
+#[inline]
+pub(super) fn task_regions(slot: usize) -> &'static RegionTable {
+    unsafe { &*ptr::addr_of!(TASK_VM_MAPPINGS[slot]) }
+}
+
 pub(super) fn mmap_prepare_task_slot(task_ptr: *mut task::Task) -> Option<usize> {
     let task_ptr = task::leader_of(task_ptr);
     let slot = mmap_task_slot(task_ptr)?;
@@ -631,7 +706,7 @@ pub(super) fn mmap_prepare_task_slot(task_ptr: *mut task::Task) -> Option<usize>
         let pid = (*task_ptr).pid;
         if TASK_VM_OWNER_PID[slot] != pid {
             TASK_VM_OWNER_PID[slot] = pid;
-            TASK_VM_MAPPINGS[slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+            TASK_VM_MAPPINGS[slot].fill(VmMapping::EMPTY);
         }
     }
     Some(slot)
@@ -644,7 +719,7 @@ pub(super) fn mmap_clear_task_regions(task_ptr: *mut task::Task) {
     };
     unsafe {
         TASK_VM_OWNER_PID[slot] = task::INVALID_PID;
-        TASK_VM_MAPPINGS[slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+        TASK_VM_MAPPINGS[slot].fill(VmMapping::EMPTY);
     }
     vm_sync_inode_pins();
 }
@@ -659,7 +734,7 @@ static mut VM_INODE_MAPPED: [bool; fs::VFS_MAX_INODES] = [false; fs::VFS_MAX_INO
 
 #[cfg(test)]
 pub(super) fn vm_mapped_inodes(
-    tables: &[[VmMapping; MMAP_MAX_REGIONS_PER_TASK]],
+    tables: &[RegionTable],
 ) -> std::boxed::Box<[bool; fs::VFS_MAX_INODES]> {
     let mut mapped = std::boxed::Box::new([false; fs::VFS_MAX_INODES]);
     vm_mapped_inodes_into(tables, &mut mapped);
@@ -667,7 +742,7 @@ pub(super) fn vm_mapped_inodes(
 }
 
 pub(super) fn vm_mapped_inodes_into(
-    tables: &[[VmMapping; MMAP_MAX_REGIONS_PER_TASK]],
+    tables: &[RegionTable],
     mapped: &mut [bool; fs::VFS_MAX_INODES],
 ) {
     mapped.fill(false);
@@ -749,7 +824,7 @@ fn mmap_shared_anon_backing(task_ptr: *mut task::Task, len: u64) -> Result<Hidde
 }
 
 pub(super) fn mmap_regions_find_free(
-    regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &RegionTable,
 ) -> Option<usize> {
     for (idx, region) in regions.iter().enumerate() {
         if region.is_empty() {
@@ -760,7 +835,7 @@ pub(super) fn mmap_regions_find_free(
 }
 
 pub(super) fn mmap_regions_overlaps(
-    regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &RegionTable,
     start: u64,
     end: u64,
 ) -> bool {
@@ -776,7 +851,7 @@ pub(super) fn mmap_regions_overlaps(
 }
 
 pub(super) fn mmap_regions_find_mapping(
-    regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &RegionTable,
     addr: u64,
 ) -> Option<VmMapping> {
     for region in regions {
@@ -806,7 +881,7 @@ pub(super) fn mmap_regions_can_merge(prev: &VmMapping, next: &VmMapping) -> bool
 }
 
 pub(super) fn mmap_regions_insert(
-    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &mut RegionTable,
     mapping: VmMapping,
 ) -> Result<(), i64> {
     if mapping.is_empty() {
@@ -857,7 +932,7 @@ pub(super) fn mmap_region_allows_prot(region: &VmMapping, prot: u32) -> bool {
 }
 
 pub(super) fn mmap_regions_split_at(
-    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &mut RegionTable,
     cut: u64,
 ) -> Result<(), i64> {
     for idx in 0..MMAP_MAX_REGIONS_PER_TASK {
@@ -886,7 +961,7 @@ pub(super) fn mmap_regions_split_at(
 }
 
 pub(super) fn mmap_regions_range_mapped(
-    regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &RegionTable,
     start: u64,
     end: u64,
 ) -> bool {
@@ -905,19 +980,25 @@ pub(super) fn mmap_regions_range_mapped(
     true
 }
 
+/// Remove `[start, end)` from the table. Fails (with the table untouched)
+/// only when punching a hole in a region needs a free slot and none is left.
 pub(super) fn mmap_regions_unmap_range(
-    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &mut RegionTable,
     start: u64,
     end: u64,
 ) -> Result<(), i64> {
-    let mut next = *regions;
-    mmap_regions_unmap_range_in_place(&mut next, start, end)?;
-    *regions = next;
-    Ok(())
+    // Regions do not overlap, so at most one strictly contains the range.
+    let needs_split = regions
+        .iter()
+        .any(|r| !r.is_empty() && start > r.start && end < r.end());
+    if needs_split && mmap_regions_find_free(regions).is_none() {
+        return Err(-ENOMEM);
+    }
+    mmap_regions_unmap_range_in_place(regions, start, end)
 }
 
 pub(super) fn mmap_regions_unmap_range_in_place(
-    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &mut RegionTable,
     start: u64,
     end: u64,
 ) -> Result<(), i64> {
@@ -970,20 +1051,11 @@ pub(super) fn mmap_regions_unmap_range_in_place(
     Ok(())
 }
 
+/// Change the protection of `[start, end)`, splitting regions at the edges
+/// and merging the result with compatible neighbours. Every check happens
+/// before the table is modified, so a failure leaves it untouched.
 pub(super) fn mmap_regions_protect_range(
-    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
-    start: u64,
-    end: u64,
-    prot: u32,
-) -> Result<(), i64> {
-    let mut next = *regions;
-    mmap_regions_protect_range_in_place(&mut next, start, end, prot)?;
-    *regions = next;
-    Ok(())
-}
-
-pub(super) fn mmap_regions_protect_range_in_place(
-    regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &mut RegionTable,
     start: u64,
     end: u64,
     prot: u32,
@@ -991,28 +1063,71 @@ pub(super) fn mmap_regions_protect_range_in_place(
     if !mmap_regions_range_mapped(regions, start, end) {
         return Err(-ENOMEM);
     }
-
-    mmap_regions_split_at(regions, start)?;
-    mmap_regions_split_at(regions, end)?;
-
+    let mut splits = 0usize;
     for region in regions.iter() {
-        if region.is_empty() {
+        if region.is_empty() || region.end() <= start || region.start >= end {
             continue;
         }
-        if region.start >= start && region.end() <= end && !mmap_region_allows_prot(region, prot) {
+        if !mmap_region_allows_prot(region, prot) {
             return Err(-EINVAL);
         }
-    }
-
-    for region in regions.iter_mut() {
-        if region.is_empty() {
+        if region.prot == prot {
             continue;
         }
-        if region.start >= start && region.end() <= end {
+        if start > region.start {
+            splits += 1;
+        }
+        if end < region.end() {
+            splits += 1;
+        }
+    }
+    let free = regions.iter().filter(|r| r.is_empty()).count();
+    if splits > free {
+        return Err(-ENOMEM);
+    }
+
+    for region in regions.iter() {
+        if !region.is_empty() && region.prot != prot && region.start < start && start < region.end() {
+            mmap_regions_split_at(regions, start)?;
+            break;
+        }
+    }
+    for region in regions.iter() {
+        if !region.is_empty() && region.prot != prot && region.start < end && end < region.end() {
+            mmap_regions_split_at(regions, end)?;
+            break;
+        }
+    }
+    for region in regions.iter_mut() {
+        if !region.is_empty() && region.start >= start && region.end() <= end {
             region.prot = prot;
         }
     }
+    mmap_regions_coalesce(regions);
     Ok(())
+}
+
+/// Merge every pair of adjacent compatible regions (for example the pieces an
+/// mprotect split off once their protections match again), freeing slots.
+pub(super) fn mmap_regions_coalesce(regions: &mut RegionTable) {
+    loop {
+        let mut merged_any = false;
+        for i in 0..MMAP_MAX_REGIONS_PER_TASK {
+            if regions[i].is_empty() {
+                continue;
+            }
+            for j in 0..MMAP_MAX_REGIONS_PER_TASK {
+                if i != j && mmap_regions_can_merge(&regions[i], &regions[j]) {
+                    regions[i].len = regions[i].len.saturating_add(regions[j].len);
+                    regions[j] = VmMapping::EMPTY;
+                    merged_any = true;
+                }
+            }
+        }
+        if !merged_any {
+            return;
+        }
+    }
 }
 
 pub(super) fn mmap_task_overlaps(task_ptr: *mut task::Task, start: u64, end: u64) -> bool {
@@ -1152,7 +1267,7 @@ pub(super) fn mmap_validate_framebuffer_window(
 }
 
 pub(super) fn mmap_regions_total_pages(
-    regions: &[VmMapping; MMAP_MAX_REGIONS_PER_TASK],
+    regions: &RegionTable,
 ) -> Result<u64, i64> {
     let mut pages = 0u64;
     for region in regions {
@@ -1310,7 +1425,10 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Some(slot) => slot,
         None => return -ESRCH,
     };
-    let mut projected_regions = unsafe { TASK_VM_MAPPINGS[slot] };
+    let mut projected_regions = match RegionScratch::copy_of(task_regions(slot)) {
+        Ok(table) => table,
+        Err(err) => return err,
+    };
 
     let start = if is_fixed {
         if (addr_hint & (PAGE_SIZE - 1)) != 0 || addr_hint < MMAP_BASE_ADDR {
@@ -1375,12 +1493,9 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                     Some(v) => v,
                     None => return -EINVAL,
                 };
-                let old_regions = unsafe { TASK_VM_MAPPINGS[slot] };
-                unmap_user_pages_in_regions(pml4, start, end, Some(&old_regions));
+                unmap_user_pages_in_regions(pml4, start, end, Some(task_regions(slot)));
             }
-            unsafe {
-                TASK_VM_MAPPINGS[slot] = projected_regions;
-            }
+            projected_regions.commit(slot);
             // Pin newly mapped files (and unpin ones a MAP_FIXED replaced)
             // before the shared-anon creation reference is dropped.
             vm_sync_inode_pins();
@@ -1456,8 +1571,8 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Some(slot) => slot,
         None => return -ESRCH,
     };
-    let regions = unsafe { TASK_VM_MAPPINGS[slot] };
-    let region = match mmap_regions_find_mapping(&regions, old_addr) {
+    let regions = task_regions(slot);
+    let region = match mmap_regions_find_mapping(regions, old_addr) {
         Some(region) => region,
         None => return -EFAULT,
     };
@@ -1475,19 +1590,20 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     if new_len < old_len {
-        let mut next = regions;
+        let mut next = match RegionScratch::copy_of(regions) {
+            Ok(table) => table,
+            Err(err) => return err,
+        };
         if let Err(err) = mmap_regions_unmap_range(&mut next, old_addr + new_len, old_end) {
             return err;
         }
-        unmap_user_pages_in_regions(pml4, old_addr + new_len, old_end, Some(&regions));
-        unsafe {
-            TASK_VM_MAPPINGS[slot] = next;
-        }
+        unmap_user_pages_in_regions(pml4, old_addr + new_len, old_end, Some(regions));
+        next.commit(slot);
         return old_addr as i64;
     }
 
     // Growing: enforce the per-task page budget and file window rules.
-    let total = match mmap_regions_total_pages(&regions) {
+    let total = match mmap_regions_total_pages(regions) {
         Ok(pages) => pages,
         Err(err) => return err,
     };
@@ -1517,16 +1633,17 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         _ => return -ENOMEM,
     };
     if old_end == region_end && mmap_range_available(ctx.current, pml4, old_end, grow_end) {
-        let mut next = regions;
+        let mut next = match RegionScratch::copy_of(regions) {
+            Ok(table) => table,
+            Err(err) => return err,
+        };
         if let Err(err) = mmap_regions_unmap_range(&mut next, old_addr, old_end) {
             return err;
         }
         if let Err(err) = mmap_regions_insert(&mut next, piece) {
             return err;
         }
-        unsafe {
-            TASK_VM_MAPPINGS[slot] = next;
-        }
+        next.commit(slot);
         return old_addr as i64;
     }
 
@@ -1538,7 +1655,10 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => return err,
     };
     piece.start = new_start;
-    let mut next = regions;
+    let mut next = match RegionScratch::copy_of(regions) {
+        Ok(table) => table,
+        Err(err) => return err,
+    };
     if let Err(err) = mmap_regions_unmap_range(&mut next, old_addr, old_end) {
         return err;
     }
@@ -1548,9 +1668,7 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if let Err(err) = mremap_move_ptes(pml4, old_addr, new_start, old_len) {
         return err;
     }
-    unsafe {
-        TASK_VM_MAPPINGS[slot] = next;
-    }
+    next.commit(slot);
     vm_sync_inode_pins();
     new_start as i64
 }
@@ -1585,16 +1703,16 @@ pub(super) fn sys_munmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Some(slot) => slot,
         None => return -ESRCH,
     };
-    let old_regions = unsafe { TASK_VM_MAPPINGS[slot] };
-    let mut next_regions = old_regions;
+    let mut next_regions = match RegionScratch::copy_of(task_regions(slot)) {
+        Ok(table) => table,
+        Err(err) => return err,
+    };
     let unmap_result = mmap_regions_unmap_range(&mut next_regions, addr, end);
     if let Err(err) = unmap_result {
         return err;
     }
-    unmap_user_pages_in_regions(pml4, addr, end, Some(&old_regions));
-    unsafe {
-        TASK_VM_MAPPINGS[slot] = next_regions;
-    }
+    unmap_user_pages_in_regions(pml4, addr, end, Some(task_regions(slot)));
+    next_regions.commit(slot);
     vm_sync_inode_pins();
     0
 }
@@ -1834,9 +1952,9 @@ pub(super) fn mmap_move_task_regions(from: *mut task::Task, to: *mut task::Task)
         return;
     };
     unsafe {
-        TASK_VM_MAPPINGS[to_slot] = TASK_VM_MAPPINGS[from_slot];
+        region_table_copy(from_slot, to_slot);
         TASK_VM_OWNER_PID[to_slot] = (*to).pid;
-        TASK_VM_MAPPINGS[from_slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+        TASK_VM_MAPPINGS[from_slot].fill(VmMapping::EMPTY);
         TASK_VM_OWNER_PID[from_slot] = task::INVALID_PID;
     }
 }
@@ -1856,9 +1974,23 @@ pub(super) fn mmap_clone_task_regions(
 
     unsafe {
         TASK_VM_OWNER_PID[child_slot] = (*child).pid;
-        TASK_VM_MAPPINGS[child_slot] = TASK_VM_MAPPINGS[parent_slot];
+        region_table_copy(parent_slot, child_slot);
     }
     Ok(())
+}
+
+/// Copy one task slot's table to another directly (no stack temporary).
+fn region_table_copy(from_slot: usize, to_slot: usize) {
+    if from_slot == to_slot {
+        return;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(
+            ptr::addr_of!(TASK_VM_MAPPINGS[from_slot]),
+            ptr::addr_of_mut!(TASK_VM_MAPPINGS[to_slot]),
+            1,
+        );
+    }
 }
 
 /// Resolve a write fault on a present copy-on-write page of the current task.

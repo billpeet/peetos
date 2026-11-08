@@ -41,10 +41,13 @@ later.
   `make run-dynlink-smoke`, see "Dynamic Linking" in `docs/elf.md`. libwayland,
   libffi and libxkbcommon also build as `.so` files, and `peetwl`/`wl_demo`
   link against them.)*
-- [ ] **Process and memory limits.** Remove whole-table stack copies in the VM
-  syscalls so the region table can grow past 32 slots; raise the per-task
-  mapping budget (32 MiB), memfd size cap (64 MiB), task limit (64), socket
-  limit (96); lift the ext2 64-entries-per-directory limit.
+- [ ] **Process and memory limits.** ~~Remove whole-table stack copies in the
+  VM syscalls so the region table can grow past 32 slots~~ (done: 256 slots,
+  see `docs/memory.md`). Still to do: raise the per-task mapping budget
+  (32 MiB), memfd size cap (64 MiB), task limit (64), socket limit (96); lift
+  the ext2 64-entries-per-directory limit. The kernel image is also close to
+  the boot disk's 10 MiB payload limit (`DISK_SECTORS`), mostly because of
+  embedded smoke-test ELFs.
 - [ ] **System information.** A usable `/proc` (and parts of `/sys`), a real-time
   clock, and the input ioctls libinput needs (`EVIOCGNAME`, `EVIOCGBIT`,
   `EVIOCGABS`, ...).

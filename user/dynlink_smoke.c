@@ -9,6 +9,8 @@
  *   - dlopen()/dlsym() of a plugin that depends on the first library and has
  *     its own (dynamically allocated) TLS block; dlerror() for a missing one
  *   - fork + execve of itself (a dynamic program exec'ing a dynamic program)
+ *   - many distinct mappings at once (well past the old 32-region limit) on
+ *     top of the loaded libraries, and an mprotect split + restore
  *
  * Output: "[dynlink] <check> ok", "[dynlink] FAIL ...", and "[dynlink] pass".
  */
@@ -18,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -40,6 +43,59 @@ static void check(int cond, const char *what) {
         printf("[dynlink] FAIL %s\n", what);
         failures++;
     }
+}
+
+#define MANY_MAPS 120
+
+/* Map MANY_MAPS one-page regions with alternating protections, so adjacent
+ * ones cannot merge, touch them, then unmap them all. */
+static int many_mappings(void) {
+    static void *maps[MANY_MAPS];
+    int ok = 1;
+    for (int i = 0; i < MANY_MAPS; i++) {
+        int prot = (i & 1) ? PROT_READ : (PROT_READ | PROT_WRITE);
+        maps[i] = mmap(NULL, 4096, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (maps[i] == MAP_FAILED) {
+            printf("[dynlink] mmap %d failed\n", i);
+            ok = 0;
+            for (int j = 0; j < i; j++) {
+                munmap(maps[j], 4096);
+            }
+            return ok;
+        }
+        if (prot & PROT_WRITE) {
+            *(volatile int *)maps[i] = i;
+        }
+    }
+    for (int i = 0; i < MANY_MAPS; i += 2) {
+        if (*(volatile int *)maps[i] != i) {
+            ok = 0;
+        }
+    }
+    for (int i = 0; i < MANY_MAPS; i++) {
+        if (munmap(maps[i], 4096) != 0) {
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+/* RELRO-style: make the middle page of a 3-page mapping read-only, then
+ * writable again, and check the data survives. */
+static int mprotect_split_restore(void) {
+    char *p = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        return 0;
+    }
+    memset(p, 0x5a, 3 * 4096);
+    int ok = mprotect(p + 4096, 4096, PROT_READ) == 0 &&
+             mprotect(p + 4096, 4096, PROT_READ | PROT_WRITE) == 0;
+    if (ok) {
+        p[4096] = 1;
+        ok = p[0] == 0x5a && p[4096] == 1 && p[2 * 4096] == 0x5a;
+    }
+    munmap(p, 3 * 4096);
+    return ok;
 }
 
 struct thread_result {
@@ -101,6 +157,9 @@ int main(int argc, char **argv) {
     check(r.lib_tls == 7, "new thread gets fresh library TLS");
     check(r.plugin_tls == 6, "new thread gets fresh plugin TLS");
     check(peetdyn_tls == 9 && plugin_tls_bump() == 7, "main thread TLS unchanged by thread");
+
+    check(many_mappings(), "120 distinct mappings alongside shared libraries");
+    check(mprotect_split_restore(), "mprotect split and restore");
 
     fflush(stdout);
     pid_t pid = fork();

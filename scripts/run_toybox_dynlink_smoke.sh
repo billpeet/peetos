@@ -67,6 +67,8 @@ for marker in \
   '\[dynlink\] dynamic TLS in dlopen.d plugin ok' \
   '\[dynlink\] new thread gets fresh library TLS ok' \
   '\[dynlink\] fork + exec of a dynamic program ok' \
+  '\[dynlink\] 120 distinct mappings alongside shared libraries ok' \
+  '\[dynlink\] mprotect split and restore ok' \
   '\[dynlink\] pass'; do
   if ! grep -q "${marker}" "${LOG_FILE}"; then
     echo "dynamic-linking smoke is missing marker: ${marker}" >&2

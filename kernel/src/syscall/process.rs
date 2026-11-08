@@ -308,11 +308,14 @@ pub(super) fn create_fork_child(
     // Shared file mappings, device mappings and shm stay shared after fork:
     // keep them out of the COW clone. The child refaults file/device pages
     // from the inherited mapping metadata and re-attaches shm below.
-    let parent_regions = mmap_prepare_task_slot(parent)
-        .map(|slot| unsafe { TASK_VM_MAPPINGS[slot] })
-        .unwrap_or([VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK]);
+    // Borrow the parent's table in place (it is too big to copy onto the
+    // stack); nothing modifies it while the address space is cloned.
+    let parent_regions: &RegionTable = match mmap_prepare_task_slot(parent) {
+        Some(slot) => unsafe { &*core::ptr::addr_of!(TASK_VM_MAPPINGS[slot]) },
+        None => &EMPTY_REGION_TABLE,
+    };
     let skip_shared = |virt: u64| -> bool {
-        if let Some(region) = mmap_regions_find_mapping(&parent_regions, virt) {
+        if let Some(region) = mmap_regions_find_mapping(parent_regions, virt) {
             if mmap_mapping_is_framebuffer(&region)
                 || (region.map_shared && region.file_inode != task::USER_FD_NONE)
             {

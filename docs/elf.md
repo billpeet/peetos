@@ -95,8 +95,9 @@ Limitations / Simplifications
   needs every page to be present (the range is mapped eagerly, but untouched
   `brk` pages are not) and keeps no per-range protection record.
 - Each shared library takes several VM region slots (one per segment, merged
-  where adjacent and compatible) out of the 32 per task, which limits how many
-  libraries a process can load.
+  where adjacent and compatible) out of the 256 per task. That is plenty for
+  today's programs, but toolkit stacks with dozens of libraries will use a
+  noticeable share.
 - There is no ASLR: the program, the loader and `mmap` placement are all
   deterministic.
 - Libraries are read through file-backed private mappings. Pages are not
