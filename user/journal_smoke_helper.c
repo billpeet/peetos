@@ -2,7 +2,9 @@
  *
  *   journal_workload write   - boot 1: sync a baseline file and a directory
  *                              of BIG_COUNT hard links (large enough to need
- *                              an htree index), then write files in small
+ *                              an htree index) and an unlinked file that
+ *                              stays open (an orphan inode at the crash),
+ *                              then write files in small
  *                              chunks until the kernel has committed (but not
  *                              checkpointed) journal transactions, announce
  *                              the crash point and wait to be killed.
@@ -151,6 +153,44 @@ static int verify_bigdir(void) {
     return 0;
 }
 
+/* Unlink a file while holding it open: it must stay readable through the
+ * fd. The fd is never closed, so the crash leaves an orphan inode for
+ * recovery (e2fsck, then the kernel at mount) to free. */
+static int keep_unlinked_open(void) {
+    static char data[3 * 4096];
+    static char back[3 * 4096];
+    memset(data, 'O', sizeof(data));
+    int fd = open("jsmoke/orphan", O_CREAT | O_TRUNC | O_RDWR, 0644);
+    if (fd < 0) {
+        say_errno("open", "jsmoke/orphan");
+        return -1;
+    }
+    if (write(fd, data, sizeof(data)) != (ssize_t)sizeof(data)) {
+        say_errno("write", "jsmoke/orphan");
+        return -1;
+    }
+    if (unlinkat(AT_FDCWD, "jsmoke/orphan", 0) != 0) {
+        say_errno("unlink", "jsmoke/orphan");
+        return -1;
+    }
+    struct stat st;
+    if (stat("jsmoke/orphan", &st) == 0) {
+        say("[ext3-journal-smoke] FAIL unlinked name still resolves\n");
+        return -1;
+    }
+    if (pread(fd, back, sizeof(back), 0) != (ssize_t)sizeof(back) ||
+        memcmp(back, data, sizeof(data)) != 0) {
+        say("[ext3-journal-smoke] FAIL unlinked file not readable through its fd\n");
+        return -1;
+    }
+    if (fstat(fd, &st) != 0 || st.st_nlink != 0) {
+        say("[ext3-journal-smoke] FAIL unlinked file reports links\n");
+        return -1;
+    }
+    say("[ext3-journal-smoke] unlinked file still readable\n");
+    return 0;
+}
+
 static void wait_for_kill(void) {
     for (;;) {
         sleep(60);
@@ -173,6 +213,9 @@ static int do_write(void) {
     }
     if (write_bigdir() != 0) {
         say("[ext3-journal-smoke] FAIL cannot fill bigdir\n");
+        return 1;
+    }
+    if (keep_unlinked_open() != 0) {
         return 1;
     }
     sync();
@@ -209,6 +252,11 @@ static int do_verify(void) {
         fail = 1;
     }
     if (verify_bigdir() != 0) {
+        fail = 1;
+    }
+    struct stat orphan_st;
+    if (stat("jsmoke/orphan", &orphan_st) == 0) {
+        say("[ext3-journal-smoke] FAIL unlinked file came back\n");
         fail = 1;
     }
 

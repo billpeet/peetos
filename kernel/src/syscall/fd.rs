@@ -183,8 +183,9 @@ pub(super) fn fd_write_slot(
 /// Every path that makes a second fd refer to the same object (`dup*`,
 /// `fcntl(F_DUPFD*)`, `fork`, `SCM_RIGHTS` transfer) must call this, and every
 /// path that drops one must call [`fd_object_release`], so object lifetimes
-/// stay balanced. Kinds without a per-object refcount (console, VFS files)
-/// are no-ops.
+/// stay balanced. VFS files count references in the fs crate, so an
+/// unlinked file stays readable until its last fd closes. Console fds have
+/// no refcount.
 pub(crate) fn fd_object_retain(kind: u8, inode: u16, flags: u32) -> Result<(), i64> {
     if inode == task::USER_FD_NONE {
         return Ok(());
@@ -206,6 +207,10 @@ pub(crate) fn fd_object_retain(kind: u8, inode: u16, flags: u32) -> Result<(), i
         task::USER_FD_KIND_EPOLL => epoll_retain(inode),
         task::USER_FD_KIND_EVENTFD | task::USER_FD_KIND_TIMERFD | task::USER_FD_KIND_SIGNALFD => {
             crate::evfd::retain(evfd_kind(kind), inode)
+        }
+        task::USER_FD_KIND_VFS => {
+            fs::inode_retain(inode);
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -230,6 +235,13 @@ pub(crate) fn fd_object_release(kind: u8, inode: u16, flags: u32) {
         }
         task::USER_FD_KIND_EVENTFD | task::USER_FD_KIND_TIMERFD | task::USER_FD_KIND_SIGNALFD => {
             crate::evfd::release(evfd_kind(kind), inode);
+        }
+        task::USER_FD_KIND_VFS => {
+            // The last fd of an unlinked ext2 file frees its inode and
+            // blocks; commit that like any other mutation.
+            if fs::inode_release(inode) {
+                super::file::sync_ext2_backing();
+            }
         }
         _ => {}
     }
@@ -600,6 +612,7 @@ pub(super) fn sys_memfd_create(ctx: &SyscallContext, call: &SyscallArgs) -> i64 
         let fd_flags = fd_flags_from_open_flags(open_flags) | FD_INTERNAL_MEMFD;
         return match fd_alloc(ctx.current, task::USER_FD_KIND_VFS, opened.inode, fd_flags) {
             Ok(fd) => {
+                fs::inode_retain(opened.inode);
                 memfd_seals_register(opened.inode, memfd_flags.allow_sealing);
                 fd
             }

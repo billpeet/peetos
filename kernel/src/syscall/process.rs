@@ -229,6 +229,7 @@ pub(super) fn fork_cleanup_child(task_ptr: *mut task::Task) {
     let owner_pid = unsafe { (*task_ptr).pid };
     mmap_clear_task_regions(task_ptr);
     close_all_fds(task_ptr);
+    super::file::release_cwd(task_ptr);
     epoll_drop_watches_for_owner(owner_pid);
     shm::cleanup_task(task_ptr);
     teardown_user_address_space(task_ptr);
@@ -338,6 +339,7 @@ pub(super) fn create_fork_child(
         (*crate::task::leader_of(child)).user_uid = (*crate::task::leader_of(parent)).user_uid;
         (*crate::task::leader_of(child)).user_gid = (*crate::task::leader_of(parent)).user_gid;
         (*crate::task::leader_of(child)).user_cwd_inode = (*crate::task::leader_of(parent)).user_cwd_inode;
+        fs::inode_retain((*crate::task::leader_of(child)).user_cwd_inode);
         (*crate::task::leader_of(child)).pgid = (*crate::task::leader_of(parent)).pgid;
         (*crate::task::leader_of(child)).sid = (*crate::task::leader_of(parent)).sid;
         (*crate::task::leader_of(child)).ctty_type = (*crate::task::leader_of(parent)).ctty_type;
@@ -1076,6 +1078,7 @@ pub(super) fn release_process_resources(leader: *mut task::Task) {
     let tgid = unsafe { (*leader).tgid };
     mmap_clear_task_regions(leader);
     close_all_fds(leader);
+    super::file::release_cwd(leader);
     epoll_drop_watches_for_owner(tgid);
     shm::cleanup_task(leader);
     // Dying non-leader threads have already dropped their reference to the

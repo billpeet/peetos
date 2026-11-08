@@ -44,7 +44,7 @@ required even for a read-only mount when `needs_recovery` is set.
 
 Explicitly out of scope until requested (keep rejecting):
 `inline_data`, `encrypt`, `casefold`, `verity`, `ea_inode`, `mmp`,
-`bigalloc`, `meta_bg`, `quota`, `project`, `orphan_file`, `fast_commit`,
+`bigalloc`, `meta_bg`, `quota`, `project`, `fast_commit`,
 `journal_dev`, `stable_inodes`, `largedir`.
 
 ## Code Seams (from a survey of `crates/fs`)
@@ -382,6 +382,60 @@ reports no rehash needed) and lookups use it.
   preserved.
 - Optional: `fallocate` unwritten extents, `FIEMAP`-like introspection.
 
+**Status: done** (the optional items are not implemented).
+- **64-bit files.** VFS node sizes are `u64`; reads, writes, `lseek` and
+  truncation use `i_size_high`. The old 32 KiB write cap on ext2-family
+  files is gone. The size limit is the map's reach (2^32 - 1 blocks for
+  extents, the triple-indirect reach otherwise) and, without `huge_file`,
+  2^32 - 1 sectors of `i_blocks`, as Linux's `ext4_max_size`; writes past it
+  return `EFBIG`. Growth is sparse: only the partial block at the old end of
+  file is zeroed, so writing at 100 GiB allocates one block. Shrinking skips
+  holes (a `next_mapped_block` walk instead of visiting every logical block).
+  `l_i_blocks_high` is written with `huge_file`, and the first file over
+  2 GiB turns on `large_file`.
+- **Timestamps.** Inode times are 64-bit seconds, encoded with the
+  `i_*time_extra` epoch bits (good to 2446) when the inode has room and
+  clamped to 2038 otherwise. Linux-written nanoseconds survive inode writes
+  that leave a time unchanged. New inodes get `i_crtime`. `l_i_version`,
+  `i_version_hi` and `i_projid` are never touched (checked by a test).
+- **Unlink while open.** VFS nodes count references (kernel fds through
+  `fd_object_retain/release`, working directories through `chdir`, fork and
+  exit). Unlinking or `rmdir`-ing a referenced node removes its name but
+  keeps the node; for ext2 the inode (links 0) goes on the `s_last_orphan`
+  list (`i_dtime` links) with its blocks. The last release frees it, takes it
+  off the list, and syncs. A removed directory takes no new entries
+  (`ENOENT`), has no path, and `stat` reports 0 links.
+- **Orphans at mount.** Read-write mounts finish every orphan after journal
+  recovery: links 0 is freed, links > 0 (an interrupted truncate) loses its
+  blocks past `i_size`. A damaged list is reported and left for e2fsck.
+- **`orphan_file`** (decision 4 revisited: newer e2fsprogs enable it by
+  default). Accepted. Every mount checks the orphan blocks' magic and
+  checksum (crc32c of the physical block number and the entries, seeded by
+  the orphan file inode), failing with `EIO` like Linux. With
+  `orphan_present` on a read-write mount the recorded orphans are finished,
+  their entries cleared and the flag dropped. The kernel itself records its
+  orphans on the classic list, which Linux and e2fsck also process.
+- **Tests.** 64-bit reads, writes and truncates on 1 KiB ext3 (to 15 GiB
+  through triple-indirect maps) and ext4 (dense 1 MiB, sparse 100 GiB);
+  `large_file` turned on demand; timestamp encode/decode vectors and
+  post-2038 round trips with preserved nanoseconds, version and project id;
+  unlink-while-open on ext4 (normal release, and a crash image the next
+  mount repairs), hard-link aliases, `rmdir` of a referenced directory,
+  tmpfs; truncate orphans; `orphan_file` processing and a corrupted orphan
+  block. `tests/ext3_fsck.sh` checks each image with `e2fsck -fn`, and has
+  e2fsck finish the kernel's orphan after replaying a crash image. The QEMU
+  journal smokes unlink a file they hold open, read it back through the fd,
+  and crash with the orphan pending; e2fsck and the kernel both finish it.
+- **Gaps.** There is no wall clock: timestamps are a tick counter, so files
+  carry 1970-era times and `i_dtime` stays 0 on delete. Truncates do not put
+  the inode on the orphan list while they run (Linux does), so a crash in
+  the middle of a long multi-transaction truncate leaves a file with some
+  blocks freed but the old size (consistent, e2fsck clean, but not finished
+  by the next mount). `stat` has no nanoseconds or `crtime` field. Times
+  before 1970 are not representable in `stat` (u64 seconds). Read-only
+  mounts verify the orphan file but do not process orphans. tmpfs files are
+  still capped at `TMPFS_MAX_FILE_SIZE` (32 KiB).
+
 ## Decisions (agreed 2026-11-08)
 
 1. **Read-only first.** M1 ships a read-only ext4 mount before any write
@@ -390,13 +444,13 @@ reports no rehash needed) and lookups use it.
    images before checksummed writes.
 3. **Checksum mismatch on read returns `EIO`** (with a serial log line);
    there is no log-and-continue mode.
-4. **`orphan_file`** stays rejected for now; whether M5 implements it is still
-   open (e2fsprogs 1.47.0, used here, does not enable it by default).
+4. **`orphan_file`** was rejected until M5, which accepts it and processes
+   its entries at mount (newer e2fsprogs enable it by default).
 
 ## Limitations / Simplifications
 
-- M0-M4 are implemented (stock ext4 mounts read-write, htree indexes are
-  maintained); M5 is not started.
+- M0-M5 are implemented; the optional M5 items (`fallocate` unwritten
+  extents, `FIEMAP`) are not.
 - The milestone list deliberately excludes the out-of-scope features listed
   above; images using them will keep failing to mount with `EINVAL`.
 - 32-bit block numbers remain an internal limit (filesystems below 16 TiB at

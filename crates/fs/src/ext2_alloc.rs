@@ -1,7 +1,7 @@
 use super::{
     ext2_adjust_group_counters_state, ext2_adjust_super_counters_state, ext2_bitmap_get,
     ext2_bitmap_set, ext2_block_group_and_bit, ext2_block_slice_mut_state, ext2_block_slice_state,
-    ext2_ensure_data_block,
+
     ext2_ensure_range_resident, ext2_group_block_bitmap_block_state, ext2_group_desc_offset,
     ext2_group_inode_bitmap_block_state, ext2_indirect_entries_per_block, ext2_inode_group_and_bit,
     ext2_inode_offset_in_state, ext2_mark_dirty_block, ext2_mark_dirty_range,
@@ -379,12 +379,33 @@ pub(super) fn ext2_write_inode_to_state(
     ext2_write_u16_state(state, inode_offset, inode.mode)?;
     ext2_write_u16_state(state, inode_offset + 2, inode.uid)?;
     ext2_write_u32_state(state, inode_offset + 4, inode.size)?;
-    ext2_write_u32_state(state, inode_offset + 8, inode.atime)?;
-    ext2_write_u32_state(state, inode_offset + 12, inode.ctime)?;
-    ext2_write_u32_state(state, inode_offset + 16, inode.mtime)?;
+    let extra_isize = super::ext2_inode_extra_isize(state, inode_offset)?;
+    for (i, (base_off, secs)) in [(8usize, inode.atime), (12, inode.ctime), (16, inode.mtime)]
+        .into_iter()
+        .enumerate()
+    {
+        let (extra_off, needs) = super::EXT4_TIME_EXTRA[i];
+        let has_extra = extra_isize >= needs;
+        let (base, epoch) = super::ext4_encode_time(secs, has_extra);
+        ext2_write_u32_state(state, inode_offset + base_off, base)?;
+        if has_extra {
+            // Keep Linux's nanoseconds while the time itself is unchanged.
+            let nsec_bits = if secs == inode.time_orig[i] { inode.time_extra[i] & !3 } else { 0 };
+            ext2_write_u32_state(state, inode_offset + extra_off, nsec_bits | epoch)?;
+        }
+    }
     ext2_write_u16_state(state, inode_offset + 24, inode.gid)?;
     ext2_write_u16_state(state, inode_offset + 26, inode.links_count)?;
     ext2_write_u32_state(state, inode_offset + 28, inode.block_count_512)?;
+    if (meta.feature_ro_compat & super::EXT4_FEATURE_RO_COMPAT_HUGE_FILE) != 0 {
+        // l_i_blocks_high: bits 32..47 of i_blocks.
+        ext2_write_u16_state(state, inode_offset + 0x74, inode.blocks_hi)?;
+    }
+    if (inode.mode & super::EXT2_S_IFMT) == super::EXT2_S_IFREG {
+        // i_size_high (only regular files; for directories this is the
+        // legacy i_dir_acl, which the kernel leaves alone).
+        ext2_write_u32_state(state, inode_offset + 108, inode.size_high)?;
+    }
 
     let mut i = 0usize;
     while i < 15 {
@@ -483,41 +504,54 @@ pub(super) fn indirect_ensure_block(
     Err(ENOSPC)
 }
 
+/// Makes bytes `[start, end)` read as zeros when a file grows past its old
+/// size. Holes already read as zeros, so only blocks that are mapped in the
+/// range (in practice the partial block holding the old end of file) are
+/// cleared; nothing is allocated, as on Linux (sparse growth).
 pub(super) fn ext2_write_zero_range(
     state: &mut VfsState,
     journal_handle: Option<Ext2JournalHandle>,
     inode: &mut Ext2Inode,
-    mut start: usize,
-    end: usize,
+    start: u64,
+    end: u64,
 ) -> Result<(), i64> {
     if start >= end {
         return Ok(());
     }
 
-    let meta = state.ext2_meta;
-    while start < end {
-        let block_idx = start / meta.block_size;
-        let step_credits = super::ext2_estimate_data_write_step_credits(state, inode, block_idx)?;
-        let chunk = super::ext2_journal::with_handle_restartable_phase(
+    let bs = state.ext2_meta.block_size as u64;
+    let mut idx = usize::try_from(start / bs).map_err(|_| EINVAL)?;
+    loop {
+        let next = match super::ext2_bmap::ext2_next_mapped_block(state, inode, idx)? {
+            Some(next) => next,
+            None => break,
+        };
+        let blk_start = next as u64 * bs;
+        if blk_start >= end {
+            break;
+        }
+        let zero_from = (core::cmp::max(start, blk_start) - blk_start) as usize;
+        let zero_to = (core::cmp::min(end, blk_start + bs) - blk_start) as usize;
+        let step_credits = super::ext2_estimate_data_write_step_credits(state, inode, next)?;
+        super::ext2_journal::with_handle_restartable_phase(
             state,
             journal_handle,
             super::Ext2JournalPhaseKind::DataZero,
             step_credits,
             |state| {
-                let block_no = ext2_ensure_data_block(state, journal_handle, inode, block_idx)?;
-                let block_off = start % meta.block_size;
-                let chunk = core::cmp::min(end - start, meta.block_size - block_off);
-
+                let block_no = super::ext2_data_block_for_logical_index_state(state, inode, next)?;
+                if block_no == 0 {
+                    return Ok(());
+                }
                 {
                     let blk = ext2_block_slice_mut_state(state, block_no)?;
-                    blk[block_off..block_off + chunk].fill(0);
+                    blk[zero_from..zero_to].fill(0);
                 }
                 super::ext2_journal::note_data_block(state, block_no)?;
-                ext2_mark_dirty_block(state, block_no)?;
-                Ok(chunk)
+                ext2_mark_dirty_block(state, block_no)
             },
         )?;
-        start += chunk;
+        idx = next + 1;
     }
 
     Ok(())

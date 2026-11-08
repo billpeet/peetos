@@ -291,9 +291,9 @@ All of the above are in `crates/fs/src/lib.rs` test module.
     directories; ext4 compat plan M4). An index the code cannot use is
     dropped (`EXT2_INDEX_FL` cleared through a dedicated helper) before a
     linear insert, as Linux does.
-  - `LARGE_FILE`: `i_size_high` is parsed; `stat` reports 64-bit sizes for
-    regular files; reads return `EOVERFLOW` and writes/truncates `EFBIG` for
-    files that do not fit in 32 bits. Unlink still frees the full block tree.
+  - `LARGE_FILE`: sizes are 64-bit end to end (ext4 compat plan M5): reads,
+    writes and truncation past 4 GiB, sparse growth, and the feature is
+    turned on for the first file over 2 GiB.
 - Fast symlinks (`i_blocks` minus the xattr block equal to zero, size < 60) are
   read from `i_block` and freed without treating the target text as block
   pointers. Before this, unlinking a fast symlink from an `mke2fs -d` image
@@ -477,7 +477,6 @@ All of the above are in `crates/fs/src/lib.rs` test module.
 - Stock ext3 images mount, but support for some features is partial:
   - xattrs are preserved/released, not exposed (`getxattr`/`setxattr` absent),
     and POSIX ACLs stored in them are not enforced.
-  - files over 4 GiB are read-only-by-refusal (no 64-bit I/O path).
 - `IMAGIC_INODES`, `DIR_PREALLOC`, and all ext4-era bits (extents, flex_bg,
   64bit, metadata_csum, huge_file, ...) are still rejected.
 - Sharing of xattr blocks is only honored on release; the kernel never creates
@@ -583,7 +582,8 @@ to something materially closer to full ext3 parity.
      `dir_index`, `large_file`), validated against a real mkfs image plus
      `e2fsck -fn` after kernel-side mutation.
    - htree indexes are maintained on insert (ext4 compat plan M4).
-   - Remaining: expose xattrs, 64-bit file I/O.
+   - 64-bit file I/O and orphan handling are done (ext4 compat plan M5).
+   - Remaining: expose xattrs.
 
 11. Done: `INCOMPAT_RECOVER` tracks live journal contents and `s_sequence`
     follows JBD semantics (section 8); checkpoint-after-reuse and shared-block
@@ -591,8 +591,8 @@ to something materially closer to full ext3 parity.
     barriers and transactions can span several descriptor blocks (section 10).
     Commit checksums, journal feature validation, and a QEMU crash/recovery
     smoke are done (section 11); htree maintenance is done (ext4 compat plan
-    M4). Remaining hardening: exposing xattrs, 64-bit file I/O, and a
-    JBD-style per-transaction size cap.
+    M4), and 64-bit file I/O and orphans in M5. Remaining hardening:
+    exposing xattrs and a JBD-style per-transaction size cap.
 
 ## Historical Comparison (`peetos_c`)
 

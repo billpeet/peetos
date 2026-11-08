@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use super::{
     ext2_block_slice_mut_state, ext2_block_slice_state, ext2_data_block_for_logical_index_state,
     ext2_dir_block_finish, ext2_dir_tail_len, ext2_ensure_data_block, ext2_mark_dirty_block,
-    ext2_recalc_inode_block_count_512_state, ext2_report, ext2_write_inode_to_state, ext4_csum,
+    ext2_report, ext2_write_inode_to_state, ext4_csum,
     read_u16_le, read_u32_le, write_u16_le, write_u32_le, Ext2Inode, Ext2JournalHandle,
     VfsState, EIO, ENOSPC, EXT2_INDEX_FL,
 };
@@ -752,7 +752,7 @@ fn append_block(
     let phys = ext2_ensure_data_block(state, handle, dir, lblk)?;
     ext2_block_slice_mut_state(state, phys)?.fill(0);
     dir.size = ((lblk + 1) * bs) as u32;
-    dir.block_count_512 = ext2_recalc_inode_block_count_512_state(state, dir)?;
+    super::ext2_update_block_count(state, dir)?;
     ext2_write_inode_to_state(state, dir.ino, dir)?;
     Ok((lblk as u32, phys))
 }

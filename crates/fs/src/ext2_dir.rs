@@ -3,7 +3,7 @@ use super::{
     ext2_dir_block_finish, ext2_dir_tail_len, EXT2_INDEX_FL, ext2_data_block_for_logical_index_state, ext2_ensure_data_block,
     ext2_for_each_dir_entry_state, ext2_logical_blocks_for_size, ext2_mark_dirty_block,
     ext2_max_addressable_file_size, ext2_mode_to_filetype, ext2_read_inode_from_state,
-    ext2_recalc_inode_block_count_512_state, ext2_write_inode_to_state, read_u16_le,
+    ext2_write_inode_to_state, read_u16_le,
     read_u32_le, write_u16_le, write_u32_le, Ext2JournalHandle, FileType, VfsState, EINVAL, EIO,
     ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK,
     EXT2_FEATURE_COMPAT_DIR_INDEX, Ext2Inode,
@@ -149,7 +149,7 @@ pub(super) fn ext2_add_dir_entry(
             if parent.size < min_size {
                 parent.size = min_size;
             }
-            parent.block_count_512 = ext2_recalc_inode_block_count_512_state(state, &parent)?;
+            super::ext2_update_block_count(state, &mut parent)?;
             ext2_write_inode_to_state(state, parent_ino, &parent)?;
             return Ok(());
         }

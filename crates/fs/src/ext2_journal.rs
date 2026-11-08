@@ -630,6 +630,8 @@ fn journal_cached_inode(state: &VfsState) -> Ext2Inode {
         ino: state.ext2_journal.inode,
         generation: state.ext2_journal.inode_generation,
         blocks_hi: 0,
+        time_extra: [0; 3],
+        time_orig: [0; 3],
     }
 }
 

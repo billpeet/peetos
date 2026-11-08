@@ -71,7 +71,7 @@ current Rust kernel implementation and forward roadmap.
 - Images formatted with stock `mke2fs -t ext3` defaults now mount read-write:
   `ext_attr`, `resize_inode`, `dir_index`, and `large_file` are accepted, each
   with explicit handling (xattr block accounting and release, maintained htree
-  indexes, and refusal of >4 GiB file I/O). Fast
+  indexes, and 64-bit file sizes). Fast
   symlinks are read and created inline. `tests/ext3_fsck.sh` requires
   `e2fsck -fn` to stay clean after kernel-side mutations of a stock ext3 image.
 - Ordered-journal fixes: freeing a block dirtied in the same transaction now
@@ -243,6 +243,10 @@ current Rust kernel implementation and forward roadmap.
   (all Linux hashes, leaf/node splits, two levels, `dx_tail` checksums), and
   the VFS node/child tables grow on demand with lazy single-name ext2
   imports, so directories with thousands of entries work.
+  M5 is done: 64-bit file sizes (no 32 KiB or 4 GiB limits, sparse growth),
+  post-2038 timestamps, reference-counted VFS files with unlink-while-open
+  semantics backed by the ext4 orphan list, orphan processing at mount, and
+  `orphan_file` support. Remaining gaps: no wall clock, xattrs not exposed.
 - Add additional filesystem support (for example FAT-family support) as needed.
 - Improve durability guarantees around writeback scheduling and crash handling.
 

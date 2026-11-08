@@ -102,12 +102,26 @@ pub fn mount_ext2_block_backend_with_options(
             rollback_ext2_mount_import(state, mount_inode);
             return Err(EIO);
         }
+        // Finish deletions/truncates interrupted by a crash (orphan inodes:
+        // the orphan file and the s_last_orphan list), as Linux does at
+        // mount. Read-only mounts only verify the orphan file.
+        let process = !state.ext2_read_only;
+        if let Err(err) = super::ext2_check_orphan_file(state, process) {
+            rollback_ext2_mount_import(state, mount_inode);
+            return Err(err);
+        }
+        if process {
+            if let Err(err) = super::ext2_process_orphans(state) {
+                rollback_ext2_mount_import(state, mount_inode);
+                return Err(err);
+            }
+        }
 
         let mount = &mut state.inodes[mount_inode as usize];
         mount.backend = NodeBackend::Ext2;
         mount.ext2_ino = EXT2_ROOT_INODE;
         mount.ext2_children_loaded = false;
-        mount.size = root.size;
+        mount.size = root.size as u64;
         mount.mode = root.mode;
         mount.links_count = root.links_count;
         mount.uid = root.uid;

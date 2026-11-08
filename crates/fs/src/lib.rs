@@ -134,6 +134,9 @@ const EXT2_FEATURE_COMPAT_IMAGIC_INODES: u32 = 0x0002;
 const EXT2_FEATURE_COMPAT_EXT_ATTR: u32 = 0x0008;
 const EXT2_FEATURE_COMPAT_RESIZE_INO: u32 = 0x0010;
 const EXT2_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
+/// ext4 `orphan_file`: orphan inode numbers live in a dedicated file
+/// (`s_orphan_file_inum`) instead of only the `s_last_orphan` list.
+const EXT4_FEATURE_COMPAT_ORPHAN_FILE: u32 = 0x1000;
 // The compat allowlist covers the stock `mke2fs -t ext3` feature set. Each bit
 // here has explicit handling (see docs/ext3_parity_audit.md):
 // - EXT_ATTR: xattr blocks are counted in i_blocks and released on delete.
@@ -147,7 +150,8 @@ const EXT2_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
 const EXT2_FEATURE_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_COMPAT_HAS_JOURNAL
     | EXT2_FEATURE_COMPAT_EXT_ATTR
     | EXT2_FEATURE_COMPAT_RESIZE_INO
-    | EXT2_FEATURE_COMPAT_DIR_INDEX;
+    | EXT2_FEATURE_COMPAT_DIR_INDEX
+    | EXT4_FEATURE_COMPAT_ORPHAN_FILE;
 
 const EXT2_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const EXT2_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
@@ -171,7 +175,10 @@ const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
 const EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
 const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 /// ext4 ro-compat features understood by the mount path.
-const EXT4_FEATURE_RO_COMPAT_ALL: u32 = EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+/// The orphan file holds entries (set while orphans are recorded there).
+const EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
+const EXT4_FEATURE_RO_COMPAT_ALL: u32 = EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT
+    | EXT4_FEATURE_RO_COMPAT_HUGE_FILE
     | EXT4_FEATURE_RO_COMPAT_GDT_CSUM
     | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
     | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE
@@ -185,9 +192,8 @@ const EXT2_FEATURE_INCOMPAT_SUPPORTED: u32 = EXT2_FEATURE_INCOMPAT_FILETYPE
     | EXT2_FEATURE_INCOMPAT_JOURNAL_DEV;
 
 const EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
-// LARGE_FILE: regular files may carry i_size_high. Files whose size does not
-// fit in 32 bits are detected and refused (EOVERFLOW/EFBIG) rather than
-// silently truncated; stat still reports their full 64-bit size.
+// LARGE_FILE: regular files carry i_size_high; sizes are 64-bit end to end,
+// and the feature is turned on when the first file grows past 2 GiB.
 const EXT2_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
 #[cfg(test)]
 const EXT2_FEATURE_RO_COMPAT_BTREE_DIR: u32 = 0x0004;
@@ -310,7 +316,7 @@ struct Inode {
     parent: u16,
     name: [u8; VFS_MAX_NAME],
     name_len: u8,
-    size: u32,
+    size: u64,
     /// Child nodes in creation order (readdir offsets index this list).
     children: Vec<u16>,
     /// tmpfs file contents / symlink target (at least `size` bytes).
@@ -325,6 +331,12 @@ struct Inode {
     atime: u64,
     mtime: u64,
     ctime: u64,
+    /// References held by the kernel (open fds, working directories):
+    /// `inode_retain` / `inode_release`.
+    open_count: u32,
+    /// Removed from its directory while still referenced: freed (and for
+    /// ext2, its on-disk inode and blocks released) on the last release.
+    unlinked: bool,
 }
 
 impl Inode {
@@ -349,6 +361,8 @@ impl Inode {
             atime: 0,
             mtime: 0,
             ctime: 0,
+            open_count: 0,
+            unlinked: false,
         }
     }
 }
@@ -757,9 +771,11 @@ struct Ext2Inode {
     mode: u16,
     uid: u16,
     size: u32,
-    atime: u32,
-    ctime: u32,
-    mtime: u32,
+    /// Seconds since the epoch, decoded with the ext4 extra epoch bits
+    /// (`i_*time_extra`) when the inode has room for them.
+    atime: u64,
+    ctime: u64,
+    mtime: u64,
     links_count: u16,
     gid: u16,
     block_count_512: u32,
@@ -778,6 +794,46 @@ struct Ext2Inode {
     generation: u32,
     /// `l_i_blocks_high` (offset 0x74): bits 32..47 of `i_blocks` (huge_file).
     blocks_hi: u16,
+    /// Raw `i_{a,c,m}time_extra` as read, and the decoded times they went
+    /// with: nanoseconds survive an inode write while a time is unchanged.
+    time_extra: [u32; 3],
+    time_orig: [u64; 3],
+}
+
+/// Byte offset and the `i_extra_isize` an inode needs for the
+/// `i_{a,c,m}time_extra` fields.
+const EXT4_TIME_EXTRA: [(usize, u16); 3] = [(0x8C, 16), (0x84, 8), (0x88, 12)];
+
+/// Decodes an ext4 timestamp: the base is signed 32-bit seconds; the low two
+/// bits of the extra field extend it past 2038 (fs/ext4/ext4.h).
+fn ext4_decode_time(base: u32, extra: Option<u32>) -> u64 {
+    let mut secs = base as i32 as i64;
+    if let Some(extra) = extra {
+        secs += ((extra & 3) as i64) << 32;
+    }
+    secs as u64
+}
+
+/// Splits `secs` into the 32-bit base and the epoch bits, clamping to what
+/// fits (0x7FFF_FFFF without extra fields, year 2446 with them).
+fn ext4_encode_time(secs: u64, has_extra: bool) -> (u32, u32) {
+    let max = if has_extra { 0x3_7FFF_FFFFi64 } else { 0x7FFF_FFFF };
+    let secs = core::cmp::min(secs as i64, max);
+    let base = secs as i32;
+    let epoch = ((secs - base as i64) >> 32) as u32 & 3;
+    (base as u32, epoch)
+}
+
+/// `i_extra_isize` of the inode at `inode_offset` (0 for 128-byte inodes).
+fn ext2_inode_extra_isize(state: &mut VfsState, inode_offset: usize) -> Result<u16, i64> {
+    if state.ext2_meta.inode_size <= 128 {
+        return Ok(0);
+    }
+    let extra = ext2_read_u16_state(state, inode_offset + 0x80)?;
+    if (extra as usize) > state.ext2_meta.inode_size - 128 {
+        return Ok(0);
+    }
+    Ok(extra)
 }
 
 fn with_state<R>(f: impl FnOnce(&mut VfsState) -> R) -> R {
@@ -921,6 +977,8 @@ fn clear_inode(inode: &mut Inode) {
     inode.atime = 0;
     inode.mtime = 0;
     inode.ctime = 0;
+    inode.open_count = 0;
+    inode.unlinked = false;
 }
 
 fn reset(state: &mut VfsState) {
@@ -1356,6 +1414,10 @@ fn resolve_parent_from_inner(
             if len == 2 && component[0] == b'.' && component[1] == b'.' {
                 return Err(EINVAL);
             }
+            if state.inodes[current as usize].unlinked {
+                // A removed (but still open) directory takes no new entries.
+                return Err(ENOENT);
+            }
             out_name[..len].copy_from_slice(&component[..len]);
             return Ok((current, len));
         }
@@ -1432,7 +1494,7 @@ fn create_regular_at_inner(state: &mut VfsState, start: u16, path: &str) -> Resu
             )?;
             let node = &mut state.inodes[inode as usize];
             node.ext2_ino = ext2_ino;
-            node.size = ext2_size;
+            node.size = ext2_size as u64;
             add_child(state, parent, inode)?;
             touch_inode_metadata(state, parent, true, true, true);
             Ok(inode)
@@ -1490,7 +1552,7 @@ fn mkdir_at_inner(state: &mut VfsState, start: u16, path: &str) -> Result<(), i6
             )?;
             let node = &mut state.inodes[inode as usize];
             node.ext2_ino = ext2_ino;
-            node.size = ext2_size;
+            node.size = ext2_size as u64;
             node.ext2_children_loaded = true;
             add_child(state, parent, inode)?;
             touch_inode_metadata(state, parent, true, true, true);
@@ -3112,9 +3174,9 @@ fn ext2_write_inode(
     write_u16_le(image, inode_offset, inode.mode)?;
     write_u16_le(image, inode_offset + 2, inode.uid)?;
     write_u32_le(image, inode_offset + 4, inode.size)?;
-    write_u32_le(image, inode_offset + 8, inode.atime)?;
-    write_u32_le(image, inode_offset + 12, inode.ctime)?;
-    write_u32_le(image, inode_offset + 16, inode.mtime)?;
+    write_u32_le(image, inode_offset + 8, inode.atime as u32)?;
+    write_u32_le(image, inode_offset + 12, inode.ctime as u32)?;
+    write_u32_le(image, inode_offset + 16, inode.mtime as u32)?;
     write_u16_le(image, inode_offset + 24, inode.gid)?;
     write_u16_le(image, inode_offset + 26, inode.links_count)?;
     write_u32_le(image, inode_offset + 28, inode.block_count_512)?;
@@ -3400,7 +3462,7 @@ fn ext2_count_indirect_tree_blocks_state(
 fn indirect_recalc_block_count_512_state(
     state: &mut VfsState,
     inode: &Ext2Inode,
-) -> Result<u32, i64> {
+) -> Result<u64, i64> {
     let meta = state.ext2_meta;
     let sectors_per_block = (meta.block_size / 512) as u32;
     let mut used_blocks = 0u32;
@@ -3429,9 +3491,94 @@ fn indirect_recalc_block_count_512_state(
         3,
     )?);
 
-    Ok(used_blocks
-        .saturating_mul(sectors_per_block)
-        .saturating_add(ext2_inode_acl_sectors(&meta, inode)))
+    Ok((used_blocks as u64) * (sectors_per_block as u64)
+        + ext2_inode_acl_sectors(&meta, inode) as u64)
+}
+
+/// Stores `sectors` (512-byte units) in `i_blocks`: 32 bits, or 48 with
+/// `huge_file` (in filesystem blocks when the inode has
+/// `EXT4_HUGE_FILE_FL`). `EFBIG` when the count does not fit.
+fn ext2_set_block_count(meta: &Ext2Meta, inode: &mut Ext2Inode, sectors: u64) -> Result<(), i64> {
+    if (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_HUGE_FILE) == 0 {
+        inode.block_count_512 = u32::try_from(sectors).map_err(|_| EFBIG)?;
+        return Ok(());
+    }
+    let raw = if (inode.flags & EXT4_HUGE_FILE_FL) != 0 {
+        sectors / (meta.block_size as u64 / 512)
+    } else {
+        sectors
+    };
+    if raw >= (1u64 << 48) {
+        return Err(EFBIG);
+    }
+    inode.block_count_512 = raw as u32;
+    inode.blocks_hi = (raw >> 32) as u16;
+    Ok(())
+}
+
+/// Recomputes `i_blocks` from the inode's block map.
+fn ext2_update_block_count(state: &mut VfsState, inode: &mut Ext2Inode) -> Result<(), i64> {
+    let sectors = ext2_recalc_inode_block_count_512_state(state, inode)?;
+    let meta = state.ext2_meta;
+    ext2_set_block_count(&meta, inode, sectors)
+}
+
+/// First mapped logical block at or after `from` in an indirect map,
+/// skipping unallocated mapping subtrees.
+fn indirect_next_mapped(
+    state: &mut VfsState,
+    inode: &Ext2Inode,
+    from: usize,
+) -> Result<Option<usize>, i64> {
+    for i in from..EXT2_INODE_DIRECT_COUNT {
+        if inode.blocks[i] != 0 {
+            return Ok(Some(i));
+        }
+    }
+    let meta = state.ext2_meta;
+    let entries = ext2_indirect_entries_per_block(&meta)?;
+    let mut base = EXT2_INODE_DIRECT_COUNT;
+    let mut span = entries;
+    for level in 1..=3u32 {
+        if from < base + span {
+            let start = from.saturating_sub(base);
+            let root = inode.blocks[EXT2_INODE_DIRECT_COUNT + level as usize - 1];
+            if let Some(off) = indirect_next_in_tree(state, root, level, start, entries)? {
+                return Ok(Some(base + off));
+            }
+        }
+        base += span;
+        span = span.checked_mul(entries).ok_or(EIO)?;
+    }
+    Ok(None)
+}
+
+fn indirect_next_in_tree(
+    state: &mut VfsState,
+    table: u32,
+    depth: u32,
+    from: usize,
+    entries: usize,
+) -> Result<Option<usize>, i64> {
+    if table == 0 {
+        return Ok(None);
+    }
+    let child_span = entries.pow(depth - 1);
+    let first = from / child_span;
+    for i in first..entries {
+        let child = ext2_read_indirect_entry_from_state(state, table, i)?;
+        if child == 0 {
+            continue;
+        }
+        if depth == 1 {
+            return Ok(Some(i));
+        }
+        let child_from = if i == first { from % child_span } else { 0 };
+        if let Some(off) = indirect_next_in_tree(state, child, depth - 1, child_from, entries)? {
+            return Ok(Some(i * child_span + off));
+        }
+    }
+    Ok(None)
 }
 
 /// `i_blocks` in 512-byte sectors. With ext4 `huge_file` the count gains 16
@@ -3465,11 +3612,26 @@ fn ext2_inode_is_fast_symlink(meta: &Ext2Meta, inode: &Ext2Inode) -> bool {
         && (inode.size as usize) < EXT2_FAST_SYMLINK_MAX
 }
 
-/// True when a regular file's size needs `i_size_high`, which the 32-bit
-/// in-memory size paths cannot represent.
-fn ext2_inode_size_exceeds_u32(inode: &Ext2Inode) -> bool {
-    (inode.mode & EXT2_S_IFMT) == EXT2_S_IFREG
-        && (inode.size_high != 0 || (inode.flags & EXT4_HUGE_FILE_FL) != 0)
+/// Sets the full size; the high half goes to `i_size_high` for regular
+/// files only.
+fn ext2_set_inode_size64(inode: &mut Ext2Inode, size: u64) {
+    inode.size = size as u32;
+    if (inode.mode & EXT2_S_IFMT) == EXT2_S_IFREG {
+        inode.size_high = (size >> 32) as u32;
+    }
+}
+
+/// Files over 2 GiB need the `large_file` ro-compat feature; like Linux,
+/// the kernel turns it on when it first creates one.
+fn ext2_note_large_file(state: &mut VfsState, size: u64) -> Result<(), i64> {
+    if size <= 0x7FFF_FFFF
+        || (state.ext2_meta.feature_ro_compat & EXT2_FEATURE_RO_COMPAT_LARGE_FILE) != 0
+    {
+        return Ok(());
+    }
+    state.ext2_meta.feature_ro_compat |= EXT2_FEATURE_RO_COMPAT_LARGE_FILE;
+    let value = state.ext2_meta.feature_ro_compat;
+    ext2_write_u32_state(state, EXT2_SUPERBLOCK_OFFSET + 100, value)
 }
 
 /// Full on-disk size: `i_size_high` only extends regular files (for
@@ -3511,7 +3673,7 @@ fn ext2_write_fast_symlink_target(state: &mut VfsState, ino: u32, target: &[u8])
         i += 1;
     }
     inode.size = target.len() as u32;
-    let now = fs_time_tick(state) as u32;
+    let now = fs_time_tick(state);
     inode.mtime = now;
     inode.ctime = now;
     ext2_write_inode_to_state(state, ino, &inode)?;
@@ -3544,6 +3706,12 @@ fn ext2_init_new_inode_layout(state: &mut VfsState, inode: &mut Ext2Inode) -> Re
         let extra = if want >= 4 && (want as usize) <= meta.inode_size - 128 { want } else { 32 };
         if (extra as usize) <= meta.inode_size - 128 {
             ext2_write_u16_state(state, offset + 0x80, extra)?;
+            if extra >= 24 {
+                // i_crtime / i_crtime_extra: creation time.
+                let (base, epoch) = ext4_encode_time(inode.ctime, true);
+                ext2_write_u32_state(state, offset + 0x90, base)?;
+                ext2_write_u32_state(state, offset + 0x94, epoch)?;
+            }
         }
     }
     ext2_update_inode_csum(state, inode.ino)
@@ -3667,9 +3835,22 @@ fn ext2_read_inode_from_state(state: &mut VfsState, ino: u32) -> Result<Ext2Inod
     let mode = ext2_read_u16_state(state, inode_offset)?;
     let uid = ext2_read_u16_state(state, inode_offset + 2)?;
     let size = ext2_read_u32_state(state, inode_offset + 4)?;
-    let atime = ext2_read_u32_state(state, inode_offset + 8)?;
-    let ctime = ext2_read_u32_state(state, inode_offset + 12)?;
-    let mtime = ext2_read_u32_state(state, inode_offset + 16)?;
+    let extra_isize = ext2_inode_extra_isize(state, inode_offset)?;
+    let mut time_extra = [0u32; 3];
+    let mut time_orig = [0u64; 3];
+    for (i, base_off) in [8usize, 12, 16].into_iter().enumerate() {
+        let base = ext2_read_u32_state(state, inode_offset + base_off)?;
+        let (extra_off, needs) = EXT4_TIME_EXTRA[i];
+        let extra = if extra_isize >= needs {
+            let raw = ext2_read_u32_state(state, inode_offset + extra_off)?;
+            time_extra[i] = raw;
+            Some(raw)
+        } else {
+            None
+        };
+        time_orig[i] = ext4_decode_time(base, extra);
+    }
+    let [atime, ctime, mtime] = time_orig;
     let gid = ext2_read_u16_state(state, inode_offset + 24)?;
     let links_count = ext2_read_u16_state(state, inode_offset + 26)?;
     let block_count_512 = ext2_read_u32_state(state, inode_offset + 28)?;
@@ -3704,6 +3885,8 @@ fn ext2_read_inode_from_state(state: &mut VfsState, ino: u32) -> Result<Ext2Inod
         ino,
         generation,
         blocks_hi,
+        time_extra,
+        time_orig,
     })
 }
 
@@ -3712,7 +3895,7 @@ fn ext2_refresh_alias_nodes(state: &mut VfsState, ext2_ino: u32, inode: &Ext2Ino
     while idx < state.inodes.len() {
         let node = &mut state.inodes[idx];
         if node.used && node.backend == NodeBackend::Ext2 && node.ext2_ino == ext2_ino {
-            node.size = inode.size;
+            node.size = ext2_inode_size64(inode);
             node.mode = inode.mode;
             node.uid = inode.uid;
             node.gid = inode.gid;
@@ -3805,11 +3988,31 @@ fn ext2_max_addressable_file_size(meta: &Ext2Meta) -> Result<usize, i64> {
     blocks.checked_mul(meta.block_size).ok_or(EIO)
 }
 
-fn ext2_effective_max_file_size(meta: &Ext2Meta) -> Result<usize, i64> {
-    Ok(core::cmp::min(
-        TMPFS_MAX_FILE_SIZE,
-        ext2_max_addressable_file_size(meta)?,
-    ))
+/// Largest size a regular file using `extents` (or an indirect map) may
+/// reach: the map's reach (2^32 - 1 blocks for extents), and without
+/// `huge_file` whatever keeps `i_blocks` within 32 bits of sectors (Linux
+/// `ext4_max_size`).
+fn ext2_max_file_size_for(meta: &Ext2Meta, extents: bool) -> Result<u64, i64> {
+    let bs = meta.block_size as u64;
+    let mut max_blocks = if extents {
+        (1u64 << 32) - 1
+    } else {
+        (ext2_max_addressable_file_size(meta)? / meta.block_size) as u64
+    };
+    if (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_HUGE_FILE) == 0 {
+        max_blocks = core::cmp::min(max_blocks, u32::MAX as u64 / (bs / 512));
+    }
+    Ok(max_blocks * bs)
+}
+
+fn ext2_max_file_size(meta: &Ext2Meta, inode: &Ext2Inode) -> Result<u64, i64> {
+    ext2_max_file_size_for(meta, (inode.flags & ext2_bmap::EXT4_EXTENTS_FL) != 0)
+}
+
+/// Largest file size on this filesystem (new files use extents when the
+/// `extent` feature is on).
+fn ext2_fs_max_file_size(meta: &Ext2Meta) -> Result<u64, i64> {
+    ext2_max_file_size_for(meta, (meta.feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) != 0)
 }
 
 fn ext2_logical_blocks_for_size(meta: &Ext2Meta, size: usize) -> Result<usize, i64> {
@@ -4129,11 +4332,9 @@ fn ext2_read_file(
 
     let meta = state.ext2_meta;
     let inode = ext2_read_inode_from_state(state, ino)?;
-    if ext2_inode_size_exceeds_u32(&inode) {
-        return Err(EOVERFLOW);
-    }
-    let size = inode.size as usize;
-    if offset as usize >= size {
+    let size = usize::try_from(ext2_inode_size64(&inode)).map_err(|_| EOVERFLOW)?;
+    let offset = usize::try_from(offset).map_err(|_| EINVAL)?;
+    if offset >= size {
         return Ok(0);
     }
 
@@ -4151,7 +4352,7 @@ fn ext2_read_file(
     }
 
     let mut copied = 0usize;
-    let mut pos = offset as usize;
+    let mut pos = offset;
     while copied < dst.len() && pos < size {
         let block_idx = pos / meta.block_size;
         let block_off = pos % meta.block_size;
@@ -4184,41 +4385,29 @@ fn ext2_write_file(
     append: bool,
 ) -> Result<WriteResult, i64> {
     let meta = state.ext2_meta;
-    let max_size = ext2_effective_max_file_size(&meta)?;
     let journal_handle = ext2_journal::current_handle(state);
 
     let mut inode = ext2_read_inode_from_state(state, ino)?;
-    if ext2_inode_size_exceeds_u32(&inode) {
-        return Err(EFBIG);
-    }
-    let start = if append {
-        inode.size as usize
-    } else {
-        usize::try_from(offset).map_err(|_| EINVAL)?
-    };
-
-    if start > max_size {
-        return Err(ENOSPC);
-    }
+    let max_size = ext2_max_file_size(&meta, &inode)?;
+    let old_size = ext2_inode_size64(&inode);
+    let start = if append { old_size } else { offset };
 
     if src.is_empty() {
         return Ok(WriteResult {
             written: 0,
-            new_offset: start as u64,
+            new_offset: start,
         });
     }
+    if start >= max_size {
+        return Err(EFBIG);
+    }
 
-    let old_size = inode.size as usize;
     if start > old_size {
         ext2_write_zero_range(state, journal_handle, &mut inode, old_size, start)?;
     }
 
-    let room = max_size - start;
-    if room == 0 {
-        return Err(ENOSPC);
-    }
-
-    let count = core::cmp::min(src.len(), room);
+    let count = core::cmp::min(src.len() as u64, max_size - start) as usize;
+    let start = usize::try_from(start).map_err(|_| EFBIG)?;
     let mut copied = 0usize;
     let mut pos = start;
     while copied < count {
@@ -4250,15 +4439,16 @@ fn ext2_write_file(
         pos += chunk;
     }
 
-    let end = start + count;
-    if end > inode.size as usize {
-        inode.size = end as u32;
+    let end = (start + count) as u64;
+    if end > ext2_inode_size64(&inode) {
+        ext2_set_inode_size64(&mut inode, end);
+        ext2_note_large_file(state, end)?;
     }
-    let now = fs_time_tick(state) as u32;
+    let now = fs_time_tick(state);
     inode.mtime = now;
     inode.ctime = now;
     inode.atime = now;
-    inode.block_count_512 = ext2_recalc_inode_block_count_512_state(state, &inode)?;
+    ext2_update_block_count(state, &mut inode)?;
     ext2_journal::with_handle_restartable_phase(
         state,
         journal_handle,
@@ -4328,15 +4518,12 @@ fn ext2_free_indirect_tree_blocks(
 
 fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
     let mut inode = ext2_read_inode_from_state(state, ino)?;
-    if ext2_inode_size_exceeds_u32(&inode) {
-        return Err(EFBIG);
-    }
     let journal_handle = ext2_journal::current_handle(state);
     bmap_free_all_blocks(state, journal_handle, &mut inode, true)?;
 
-    inode.size = 0;
+    ext2_set_inode_size64(&mut inode, 0);
     inode.block_count_512 = ext2_inode_acl_sectors(&state.ext2_meta, &inode);
-    let now = fs_time_tick(state) as u32;
+    let now = fs_time_tick(state);
     inode.mtime = now;
     inode.ctime = now;
     inode.atime = now;
@@ -4351,23 +4538,20 @@ fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
     Ok(())
 }
 
-fn ext2_truncate_to_length(state: &mut VfsState, ino: u32, length: usize) -> Result<(), i64> {
+fn ext2_truncate_to_length(state: &mut VfsState, ino: u32, length: u64) -> Result<(), i64> {
     let meta = state.ext2_meta;
-    let max_size = ext2_effective_max_file_size(&meta)?;
-    if length > max_size || length > u32::MAX as usize {
-        return Err(ENOSPC);
-    }
-
     let mut inode = ext2_read_inode_from_state(state, ino)?;
-    if ext2_inode_size_exceeds_u32(&inode) {
+    if length > ext2_max_file_size(&meta, &inode)? {
         return Err(EFBIG);
     }
     let journal_handle = ext2_journal::current_handle(state);
-    let old_size = inode.size as usize;
+    let old_size = ext2_inode_size64(&inode);
 
     if length > old_size {
         ext2_write_zero_range(state, journal_handle, &mut inode, old_size, length)?;
     } else if length < old_size {
+        let old_size = usize::try_from(old_size).map_err(|_| EFBIG)?;
+        let length = length as usize;
         let old_blocks = ext2_logical_blocks_for_size(&meta, old_size)?;
         let new_blocks = ext2_logical_blocks_for_size(&meta, length)?;
 
@@ -4393,8 +4577,13 @@ fn ext2_truncate_to_length(state: &mut VfsState, ino: u32, length: usize) -> Res
             }
         }
 
+        // Skip holes: a sparse multi-GiB file has few mapped blocks.
         let mut idx = new_blocks;
         while idx < old_blocks {
+            idx = match ext2_bmap::ext2_next_mapped_block(state, &inode, idx)? {
+                Some(next) if next < old_blocks => next,
+                _ => break,
+            };
             let step_credits = ext2_estimate_detach_step_credits(state, &inode, idx)?;
             ext2_journal::with_handle_restartable_phase(
                 state,
@@ -4413,12 +4602,13 @@ fn ext2_truncate_to_length(state: &mut VfsState, ino: u32, length: usize) -> Res
         }
     }
 
-    inode.size = length as u32;
-    let now = fs_time_tick(state) as u32;
+    ext2_set_inode_size64(&mut inode, length);
+    ext2_note_large_file(state, length)?;
+    let now = fs_time_tick(state);
     inode.mtime = now;
     inode.ctime = now;
     inode.atime = now;
-    inode.block_count_512 = ext2_recalc_inode_block_count_512_state(state, &inode)?;
+    ext2_update_block_count(state, &mut inode)?;
     ext2_journal::with_handle_restartable_phase(
         state,
         journal_handle,
@@ -4509,13 +4699,13 @@ fn ext2_free_inode_blocks(state: &mut VfsState, inode: &mut Ext2Inode) -> Result
         // i_block holds the inline target text, not block pointers.
         inode.blocks = [0; 15];
         ext2_release_xattr_block(state, journal_handle, inode)?;
-        inode.size = 0;
+        ext2_set_inode_size64(inode, 0);
         inode.block_count_512 = 0;
         return Ok(());
     }
     ext2_release_xattr_block(state, journal_handle, inode)?;
     bmap_free_all_blocks(state, journal_handle, inode, false)?;
-    inode.size = 0;
+    ext2_set_inode_size64(inode, 0);
     inode.block_count_512 = 0;
     Ok(())
 }
@@ -4616,7 +4806,7 @@ fn ext2_create_child_on_disk(
     let is_dir = file_type == FileType::Directory;
     let ino = ext2_alloc_inode(state, journal_handle, is_dir)?;
     let meta = state.ext2_meta;
-    let now = fs_time_tick(state) as u32;
+    let now = fs_time_tick(state);
 
     let mut inode = Ext2Inode {
         mode: match file_type {
@@ -4640,6 +4830,8 @@ fn ext2_create_child_on_disk(
         ino,
         generation: 0,
         blocks_hi: 0,
+        time_extra: [0; 3],
+        time_orig: [0; 3],
     };
 
     if let Err(err) = ext2_init_new_inode_layout(state, &mut inode) {
@@ -4657,7 +4849,7 @@ fn ext2_create_child_on_disk(
             }
         };
         inode.size = meta.block_size as u32;
-        inode.block_count_512 = ext2_recalc_inode_block_count_512_state(state, &inode)?;
+        ext2_update_block_count(state, &mut inode)?;
 
         let tail = ext2_dir_tail_len(state);
         {
@@ -4829,7 +5021,7 @@ fn ext2_import_node(
     {
         let node_ref = &mut state.inodes[node as usize];
         node_ref.ext2_ino = inode_num;
-        node_ref.size = ext2_inode.size;
+        node_ref.size = ext2_inode_size64(&ext2_inode);
         node_ref.mode = ext2_inode.mode;
         node_ref.uid = ext2_inode.uid;
         node_ref.gid = ext2_inode.gid;
@@ -4902,7 +5094,7 @@ fn ext2_ensure_dir_children_loaded(state: &mut VfsState, dir: u16) -> Result<(),
     }
 
     let node_ref = &mut state.inodes[dir as usize];
-    node_ref.size = ext2_inode.size;
+    node_ref.size = ext2_inode_size64(&ext2_inode);
     node_ref.mode = ext2_inode.mode;
     node_ref.uid = ext2_inode.uid;
     node_ref.gid = ext2_inode.gid;
@@ -5265,24 +5457,17 @@ fn ext2_estimate_write_credits(
 ) -> Result<usize, i64> {
     let meta = state.ext2_meta;
     let inode = ext2_read_inode_from_state(state, ino)?;
-    let max_size = ext2_effective_max_file_size(&meta)?;
-    let start = if append {
-        inode.size as usize
-    } else {
-        usize::try_from(offset).map_err(|_| EINVAL)?
-    };
-    if start > max_size {
+    let max_size = ext2_max_file_size(&meta, &inode)?;
+    let old_size = ext2_inode_size64(&inode);
+    let start = if append { old_size } else { offset };
+    if start >= max_size {
         return Ok(EXT2_JOURNAL_CREDITS_VARIABLE_BASE);
     }
-    let room = max_size.saturating_sub(start);
-    let write_len = core::cmp::min(src_len, room);
+    let write_len = core::cmp::min(src_len as u64, max_size - start) as usize;
+    let start = usize::try_from(start).map_err(|_| EFBIG)?;
     let end = start.checked_add(write_len).ok_or(EIO)?;
-    let old_size = inode.size as usize;
-    let gap_blocks = if start > old_size {
-        ext2_count_blocks_in_byte_range(meta.block_size, old_size, start)?
-    } else {
-        0
-    };
+    // Growth is sparse: only the block holding the old end is touched.
+    let gap_blocks: usize = if start as u64 > old_size { 1 } else { 0 };
     let write_blocks = ext2_count_blocks_in_byte_range(meta.block_size, start, end)?;
     gap_blocks
         .checked_add(write_blocks)
@@ -5304,17 +5489,14 @@ fn ext2_estimate_truncate_to_zero_credits(state: &mut VfsState, ino: u32) -> Res
 fn ext2_estimate_truncate_to_length_credits(
     state: &mut VfsState,
     ino: u32,
-    length: usize,
+    length: u64,
 ) -> Result<usize, i64> {
     let meta = state.ext2_meta;
     let inode = ext2_read_inode_from_state(state, ino)?;
-    let old_size = inode.size as usize;
-    let changed_blocks = if length > old_size {
-        ext2_count_blocks_in_byte_range(meta.block_size, old_size, length)?
-    } else {
-        ext2_count_blocks_in_byte_range(meta.block_size, length, old_size)?
-    };
     let allocated = ext2_allocated_block_count_from_inode(&meta, &inode)?;
+    // Only mapped blocks change (growth is sparse; shrinking frees what is
+    // mapped), plus the partial block at either end.
+    let changed_blocks = if length > ext2_inode_size64(&inode) { 1 } else { allocated + 1 };
     changed_blocks
         .checked_add(allocated)
         .and_then(|blocks| blocks.checked_mul(2))
@@ -5539,6 +5721,7 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
     let node_file_type = node.file_type;
     let node_backend = node.backend;
     let node_ext2_ino = node.ext2_ino;
+    let node_unlinked = node.unlinked;
 
     let mut stat = FileStat {
         ino: node_ino,
@@ -5571,6 +5754,10 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
         stat.atime = ext.atime as u64;
         stat.mtime = ext.mtime as u64;
         stat.ctime = ext.ctime as u64;
+    }
+    if node_unlinked {
+        // Removed but still open: no names left (Linux reports 0 links).
+        stat.nlink = 0;
     }
 
     Ok(stat)
@@ -5628,25 +5815,41 @@ fn unlink_at_inner(
         }
 
         let mut child_ext = ext2_read_inode_from_state(state, child_ext2_ino)?;
+        // Still open (through this name or an earlier-removed one): keep the
+        // inode and its blocks, parked on the orphan list until the last
+        // release (or the next mount after a crash) frees them.
+        let busy = ext2_inode_busy(state, child_ext2_ino);
         if remove_dir {
             if !ext2_directory_is_empty(state, child_ext2_ino)? {
                 return Err(ENOTEMPTY);
             }
-            ext2_free_inode_blocks(state, &mut child_ext)?;
-            ext2_free_inode(state, journal_handle, child_ext2_ino, true)?;
+            if busy {
+                child_ext.links_count = 0;
+                child_ext.ctime = fs_time_tick(state);
+                ext2_write_inode_to_state(state, child_ext2_ino, &child_ext)?;
+                ext2_orphan_add(state, child_ext2_ino)?;
+            } else {
+                ext2_free_inode_blocks(state, &mut child_ext)?;
+                ext2_free_inode(state, journal_handle, child_ext2_ino, true)?;
+            }
             let mut parent_ext = ext2_read_inode_from_state(state, parent_ino)?;
             parent_ext.links_count = ext2_dir_links_dec(&state.ext2_meta, parent_ext.links_count);
-            parent_ext.mtime = fs_time_tick(state) as u32;
+            parent_ext.mtime = fs_time_tick(state);
             parent_ext.ctime = parent_ext.mtime;
             ext2_write_inode_to_state(state, parent_ino, &parent_ext)?;
         } else {
             if child_ext.links_count > 1 {
                 child_ext.links_count -= 1;
-                let now = fs_time_tick(state) as u32;
+                let now = fs_time_tick(state);
                 child_ext.ctime = now;
                 child_ext.mtime = now;
                 ext2_write_inode_to_state(state, child_ext2_ino, &child_ext)?;
                 ext2_refresh_alias_nodes(state, child_ext2_ino, &child_ext);
+            } else if busy {
+                child_ext.links_count = 0;
+                child_ext.ctime = fs_time_tick(state);
+                ext2_write_inode_to_state(state, child_ext2_ino, &child_ext)?;
+                ext2_orphan_add(state, child_ext2_ino)?;
             } else {
                 ext2_free_inode_blocks(state, &mut child_ext)?;
                 ext2_free_inode(state, journal_handle, child_ext2_ino, false)?;
@@ -5655,9 +5858,279 @@ fn unlink_at_inner(
     }
 
     remove_child(state, parent, child)?;
-    clear_inode(&mut state.inodes[child as usize]);
+    if state.inodes[child as usize].open_count > 0 {
+        state.inodes[child as usize].unlinked = true;
+    } else {
+        clear_inode(&mut state.inodes[child as usize]);
+    }
     touch_inode_metadata(state, parent, true, true, true);
     Ok(())
+}
+
+/// Some live VFS node for ext2 inode `ino` is still referenced.
+fn ext2_inode_busy(state: &VfsState, ino: u32) -> bool {
+    state.inodes.iter().any(|n| {
+        n.used && n.backend == NodeBackend::Ext2 && n.ext2_ino == ino && n.open_count > 0
+    })
+}
+
+const EXT2_SB_LAST_ORPHAN: usize = EXT2_SUPERBLOCK_OFFSET + 0xE8;
+/// `i_dtime` links orphan inodes into a list headed by `s_last_orphan`.
+const EXT2_INODE_DTIME: usize = 20;
+
+fn ext2_inode_dtime(state: &mut VfsState, ino: u32) -> Result<u32, i64> {
+    let meta = state.ext2_meta;
+    let off = ext2_inode_offset_in_state(state, &meta, ino)?;
+    ext2_ensure_range_resident(state, off, meta.inode_size)?;
+    ext2_read_u32_state(state, off + EXT2_INODE_DTIME)
+}
+
+fn ext2_set_inode_dtime(state: &mut VfsState, ino: u32, value: u32) -> Result<(), i64> {
+    let meta = state.ext2_meta;
+    let off = ext2_inode_offset_in_state(state, &meta, ino)?;
+    ext2_ensure_range_resident(state, off, meta.inode_size)?;
+    ext2_write_u32_state(state, off + EXT2_INODE_DTIME, value)?;
+    ext2_update_inode_csum(state, ino)
+}
+
+/// Pushes `ino` onto the on-disk orphan list (`ext4_orphan_add`, classic
+/// `s_last_orphan` list), so e2fsck or the next mount finishes the deletion
+/// after a crash.
+fn ext2_orphan_add(state: &mut VfsState, ino: u32) -> Result<(), i64> {
+    let head = ext2_read_u32_state(state, EXT2_SB_LAST_ORPHAN)?;
+    ext2_set_inode_dtime(state, ino, head)?;
+    ext2_write_u32_state(state, EXT2_SB_LAST_ORPHAN, ino)
+}
+
+/// Unlinks `ino` from the orphan list (`ext4_orphan_del`).
+fn ext2_orphan_del(state: &mut VfsState, ino: u32) -> Result<(), i64> {
+    let next = ext2_inode_dtime(state, ino)?;
+    let head = ext2_read_u32_state(state, EXT2_SB_LAST_ORPHAN)?;
+    if head == ino {
+        ext2_write_u32_state(state, EXT2_SB_LAST_ORPHAN, next)?;
+    } else {
+        let mut cur = head;
+        let mut guard = state.ext2_meta.total_inodes;
+        while cur != 0 && guard > 0 {
+            if cur > state.ext2_meta.total_inodes {
+                return Err(EIO);
+            }
+            let after = ext2_inode_dtime(state, cur)?;
+            if after == ino {
+                ext2_set_inode_dtime(state, cur, next)?;
+                break;
+            }
+            cur = after;
+            guard -= 1;
+        }
+    }
+    ext2_set_inode_dtime(state, ino, 0)
+}
+
+/// Frees an orphaned inode whose last name is gone (links 0) or trims the
+/// blocks past `i_size` of one parked for a truncate (links > 0), as Linux's
+/// `ext4_orphan_cleanup` does. Leaves it off the list.
+fn ext2_orphan_finish(state: &mut VfsState, ino: u32) -> Result<(), i64> {
+    let mut ext = ext2_read_inode_from_state(state, ino)?;
+    let is_dir = ext2_mode_to_filetype(ext.mode) == Some(FileType::Directory);
+    let credits = ext2_estimate_truncate_to_zero_credits(state, ino)?;
+    let plan = ext2_plan_variable_journal_credits(credits);
+    with_ext2_journal_scope_credit_policy(
+        state,
+        true,
+        plan.initial_credits,
+        true,
+        plan.growth_chunk,
+        |state| {
+            ext2_orphan_del(state, ino)?;
+            if ext.links_count == 0 {
+                let handle = ext2_journal::current_handle(state);
+                ext2_free_inode_blocks(state, &mut ext)?;
+                // i_dtime stays 0 (ext2_orphan_del cleared it): without a
+                // wall clock a tick count would look like an orphan-list
+                // link to e2fsck.
+                ext2_free_inode(state, handle, ino, is_dir)
+            } else if (ext.mode & EXT2_S_IFMT) == EXT2_S_IFREG {
+                ext2_trim_blocks_past_size(state, ino)
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+/// Frees every mapped block past `i_size` (the end of an interrupted
+/// truncate, whose size was already lowered).
+fn ext2_trim_blocks_past_size(state: &mut VfsState, ino: u32) -> Result<(), i64> {
+    let meta = state.ext2_meta;
+    let mut inode = ext2_read_inode_from_state(state, ino)?;
+    let size = usize::try_from(ext2_inode_size64(&inode)).map_err(|_| EFBIG)?;
+    let keep = ext2_logical_blocks_for_size(&meta, size)?;
+    let handle = ext2_journal::current_handle(state);
+    let mut idx = keep;
+    while let Some(next) = ext2_bmap::ext2_next_mapped_block(state, &inode, idx)? {
+        let step_credits = ext2_estimate_detach_step_credits(state, &inode, next)?;
+        ext2_journal::with_handle_restartable_phase(
+            state,
+            handle,
+            Ext2JournalPhaseKind::IndirectUnlink,
+            step_credits,
+            |state| {
+                let removed = ext2_detach_data_block(state, handle, &mut inode, next)?;
+                if removed != 0 {
+                    ext2_free_block(state, handle, removed)?;
+                }
+                Ok(())
+            },
+        )?;
+        idx = next + 1;
+    }
+    ext2_update_block_count(state, &mut inode)?;
+    ext2_write_inode_to_state(state, ino, &inode)?;
+    ext2_refresh_alias_nodes(state, ino, &inode);
+    Ok(())
+}
+
+const EXT4_SB_ORPHAN_FILE_INUM: usize = EXT2_SUPERBLOCK_OFFSET + 0x280;
+const EXT4_ORPHAN_BLOCK_MAGIC: u32 = 0x0b10_ca04;
+
+/// Checksum of one orphan file block (`ext4_orphan_file_block_csum`):
+/// crc32c over the block's physical number (le64) and the entry array,
+/// seeded by the orphan file inode.
+fn ext4_orphan_block_csum(seed: u32, phys: u64, block: &[u8]) -> u32 {
+    let csum = ext4_csum::crc32c(seed, &phys.to_le_bytes());
+    ext4_csum::crc32c(csum, &block[..block.len() - 8])
+}
+
+/// `orphan_file`: checks every orphan block's magic and checksum (a bad
+/// block fails the mount with `EIO`, as on Linux). With `process` (read-write
+/// mounts) and `orphan_present` set, finishes each recorded orphan, clears
+/// its entry, and clears `orphan_present`. Returns the orphans processed.
+fn ext2_check_orphan_file(state: &mut VfsState, process: bool) -> Result<u32, i64> {
+    if (state.ext2_meta.feature_compat & EXT4_FEATURE_COMPAT_ORPHAN_FILE) == 0 {
+        return Ok(0);
+    }
+    let ino = ext2_read_u32_state(state, EXT4_SB_ORPHAN_FILE_INUM)?;
+    if ino == 0 || ino > state.ext2_meta.total_inodes {
+        ext2_report(state, "orphan file inode", ino as u64);
+        return Err(EIO);
+    }
+    let file = ext2_read_inode_from_state(state, ino)?;
+    let bs = state.ext2_meta.block_size;
+    let blocks = (ext2_inode_size64(&file) / bs as u64) as usize;
+    let seed = state
+        .ext4_csum
+        .filter(|c| c.metadata_csum)
+        .map(|c| c.inode_seed_for(ino, file.generation));
+    let present =
+        (state.ext2_meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT) != 0;
+    let mut processed = 0u32;
+    for lblk in 0..blocks {
+        let phys = ext2_data_block_for_logical_index_state(state, &file, lblk)?;
+        if phys == 0 {
+            ext2_report(state, "orphan file block", lblk as u64);
+            return Err(EIO);
+        }
+        let (magic_ok, csum_ok, entries) = {
+            let blk = ext2_block_slice_state(state, phys)?;
+            let magic = read_u32_le(blk, bs - 8)?;
+            let stored = read_u32_le(blk, bs - 4)?;
+            let csum_ok = seed.map_or(true, |s| stored == ext4_orphan_block_csum(s, phys as u64, blk));
+            let mut entries = Vec::new();
+            if present && process {
+                for slot in 0..(bs - 8) / 4 {
+                    let entry = read_u32_le(blk, slot * 4)?;
+                    if entry != 0 {
+                        entries.try_reserve(1).map_err(|_| ENOSPC)?;
+                        entries.push((slot, entry));
+                    }
+                }
+            }
+            (magic == EXT4_ORPHAN_BLOCK_MAGIC, csum_ok, entries)
+        };
+        if !magic_ok || !csum_ok {
+            ext2_report(state, "orphan file block checksum", phys as u64);
+            return Err(EIO);
+        }
+        for (slot, orphan) in entries {
+            if orphan > state.ext2_meta.total_inodes {
+                ext2_report(state, "orphan file entry", orphan as u64);
+                continue;
+            }
+            ext2_orphan_finish(state, orphan)?;
+            with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_METADATA_UPDATE, |state| {
+                {
+                    let blk = ext2_block_slice_mut_state(state, phys)?;
+                    write_u32_le(blk, slot * 4, 0)?;
+                    if let Some(s) = seed {
+                        let value = ext4_orphan_block_csum(s, phys as u64, blk);
+                        write_u32_le(blk, bs - 4, value)?;
+                    }
+                }
+                ext2_mark_dirty_block(state, phys)
+            })?;
+            processed += 1;
+        }
+    }
+    if present && process {
+        with_ext2_journal_scope_credits(state, true, EXT2_JOURNAL_CREDITS_METADATA_UPDATE, |state| {
+            state.ext2_meta.feature_ro_compat &= !EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT;
+            let value = state.ext2_meta.feature_ro_compat;
+            ext2_write_u32_state(state, EXT2_SUPERBLOCK_OFFSET + 100, value)
+        })?;
+    }
+    Ok(processed)
+}
+
+/// Mount-time orphan processing (read-write mounts, after journal
+/// recovery): every inode on the `s_last_orphan` list is finished. A
+/// damaged list (an inode number out of range or a loop) stops processing
+/// and is reported; e2fsck repairs it.
+fn ext2_process_orphans(state: &mut VfsState) -> Result<u32, i64> {
+    let mut processed = 0u32;
+    let mut ino = ext2_read_u32_state(state, EXT2_SB_LAST_ORPHAN)?;
+    let total = state.ext2_meta.total_inodes;
+    while ino != 0 {
+        if ino > total || processed > total {
+            ext2_report(state, "orphan list", ino as u64);
+            break;
+        }
+        ext2_orphan_finish(state, ino)?;
+        processed += 1;
+        ino = ext2_read_u32_state(state, EXT2_SB_LAST_ORPHAN)?;
+    }
+    Ok(processed)
+}
+
+/// Drops a reference; the last one on a removed node frees it. Returns
+/// true when that changed the ext2 filesystem (the caller syncs).
+fn inode_release_inner(state: &mut VfsState, inode: u16) -> Result<bool, i64> {
+    if (inode as usize) >= state.inodes.len() || !state.inodes[inode as usize].used {
+        return Ok(false);
+    }
+    let node = &mut state.inodes[inode as usize];
+    if node.open_count == 0 {
+        return Ok(false);
+    }
+    node.open_count -= 1;
+    if node.open_count > 0 || !node.unlinked {
+        return Ok(false);
+    }
+    let (backend, ext2_ino) = (node.backend, node.ext2_ino);
+    clear_inode(&mut state.inodes[inode as usize]);
+    if backend != NodeBackend::Ext2 || ext2_ino == 0 || !state.ext2_mounted || state.ext2_read_only
+    {
+        return Ok(false);
+    }
+    if ext2_inode_busy(state, ext2_ino) {
+        return Ok(false);
+    }
+    let ext = ext2_read_inode_from_state(state, ext2_ino)?;
+    if ext.links_count != 0 {
+        return Ok(false);
+    }
+    ext2_orphan_finish(state, ext2_ino)?;
+    Ok(true)
 }
 
 fn is_descendant_of(state: &VfsState, ancestor: u16, node: u16) -> bool {
@@ -5764,7 +6237,7 @@ fn rename_at_inner(
         }
 
         let mut ext_child = ext2_read_inode_from_state(state, child_ext2_ino)?;
-        let now = fs_time_tick(state) as u32;
+        let now = fs_time_tick(state);
         ext_child.ctime = now;
         ext_child.mtime = now;
         ext2_write_inode_to_state(state, child_ext2_ino, &ext_child)?;
@@ -5844,7 +6317,7 @@ fn link_at_inner(
                 old.links_count = old_links;
                 old.ctime = now;
 
-                link.size = old_size as u32;
+                link.size = old_size as u64;
                 link.data = Vec::new();
                 link.data.try_reserve_exact(old_size).map_err(|_| ENOSPC)?;
                 link.data.extend_from_slice(&old.data[..old_size]);
@@ -5878,7 +6351,7 @@ fn link_at_inner(
 
             let mut ext_inode = ext2_read_inode_from_state(state, old_ext2_ino)?;
             ext_inode.links_count = ext_inode.links_count.saturating_add(1);
-            ext_inode.ctime = fs_time_tick(state) as u32;
+            ext_inode.ctime = fs_time_tick(state);
             ext2_write_inode_to_state(state, old_ext2_ino, &ext_inode)?;
 
             let new_inode = match alloc_inode(
@@ -5970,7 +6443,7 @@ fn symlink_at_inner(
             )?;
             {
                 let node = &mut state.inodes[inode as usize];
-                node.size = target_bytes.len() as u32;
+                node.size = target_bytes.len() as u64;
                 node.data.try_reserve_exact(target_bytes.len()).map_err(|_| ENOSPC)?;
                 node.data.extend_from_slice(target_bytes);
             }
@@ -6047,7 +6520,7 @@ fn symlink_at_inner(
             {
                 let node = &mut state.inodes[inode as usize];
                 node.ext2_ino = ext2_ino;
-                node.size = child.size;
+                node.size = ext2_inode_size64(&child);
                 node.mode = child.mode;
                 node.uid = child.uid;
                 node.gid = child.gid;
@@ -6135,13 +6608,13 @@ fn set_times_inner(state: &mut VfsState, inode: u16, atime: u64, mtime: u64) -> 
         }
         NodeBackend::Ext2 => {
             let ext2_ino = state.inodes[inode as usize].ext2_ino;
-            if ext2_ino == 0 || atime > u32::MAX as u64 || mtime > u32::MAX as u64 {
+            if ext2_ino == 0 {
                 return Err(EINVAL);
             }
             let mut ext_inode = ext2_read_inode_from_state(state, ext2_ino)?;
-            ext_inode.atime = atime as u32;
-            ext_inode.mtime = mtime as u32;
-            ext_inode.ctime = ctime as u32;
+            ext_inode.atime = atime;
+            ext_inode.mtime = mtime;
+            ext_inode.ctime = ctime;
             ext2_write_inode_to_state(state, ext2_ino, &ext_inode)?;
             ext2_refresh_alias_nodes(state, ext2_ino, &ext_inode);
             Ok(())
@@ -6180,7 +6653,7 @@ fn chmod_inner(state: &mut VfsState, inode: u16, mode: u16) -> Result<(), i64> {
             let mut ext_inode = ext2_read_inode_from_state(state, ext2_ino)?;
             let file_type_bits = ext_inode.mode & EXT2_S_IFMT;
             ext_inode.mode = file_type_bits | (mode & 0o7777);
-            ext_inode.ctime = ctime as u32;
+            ext_inode.ctime = ctime;
             ext2_write_inode_to_state(state, ext2_ino, &ext_inode)?;
             ext2_refresh_alias_nodes(state, ext2_ino, &ext_inode);
             Ok(())
@@ -6230,7 +6703,7 @@ fn chown_inner(state: &mut VfsState, inode: u16, uid: u32, gid: u32) -> Result<(
             let mut ext_inode = ext2_read_inode_from_state(state, ext2_ino)?;
             ext_inode.uid = new_uid;
             ext_inode.gid = new_gid;
-            ext_inode.ctime = ctime as u32;
+            ext_inode.ctime = ctime;
             ext2_write_inode_to_state(state, ext2_ino, &ext_inode)?;
             ext2_refresh_alias_nodes(state, ext2_ino, &ext_inode);
             Ok(())
@@ -6299,7 +6772,7 @@ pub fn inode_path(inode: u16, out: &mut [u8]) -> Result<usize, i64> {
             chain.try_reserve(1).map_err(|_| ENOSPC)?;
             chain.push(cur);
             let node = &state.inodes[cur as usize];
-            if !node.used || (node.parent as usize) >= state.inodes.len() {
+            if !node.used || node.unlinked || (node.parent as usize) >= state.inodes.len() {
                 return Err(ENOENT);
             }
             cur = node.parent;
@@ -6324,6 +6797,26 @@ pub fn inode_path(inode: u16, out: &mut [u8]) -> Result<usize, i64> {
         }
         Ok(len)
     })
+}
+
+/// Takes a reference on `inode` (an open fd or a working directory). A
+/// referenced node survives unlink/rmdir until `inode_release`.
+pub fn inode_retain(inode: u16) {
+    with_state(|state| {
+        if let Some(node) = state.inodes.get_mut(inode as usize) {
+            if node.used {
+                node.open_count = node.open_count.saturating_add(1);
+            }
+        }
+    })
+}
+
+/// Drops a reference taken by `inode_retain`. Releasing the last reference
+/// to an unlinked node frees it; for ext2 its inode and blocks are released
+/// and taken off the orphan list. Returns true when the ext2 filesystem
+/// changed (block-backed callers then sync it).
+pub fn inode_release(inode: u16) -> bool {
+    with_state(|state| inode_release_inner(state, inode).unwrap_or(false))
 }
 
 pub fn inode_is_dir(inode: u16) -> Result<bool, i64> {
@@ -6600,7 +7093,7 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
 
                 start += count;
                 if start > node_ref.size as usize {
-                    node_ref.size = start as u32;
+                    node_ref.size = start as u64;
                 }
 
                 WriteResult {
@@ -6624,7 +7117,7 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
                     |state| ext2_write_file(state, ext2_ino, offset, src, append),
                 )?;
                 state.inodes[inode as usize].size =
-                    core::cmp::max(state.inodes[inode as usize].size, result.new_offset as u32);
+                    core::cmp::max(state.inodes[inode as usize].size, result.new_offset);
                 result
             }
             NodeBackend::ProcUptime
@@ -6677,7 +7170,7 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
                 if node_ext2_ino == 0 {
                     return Err(EIO);
                 }
-                ext2_read_inode_from_state(state, node_ext2_ino)?.size as u64
+                ext2_inode_size64(&ext2_read_inode_from_state(state, node_ext2_ino)?)
             }
             NodeBackend::ProcUptime
             | NodeBackend::ProcMeminfo
@@ -6716,7 +7209,7 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
                 }
             }
             NodeBackend::Ext2 => {
-                let max_size = ext2_effective_max_file_size(&state.ext2_meta)?;
+                let max_size = ext2_fs_max_file_size(&state.ext2_meta)?;
                 if target > max_size as i128 {
                     return Err(EINVAL);
                 }
@@ -6767,7 +7260,7 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
                 if node.ext2_ino == 0 {
                     return Err(EIO);
                 }
-                ext2_read_inode_from_state(state, node.ext2_ino)?.size as u64
+                ext2_inode_size64(&ext2_read_inode_from_state(state, node.ext2_ino)?)
             }
             NodeBackend::ProcUptime
             | NodeBackend::ProcMeminfo
@@ -6880,14 +7373,14 @@ pub fn truncate_to(inode: u16, length: u64) -> Result<(), i64> {
                     node.data.try_reserve(grow).map_err(|_| ENOSPC)?;
                 }
                 node.data.resize(new_len, 0);
-                node.size = new_len as u32;
+                node.size = new_len as u64;
                 touch_inode_metadata(state, inode, false, true, true);
             }
             NodeBackend::Ext2 => {
                 if ext2_ino == 0 {
                     return Err(EIO);
                 }
-                let new_len = usize::try_from(length).map_err(|_| EINVAL)?;
+                let new_len = length;
                 let credits = ext2_estimate_truncate_to_length_credits(state, ext2_ino, new_len)?;
                 let plan = ext2_plan_variable_journal_credits(credits);
                 with_ext2_journal_scope_credit_policy(
@@ -6898,7 +7391,7 @@ pub fn truncate_to(inode: u16, length: u64) -> Result<(), i64> {
                     plan.growth_chunk,
                     |state| {
                     ext2_truncate_to_length(state, ext2_ino, new_len)?;
-                    state.inodes[inode as usize].size = new_len as u32;
+                    state.inodes[inode as usize].size = new_len;
                     touch_inode_metadata(state, inode, false, true, true);
                     Ok(())
                 },
@@ -7160,6 +7653,8 @@ mod tests {
             ino: 0,
             generation: 0,
             blocks_hi: 0,
+            time_extra: [0; 3],
+            time_orig: [0; 3],
         };
         for (idx, block) in journal_blocks.iter().enumerate() {
             journal_inode.blocks[idx] = *block;
@@ -7257,6 +7752,8 @@ mod tests {
             ino: 0,
             generation: 0,
             blocks_hi: 0,
+            time_extra: [0; 3],
+            time_orig: [0; 3],
         };
         for (idx, block) in journal_blocks.iter().enumerate() {
             journal_inode.blocks[idx] = *block;
@@ -7734,6 +8231,8 @@ mod tests {
             ino: 0,
             generation: 0,
             blocks_hi: 0,
+            time_extra: [0; 3],
+            time_orig: [0; 3],
         };
 
         inode.blocks[0] = 2;
@@ -9792,9 +10291,14 @@ mod tests {
 
         let _ctx = mount_ext2_backend_image(SAMPLE_EXT2, head_len);
 
+        // Block 1 is only half covered by the head: if mount reads it (the
+        // orphan check reads the superblock), it must come from the backend.
         with_state(|state| {
             assert!(ext2_block_cached(state, 0));
-            assert!(!ext2_block_cached(state, 1));
+            if ext2_block_cached(state, 1) {
+                let idx = ext2_cache_find(state, 1).unwrap();
+                assert_eq!(&state.ext2_cached_blocks[idx].data[..], &SAMPLE_EXT2[1024..2048]);
+            }
         });
     }
 
@@ -10287,28 +10791,461 @@ mod tests {
         assert_eq!(ext2_free_counts().0, free_blocks_before);
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Files past 4 GiB on 1 KiB-block ext3 (indirect maps): reads, writes
+    /// and truncation use the full 64-bit size, growth stays sparse, and the
+    /// result is exported for e2fsck (PEETOS_EXT3_LARGE_FSCK_IMAGE).
     #[test]
-    fn ext3_large_file_reports_full_size_and_refuses_32bit_io() {
+    fn ext3_large_files_use_64bit_sizes() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+
+        let opened = open("/mnt/ext2/large.bin", O_RDWR, 0).expect("open large file");
+        assert_eq!(stat(opened.inode).unwrap().size, 5 * GIB);
+        assert_eq!(seek(opened.inode, 0, 0, SEEK_END).unwrap(), 5 * GIB);
+        let mut buf = [0xAAu8; 16];
+        let n = read(opened.inode, 4 * GIB, &mut buf).expect("read past 4 GiB");
+        assert_eq!((n, buf), (16, [0u8; 16]), "hole reads as zeros");
+        let (free_before, _) = ext2_free_counts();
+        let wrote = write(opened.inode, 5 * GIB + 100, b"beyond five", false).unwrap();
+        assert_eq!(wrote.new_offset, 5 * GIB + 111);
+        let (free_after, _) = ext2_free_counts();
+        assert!(free_before - free_after <= 4, "sparse growth allocates the block and its maps");
+        let n = read(opened.inode, 5 * GIB + 100, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"beyond five");
+        // Past the double-indirect reach (~16 MiB... 1 KiB blocks reach
+        // 16 GiB through triple-indirect tables).
+        let _ = write(opened.inode, 15 * GIB, b"triple", false).unwrap();
+        assert_eq!(stat(opened.inode).unwrap().size, 15 * GIB + 6);
+        let max = ext2_max_file_size_for(&with_state(|s| s.ext2_meta), false).unwrap();
+        assert_eq!(write(opened.inode, max, b"x", false).unwrap_err(), EFBIG);
+        truncate_to(opened.inode, 5 * GIB + 105).unwrap();
+        assert_eq!(stat(opened.inode).unwrap().size, 5 * GIB + 105);
+        let n = read(opened.inode, 5 * GIB + 100, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"beyon");
+        assert_eq!(read(opened.inode, 15 * GIB, &mut buf).unwrap(), 0);
+
+        // A new file grows past 4 GiB too.
+        let big = open("/mnt/ext2/big_new.bin", O_CREAT | O_RDWR, 0).unwrap();
+        let _ = write(big.inode, 6 * GIB, b"six", false).unwrap();
+        truncate_to(big.inode, 7 * GIB).unwrap();
+        assert_eq!(stat(big.inode).unwrap().size, 7 * GIB);
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        let synced = ctx.image.clone();
+        if let Ok(path) = std::env::var("PEETOS_EXT3_LARGE_FSCK_IMAGE") {
+            std::fs::write(&path, &synced).expect("write fsck image");
+        }
+
+        init();
+        let _ctx2 = mount_ext2_backend_image(&synced, 4096);
+        let big = open("/mnt/ext2/big_new.bin", O_RDONLY, 0).unwrap();
+        assert_eq!(stat(big.inode).unwrap().size, 7 * GIB);
+        let n = read(big.inode, 6 * GIB, &mut buf).unwrap();
+        assert_eq!(&buf[..3], b"six");
+        assert_eq!(n, 16);
+        // O_TRUNC and unlink release everything.
+        let (free_before, _) = ext2_free_counts();
+        let _ = open("/mnt/ext2/big_new.bin", O_WRONLY | O_TRUNC, 0).unwrap();
+        unlink("/mnt/ext2/large.bin").unwrap();
+        assert!(ext2_free_counts().0 > free_before);
+    }
+
+    /// Extent files: the 32 KiB write cap is gone (dense megabytes), files
+    /// grow sparsely to 100 GiB, and shrinking a sparse file skips its holes.
+    /// Exported as PEETOS_EXT4_LARGE_FSCK_IMAGE.
+    #[test]
+    fn ext4_large_sparse_and_dense_files() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext4();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+
+        let dense = open("/mnt/ext2/dense.bin", O_CREAT | O_RDWR, 0).unwrap();
+        let mut payload = std::vec![0u8; 1024 * 1024];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i * 7 % 251) as u8;
+        }
+        let wrote = write(dense.inode, 0, &payload, false).unwrap();
+        assert_eq!(wrote.written, payload.len());
+
+        let sparse = open("/mnt/ext2/sparse.bin", O_CREAT | O_RDWR, 0).unwrap();
+        let (free_before, _) = ext2_free_counts();
+        let _ = write(sparse.inode, 0, b"head", false).unwrap();
+        let _ = write(sparse.inode, 100 * GIB, b"tail at 100 GiB", false).unwrap();
+        let _ = write(sparse.inode, 50 * GIB, b"middle", false).unwrap();
+        assert!(free_before - ext2_free_counts().0 <= 4);
+        assert_eq!(stat(sparse.inode).unwrap().size, 100 * GIB + 15);
+        assert_eq!(stat(sparse.inode).unwrap().blocks, 3 * 8);
+        truncate_to(sparse.inode, 60 * GIB).unwrap();
+        assert_eq!(stat(sparse.inode).unwrap().blocks, 2 * 8);
+        let mut buf = [0u8; 8];
+        let n = read(sparse.inode, 50 * GIB, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"middle\0\0");
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        let synced = ctx.image.clone();
+        ext4_verify_all_checksums(&synced);
+        if let Ok(path) = std::env::var("PEETOS_EXT4_LARGE_FSCK_IMAGE") {
+            std::fs::write(&path, &synced).expect("write fsck image");
+        }
+
+        init();
+        let _ctx2 = mount_ext2_backend_image(&synced, 4096);
+        let dense = open("/mnt/ext2/dense.bin", O_RDONLY, 0).unwrap();
+        let mut back = std::vec![0u8; payload.len()];
+        assert_eq!(read(dense.inode, 0, &mut back).unwrap(), payload.len());
+        assert!(back == payload, "dense megabyte reads back");
+        let sparse = open("/mnt/ext2/sparse.bin", O_RDONLY, 0).unwrap();
+        assert_eq!(stat(sparse.inode).unwrap().size, 60 * GIB);
+    }
+
+    #[test]
+    fn ext4_time_encoding_matches_linux() {
+        // Base is signed 32-bit seconds, the extra epoch bits add 2^32 each.
+        assert_eq!(ext4_encode_time(0x9000_0000, true), (0x9000_0000, 1));
+        assert_eq!(ext4_decode_time(0x9000_0000, Some(1)), 0x9000_0000);
+        assert_eq!(ext4_encode_time(0x1_2345_6789, true), (0x2345_6789, 1));
+        assert_eq!(ext4_decode_time(0x2345_6789, Some(1)), 0x1_2345_6789);
+        assert_eq!(ext4_encode_time(1_700_000_000, true), (1_700_000_000, 0));
+        // Without extra fields the time clamps to 2038; with them to 2446.
+        assert_eq!(ext4_encode_time(0x9000_0000, false), (0x7FFF_FFFF, 0));
+        assert_eq!(ext4_encode_time(u64::MAX >> 1, true), (0x7FFF_FFFF, 3));
+        // Nanoseconds in the upper 30 bits do not change the seconds.
+        assert_eq!(ext4_decode_time(5, Some((999_999_999 << 2) | 1)), 5 + (1 << 32));
+    }
+
+    /// Post-2038 times round-trip through utimensat and the extra epoch
+    /// bits; inode writes keep Linux-written nanoseconds, `i_version` and the
+    /// project id; new inodes get `i_crtime`. Exported as
+    /// PEETOS_EXT4_TIME_FSCK_IMAGE.
+    #[test]
+    fn ext4_timestamps_past_2038_and_preserved_inode_fields() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4_NOCSUM);
+        let meta = ext4_layout(&image);
+        // Inode of hello.txt: find it through a throwaway mount.
+        init();
+        let probe = mount_ext2_backend_image(&image, 4096);
+        let hello_ino = stat(lookup("/mnt/ext2/hello.txt").unwrap()).unwrap().ino as u32;
+        drop(probe);
+        let off = ext2_inode_offset_in_image(&image, &meta, hello_ino).unwrap();
+        // Linux-written fields the kernel must not clobber.
+        image[off + 0x88..off + 0x8C].copy_from_slice(&((123_456_789u32 << 2) | 0).to_le_bytes());
+        image[off + 0x24..off + 0x28].copy_from_slice(&0x1111_2222u32.to_le_bytes()); // l_i_version
+        image[off + 0x98..off + 0x9C].copy_from_slice(&0x3333_4444u32.to_le_bytes()); // i_version_hi
+        image[off + 0x9C..off + 0xA0].copy_from_slice(&77u32.to_le_bytes()); // i_projid
+        let mtime_before = read_u32_le(&image, off + 16).unwrap();
+
+        init();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+        let hello = lookup("/mnt/ext2/hello.txt").unwrap();
+        chmod(hello, 0o600).unwrap();
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        let raw = ext4_raw_inode(&ctx.image, &meta, hello_ino);
+        assert_eq!(read_u32_le(raw, 16).unwrap(), mtime_before, "mtime untouched by chmod");
+        assert_eq!(read_u32_le(raw, 0x88).unwrap(), 123_456_789 << 2, "nanoseconds kept");
+        assert_eq!(read_u32_le(raw, 0x24).unwrap(), 0x1111_2222);
+        assert_eq!(read_u32_le(raw, 0x98).unwrap(), 0x3333_4444);
+        assert_eq!(read_u32_le(raw, 0x9C).unwrap(), 77);
+
+        // 2124 and 2046.
+        let atime = 0x1_2345_6789u64;
+        let mtime = 0x9000_0000u64;
+        set_times(hello, atime, mtime).unwrap();
+        let st = stat(hello).unwrap();
+        assert_eq!((st.atime, st.mtime), (atime, mtime));
+        let created = open("/mnt/ext2/born.txt", O_CREAT | O_RDWR, 0).unwrap();
+        let born_ino = stat(created.inode).unwrap().ino as u32;
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        let raw = ext4_raw_inode(&ctx.image, &meta, hello_ino);
+        assert_eq!(read_u32_le(raw, 8).unwrap(), 0x2345_6789);
+        assert_eq!(read_u32_le(raw, 0x8C).unwrap() & 3, 1, "atime epoch bits");
+        assert_eq!(read_u32_le(raw, 16).unwrap(), 0x9000_0000);
+        assert_eq!(read_u32_le(raw, 0x88).unwrap(), 1, "new mtime: epoch 1, no stale nanoseconds");
+        assert_eq!(read_u32_le(raw, 0x9C).unwrap(), 77, "project id survives");
+        let born = ext4_raw_inode(&ctx.image, &meta, born_ino);
+        assert_eq!(read_u32_le(born, 0x90).unwrap(), read_u32_le(born, 12).unwrap(), "crtime = ctime");
+        let synced = ctx.image.clone();
+        if let Ok(path) = std::env::var("PEETOS_EXT4_TIME_FSCK_IMAGE") {
+            std::fs::write(&path, &synced).expect("write fsck image");
+        }
+
+        init();
+        let _ctx2 = mount_ext2_backend_image(&synced, 4096);
+        let st = stat(lookup("/mnt/ext2/hello.txt").unwrap()).unwrap();
+        assert_eq!((st.atime, st.mtime), (atime, mtime), "decoded after remount");
+    }
+
+    fn last_orphan(image: &[u8]) -> u32 {
+        read_u32_le(image, EXT2_SUPERBLOCK_OFFSET + 0xE8).unwrap()
+    }
+
+    /// Unlink while open on the stock ext4 image: the data stays readable
+    /// through the open node, the inode sits on the orphan list, the last
+    /// release frees it. A crash in between leaves an orphan that the next
+    /// mount (and e2fsck) finish. Images: PEETOS_EXT4_ORPHAN_CRASH_IMAGE
+    /// (unrecovered), PEETOS_EXT4_ORPHAN_FSCK_IMAGE (after release).
+    #[test]
+    fn ext4_unlink_while_open_uses_the_orphan_list() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext4();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+        let (free_blocks0, free_inodes0) = ext2_free_counts();
+        let f = open("/mnt/ext2/sub/doomed", O_CREAT | O_RDWR, 0).unwrap();
+        let data = std::vec![0x5Au8; 3 * 4096];
+        let _ = write(f.inode, 0, &data, false).unwrap();
+        let ino = stat(f.inode).unwrap().ino as u32;
+        inode_retain(f.inode);
+        unlink("/mnt/ext2/sub/doomed").unwrap();
+        assert_eq!(lookup("/mnt/ext2/sub/doomed"), Err(ENOENT));
+        let mut buf = std::vec![0u8; data.len()];
+        assert_eq!(read(f.inode, 0, &mut buf).unwrap(), data.len(), "still readable");
+        assert!(buf == data);
+        let _ = write(f.inode, 0, b"still writable", false).unwrap();
+        assert_eq!(stat(f.inode).unwrap().nlink, 0);
+        assert!(ext2_inode_in_use(ino), "inode kept while open");
+        assert!(ext2_free_counts().0 < free_blocks0);
+        flush_ext2_dirty_blocks().expect("commit without checkpoint");
+        assert_eq!(last_orphan(&ctx.image), 0, "home superblock still old (journaled)");
+        let crashed = ctx.image.clone();
+        if let Ok(path) = std::env::var("PEETOS_EXT4_ORPHAN_CRASH_IMAGE") {
+            std::fs::write(&path, &crashed).expect("write crash image");
+        }
+
+        // Normal path: the last release frees everything.
+        assert!(inode_release(f.inode));
+        assert!(!ext2_inode_in_use(ino));
+        assert_eq!(ext2_free_counts(), (free_blocks0, free_inodes0));
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        assert_eq!(last_orphan(&ctx.image), 0);
+        ext4_verify_all_checksums(&ctx.image);
+        if let Ok(path) = std::env::var("PEETOS_EXT4_ORPHAN_FSCK_IMAGE") {
+            std::fs::write(&path, &ctx.image).expect("write fsck image");
+        }
+
+        // Crash path: replay brings back the orphan, mount finishes it.
+        init();
+        let ctx2 = mount_ext2_backend_image(&crashed, 4096);
+        assert!(!ext2_inode_in_use(ino), "mount freed the orphan");
+        assert_eq!(ext2_free_counts(), (free_blocks0, free_inodes0));
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        assert_eq!(last_orphan(&ctx2.image), 0);
+        ext4_verify_all_checksums(&ctx2.image);
+    }
+
+    #[test]
+    fn ext3_open_hard_links_and_directories_outlive_their_names() {
         let _guard = TEST_LOCK.lock().expect("lock should work");
         init();
         let _ctx = mount_sample_ext3();
+        let (free_blocks0, free_inodes0) = ext2_free_counts();
 
-        let opened = open("/mnt/ext2/large.bin", O_RDONLY, 0).expect("open large file");
-        assert_eq!(stat(opened.inode).unwrap().size, 5 * 1024 * 1024 * 1024);
-        let mut buf = [0u8; 8];
-        assert_eq!(read(opened.inode, 0, &mut buf).unwrap_err(), EOVERFLOW);
-        let writer = open("/mnt/ext2/large.bin", O_WRONLY, 0).expect("open large for write");
-        assert_eq!(write(writer.inode, 0, b"x", false).unwrap_err(), EFBIG);
-        assert_eq!(
-            open("/mnt/ext2/large.bin", O_WRONLY | O_TRUNC, 0).unwrap_err(),
-            EFBIG
+        // Two names; the open one is removed first, so the second unlink
+        // drops the last link while the inode is still in use.
+        let a = open("/mnt/ext2/sub/a", O_CREAT | O_RDWR, 0).unwrap();
+        let _ = write(a.inode, 0, b"shared", false).unwrap();
+        linkat(root_inode(), "/mnt/ext2/sub/a", root_inode(), "/mnt/ext2/sub/b").unwrap();
+        inode_retain(a.inode);
+        unlink("/mnt/ext2/sub/a").unwrap();
+        let ino = stat(a.inode).unwrap().ino as u32;
+        unlink("/mnt/ext2/sub/b").unwrap();
+        assert!(ext2_inode_in_use(ino));
+        assert_eq!(read_whole_inode(a.inode), b"shared");
+        assert_eq!(with_state(|s| last_orphan_state(s)), ino);
+        assert!(inode_release(a.inode));
+        assert!(!ext2_inode_in_use(ino));
+        assert_eq!(with_state(|s| last_orphan_state(s)), 0);
+
+        // rmdir of a directory that is still referenced (an open fd or a
+        // working directory): it disappears, takes no new entries, and is
+        // freed on release.
+        mkdir("/mnt/ext2/sub/gone").unwrap();
+        let dir = lookup("/mnt/ext2/sub/gone").unwrap();
+        inode_retain(dir);
+        rmdir("/mnt/ext2/sub/gone").unwrap();
+        assert_eq!(lookup("/mnt/ext2/sub/gone"), Err(ENOENT));
+        assert_eq!(openat(dir, "new", O_CREAT | O_RDWR, 0).unwrap_err(), ENOENT);
+        assert_eq!(mkdirat(dir, "child"), Err(ENOENT));
+        let mut buf = [0u8; VFS_MAX_PATH];
+        assert_eq!(inode_path(dir, &mut buf), Err(ENOENT));
+        assert!(inode_release(dir));
+        assert_eq!(ext2_free_counts(), (free_blocks0, free_inodes0));
+        assert_eq!(with_state(|s| last_orphan_state(s)), 0);
+        // Releasing an unreferenced or stale handle is harmless.
+        assert!(!inode_release(dir));
+        assert!(!inode_release(60000));
+    }
+
+    fn last_orphan_state(state: &mut VfsState) -> u32 {
+        ext2_read_u32_state(state, EXT2_SB_LAST_ORPHAN).unwrap()
+    }
+
+    fn read_whole_inode(inode: u16) -> std::vec::Vec<u8> {
+        let mut buf = std::vec![0u8; 256];
+        let n = read(inode, 0, &mut buf).unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    #[test]
+    fn tmpfs_unlink_while_open_keeps_data_until_release() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let f = open("/tmp/open_unlinked", O_CREAT | O_RDWR, 0).unwrap();
+        let _ = write(f.inode, 0, b"tmp data", false).unwrap();
+        inode_retain(f.inode);
+        unlink("/tmp/open_unlinked").unwrap();
+        assert_eq!(lookup("/tmp/open_unlinked"), Err(ENOENT));
+        assert_eq!(read_whole_inode(f.inode), b"tmp data");
+        // The slot is not reused while referenced.
+        let other = open("/tmp/other", O_CREAT | O_RDWR, 0).unwrap();
+        assert_ne!(other.inode, f.inode);
+        assert!(!inode_release(f.inode));
+        assert_eq!(stat(f.inode), Err(ENOENT));
+    }
+
+    /// An orphan with links left is a truncate that did not finish: the next
+    /// mount trims the blocks past i_size. Exported as
+    /// PEETOS_EXT4_TRUNC_ORPHAN_FSCK_IMAGE.
+    #[test]
+    fn mount_finishes_truncate_orphans() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4_NOCSUM);
+        init();
+        let probe = mount_ext2_backend_image(&image, 4096);
+        let frag = lookup("/mnt/ext2/frag.bin").unwrap();
+        let frag_ino = stat(frag).unwrap().ino as u32;
+        let blocks_before = stat(frag).unwrap().blocks;
+        drop(probe);
+        let meta = ext4_layout(&image);
+        let off = ext2_inode_offset_in_image(&image, &meta, frag_ino).unwrap();
+        image[off + 4..off + 8].copy_from_slice(&(2 * 4096u32).to_le_bytes());
+        image[off + 20..off + 24].copy_from_slice(&0u32.to_le_bytes());
+        let sb = EXT2_SUPERBLOCK_OFFSET + 0xE8;
+        image[sb..sb + 4].copy_from_slice(&frag_ino.to_le_bytes());
+
+        init();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+        let frag = lookup("/mnt/ext2/frag.bin").unwrap();
+        let st = stat(frag).unwrap();
+        assert_eq!(st.size, 2 * 4096);
+        assert!(st.blocks < blocks_before, "blocks past i_size were freed");
+        assert!(st.blocks <= 3 * 8, "two data blocks (+ at most an extent leaf)");
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        assert_eq!(last_orphan(&ctx.image), 0);
+        if let Ok(path) = std::env::var("PEETOS_EXT4_TRUNC_ORPHAN_FSCK_IMAGE") {
+            std::fs::write(&path, &ctx.image).expect("write fsck image");
+        }
+    }
+
+    static SAMPLE_EXT4_ORPHAN: &[u8] = include_bytes!("../../../user/sample_ext4_orphan.img");
+
+    /// `orphan_file` (newer mkfs.ext4 default): the image mounts read-write,
+    /// mkfs-written orphan blocks pass the magic/checksum check, recorded
+    /// orphans are finished at mount and `orphan_present` cleared, and a
+    /// damaged orphan block fails the mount. Exported as
+    /// PEETOS_EXT4_ORPHAN_FILE_FSCK_IMAGE.
+    #[test]
+    fn ext4_orphan_file_entries_are_processed_at_mount() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _clean = mount_ext2_backend_image(SAMPLE_EXT4_ORPHAN, 4096);
+        assert!(!ext2_mount_read_only());
+        let doomed = open("/mnt/ext2/sub/orphaned", O_CREAT | O_RDWR, 0).unwrap();
+        let _ = write(doomed.inode, 0, &[7u8; 8192], false).unwrap();
+        let doomed_ino = stat(doomed.inode).unwrap().ino as u32;
+        let (free_blocks0, free_inodes0) = (ext2_free_counts().0, ext2_free_counts().1);
+        // Drop the name but keep the inode, as a crash would leave it.
+        inode_retain(doomed.inode);
+        unlink("/mnt/ext2/sub/orphaned").unwrap();
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        let mut image = _clean.image.clone();
+        // Move the orphan from the s_last_orphan list into the orphan file
+        // (where Linux records it with orphan_file).
+        let sb = EXT2_SUPERBLOCK_OFFSET;
+        assert_eq!(last_orphan(&image), doomed_ino);
+        image[sb + 0xE8..sb + 0xEC].fill(0);
+        let meta = ext4_layout(&image);
+        let csum = ext4_csum_params(&image);
+        let off = ext2_inode_offset_in_image(&image, &meta, doomed_ino).unwrap();
+        image[off + 20..off + 24].fill(0);
+        let fixed = csum.inode(doomed_ino, &image[off..off + meta.inode_size]).unwrap();
+        let (lo, hi) = (fixed as u16, (fixed >> 16) as u16);
+        image[off + 0x7C..off + 0x7E].copy_from_slice(&lo.to_le_bytes());
+        image[off + 0x82..off + 0x84].copy_from_slice(&hi.to_le_bytes());
+        let orphan_ino = read_u32_le(&image, sb + 0x280).unwrap();
+        let oraw = ext4_raw_inode(&image, &meta, orphan_ino).to_vec();
+        let ogen = read_u32_le(&oraw, 0x64).unwrap();
+        let seed = csum.inode_seed_for(orphan_ino, ogen);
+        let first = read_u32_le(&oraw, 0x28 + 12 + 8).unwrap() as usize * 4096;
+        assert!(
+            read_u32_le(&image, first + 4088).unwrap() == EXT4_ORPHAN_BLOCK_MAGIC
+                && read_u32_le(&image, first + 4092).unwrap()
+                    == ext4_orphan_block_csum(seed, (first / 4096) as u64, &image[first..first + 4096]),
+            "mkfs-written orphan block verifies"
         );
+        image[first + 40..first + 44].copy_from_slice(&doomed_ino.to_le_bytes());
+        let value = ext4_orphan_block_csum(seed, (first / 4096) as u64, &image[first..first + 4096]);
+        image[first + 4092..first + 4096].copy_from_slice(&value.to_le_bytes());
+        let ro = read_u32_le(&image, sb + 100).unwrap() | EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT;
+        image[sb + 100..sb + 104].copy_from_slice(&ro.to_le_bytes());
+        let sbsum = ext4_csum::superblock_csum(&image[sb..sb + 1024]).unwrap();
+        image[sb + 0x3FC..sb + 0x400].copy_from_slice(&sbsum.to_le_bytes());
 
-        // Unlink walks the block tree (1 data block + 3 indirect tables).
-        let (free_blocks_before, _) = ext2_free_counts();
-        unlink("/mnt/ext2/large.bin").expect("unlink large file");
-        let (free_blocks_after, _) = ext2_free_counts();
-        assert_eq!(free_blocks_after, free_blocks_before + 4);
+        // A damaged orphan block fails the mount.
+        let mut bad = image.clone();
+        bad[first + 100] ^= 1;
+        init();
+        assert_eq!(mount_ext2_backend_image_expect_err(&bad, 4096), EIO);
+
+        init();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+        assert!(!ext2_inode_in_use(doomed_ino), "orphan finished at mount");
+        let _ = (free_blocks0, free_inodes0);
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        assert_eq!(read_u32_le(&ctx.image, sb + 100).unwrap() & EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT, 0);
+        assert_eq!(read_u32_le(&ctx.image, first + 40).unwrap(), 0, "entry cleared");
+        assert_eq!(
+            read_u32_le(&ctx.image, first + 4092).unwrap(),
+            ext4_orphan_block_csum(seed, (first / 4096) as u64, &ctx.image[first..first + 4096])
+        );
+        ext4_verify_all_checksums(&ctx.image);
+        if let Ok(path) = std::env::var("PEETOS_EXT4_ORPHAN_FILE_FSCK_IMAGE") {
+            std::fs::write(&path, &ctx.image).expect("write fsck image");
+        }
+    }
+
+    /// The first file over 2 GiB turns on `large_file`, as Linux does.
+    #[test]
+    fn large_file_feature_is_enabled_on_demand() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4_NOCSUM);
+        let sb = EXT2_SUPERBLOCK_OFFSET;
+        let ro = read_u32_le(&image, sb + 100).unwrap() & !EXT2_FEATURE_RO_COMPAT_LARGE_FILE;
+        image[sb + 100..sb + 104].copy_from_slice(&ro.to_le_bytes());
+        init();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+        let f = open("/mnt/ext2/small_then_big", O_CREAT | O_RDWR, 0).unwrap();
+        let _ = write(f.inode, GIB, b"1 GiB", false).unwrap();
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        assert_eq!(read_u32_le(&ctx.image, sb + 100).unwrap() & EXT2_FEATURE_RO_COMPAT_LARGE_FILE, 0);
+        let _ = write(f.inode, 3 * GIB, b"3 GiB", false).unwrap();
+        flush_ext2_dirty_blocks().unwrap();
+        checkpoint_ext2_journal().unwrap();
+        assert_ne!(read_u32_le(&ctx.image, sb + 100).unwrap() & EXT2_FEATURE_RO_COMPAT_LARGE_FILE, 0);
     }
 
     /// Regression: freeing blocks that were dirtied in the same ordered
@@ -11205,7 +12142,9 @@ mod tests {
 
             let large = open("/mnt/ext2/large.bin", O_RDONLY, 0).unwrap();
             assert_eq!(stat(large.inode).unwrap().size, 5 * 1024 * 1024 * 1024);
-            assert_eq!(read(large.inode, 0, &mut buf).unwrap_err(), EOVERFLOW);
+            // 64-bit sizes (M5): the sparse 5 GiB file reads its holes.
+            let n = read(large.inode, 4 * 1024 * 1024 * 1024 + 7, &mut buf).unwrap();
+            assert!(n > 0 && buf[..n].iter().all(|&b| b == 0));
 
             if read_only {
                 assert_eq!(ctx.writes, 0, "a read-only mount must not write");

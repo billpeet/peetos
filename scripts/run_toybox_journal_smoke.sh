@@ -136,6 +136,8 @@ if grep -aq "read-only" <(grep -a "\[VFS\] Mounted" "${LOG1}"); then
   fail "boot 1 mounted the root read-only"
 fi
 grep -aq "\[ext3-journal-smoke\] baseline synced" "${LOG1}" || fail "boot 1 did not sync the baseline"
+grep -aq "\[ext3-journal-smoke\] unlinked file still readable" "${LOG1}" \
+  || fail "boot 1: an unlinked open file was not readable through its fd"
 
 # Debug aid: PEETOS_JOURNAL_SMOKE_KEEP=<dir> keeps the crashed image and the
 # boot 1 serial log for offline inspection.
@@ -168,6 +170,8 @@ if [[ "${linux_rc}" -gt 1 ]]; then
   fail "e2fsck could not recover the crashed image (rc=${linux_rc})"
 fi
 grep -q "recovering journal" "${WORK_DIR}/linux_replay.txt" || fail "e2fsck did not replay the journal"
+# The unlinked-but-open file is an orphan inode in the crashed image.
+grep -qi "orphan" "${WORK_DIR}/linux_replay.txt" || fail "e2fsck found no orphan to finish"
 e2fsck -fn "${LINUX_IMG}" > "${WORK_DIR}/linux_check.txt" 2>&1 \
   || { cat "${WORK_DIR}/linux_check.txt" >&2; fail "filesystem not clean after e2fsck recovery"; }
 debugfs -R "cat /jsmoke/baseline" "${LINUX_IMG}" 2>/dev/null | grep -q "file baseline line 63" \

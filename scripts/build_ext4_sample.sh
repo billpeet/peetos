@@ -10,6 +10,9 @@
 #     (names and entry count stay inside the VFS name/child limits)
 #   - xattr_block.txt: external xattr block; fastlink: inline symlink;
 #     large.bin: sparse 5 GiB file (large_file / huge_file territory)
+# It also builds sample_ext4_nocsum.img, sample_ext4_journal.img, and
+# sample_ext4_orphan.img (stock features plus orphan_file, the default of
+# newer e2fsprogs). `--orphan-only` rebuilds just the last one.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -79,6 +82,13 @@ build_image() {
   chmod 0644 "${out}"
   echo "Built ${out}"
 }
+
+# orphan_file (mke2fs.conf default in newer e2fsprogs): the stock feature
+# set plus an orphan file, with checksummed (empty) orphan blocks.
+build_image "${ROOT_DIR}/user/sample_ext4_orphan.img" "orphan_file"
+if [[ "${1:-}" == "--orphan-only" ]]; then
+  exit 0
+fi
 
 # Stock image (metadata_csum: crc32c everywhere).
 build_image "${OUT_IMG}"

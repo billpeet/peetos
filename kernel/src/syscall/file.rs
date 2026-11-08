@@ -268,6 +268,10 @@ pub(super) fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(fd) => fd,
         Err(err) => return err,
     };
+    if fd_kind == task::USER_FD_KIND_VFS {
+        // Balanced by fd_object_release when the fd closes.
+        fs::inode_retain(opened.inode);
+    }
 
     if (fs_flags & (fs::O_CREAT | fs::O_TRUNC)) != 0 {
         sync_ext2_backing();
@@ -360,9 +364,7 @@ pub(super) fn sys_chdir(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
     match fs::inode_is_dir(inode) {
         Ok(true) => {
-            unsafe {
-                (*crate::task::leader_of(ctx.current)).user_cwd_inode = inode;
-            }
+            set_cwd(ctx.current, inode);
             0
         }
         Ok(false) => -ENOTDIR,
@@ -375,10 +377,36 @@ pub(super) fn sys_fchdir(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(inode) => inode,
         Err(err) => return err,
     };
-    unsafe {
-        (*crate::task::leader_of(ctx.current)).user_cwd_inode = inode;
-    }
+    set_cwd(ctx.current, inode);
     0
+}
+
+/// Points the process's working directory at `inode`, holding a reference
+/// on it (a removed working directory stays valid, as on Linux).
+pub(super) fn set_cwd(task_ptr: *mut task::Task, inode: u16) {
+    fs::inode_retain(inode);
+    let old = unsafe {
+        let leader = crate::task::leader_of(task_ptr);
+        let old = (*leader).user_cwd_inode;
+        (*leader).user_cwd_inode = inode;
+        old
+    };
+    if fs::inode_release(old) {
+        sync_ext2_backing();
+    }
+}
+
+/// Drops the working-directory reference when a process goes away.
+pub(super) fn release_cwd(task_ptr: *mut task::Task) {
+    let old = unsafe {
+        let leader = crate::task::leader_of(task_ptr);
+        let old = (*leader).user_cwd_inode;
+        (*leader).user_cwd_inode = fs::root_inode();
+        old
+    };
+    if fs::inode_release(old) {
+        sync_ext2_backing();
+    }
 }
 
 pub(super) fn sys_getcwd(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {

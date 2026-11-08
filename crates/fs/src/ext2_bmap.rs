@@ -559,15 +559,14 @@ fn extent_free_all(
     Ok(())
 }
 
-fn extent_recalc_block_count_512(state: &mut VfsState, inode: &Ext2Inode) -> Result<u32, i64> {
+fn extent_recalc_block_count_512(state: &mut VfsState, inode: &Ext2Inode) -> Result<u64, i64> {
     let (extents, tree) = load_extents(state, inode)?;
     let mut blocks = tree.len() as u64;
     for ext in &extents {
         blocks += ext.len as u64;
     }
-    let sectors = blocks * (state.ext2_meta.block_size as u64 / 512)
-        + ext2_inode_acl_sectors(&state.ext2_meta, inode) as u64;
-    u32::try_from(sectors).map_err(|_| EIO)
+    Ok(blocks * (state.ext2_meta.block_size as u64 / 512)
+        + ext2_inode_acl_sectors(&state.ext2_meta, inode) as u64)
 }
 
 /// Journal credits one extent mapping change may use: rewriting every tree
@@ -654,12 +653,37 @@ pub(super) fn bmap_free_all_blocks(
     }
 }
 
+/// First mapped logical block at or after `from` (holes are skipped
+/// without visiting each block), or `None` past the last mapped block.
+pub(super) fn ext2_next_mapped_block(
+    state: &mut VfsState,
+    inode: &Ext2Inode,
+    from: usize,
+) -> Result<Option<usize>, i64> {
+    match block_map_kind(inode) {
+        BlockMapKind::Indirect => super::indirect_next_mapped(state, inode, from),
+        BlockMapKind::Extents => {
+            let (extents, _) = load_extents(state, inode)?;
+            let mut best: Option<usize> = None;
+            for ext in &extents {
+                let start = ext.lblk as usize;
+                let end = start + ext.len as usize;
+                if end > from {
+                    let cand = core::cmp::max(start, from);
+                    best = Some(best.map_or(cand, |b| core::cmp::min(b, cand)));
+                }
+            }
+            Ok(best)
+        }
+    }
+}
+
 /// `i_blocks` (512-byte sectors) implied by the inode's map, including
 /// mapping blocks and any external xattr block.
 pub(super) fn ext2_recalc_inode_block_count_512_state(
     state: &mut VfsState,
     inode: &Ext2Inode,
-) -> Result<u32, i64> {
+) -> Result<u64, i64> {
     match block_map_kind(inode) {
         BlockMapKind::Indirect => indirect_recalc_block_count_512_state(state, inode),
         BlockMapKind::Extents => extent_recalc_block_count_512(state, inode),

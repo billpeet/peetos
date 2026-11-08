@@ -333,3 +333,51 @@ if [[ "${checked}" -eq 0 ]]; then
   exit 1
 fi
 echo "[ext3-fsck] ${checked} recovered htree-split crash-point images are e2fsck clean"
+
+# M5: 64-bit file sizes, post-2038 timestamps, orphan handling.
+for spec in "PEETOS_EXT3_LARGE_FSCK_IMAGE:ext3_large_files_use_64bit_sizes" \
+            "PEETOS_EXT4_LARGE_FSCK_IMAGE:ext4_large_sparse_and_dense_files" \
+            "PEETOS_EXT4_TIME_FSCK_IMAGE:ext4_timestamps_past_2038_and_preserved_inode_fields" \
+            "PEETOS_EXT4_ORPHAN_FSCK_IMAGE:ext4_unlink_while_open_uses_the_orphan_list" \
+            "PEETOS_EXT4_TRUNC_ORPHAN_FSCK_IMAGE:mount_finishes_truncate_orphans" \
+            "PEETOS_EXT4_ORPHAN_FILE_FSCK_IMAGE:ext4_orphan_file_entries_are_processed_at_mount"; do
+  IFS=: read -r env_name test_name <<< "${spec}"
+  img="${WORK_DIR}/${test_name}.img"
+  env "${env_name}=${img}" cargo test -p fs --target "${HOST}" --quiet -- --exact "tests::${test_name}"
+  if [[ ! -s "${img}" ]]; then
+    echo "[ext3-fsck] ${test_name} did not export an image" >&2
+    exit 1
+  fi
+  if ! e2fsck -fn "${img}" >"${img}.fsck" 2>&1; then
+    echo "[ext3-fsck] e2fsck reported problems after ${test_name}" >&2
+    cat "${img}.fsck" >&2
+    exit 1
+  fi
+done
+echo "[ext3-fsck] e2fsck clean on large-file, timestamp and orphan images"
+
+# A crash while an unlinked file is still open: e2fsck replays the journal
+# and must find the inode on the orphan list (Linux format) and free it.
+ORPHAN_CRASH_IMG="${WORK_DIR}/orphan_crash.img"
+PEETOS_EXT4_ORPHAN_CRASH_IMAGE="${ORPHAN_CRASH_IMG}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::ext4_unlink_while_open_uses_the_orphan_list
+set +e
+e2fsck -fy "${ORPHAN_CRASH_IMG}" >"${WORK_DIR}/orphan_crash.fsck" 2>&1
+orphan_rc=$?
+set -e
+if [[ "${orphan_rc}" -gt 1 ]]; then
+  echo "[ext3-fsck] e2fsck could not recover the orphan crash image (rc=${orphan_rc})" >&2
+  cat "${WORK_DIR}/orphan_crash.fsck" >&2
+  exit 1
+fi
+if ! grep -qi "orphan" "${WORK_DIR}/orphan_crash.fsck"; then
+  echo "[ext3-fsck] e2fsck did not process the kernel's orphan list" >&2
+  cat "${WORK_DIR}/orphan_crash.fsck" >&2
+  exit 1
+fi
+if ! e2fsck -fn "${ORPHAN_CRASH_IMG}" >"${WORK_DIR}/orphan_crash2.fsck" 2>&1; then
+  echo "[ext3-fsck] orphan crash image not clean after e2fsck" >&2
+  cat "${WORK_DIR}/orphan_crash2.fsck" >&2
+  exit 1
+fi
+echo "[ext3-fsck] e2fsck finishes the kernel's orphan after a crash"
