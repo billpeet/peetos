@@ -500,7 +500,7 @@ Progress (2026-11-08):
 - [x] QEMU smoke: libwayland server + separate client process over `/tmp/wayland-0`, registry roundtrips, `wl_compositor`/`wl_shm` binding, sealed memfd pool, two presented frames with pool growth (`mremap`), frame callbacks, timer and signal event sources, clean disconnect (`make run-wayland-smoke`).
 - [ ] Turn the smoke compositor into the real compositor: present committed `wl_shm` buffers to `/dev/fb0`, route `/dev/input` events through `wl_seat`/`wl_pointer`/`wl_keyboard`, and replace the peet-gui demo paths.
 - [ ] Port `wayland-protocols` and implement `xdg_wm_base`/`xdg_surface`/`xdg_toplevel`.
-- [ ] Build and run upstream libwayland tests (or a subset) for protocol compliance.
+- [x] Build and run upstream libwayland tests (or a subset) for protocol compliance: 21 of upstream's test binaries (131 cases) pass in QEMU in the `musl-ext2-wayland-tests` profile (`make run-wayland-tests`, part of `make test`). `os-wrappers-test` is skipped because it needs `dlsym(RTLD_NEXT)`. See `docs/wayland.md` ("Upstream Test Suite").
 
 Scope:
 

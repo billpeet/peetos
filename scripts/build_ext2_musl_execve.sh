@@ -95,6 +95,20 @@ if [[ -x "${ROOT_DIR}/user/wayland_smoke.elf" ]]; then
   chmod 0755 "${STAGE_ROOT}/bin/wayland_smoke"
 fi
 
+# Stage upstream libwayland test-suite binaries when built
+# (scripts/build_wayland_tests.sh); run by bin/wayland_tests.sh.
+WAYLAND_TESTS_DIR="${ROOT_DIR}/wayland/out/tests"
+if [[ -f "${WAYLAND_TESTS_DIR}/TESTS" ]]; then
+  mkdir -p "${STAGE_ROOT}/wltests"
+  cp "${WAYLAND_TESTS_DIR}/TESTS" "${STAGE_ROOT}/wltests/TESTS"
+  chmod 0644 "${STAGE_ROOT}/wltests/TESTS"
+  cp "${WAYLAND_TESTS_DIR}/exec-fd-leak-checker" "${STAGE_ROOT}/wltests/"
+  while read -r wl_test; do
+    cp "${WAYLAND_TESTS_DIR}/${wl_test}" "${STAGE_ROOT}/wltests/${wl_test}"
+  done < "${WAYLAND_TESTS_DIR}/TESTS"
+  chmod 0755 "${STAGE_ROOT}"/wltests/*-test "${STAGE_ROOT}/wltests/exec-fd-leak-checker"
+fi
+
 # Stage FPU/SSE context-switch smoke helper when available.
 if [[ -x "${ROOT_DIR}/user/fpu_context_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/fpu_context_smoke.elf" "${STAGE_ROOT}/bin/fpu_context_smoke"
@@ -521,6 +535,37 @@ fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/wayland_smoke.sh"
 
+cat > "${STAGE_ROOT}/bin/wayland_tests.sh" <<'EOS'
+fail=0
+# Upstream test-runner: exec-fd-leak-checker lives next to the tests, and
+# each runner creates its own wayland-tests-XXXXXX dir under XDG_RUNTIME_DIR.
+export TEST_BUILD_DIR=/mnt/ext2/wltests
+export XDG_RUNTIME_DIR=/tmp
+
+if [ ! -f wltests/TESTS ]; then
+  echo [musl-ext2-wayland-tests] missing wltests/TESTS
+  fail=1
+else
+  for t in $(toybox cat wltests/TESTS); do
+    echo "[wl-tests] run $t"
+    wltests/$t
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "[wl-tests] PASS $t"
+    else
+      echo "[wl-tests] FAIL $t rc=$rc"
+      fail=1
+    fi
+  done
+fi
+
+echo [musl-ext2-wayland-tests] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-wayland-tests] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/wayland_tests.sh"
+
 cat > "${STAGE_ROOT}/bin/fpu_smoke.sh" <<'EOS'
 fail=0
 
@@ -705,6 +750,10 @@ TMP_IMG="${TMP_DIR}/ext2.img"
 payload_kib="$(du -sk "${STAGE_ROOT}" | awk '{print $1}')"
 # Keep a modest metadata/slack margin above staged payload size.
 img_kib=$((payload_kib + 1024))
+if [[ -d "${STAGE_ROOT}/wltests" ]]; then
+  # Upstream libwayland tests create sockets, locks and temp dirs in /tmp.
+  img_kib=$((img_kib + 1024))
+fi
 if [[ "${img_kib}" -lt 3072 ]]; then
   img_kib=3072
 fi

@@ -141,6 +141,7 @@ current Rust kernel implementation and forward roadmap.
 ### Userspace Runtime Bring-Up
 
 - libwayland 1.23.1 and libffi 3.4.6 build as static musl libraries (`make -C wayland`), and the `musl-ext2-wayland-smoke` profile runs a libwayland compositor plus a separate libwayland client end to end in QEMU (`docs/wayland.md`).
+- 21 of upstream libwayland's own test binaries (131 cases, all but the `dlsym`-based `os-wrappers-test` and the host-only scanner/C++ checks) pass in QEMU in the `musl-ext2-wayland-tests` profile, part of `make test`. Getting there fixed several kernel gaps: `mkdir`/`rmdir`, `/dev/fd`, unlinked-but-open (and mapped) files, `fstat` on non-file fds, `setitimer`/`alarm`, `WIFSIGNALED` wait status, `MAP_SHARED | MAP_ANONYMOUS`, AF_UNIX path lifetime, and the fd/socket/flock/directory capacity limits. See `docs/wayland.md`.
 
 - musl sysroot bootstrap is integrated.
 - toybox staging supports interactive shell and broad applet coverage,
