@@ -508,6 +508,30 @@ fn get_physical_in_locked(target_pml4: PhysAddr, virt: VirtAddr) -> Option<PhysA
 /// Raw 4 KiB leaf page-table entry for `virt` in `target_pml4`, or `None` if
 /// the page is not present or is covered by a large page.
 pub fn get_pte_in(target_pml4: PhysAddr, virt: VirtAddr) -> Option<u64> {
+    let _guard = VMM_LOCK.lock();
+    get_pte_in_locked(target_pml4, virt)
+}
+
+/// Move one present 4 KiB user mapping from `from` to `to` in the same
+/// address space, keeping its frame and flags (used by `mremap`). The read,
+/// map, and unmap happen under one `VMM_LOCK` hold, so no other CPU observes
+/// the page mapped twice or not at all; unmapping `from` shoots down stale
+/// TLB entries. Returns `Ok(false)` if `from` is not mapped, and `Err(())`
+/// (with nothing changed) if `to` could not be mapped.
+pub fn move_page_in(target_pml4: PhysAddr, from: VirtAddr, to: VirtAddr) -> Result<bool, ()> {
+    let _guard = VMM_LOCK.lock();
+    let Some(pte) = get_pte_in_locked(target_pml4, from) else {
+        return Ok(false);
+    };
+    let phys = PhysAddr::new(pte & PTE_ADDR_MASK);
+    if map_page_in_locked(target_pml4, to, phys, pte & PTE_FLAGS_MASK) != 0 {
+        return Err(());
+    }
+    let _ = unmap_page_in_locked(target_pml4, from);
+    Ok(true)
+}
+
+fn get_pte_in_locked(target_pml4: PhysAddr, virt: VirtAddr) -> Option<u64> {
     let mut pml4 = target_pml4;
     if pml4.as_u64() == 0 {
         pml4 = unsafe { PML4_PHYS };

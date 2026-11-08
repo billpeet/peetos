@@ -61,6 +61,11 @@ On initialization, the kernel creates:
   - `/dev/null`: reads EOF, writes are discarded
   - `/dev/zero`: reads return zero bytes, writes are discarded
   - `/dev/console`: opened as a console descriptor; kernel routes writes to serial (mirrored to framebuffer text when available) and reads through canonical line-buffered TTY input
+  - `/dev/fd`: a directory whose `getdents64` listing is synthesized per process (`dev_fd_dir_entry` in `kernel/src/syscall/file.rs`): one `DT_LNK` entry per open descriptor of the caller, named by number, read live (so it includes the descriptor used to read it, as Linux's `/proc/self/fd` does). Upstream libwayland's fd-leak checks count these entries.
+- Unlinked files stay usable while open, as POSIX requires:
+  - every open file description holds an fs reference (`fs::inode_open_retain`/`inode_open_release`), taken when `openat`/`memfd_create` create a VFS fd and kept balanced by the kernel's `fd_object_retain`/`fd_object_release` across `dup*`, `fork`, `SCM_RIGHTS` and close;
+  - every file some task maps holds one more reference (`vm_sync_inode_pins` in `kernel/src/syscall/vm.rs`, recomputed after `mmap`, `munmap` and address-space teardown);
+  - `unlink`/`rmdir` of a referenced node detaches it from its directory (it reports `st_nlink == 0`) and frees it on the last release, including the ext2 inode and blocks; cached pages of any freed inode are dropped so a reused inode slot never sees stale data.
 - `procfs` behavior:
   - `/proc/uptime` and `/proc/meminfo` are generated from runtime kernel stats
   - `/proc/mounts` is generated from the mount table and reflects mounted ext2 entries (journaled mounts are surfaced as ext3), plus pseudo mounts such as `/boot`, `/temp`, `/dev`, and `/proc`
@@ -118,8 +123,10 @@ On initialization, the kernel creates:
   - `utimensat` (`280`)
   - `read` (`0`)
   - `write` (`1`)
+  - `mkdir` (`83`) and `rmdir` (`84`): legacy wrappers over `mkdirat`/`unlinkat(AT_REMOVEDIR)`; musl's `mkdir()`/`rmdir()` use them on x86_64
+- `fstat` (and `fstatat(fd, "", AT_EMPTY_PATH)`) also answer for non-file descriptors with a synthetic `stat` (`synthetic_fd_stat_identity`): `S_IFSOCK` for sockets, `S_IFIFO` for pipes, `S_IFCHR` for console/PTYs, and an anon-inode style mode for epoll/eventfd/timerfd/signalfd, each kind on its own pseudo `st_dev`.
 - Mutating syscall paths (`open` with `O_CREAT`/`O_TRUNC`, `write`, `mkdirat`, `unlinkat`/`rmdirat`, `renameat`, `linkat`, `symlinkat`, `utimensat`) invoke kernel-side ext2 sync when a block-backed ext2 mount is active.
-- Per-task FD tables track kind/inode/offset/flags.
+- Per-process FD tables track kind/inode/offset/flags for up to 128 descriptors (`task::MAX_TASK_FDS`).
 - `flock(fd, op)` (`73`) provides advisory `LOCK_SH`/`LOCK_EX`/`LOCK_UN` locks with `LOCK_NB`; blocking requests yield until the lock is free and return `-EINTR` on a pending signal. Locks are dropped on `LOCK_UN` and whenever the locking fd closes (including close-on-exec and task exit).
 - `fallocate(fd, 0, offset, len)` (`285`) extends a regular file to `offset + len` if it is shorter (blocks are allocated lazily on write) and respects memfd `F_SEAL_GROW`. Other modes return `-EOPNOTSUPP`, which libc callers such as libwayland treat as "fall back to `ftruncate`".
 - User stdio (`fd 0/1/2`) is pre-seeded as console descriptors, and each user task tracks a cwd inode (currently rooted at `/`).
@@ -144,7 +151,11 @@ Limitations / Simplifications
 - Dirty-pressure flush is opportunistic in filesystem paths (no dedicated background flusher thread yet).
 - Ext2 still uses its own sparse block cache for on-disk block residency/dirty tracking, but syscall-level file reads and file-backed `MAP_SHARED` faults now share a kernel VM inode-page cache path. Full fs-wide VM page-cache integration (including writable shared mmap writeback and unified reclaim policy) remains pending.
 - ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.
-- `flock` lock owners are `(pid, fd)` pairs, not open file descriptions: a `dup`ed fd or a forked child does not share its parent's lock as it would on Linux, and the lock table holds at most 32 locks.
+- `flock` lock owners are `(pid, fd)` pairs, not open file descriptions: a `dup`ed fd or a forked child does not share its parent's lock as it would on Linux, and the system-wide lock table holds at most 128 locks.
+- Capacities are static: 256 VFS nodes in total, 128 entries per directory node (`VFS_MAX_CHILDREN`), and ext2 directories import at most 64 entries when first loaded (the import buffers names on the kernel stack).
+- `/dev/fd/N` cannot be opened (there is no reopen-by-descriptor), and `/proc/self/fd` does not exist.
+- Orphaned (unlinked but open) ext2 files are freed only at last close; if the system stops first, the on-disk inode stays allocated with zero links, since there is no ext2 orphan list or fsck-style recovery.
+- File offsets live in the per-process fd slot, so `dup`ed descriptors do not share an offset as Linux open file descriptions do.
 - `fallocate` does not reserve blocks, so a later write can still hit `ENOSPC`.
 - `/boot` is currently a mountpoint placeholder (`bootfs` in `/proc/mounts`); there is no dedicated boot-filesystem backend yet.
 - Bare-metal kernel builds currently skip embedding the sample ext2 fallback image to keep the default kernel/image lean.

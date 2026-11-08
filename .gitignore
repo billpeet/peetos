@@ -17,6 +17,9 @@
 /dropbear/dropbear-*.tar.bz2
 /wayland/wayland-src
 /wayland/libffi-src
+/wayland/wayland-protocols-src
+/wayland/libxkbcommon-src
+/wayland/libxkbcommon-*.tar.xz
 /wayland/out
 /wayland/wayland-*.tar.xz
 /wayland/libffi-*.tar.gz

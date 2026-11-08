@@ -17,7 +17,10 @@ pub const TASK_NAME_MAX: usize = 32;
 pub const KERNEL_STACK_SIZE: u64 = 16 * 1024;
 pub const KERNEL_STACK_PAGES: usize = (KERNEL_STACK_SIZE / 4096) as usize;
 pub const MAX_TASKS: usize = 64;
-pub const MAX_TASK_FDS: usize = 32;
+/// Per-process descriptor limit. libwayland compositors hold a listening
+/// socket and lock file per display socket plus one fd per client, so 32
+/// was too small (upstream `socket-test` alone opens ~70).
+pub const MAX_TASK_FDS: usize = 128;
 pub const MAX_TASK_SHM_ATTACH: usize = 8;
 /// Signal slots per task: signals 1..=64 (index 0 unused).
 pub const SIG_MAX_TASK_SIGNALS: usize = 65;
@@ -133,6 +136,10 @@ pub struct Task {
     pub(crate) time_slice: u64,
     pub(crate) total_ticks: u64,
     pub(crate) sleep_until: u64,
+    /// `ITIMER_REAL` (setitimer/alarm), on the thread-group leader: absolute
+    /// expiry in timer ticks (0 = disarmed) and reload interval in ticks.
+    pub(crate) itimer_real_deadline: u64,
+    pub(crate) itimer_real_interval: u64,
     pub(crate) next: *mut Task,
     pub(crate) prev: *mut Task,
     /// Saved user x87/SSE register state while the task is switched out.
@@ -143,8 +150,9 @@ pub struct Task {
     pub(crate) bkl_resume: bool,
 }
 
-// Tasks are allocated as a single physical page in `task_alloc`.
-const _: () = assert!(size_of::<Task>() <= 4096);
+/// Physically contiguous pages backing one `Task` (see `task_alloc`).
+const TASK_STRUCT_PAGES: usize = 2;
+const _: () = assert!(size_of::<Task>() <= TASK_STRUCT_PAGES * 4096);
 
 static mut TASK_TABLE: [*mut Task; MAX_TASKS] = [ptr::null_mut(); MAX_TASKS];
 static mut TASK_COUNT: usize = 0;
@@ -241,6 +249,8 @@ pub fn init() {
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,
+            itimer_real_deadline: 0,
+            itimer_real_interval: 0,
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
             fpu: FxSaveArea::new_default(),
@@ -267,7 +277,7 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         }
     };
 
-    let task_phys = pmm::alloc_page();
+    let task_phys = pmm::alloc_pages(TASK_STRUCT_PAGES);
     if task_phys.as_u64() == 0 {
         serial_println!("[TASK] ERROR: failed to allocate task struct");
         return ptr::null_mut();
@@ -280,7 +290,7 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
     let stack_phys = pmm::alloc_pages(KERNEL_STACK_PAGES);
     if stack_phys.as_u64() == 0 {
         serial_println!("[TASK] ERROR: failed to allocate kernel stack");
-        pmm::free_page(task_phys);
+        pmm::free_pages(task_phys, TASK_STRUCT_PAGES);
         return ptr::null_mut();
     }
     let stack_base = stack_phys.to_virt().as_u64();
@@ -343,6 +353,8 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.time_slice = 0;
         task.total_ticks = 0;
         task.sleep_until = 0;
+        task.itimer_real_deadline = 0;
+        task.itimer_real_interval = 0;
         task.next = ptr::null_mut();
         task.prev = ptr::null_mut();
         task.fpu = FxSaveArea::new_default();
@@ -393,7 +405,7 @@ pub fn task_destroy(task: *mut Task) {
         }
 
         let task_phys = VirtAddr::new(task as u64).to_phys();
-        pmm::free_page(task_phys);
+        pmm::free_pages(task_phys, TASK_STRUCT_PAGES);
     }
 }
 
@@ -495,6 +507,11 @@ pub fn take_over_group_leadership(thread: *mut Task) {
         new.user_base_addr = prev.user_base_addr;
         new.user_interp_base = prev.user_interp_base;
         new.user_is_dynamic = prev.user_is_dynamic;
+        // Interval timers survive execve, so they follow the process.
+        new.itimer_real_deadline = prev.itimer_real_deadline;
+        new.itimer_real_interval = prev.itimer_real_interval;
+        prev.itimer_real_deadline = 0;
+        prev.itimer_real_interval = 0;
 
         // The state now lives on `thread`; leave no second owner behind.
         prev.user_fd_kind = [USER_FD_KIND_EMPTY; MAX_TASK_FDS];
@@ -744,6 +761,8 @@ impl Task {
             time_slice: 0,
             total_ticks: 0,
             sleep_until: 0,
+            itimer_real_deadline: 0,
+            itimer_real_interval: 0,
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
             fpu: FxSaveArea::new_default(),

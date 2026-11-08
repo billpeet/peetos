@@ -529,7 +529,7 @@ pub(super) fn apply_pending_signals<R: UserRegs>(regs: &mut R, nr: Option<u64>) 
                     code - 128
                 );
                 let ctx = SyscallContext::new(current);
-                return Some(sys_exit_common(&ctx, code));
+                return Some(sys_exit_common(&ctx, exit_code_for_signal((code - 128) as u32)));
             }
             signal::DeliveryAction::Handle(delivery) => {
                 if let Some(nr) = restart_nr {
@@ -541,7 +541,7 @@ pub(super) fn apply_pending_signals<R: UserRegs>(regs: &mut R, nr: Option<u64>) 
                 }
                 if install_rt_signal_frame(current, regs, delivery).is_err() {
                     let ctx = SyscallContext::new(current);
-                    return Some(sys_exit_common(&ctx, 128 + signal::SIGSEGV as i32));
+                    return Some(sys_exit_common(&ctx, exit_code_for_signal(signal::SIGSEGV)));
                 }
                 return None;
             }

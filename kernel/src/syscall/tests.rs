@@ -38,6 +38,139 @@ fn page_align_up_rounds_correctly() {
 }
 
 #[test]
+fn dev_fd_dir_entry_lists_open_descriptors_in_order() {
+    let open = |fd: usize| matches!(fd, 0 | 1 | 2 | 7 | 12);
+    let mut names = std::vec::Vec::new();
+    let mut offset = DEV_FD_FIRST_OFFSET;
+    while let Some(entry) = dev_fd_dir_entry(offset, open) {
+        assert_eq!(entry.d_type, fs::DT_LNK);
+        assert!(entry.next_offset > offset);
+        names.push(std::string::String::from_utf8(entry.name[..entry.name_len].to_vec()).unwrap());
+        offset = entry.next_offset;
+    }
+    assert_eq!(names, ["0", "1", "2", "7", "12"]);
+    // "." and ".." offsets belong to the filesystem, not the synthesized list.
+    assert!(dev_fd_dir_entry(0, open).is_none());
+    assert!(dev_fd_dir_entry(1, open).is_none());
+    // Resuming mid-listing continues after the last returned descriptor.
+    let resumed = dev_fd_dir_entry(DEV_FD_FIRST_OFFSET + 8, open).unwrap();
+    assert_eq!(&resumed.name[..resumed.name_len], b"12");
+    assert!(dev_fd_dir_entry(DEV_FD_FIRST_OFFSET + 13, open).is_none());
+}
+
+#[test]
+fn synthetic_fd_stat_identity_covers_non_file_kinds() {
+    let sock = synthetic_fd_stat_identity(task::USER_FD_KIND_SOCKET).unwrap();
+    assert_eq!(sock.1 & 0o170000, 0o140000);
+    let pipe = synthetic_fd_stat_identity(task::USER_FD_KIND_PIPE).unwrap();
+    assert_eq!(pipe.1 & 0o170000, 0o010000);
+    let evfd = synthetic_fd_stat_identity(task::USER_FD_KIND_EVENTFD).unwrap();
+    assert_eq!(evfd.1 & 0o170000, 0);
+    let console = synthetic_fd_stat_identity(task::USER_FD_KIND_CONSOLE).unwrap();
+    assert_eq!(console.1 & 0o170000, 0o020000);
+    // Kinds sharing an id space must not collide on st_dev.
+    assert_ne!(sock.0, pipe.0);
+    assert_ne!(sock.0, evfd.0);
+    // VFS files use the filesystem's own stat; empty slots have none.
+    assert!(synthetic_fd_stat_identity(task::USER_FD_KIND_VFS).is_none());
+    assert!(synthetic_fd_stat_identity(task::USER_FD_KIND_EMPTY).is_none());
+}
+
+#[test]
+fn itimer_timeval_conversion_rounds_up_and_validates() {
+    let tv = |s, us| LinuxTimeVal { tv_sec: s, tv_usec: us };
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 0)), Ok(0));
+    // 100 Hz: anything up to 10 ms is one tick, never zero.
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 1)), Ok(1));
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 10_000)), Ok(1));
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 10_001)), Ok(2));
+    assert_eq!(itimer_timeval_to_ticks(tv(2, 0)), Ok(2 * pit::TIMER_FREQUENCY as u64));
+    assert_eq!(itimer_timeval_to_ticks(tv(-1, 0)), Err(-EINVAL));
+    assert_eq!(itimer_timeval_to_ticks(tv(0, 1_000_000)), Err(-EINVAL));
+}
+
+#[test]
+fn itimer_real_read_reports_remaining_and_interval() {
+    let hz = pit::TIMER_FREQUENCY as u64;
+    let disarmed = itimer_real_read(0, 0, 500);
+    assert_eq!(disarmed, LinuxITimerVal::default());
+    let armed = itimer_real_read(500 + 3 * hz / 2, hz, 500);
+    assert_eq!(armed.it_value, LinuxTimeVal { tv_sec: 1, tv_usec: 500_000 });
+    assert_eq!(armed.it_interval, LinuxTimeVal { tv_sec: 1, tv_usec: 0 });
+    // Expired but not yet delivered still reads as armed.
+    assert_ne!(itimer_real_read(400, 0, 500).it_value, LinuxTimeVal::default());
+}
+
+#[test]
+fn alarm_seconds_left_rounds_like_linux() {
+    let tv = |s, us| LinuxTimeVal { tv_sec: s, tv_usec: us };
+    assert_eq!(alarm_seconds_left(tv(0, 0)), 0);
+    assert_eq!(alarm_seconds_left(tv(0, 1)), 1);
+    assert_eq!(alarm_seconds_left(tv(3, 499_999)), 3);
+    assert_eq!(alarm_seconds_left(tv(3, 500_000)), 4);
+}
+
+#[test]
+fn vm_mapped_inodes_collects_file_backed_regions_across_tasks() {
+    let mut tables = [[VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK]; 2];
+    tables[0][0] = VmMapping {
+        start: MMAP_BASE_ADDR,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: 7,
+        prot: PROT_READ,
+        map_shared: true,
+        map_shared_can_write: false,
+    };
+    // Anonymous region: no inode.
+    tables[0][1] = VmMapping {
+        start: MMAP_BASE_ADDR + PAGE_SIZE,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+    tables[1][3] = VmMapping { file_inode: 9, ..tables[0][0] };
+    let mapped = vm_mapped_inodes(&tables);
+    let set: std::vec::Vec<usize> = (0..fs::VFS_MAX_INODES).filter(|&i| mapped[i]).collect();
+    assert_eq!(set, [7, 9]);
+}
+
+#[test]
+fn vm_inode_pins_keep_unlinked_mapped_file_alive() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+
+    let opened = fs::open("/tmp/mapped-orphan", fs::O_CREAT | fs::O_RDWR, 0o600).expect("create");
+    let inode = opened.inode;
+    let slot = 5;
+    unsafe {
+        TASK_VM_MAPPINGS[slot][0] = VmMapping {
+            start: MMAP_BASE_ADDR,
+            len: PAGE_SIZE,
+            file_offset: 0,
+            file_inode: inode,
+            prot: PROT_READ | PROT_WRITE,
+            map_shared: true,
+            map_shared_can_write: true,
+        };
+    }
+    vm_sync_inode_pins();
+    assert_eq!(fs::inode_open_refs(inode), 1);
+
+    fs::unlink("/tmp/mapped-orphan").expect("unlink while mapped");
+    assert!(fs::stat(inode).is_ok(), "mapping keeps the orphan alive");
+
+    unsafe {
+        TASK_VM_MAPPINGS[slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    }
+    vm_sync_inode_pins();
+    assert!(fs::stat(inode).is_err(), "last unmap frees it");
+}
+
+#[test]
 fn syscall_lookup_finds_known_entry() {
     let def = lookup_syscall(SYS_GETPID).expect("syscall should exist");
     assert_eq!(def.name, "getpid");
@@ -81,6 +214,11 @@ fn syscall_lookup_includes_vfs_extensions() {
     assert_eq!(lookup_syscall(SYS_SHMCTL).map(|d| d.name), Some("shmctl"));
     assert_eq!(lookup_syscall(SYS_UMASK).map(|d| d.name), Some("umask"));
     assert_eq!(lookup_syscall(SYS_MKDIRAT).map(|d| d.name), Some("mkdirat"));
+    assert_eq!(lookup_syscall(SYS_MKDIR).map(|d| d.name), Some("mkdir"));
+    assert_eq!(lookup_syscall(SYS_SETITIMER).map(|d| d.name), Some("setitimer"));
+    assert_eq!(lookup_syscall(SYS_GETITIMER).map(|d| d.name), Some("getitimer"));
+    assert_eq!(lookup_syscall(SYS_ALARM).map(|d| d.name), Some("alarm"));
+    assert_eq!(lookup_syscall(SYS_RMDIR).map(|d| d.name), Some("rmdir"));
     assert_eq!(lookup_syscall(SYS_FUTEX).map(|d| d.name), Some("futex"));
     assert_eq!(
         lookup_syscall(SYS_NEWFSTATAT).map(|d| d.name),
@@ -1450,6 +1588,13 @@ fn wait_status_encodes_exit_code_for_waitpid_macros() {
     assert_eq!(wait_status_from_exit_code(0), 0);
     assert_eq!(wait_status_from_exit_code(1), 0x0100);
     assert_eq!(wait_status_from_exit_code(255), 0xFF00_u32 as i32);
+    // exit(134) and death by SIGABRT (6) must decode differently.
+    assert_eq!(wait_status_from_exit_code(134), 134 << 8);
+    let killed = wait_status_from_exit_code(exit_code_for_signal(signal::SIGABRT));
+    assert_eq!(killed & 0x7f, signal::SIGABRT as i32); // WIFSIGNALED, WTERMSIG
+    assert_eq!(killed & 0xff00, 0);
+    let segv = wait_status_from_exit_code(exit_code_for_signal(signal::SIGSEGV));
+    assert_eq!(segv, signal::SIGSEGV as i32);
 }
 
 #[test]
@@ -1794,6 +1939,18 @@ fn timespec_conversion_validates_nanoseconds() {
 }
 
 #[test]
+fn flock_table_holds_one_lock_per_wayland_auto_socket() {
+    let _guard = evfd_test_setup();
+    // wl_display_add_socket_auto holds wayland-0.lock .. wayland-32.lock.
+    for i in 0..33u16 {
+        assert_eq!(flock_try_acquire(100 + i, 1, 3 + i as i32, true), Ok(()));
+    }
+    for i in 0..33u16 {
+        flock_release_fd(1, 3 + i as i32);
+    }
+}
+
+#[test]
 fn flock_exclusive_conflicts_and_releases_on_unlock() {
     let _guard = evfd_test_setup();
     assert_eq!(flock_try_acquire(7, 1, 3, true), Ok(()));
@@ -1888,4 +2045,178 @@ fn lock_free_return_falls_back_for_signals_and_exit() {
     assert!(needs_locked_return(1 << 9, 0, 0));
     // Told to exit by a sibling thread.
     assert!(needs_locked_return(0, 0, task::TASK_FLAG_EXITING));
+}
+
+#[test]
+fn process_exit_sends_sigchld_to_parent() {
+    let _guard = evfd_test_setup();
+    task::Task::reset_registry_for_test();
+    let mut parent = task::Task::for_test(410);
+    let mut child = task::Task::for_test(411);
+    child.ppid = 410;
+    let parent_ptr = &mut parent as *mut task::Task;
+    let child_ptr = &mut child as *mut task::Task;
+    task::Task::install_for_test(0, parent_ptr);
+    task::Task::install_for_test(1, child_ptr);
+
+    // Default disposition ignores SIGCHLD: nothing is queued.
+    notify_parent_of_exit(child_ptr);
+    assert_eq!(parent.sig_pending & signal::signal_bit(signal::SIGCHLD), 0);
+
+    // A parent that blocks SIGCHLD (e.g. to read it from a signalfd) sees it.
+    parent.signal_blocked |= signal::signal_bit(signal::SIGCHLD);
+    notify_parent_of_exit(child_ptr);
+    assert_ne!(parent.sig_pending & signal::signal_bit(signal::SIGCHLD), 0);
+
+    // No parent: nothing to do (and no crash).
+    child.ppid = 999;
+    notify_parent_of_exit(child_ptr);
+
+    task::Task::install_for_test(0, core::ptr::null_mut());
+    task::Task::install_for_test(1, core::ptr::null_mut());
+}
+
+#[test]
+fn shared_write_window_allows_partial_last_page() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+    let opened = fs::open("/temp/window-test", fs::O_CREAT | fs::O_RDWR, 0o600).expect("create");
+    let inode = opened.inode;
+    fs::write(inode, 0, &[7u8; 100], false).expect("write");
+    // A 100-byte file can be mapped with one (page-rounded) page...
+    assert_eq!(mmap_validate_shared_write_window(inode, 0, PAGE_SIZE), Ok(()));
+    // ...but not with two.
+    assert_eq!(mmap_validate_shared_write_window(inode, 0, 2 * PAGE_SIZE), Err(-EINVAL));
+}
+
+#[test]
+fn memfd_shmem_object_lives_until_last_fd_and_mapping_are_gone() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+    crate::shmem::reset_for_test();
+    let mut task = task::Task::for_test(420);
+    let task_ptr = &mut task as *mut task::Task;
+    task::Task::install_for_test(0, task_ptr);
+
+    // What memfd_create does: tmpfs inode + fd (open reference) + shmem
+    // object, then unlink so only references keep it alive.
+    let opened = fs::open("/temp/memfd-life", fs::O_CREAT | fs::O_RDWR, 0o600).expect("create");
+    let inode = opened.inode;
+    let fd = fd_alloc(task_ptr, task::USER_FD_KIND_VFS, inode, fs::O_RDWR | FD_INTERNAL_MEMFD)
+        .expect("fd") as i32;
+    crate::shmem::create(inode).expect("shmem");
+    fs::unlink("/temp/memfd-life").expect("unlink");
+    assert_eq!(vfs_truncate_to(inode, 3 * 1024 * 1024), Ok(()));
+    assert_eq!(vfs_file_size(inode), Ok(3 * 1024 * 1024));
+
+    // dup + close the original: the object survives through the dup.
+    let dup = fd_dup_from(task_ptr, fd, 8, false).expect("dup") as i32;
+    fd_close(task_ptr, fd).expect("close original");
+    assert!(crate::shmem::exists(inode));
+
+    // A mapping keeps the object alive after the last fd closes.
+    let slot = mmap_prepare_task_slot(task_ptr).expect("vm slot");
+    unsafe {
+        TASK_VM_MAPPINGS[slot][0] = VmMapping {
+            start: 0x1_0000_0000,
+            len: PAGE_SIZE,
+            file_offset: 0,
+            file_inode: inode,
+            prot: PROT_READ | PROT_WRITE,
+            map_shared: true,
+            map_shared_can_write: true,
+        };
+    }
+    vm_sync_inode_pins();
+    fd_close(task_ptr, dup).expect("close dup");
+    assert!(crate::shmem::exists(inode), "still mapped");
+
+    // Dropping the mapping frees the inode and with it the shmem object.
+    mmap_clear_task_regions(task_ptr);
+    assert!(!crate::shmem::exists(inode));
+
+    task::Task::install_for_test(0, core::ptr::null_mut());
+}
+
+fn anon_region(start: u64, pages: u64) -> VmMapping {
+    VmMapping {
+        start,
+        len: pages * PAGE_SIZE,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: false,
+        map_shared_can_write: false,
+    }
+}
+
+#[test]
+fn adjacent_compatible_regions_merge_on_insert() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x1_0000_0000u64;
+    mmap_regions_insert(&mut regions, anon_region(base, 2)).unwrap();
+    mmap_regions_insert(&mut regions, anon_region(base + 4 * PAGE_SIZE, 1)).unwrap();
+    // Fills the gap: all three become one region.
+    mmap_regions_insert(&mut regions, anon_region(base + 2 * PAGE_SIZE, 2)).unwrap();
+    let used: Vec<_> = regions.iter().filter(|r| !r.is_empty()).collect();
+    assert_eq!(used.len(), 1);
+    assert_eq!((used[0].start, used[0].len), (base, 5 * PAGE_SIZE));
+
+    // Different protection does not merge.
+    let mut ro = anon_region(base + 5 * PAGE_SIZE, 1);
+    ro.prot = PROT_READ;
+    mmap_regions_insert(&mut regions, ro).unwrap();
+    assert_eq!(regions.iter().filter(|r| !r.is_empty()).count(), 2);
+}
+
+#[test]
+fn full_region_table_rejects_unmergeable_insert_without_changes() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x4_0000_0000u64;
+    // Fill every slot with non-adjacent regions (gaps prevent merging).
+    for i in 0..MMAP_MAX_REGIONS_PER_TASK as u64 {
+        mmap_regions_insert(&mut regions, anon_region(base + i * 4 * PAGE_SIZE, 1)).unwrap();
+    }
+    let before = regions;
+    let far = anon_region(base + 1000 * PAGE_SIZE, 1);
+    assert_eq!(mmap_regions_insert(&mut regions, far), Err(-ENOMEM));
+    assert_eq!(regions, before, "failed insert must not modify the table");
+    // A region adjacent to an existing one still fits by merging.
+    mmap_regions_insert(&mut regions, anon_region(base + PAGE_SIZE, 1)).unwrap();
+}
+
+#[test]
+fn region_table_copies_stay_small() {
+    // Syscall paths copy whole tables onto the 16 KiB kernel stack.
+    assert!(core::mem::size_of::<[VmMapping; MMAP_MAX_REGIONS_PER_TASK]>() <= 1024);
+}
+
+#[test]
+fn file_regions_merge_only_with_contiguous_offsets() {
+    let file = |start: u64, off: u64| VmMapping {
+        start,
+        len: PAGE_SIZE,
+        file_offset: off,
+        file_inode: 9,
+        prot: PROT_READ,
+        map_shared: true,
+        map_shared_can_write: false,
+    };
+    let base = 0x2_0000_0000u64;
+    assert!(mmap_regions_can_merge(&file(base, 0), &file(base + PAGE_SIZE, PAGE_SIZE)));
+    assert!(!mmap_regions_can_merge(&file(base, 0), &file(base + PAGE_SIZE, 0)));
+    let mut other = file(base + PAGE_SIZE, PAGE_SIZE);
+    other.file_inode = 10;
+    assert!(!mmap_regions_can_merge(&file(base, 0), &other));
+}
+
+#[test]
+fn many_adjacent_anonymous_maps_use_one_slot() {
+    // What musl's allocator does while libxkbcommon compiles a keymap.
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x3_0000_0000u64;
+    for i in 0..(2 * MMAP_MAX_REGIONS_PER_TASK as u64) {
+        mmap_regions_insert(&mut regions, anon_region(base + i * PAGE_SIZE, 1)).unwrap();
+    }
+    assert_eq!(regions.iter().filter(|r| !r.is_empty()).count(), 1);
 }

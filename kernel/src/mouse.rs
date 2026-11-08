@@ -135,6 +135,12 @@ fn decode_packet(bytes: [u8; 3]) -> Option<MousePacket> {
     })
 }
 
+/// Relative motion in the Linux evdev convention for `/dev/input/event1`.
+/// PS/2 reports Y as positive-up; evdev `REL_Y` is positive-down.
+fn evdev_relative_delta(packet: MousePacket) -> (i16, i16) {
+    (packet.dx, packet.dy.saturating_neg())
+}
+
 fn apply_motion(x: i32, y: i32, dx: i32, dy: i32, max_x: i32, max_y: i32) -> (i32, i32) {
     let next_x = x.saturating_add(dx).clamp(0, max_x);
     let next_y = y.saturating_sub(dy).clamp(0, max_y);
@@ -448,7 +454,8 @@ fn queue_packet(packet: MousePacket) {
     PENDING_DX.fetch_add(packet.dx as i32, Ordering::Relaxed);
     PENDING_DY.fetch_add(packet.dy as i32, Ordering::Relaxed);
     BUTTON_STATE.store(packet.buttons, Ordering::Relaxed);
-    crate::input::push_pointer_relative(packet.dx, packet.dy, packet.buttons);
+    let (dx, dy) = evdev_relative_delta(packet);
+    crate::input::push_pointer_relative(dx, dy, packet.buttons);
 }
 
 #[cfg(target_os = "none")]
@@ -672,6 +679,15 @@ pub fn set_absolute_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evdev_relative_delta_flips_ps2_y_axis() {
+        // PS/2 "up" (positive dy) must become evdev REL_Y negative.
+        let up = MousePacket { buttons: 0, dx: 5, dy: 7 };
+        assert_eq!(evdev_relative_delta(up), (5, -7));
+        let down = MousePacket { buttons: 0, dx: -3, dy: -128 };
+        assert_eq!(evdev_relative_delta(down), (-3, 128));
+    }
 
     #[test]
     fn packet_assembler_resyncs_to_header_bit() {

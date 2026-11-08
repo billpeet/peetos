@@ -7,8 +7,9 @@
 > `user/peet_gui_compositor_smoke.c` composites two clients that are structs
 > inside the compositor process with `malloc`ed buffers. The host tests in
 > `kernel/src/gui_protocol.rs` (built only under `cfg(test)`) model a protocol
-> that neither C program speaks. The multi-process compositor is now being
-> built on libwayland instead; see `docs/wayland.md`.
+> that neither C program speaks. The real multi-process compositor is now
+> `peetwl` (`user/peetwl.c`), built on libwayland with xdg-shell; see
+> `docs/wayland.md`.
 
 This document tracks the current landed Phase 4 userspace compositor MVP
 baseline.

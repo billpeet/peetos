@@ -110,6 +110,21 @@ process (not the thread) as its parent.
 - `SA_SIGINFO`, `SA_RESTART`, `SA_NODEFER` and `SA_RESETHAND` are honored.
 - Ignored signals that are not blocked are discarded when sent, as on Linux,
   so they never wake or interrupt anything.
+- `setitimer(ITIMER_REAL)`/`alarm` arm a per-process timer stored on the
+  thread-group leader (`itimer_real_deadline`/`itimer_real_interval`, in
+  ticks). The timer tick sends `SIGALRM` to the process when it expires and
+  reloads periodic timers. Timers survive `execve` (including a non-leader
+  `execve` taking over the leader) and are cleared in `fork` children.
+
+## Child Exit Notification
+
+When the last thread of a process exits, its parent process is sent
+`SIGCHLD` (`notify_parent_of_exit` in `kernel/src/syscall/process.rs`).
+`clone` only accepts `SIGCHLD` as the exit signal for new processes, so no
+other exit signal exists. With the default disposition the signal is
+discarded at send; a parent that installs a handler, or blocks `SIGCHLD` and
+reads it through a signalfd (as the `peetwl` compositor does), sees it. Before
+this, `SIGCHLD` was never raised and parents could only poll with `wait4`.
 
 ## Interrupted Syscalls
 
@@ -157,6 +172,9 @@ Pipe writes that already moved data return the partial count.
   space.
 - An exiting task never returns to user mode: after becoming a zombie it
   yields, and the scheduler never runs a zombie again.
+- `wait4` reports a process killed by a signal (default "terminate" action,
+  or a fatal fault as `SIGSEGV`) as `WIFSIGNALED` with `WTERMSIG`, not as an
+  `exit(128 + sig)`.
 - Only thread group leaders are visible to `wait4`. A leader that exited
   before its threads (e.g. the main thread called `pthread_exit`) is reaped
   only after the whole group is gone. Exited non-leader threads are freed
@@ -202,3 +220,9 @@ Limitations / Simplifications
   this work); shared read-only frames are not protected from such writes.
 - Frame share counts are 16-bit; a frame that would overflow is copied
   instead of shared.
+
+Note on `ITIMER_REAL` under SMP: the BSP timer tick (`sched::tick`) only
+records which processes' timers expired while it holds `SCHED_LOCK`, and
+sends `SIGALRM` after releasing it. Sending can wake a sleeping target via
+`sched::unblock`, which takes `SCHED_LOCK`; doing it inside the scan
+deadlocked the tick (seen as a hang in upstream libwayland's `sanity-test`).

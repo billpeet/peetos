@@ -61,7 +61,7 @@ impl ExecImage {
 }
 
 pub(super) fn read_exec_image_from_inode(inode: u16) -> Result<ExecImage, i64> {
-    let stat = fs::stat(inode).map_err(|err| -fs_to_errno(err))?;
+    let stat = vfs_stat(inode).map_err(|err| -fs_to_errno(err))?;
     if stat.file_type != fs::FileType::Regular {
         return Err(-EACCES);
     }
@@ -217,9 +217,25 @@ pub(super) fn execve_common(
     result
 }
 
+/// Internal `exit_code` flag: the process was killed by signal
+/// `code & 0x7f` rather than calling `exit(code)`. Kept out of the 8-bit
+/// exit-status range so `exit(134)` and death by `SIGABRT` stay distinct.
+pub(super) const EXIT_CODE_KILLED_BY_SIGNAL: i32 = 0x1_0000;
+
+#[inline]
+pub(super) fn exit_code_for_signal(signum: u32) -> i32 {
+    EXIT_CODE_KILLED_BY_SIGNAL | (signum as i32 & 0x7f)
+}
+
+/// Linux `wait4` status word: `WIFEXITED` (`code << 8`) for normal exits,
+/// `WIFSIGNALED` (signal number in the low 7 bits) for signal deaths.
 #[inline]
 pub(super) fn wait_status_from_exit_code(code: i32) -> i32 {
-    (code & 0xFF) << 8
+    if (code & EXIT_CODE_KILLED_BY_SIGNAL) != 0 {
+        code & 0x7f
+    } else {
+        (code & 0xFF) << 8
+    }
 }
 
 pub(super) fn fork_cleanup_child(task_ptr: *mut task::Task) {
@@ -339,7 +355,7 @@ pub(super) fn create_fork_child(
         (*crate::task::leader_of(child)).user_uid = (*crate::task::leader_of(parent)).user_uid;
         (*crate::task::leader_of(child)).user_gid = (*crate::task::leader_of(parent)).user_gid;
         (*crate::task::leader_of(child)).user_cwd_inode = (*crate::task::leader_of(parent)).user_cwd_inode;
-        fs::inode_retain((*crate::task::leader_of(child)).user_cwd_inode);
+        fs::inode_open_retain((*crate::task::leader_of(child)).user_cwd_inode);
         (*crate::task::leader_of(child)).pgid = (*crate::task::leader_of(parent)).pgid;
         (*crate::task::leader_of(child)).sid = (*crate::task::leader_of(parent)).sid;
         (*crate::task::leader_of(child)).ctty_type = (*crate::task::leader_of(parent)).ctty_type;
@@ -1186,6 +1202,25 @@ pub(super) fn leave_exited_task(ctx: &SyscallContext) {
     }
 }
 
+/// Send the exit signal (always `SIGCHLD`: `clone` only accepts that exit
+/// signal for new processes) to the parent of a process that just exited.
+/// Like any signal, it is discarded when the parent ignores `SIGCHLD`
+/// (the default) and stays pending when the parent blocks it.
+pub(super) fn notify_parent_of_exit(leader: *mut task::Task) {
+    if leader.is_null() {
+        return;
+    }
+    let ppid = unsafe { (*leader).ppid };
+    if ppid <= 0 {
+        return;
+    }
+    let parent = task::get_by_pid(ppid);
+    if parent.is_null() || !task::is_live(parent) {
+        return;
+    }
+    let _ = signal::send_to_process(parent, signal::SIGCHLD);
+}
+
 /// Exit the calling thread. When it is the last live thread of its process,
 /// the process's resources are released and the leader becomes waitable.
 pub(super) fn exit_current_thread(ctx: &SyscallContext, code: i32) -> i64 {
@@ -1218,6 +1253,7 @@ pub(super) fn exit_current_thread(ctx: &SyscallContext, code: i32) -> i64 {
             (*leader).exit_code = status;
         }
         release_process_resources(leader);
+        notify_parent_of_exit(leader);
         crate::user::maybe_restore_console_after_init_exit(leader, status);
     }
 

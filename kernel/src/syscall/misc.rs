@@ -25,6 +25,137 @@ pub(super) fn timespec_to_unix_seconds(
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(super) struct LinuxITimerVal {
+    pub(super) it_interval: LinuxTimeVal,
+    pub(super) it_value: LinuxTimeVal,
+}
+
+pub(super) const ITIMER_REAL: i32 = 0;
+
+/// Interval-timer `timeval` to timer ticks, rounding up so a timer never
+/// fires early (and a non-zero value never becomes "disarmed").
+pub(super) fn itimer_timeval_to_ticks(tv: LinuxTimeVal) -> Result<u64, i64> {
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return Err(-EINVAL);
+    }
+    let hz = pit::TIMER_FREQUENCY as u128;
+    let total_us = (tv.tv_sec as u128) * 1_000_000 + tv.tv_usec as u128;
+    let ticks = (total_us * hz + 999_999) / 1_000_000;
+    Ok(cmp::min(ticks, u64::MAX as u128 / 2) as u64)
+}
+
+pub(super) fn itimer_ticks_to_timeval(ticks: u64) -> LinuxTimeVal {
+    let (sec, nsec) = ticks_to_seconds_nanos(ticks);
+    LinuxTimeVal {
+        tv_sec: sec,
+        tv_usec: nsec / 1000,
+    }
+}
+
+/// Current `ITIMER_REAL` setting of a process leader.
+pub(super) fn itimer_real_read(deadline: u64, interval: u64, now: u64) -> LinuxITimerVal {
+    let remaining = if deadline == 0 {
+        0
+    } else {
+        // Armed but not yet delivered by the tick handler: report one tick.
+        cmp::max(deadline.saturating_sub(now), 1)
+    };
+    LinuxITimerVal {
+        it_interval: itimer_ticks_to_timeval(interval),
+        it_value: itimer_ticks_to_timeval(remaining),
+    }
+}
+
+/// Replace the calling process's `ITIMER_REAL`; returns the old setting.
+fn itimer_real_swap(ctx: &SyscallContext, new: LinuxITimerVal) -> Result<LinuxITimerVal, i64> {
+    let value = itimer_timeval_to_ticks(new.it_value)?;
+    let interval = itimer_timeval_to_ticks(new.it_interval)?;
+    let leader = crate::task::leader_of(ctx.current);
+    Ok(arch_x86_64::interrupts::without_interrupts(|| unsafe {
+        let now = pit::ticks();
+        let old = itimer_real_read((*leader).itimer_real_deadline, (*leader).itimer_real_interval, now);
+        if value == 0 {
+            (*leader).itimer_real_deadline = 0;
+            (*leader).itimer_real_interval = 0;
+        } else {
+            (*leader).itimer_real_deadline = now.saturating_add(value);
+            (*leader).itimer_real_interval = interval;
+        }
+        old
+    }))
+}
+
+/// `getitimer(which, curr)`. Only `ITIMER_REAL` is implemented.
+pub(super) fn sys_getitimer(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    if call.arg(0) as i32 != ITIMER_REAL {
+        return -EINVAL;
+    }
+    let leader = crate::task::leader_of(ctx.current);
+    let cur = arch_x86_64::interrupts::without_interrupts(|| unsafe {
+        itimer_real_read((*leader).itimer_real_deadline, (*leader).itimer_real_interval, pit::ticks())
+    });
+    match write_struct_to_user(ctx.current, call.arg(1), &cur) {
+        Ok(()) => 0,
+        Err(e) => -e,
+    }
+}
+
+/// `setitimer(which, new, old)`: `ITIMER_REAL` delivers `SIGALRM` to the
+/// process from the timer tick (`signal::itimer_real_take_expiry`, then `itimer_real_fire` once `SCHED_LOCK` is released).
+pub(super) fn sys_setitimer(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    if call.arg(0) as i32 != ITIMER_REAL {
+        return -EINVAL;
+    }
+    let new = if call.arg(1) == 0 {
+        LinuxITimerVal::default()
+    } else {
+        match read_struct_from_user::<LinuxITimerVal>(ctx.current, call.arg(1)) {
+            Ok(v) => v,
+            Err(e) => return -e,
+        }
+    };
+    let old = match itimer_real_swap(ctx, new) {
+        Ok(old) => old,
+        Err(e) => return e,
+    };
+    if call.arg(2) != 0 {
+        if let Err(e) = write_struct_to_user(ctx.current, call.arg(2), &old) {
+            return -e;
+        }
+    }
+    0
+}
+
+/// Seconds `alarm()` reports for a remaining timer: rounded to nearest,
+/// but never 0 while the timer is still armed (Linux semantics).
+pub(super) fn alarm_seconds_left(old: LinuxTimeVal) -> u64 {
+    if old.tv_sec == 0 && old.tv_usec == 0 {
+        return 0;
+    }
+    let mut secs = old.tv_sec as u64;
+    if old.tv_usec >= 500_000 || secs == 0 {
+        secs += 1;
+    }
+    secs
+}
+
+/// `alarm(seconds)`: one-shot `ITIMER_REAL`.
+pub(super) fn sys_alarm(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let new = LinuxITimerVal {
+        it_interval: LinuxTimeVal::default(),
+        it_value: LinuxTimeVal {
+            tv_sec: call.arg(0) as u32 as i64,
+            tv_usec: 0,
+        },
+    };
+    match itimer_real_swap(ctx, new) {
+        Ok(old) => alarm_seconds_left(old.it_value) as i64,
+        Err(e) => e,
+    }
+}
+
 #[inline]
 pub(super) fn ticks_to_seconds_nanos(ticks: u64) -> (i64, i64) {
     let hz = pit::TIMER_FREQUENCY as u64;

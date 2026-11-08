@@ -646,6 +646,106 @@ pub(super) fn mmap_clear_task_regions(task_ptr: *mut task::Task) {
         TASK_VM_OWNER_PID[slot] = task::INVALID_PID;
         TASK_VM_MAPPINGS[slot] = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
     }
+    vm_sync_inode_pins();
+}
+
+/// Inodes on which the VM currently holds one fs open reference.
+pub(super) static mut VM_INODE_PINNED: [bool; fs::VFS_MAX_INODES] = [false; fs::VFS_MAX_INODES];
+
+/// Which inodes some task's region table maps.
+/// Mapped-inode set for `vm_sync_inode_pins`; static because one bool per
+/// possible VFS node (`fs::VFS_MAX_INODES`) is too big for the kernel stack.
+static mut VM_INODE_MAPPED: [bool; fs::VFS_MAX_INODES] = [false; fs::VFS_MAX_INODES];
+
+#[cfg(test)]
+pub(super) fn vm_mapped_inodes(
+    tables: &[[VmMapping; MMAP_MAX_REGIONS_PER_TASK]],
+) -> std::boxed::Box<[bool; fs::VFS_MAX_INODES]> {
+    let mut mapped = std::boxed::Box::new([false; fs::VFS_MAX_INODES]);
+    vm_mapped_inodes_into(tables, &mut mapped);
+    mapped
+}
+
+pub(super) fn vm_mapped_inodes_into(
+    tables: &[[VmMapping; MMAP_MAX_REGIONS_PER_TASK]],
+    mapped: &mut [bool; fs::VFS_MAX_INODES],
+) {
+    mapped.fill(false);
+    for table in tables {
+        for region in table.iter() {
+            if !region.is_empty()
+                && region.file_inode != task::USER_FD_NONE
+                && (region.file_inode as usize) < fs::VFS_MAX_INODES
+            {
+                mapped[region.file_inode as usize] = true;
+            }
+        }
+    }
+}
+
+/// Hold one fs open reference per inode that any task maps, so a file that
+/// is unlinked (and closed) while mapped, or the hidden file behind a
+/// `MAP_SHARED | MAP_ANONYMOUS` region, lives exactly as long as its
+/// mappings. Called after every change to the set of mapped files.
+pub(super) fn vm_sync_inode_pins() {
+    let mapped = unsafe {
+        let mapped = &mut *core::ptr::addr_of_mut!(VM_INODE_MAPPED);
+        vm_mapped_inodes_into(&*core::ptr::addr_of!(TASK_VM_MAPPINGS), mapped);
+        mapped
+    };
+    for inode in 0..fs::VFS_MAX_INODES {
+        let pinned = unsafe { VM_INODE_PINNED[inode] };
+        if mapped[inode] && !pinned {
+            fs::inode_open_retain(inode as u16);
+            unsafe { VM_INODE_PINNED[inode] = true };
+        } else if !mapped[inode] && pinned {
+            unsafe { VM_INODE_PINNED[inode] = false };
+            if fs::inode_open_release(inode as u16) {
+                vfs_inode_freed(inode as u16);
+            }
+        }
+    }
+}
+
+/// Temporary open reference on a freshly created hidden file; dropping it
+/// frees the file unless a mapping pinned it meanwhile.
+struct HiddenFileRef(u16);
+
+impl Drop for HiddenFileRef {
+    fn drop(&mut self) {
+        if fs::inode_open_release(self.0) {
+            vfs_inode_freed(self.0);
+        }
+    }
+}
+
+/// Backing object for `MAP_SHARED | MAP_ANONYMOUS`: an unlinked tmpfs file
+/// (in the memfd storage dir) whose pages live in the shared page cache, so
+/// `fork`ed children see the same memory. The returned guard holds the only
+/// reference until `vm_sync_inode_pins` pins the new mapping.
+fn mmap_shared_anon_backing(task_ptr: *mut task::Task, len: u64) -> Result<HiddenFileRef, i64> {
+    memfd_storage_dir_ready()?;
+    let pid = unsafe { (*task_ptr).pid };
+    let mut path_buf = [0u8; fs::VFS_MAX_PATH];
+    for _ in 0..MEMFD_CREATE_MAX_RETRIES {
+        let sequence = MEMFD_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = memfd_build_path(pid, sequence, b"shared-anon", &mut path_buf)?;
+        let opened = match fs::open(path, fs::O_CREAT | fs::O_EXCL | fs::O_RDWR, 0o600) {
+            Ok(opened) => opened,
+            Err(fs::EEXIST) => continue,
+            Err(fs::ENOSPC) => return Err(-ENOMEM),
+            Err(err) => return Err(-fs_to_errno(err)),
+        };
+        fs::inode_open_retain(opened.inode);
+        let guard = HiddenFileRef(opened.inode);
+        // Page-backed storage (crate::shmem), freed with the inode, so the
+        // region is not limited by tmpfs's inline file size.
+        crate::shmem::create(opened.inode)?;
+        vfs_truncate_to(opened.inode, len).map_err(|err| -fs_to_errno(err))?;
+        let _ = fs::unlink(path);
+        return Ok(guard);
+    }
+    Err(-EAGAIN)
 }
 
 pub(super) fn mmap_regions_find_free(
@@ -690,6 +790,21 @@ pub(super) fn mmap_regions_find_mapping(
     None
 }
 
+/// True when `next` starts exactly where `prev` ends and both describe the
+/// same kind of mapping, so they can be one region (like Linux VMA merging).
+/// File mappings also need contiguous file offsets.
+pub(super) fn mmap_regions_can_merge(prev: &VmMapping, next: &VmMapping) -> bool {
+    !prev.is_empty()
+        && !next.is_empty()
+        && prev.end() == next.start
+        && prev.prot == next.prot
+        && prev.map_shared == next.map_shared
+        && prev.map_shared_can_write == next.map_shared_can_write
+        && prev.file_inode == next.file_inode
+        && (prev.file_inode == task::USER_FD_NONE
+            || prev.file_offset.checked_add(prev.len) == Some(next.file_offset))
+}
+
 pub(super) fn mmap_regions_insert(
     regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
     mapping: VmMapping,
@@ -701,12 +816,36 @@ pub(super) fn mmap_regions_insert(
         return Err(-EINVAL);
     }
 
-    let slot = match mmap_regions_find_free(regions) {
-        Some(slot) => slot,
-        None => return Err(-ENOMEM),
-    };
-    regions[slot] = mapping;
-    Ok(())
+    // Absorb compatible neighbours, in place (no table copy: this runs on the
+    // kernel stack under callers that already hold copies). Allocators such
+    // as musl's mallocng map many small adjacent anonymous areas; without
+    // merging each one would use a region slot. Absorbing a neighbour frees
+    // its slot, so the only failure (table full) leaves `regions` untouched.
+    let mergeable = regions
+        .iter()
+        .any(|r| mmap_regions_can_merge(r, &mapping) || mmap_regions_can_merge(&mapping, r));
+    if !mergeable && mmap_regions_find_free(regions).is_none() {
+        return Err(-ENOMEM);
+    }
+    let mut merged = mapping;
+    for region in regions.iter_mut() {
+        if mmap_regions_can_merge(region, &merged) {
+            merged.start = region.start;
+            merged.len = merged.len.saturating_add(region.len);
+            merged.file_offset = region.file_offset;
+            *region = VmMapping::EMPTY;
+        } else if mmap_regions_can_merge(&merged, region) {
+            merged.len = merged.len.saturating_add(region.len);
+            *region = VmMapping::EMPTY;
+        }
+    }
+    match mmap_regions_find_free(regions) {
+        Some(slot) => {
+            regions[slot] = merged;
+            Ok(())
+        }
+        None => Err(-ENOMEM), // unreachable: checked above
+    }
 }
 
 #[inline]
@@ -986,8 +1125,11 @@ pub(super) fn mmap_validate_shared_write_window(
     len: u64,
 ) -> Result<(), i64> {
     let end = offset.checked_add(len).ok_or(-EINVAL)?;
-    let stat = fs::stat(inode).map_err(|err| -fs_to_errno(err))?;
-    if end > stat.size {
+    let stat = vfs_stat(inode).map_err(|err| -fs_to_errno(err))?;
+    // `len` is page-rounded; like Linux, the mapping may cover the partial
+    // page holding the end of the file.
+    let limit = stat.size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    if end > limit {
         return Err(-EINVAL);
     }
     Ok(())
@@ -1109,17 +1251,25 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => return err,
     };
 
+    let mut shared_anon: Option<HiddenFileRef> = None;
     let file_src = if is_anon {
-        if is_shared {
-            return -EINVAL;
-        }
         if fd_raw != -1 {
             return -EINVAL;
         }
         if offset != 0 {
             return -EINVAL;
         }
-        None
+        if is_shared {
+            let backing = match mmap_shared_anon_backing(ctx.current, len) {
+                Ok(backing) => backing,
+                Err(err) => return err,
+            };
+            let inode = backing.0;
+            shared_anon = Some(backing);
+            Some((inode, 0, true))
+        } else {
+            None
+        }
     } else {
         if fd_raw < 0 || fd_raw > i32::MAX as i64 {
             return -EBADF;
@@ -1231,6 +1381,10 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             unsafe {
                 TASK_VM_MAPPINGS[slot] = projected_regions;
             }
+            // Pin newly mapped files (and unpin ones a MAP_FIXED replaced)
+            // before the shared-anon creation reference is dropped.
+            vm_sync_inode_pins();
+            drop(shared_anon);
             start as i64
         }
         Err(err) => err,
@@ -1246,29 +1400,20 @@ pub(super) const MREMAP_MAYMOVE: u32 = 1;
 pub(super) fn mremap_move_ptes(pml4: PhysAddr, old_start: u64, new_start: u64, len: u64) -> Result<(), i64> {
     let mut off = 0u64;
     while off < len {
-        let old_va = VirtAddr::new(old_start + off);
-        if let Some(pte) = vmm::get_pte_in(pml4, old_va) {
-            let phys = PhysAddr::new(pte & vmm::PTE_ADDR_MASK);
-            let flags = pte & vmm::PTE_FLAGS_MASK;
-            if vmm::map_page_in(pml4, VirtAddr::new(new_start + off), phys, flags) != 0 {
-                // Roll back the pages moved so far.
-                let mut back = 0u64;
-                while back < off {
-                    let new_va = VirtAddr::new(new_start + back);
-                    if let Some(moved) = vmm::get_pte_in(pml4, new_va) {
-                        let _ = vmm::map_page_in(
-                            pml4,
-                            VirtAddr::new(old_start + back),
-                            PhysAddr::new(moved & vmm::PTE_ADDR_MASK),
-                            moved & vmm::PTE_FLAGS_MASK,
-                        );
-                        let _ = vmm::unmap_page_in(pml4, new_va);
-                    }
-                    back += PAGE_SIZE;
-                }
-                return Err(-ENOMEM);
+        let from = VirtAddr::new(old_start + off);
+        let to = VirtAddr::new(new_start + off);
+        if vmm::move_page_in(pml4, from, to).is_err() {
+            // Roll back the pages moved so far.
+            let mut back = 0u64;
+            while back < off {
+                let _ = vmm::move_page_in(
+                    pml4,
+                    VirtAddr::new(new_start + back),
+                    VirtAddr::new(old_start + back),
+                );
+                back += PAGE_SIZE;
             }
-            let _ = vmm::unmap_page_in(pml4, old_va);
+            return Err(-ENOMEM);
         }
         off += PAGE_SIZE;
     }
@@ -1406,6 +1551,7 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     unsafe {
         TASK_VM_MAPPINGS[slot] = next;
     }
+    vm_sync_inode_pins();
     new_start as i64
 }
 
@@ -1449,6 +1595,7 @@ pub(super) fn sys_munmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     unsafe {
         TASK_VM_MAPPINGS[slot] = next_regions;
     }
+    vm_sync_inode_pins();
     0
 }
 
@@ -1559,6 +1706,31 @@ pub(super) fn mmap_fault_map_page(
             pte_flags,
         ) != 0
         {
+            return Err(-ENOMEM);
+        }
+        return Ok(());
+    }
+
+    if mapping.map_shared
+        && mapping.file_inode != task::USER_FD_NONE
+        && crate::shmem::exists(mapping.file_inode)
+    {
+        // memfd pages are owned by the shmem object; each mapping takes its
+        // own PMM share reference, dropped by the normal unmap/exit paths.
+        let map_delta = page_addr.checked_sub(mapping.start).ok_or(-EINVAL)?;
+        let file_off = mapping.file_offset.checked_add(map_delta).ok_or(-EINVAL)?;
+        let page_off = align_down(file_off, PAGE_SIZE);
+        let phys = match crate::shmem::fault_page(mapping.file_inode, page_off) {
+            Some(Ok(phys)) => PhysAddr::new(phys),
+            Some(Err(err)) => return Err(err),
+            None => return Err(-EINVAL),
+        };
+        if !pmm::page_share(phys) {
+            return Err(-ENOMEM);
+        }
+        let pte_flags = mmap_prot_to_pte_flags(mapping.prot)?;
+        if vmm::map_page_in(pml4, VirtAddr::new(page_addr), phys, pte_flags) != 0 {
+            pmm::free_page(phys);
             return Err(-ENOMEM);
         }
         return Ok(());
@@ -1756,7 +1928,7 @@ pub fn terminate_current_user_fault(
     );
 
     let ctx = SyscallContext::new(current);
-    let _ = sys_exit_common(&ctx, 128 + signal::SIGSEGV as i32);
+    let _ = sys_exit_common(&ctx, exit_code_for_signal(signal::SIGSEGV));
     true
 }
 

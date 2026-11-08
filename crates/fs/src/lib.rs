@@ -332,7 +332,7 @@ struct Inode {
     mtime: u64,
     ctime: u64,
     /// References held by the kernel (open fds, working directories):
-    /// `inode_retain` / `inode_release`.
+    /// `inode_open_retain` / `inode_open_release`.
     open_count: u32,
     /// Removed from its directory while still referenced: freed (and for
     /// ext2, its on-disk inode and blocks released) on the last release.
@@ -1059,6 +1059,8 @@ fn ensure_init(state: &mut VfsState) {
     let _ = create_virtual_file_inner(state, "/dev/tty", NodeBackend::DevTty);
     let _ = create_virtual_file_inner(state, "/dev/ptmx", NodeBackend::DevPtmx);
     let _ = create_virtual_file_inner(state, "/dev/fb0", NodeBackend::DevFramebuffer);
+    // Listing is synthesized per process by the kernel (getdents64).
+    let _ = mkdir_virtual_inner(state, "/dev/fd");
     let _ = mkdir_virtual_inner(state, "/dev/input");
     if let Ok(inode) =
         create_virtual_file_inner(state, "/dev/input/event0", NodeBackend::DevInputEvent)
@@ -6102,8 +6104,8 @@ fn ext2_process_orphans(state: &mut VfsState) -> Result<u32, i64> {
     Ok(processed)
 }
 
-/// Drops a reference; the last one on a removed node frees it. Returns
-/// true when that changed the ext2 filesystem (the caller syncs).
+/// Drops a reference; the last one on a removed node frees it and returns
+/// true (any backend: the kernel drops the node's cached pages).
 fn inode_release_inner(state: &mut VfsState, inode: u16) -> Result<bool, i64> {
     if (inode as usize) >= state.inodes.len() || !state.inodes[inode as usize].used {
         return Ok(false);
@@ -6120,16 +6122,15 @@ fn inode_release_inner(state: &mut VfsState, inode: u16) -> Result<bool, i64> {
     clear_inode(&mut state.inodes[inode as usize]);
     if backend != NodeBackend::Ext2 || ext2_ino == 0 || !state.ext2_mounted || state.ext2_read_only
     {
-        return Ok(false);
+        return Ok(true);
     }
     if ext2_inode_busy(state, ext2_ino) {
-        return Ok(false);
+        return Ok(true);
     }
     let ext = ext2_read_inode_from_state(state, ext2_ino)?;
-    if ext.links_count != 0 {
-        return Ok(false);
+    if ext.links_count == 0 {
+        ext2_orphan_finish(state, ext2_ino)?;
     }
-    ext2_orphan_finish(state, ext2_ino)?;
     Ok(true)
 }
 
@@ -6799,9 +6800,11 @@ pub fn inode_path(inode: u16, out: &mut [u8]) -> Result<usize, i64> {
     })
 }
 
-/// Takes a reference on `inode` (an open fd or a working directory). A
-/// referenced node survives unlink/rmdir until `inode_release`.
-pub fn inode_retain(inode: u16) {
+/// Takes a reference on `inode`: an open file description (the kernel calls
+/// this for every descriptor it creates or duplicates), a working directory,
+/// or a file mapping. A referenced node survives unlink/rmdir until
+/// `inode_open_release`.
+pub fn inode_open_retain(inode: u16) {
     with_state(|state| {
         if let Some(node) = state.inodes.get_mut(inode as usize) {
             if node.used {
@@ -6811,12 +6814,20 @@ pub fn inode_retain(inode: u16) {
     })
 }
 
-/// Drops a reference taken by `inode_retain`. Releasing the last reference
-/// to an unlinked node frees it; for ext2 its inode and blocks are released
-/// and taken off the orphan list. Returns true when the ext2 filesystem
-/// changed (block-backed callers then sync it).
-pub fn inode_release(inode: u16) -> bool {
+/// Drops a reference taken by `inode_open_retain`. Releasing the last
+/// reference to an unlinked node frees it (for ext2 its inode and blocks are
+/// released and taken off the orphan list) and returns true: the caller then
+/// drops cached pages for the inode and syncs ext2.
+pub fn inode_open_release(inode: u16) -> bool {
     with_state(|state| inode_release_inner(state, inode).unwrap_or(false))
+}
+
+/// References recorded on `inode` (0 for unknown or free nodes).
+pub fn inode_open_refs(inode: u16) -> u32 {
+    with_state(|state| match state.inodes.get(inode as usize) {
+        Some(node) if node.used => node.open_count,
+        _ => 0,
+    })
 }
 
 pub fn inode_is_dir(inode: u16) -> Result<bool, i64> {
@@ -7964,6 +7975,74 @@ mod tests {
         let dir = open("/tmp", O_RDONLY | O_DIRECTORY, 0).expect("directory open should work");
         let err = write(dir.inode, 0, b"bad", false).unwrap_err();
         assert_eq!(err, EISDIR);
+    }
+
+    #[test]
+    fn unlinked_open_file_stays_usable_until_last_release() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let opened = open("/tmp/orphan.txt", O_CREAT | O_RDWR, 0).expect("create");
+        inode_open_retain(opened.inode);
+        inode_open_retain(opened.inode); // a dup
+        write(opened.inode, 0, b"still here", false).expect("write");
+
+        unlink("/tmp/orphan.txt").expect("unlink while open");
+        assert_eq!(lookup("/tmp/orphan.txt"), Err(ENOENT));
+        // The name can be reused immediately for a different file.
+        let other = open("/tmp/orphan.txt", O_CREAT | O_RDWR, 0).expect("recreate");
+        assert_ne!(other.inode, opened.inode);
+
+        let st = stat(opened.inode).expect("fstat orphan");
+        assert_eq!(st.nlink, 0);
+        assert_eq!(st.size, 10);
+        let mut buf = [0u8; 10];
+        assert_eq!(read(opened.inode, 0, &mut buf).unwrap(), 10);
+        assert_eq!(&buf, b"still here");
+        write(opened.inode, 10, b"!", false).expect("write orphan");
+
+        assert!(!inode_open_release(opened.inode));
+        assert!(stat(opened.inode).is_ok());
+        assert!(inode_open_release(opened.inode), "last release frees the orphan");
+        assert_eq!(stat(opened.inode).unwrap_err(), ENOENT);
+        assert_eq!(inode_open_refs(opened.inode), 0);
+    }
+
+    #[test]
+    fn unlink_without_open_refs_frees_immediately() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let opened = open("/tmp/closed.txt", O_CREAT | O_RDWR, 0).expect("create");
+        unlink("/tmp/closed.txt").expect("unlink");
+        assert_eq!(stat(opened.inode).unwrap_err(), ENOENT);
+    }
+
+    #[test]
+    fn tmpfs_directory_holds_more_than_64_entries() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        mkdir("/tmp/many").expect("mkdir");
+        for i in 0..100 {
+            let path = std::format!("/tmp/many/f{}", i);
+            open(&path, O_CREAT | O_RDWR, 0).expect("create entry");
+        }
+        assert!(lookup("/tmp/many/f99").is_ok());
+    }
+
+    #[test]
+    fn devfs_has_empty_fd_directory() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let dir = open("/dev/fd", O_RDONLY | O_DIRECTORY, 0).expect("open /dev/fd");
+        assert_eq!(inode_is_dir(dir.inode), Ok(true));
+        assert_eq!(lookup("/dev/fd"), Ok(dir.inode));
+        // Only "." and "..": the kernel supplies the per-process entries.
+        assert!(readdir(dir.inode, 0).unwrap().is_some());
+        assert!(readdir(dir.inode, 1).unwrap().is_some());
+        assert!(readdir(dir.inode, 2).unwrap().is_none());
     }
 
     #[test]
@@ -11002,7 +11081,7 @@ mod tests {
         let data = std::vec![0x5Au8; 3 * 4096];
         let _ = write(f.inode, 0, &data, false).unwrap();
         let ino = stat(f.inode).unwrap().ino as u32;
-        inode_retain(f.inode);
+        inode_open_retain(f.inode);
         unlink("/mnt/ext2/sub/doomed").unwrap();
         assert_eq!(lookup("/mnt/ext2/sub/doomed"), Err(ENOENT));
         let mut buf = std::vec![0u8; data.len()];
@@ -11020,7 +11099,7 @@ mod tests {
         }
 
         // Normal path: the last release frees everything.
-        assert!(inode_release(f.inode));
+        assert!(inode_open_release(f.inode));
         assert!(!ext2_inode_in_use(ino));
         assert_eq!(ext2_free_counts(), (free_blocks0, free_inodes0));
         flush_ext2_dirty_blocks().unwrap();
@@ -11054,14 +11133,14 @@ mod tests {
         let a = open("/mnt/ext2/sub/a", O_CREAT | O_RDWR, 0).unwrap();
         let _ = write(a.inode, 0, b"shared", false).unwrap();
         linkat(root_inode(), "/mnt/ext2/sub/a", root_inode(), "/mnt/ext2/sub/b").unwrap();
-        inode_retain(a.inode);
+        inode_open_retain(a.inode);
         unlink("/mnt/ext2/sub/a").unwrap();
         let ino = stat(a.inode).unwrap().ino as u32;
         unlink("/mnt/ext2/sub/b").unwrap();
         assert!(ext2_inode_in_use(ino));
         assert_eq!(read_whole_inode(a.inode), b"shared");
         assert_eq!(with_state(|s| last_orphan_state(s)), ino);
-        assert!(inode_release(a.inode));
+        assert!(inode_open_release(a.inode));
         assert!(!ext2_inode_in_use(ino));
         assert_eq!(with_state(|s| last_orphan_state(s)), 0);
 
@@ -11070,19 +11149,19 @@ mod tests {
         // freed on release.
         mkdir("/mnt/ext2/sub/gone").unwrap();
         let dir = lookup("/mnt/ext2/sub/gone").unwrap();
-        inode_retain(dir);
+        inode_open_retain(dir);
         rmdir("/mnt/ext2/sub/gone").unwrap();
         assert_eq!(lookup("/mnt/ext2/sub/gone"), Err(ENOENT));
         assert_eq!(openat(dir, "new", O_CREAT | O_RDWR, 0).unwrap_err(), ENOENT);
         assert_eq!(mkdirat(dir, "child"), Err(ENOENT));
         let mut buf = [0u8; VFS_MAX_PATH];
         assert_eq!(inode_path(dir, &mut buf), Err(ENOENT));
-        assert!(inode_release(dir));
+        assert!(inode_open_release(dir));
         assert_eq!(ext2_free_counts(), (free_blocks0, free_inodes0));
         assert_eq!(with_state(|s| last_orphan_state(s)), 0);
         // Releasing an unreferenced or stale handle is harmless.
-        assert!(!inode_release(dir));
-        assert!(!inode_release(60000));
+        assert!(!inode_open_release(dir));
+        assert!(!inode_open_release(60000));
     }
 
     fn last_orphan_state(state: &mut VfsState) -> u32 {
@@ -11102,14 +11181,14 @@ mod tests {
         init();
         let f = open("/tmp/open_unlinked", O_CREAT | O_RDWR, 0).unwrap();
         let _ = write(f.inode, 0, b"tmp data", false).unwrap();
-        inode_retain(f.inode);
+        inode_open_retain(f.inode);
         unlink("/tmp/open_unlinked").unwrap();
         assert_eq!(lookup("/tmp/open_unlinked"), Err(ENOENT));
         assert_eq!(read_whole_inode(f.inode), b"tmp data");
         // The slot is not reused while referenced.
         let other = open("/tmp/other", O_CREAT | O_RDWR, 0).unwrap();
         assert_ne!(other.inode, f.inode);
-        assert!(!inode_release(f.inode));
+        assert!(inode_open_release(f.inode), "last release frees the tmpfs node");
         assert_eq!(stat(f.inode), Err(ENOENT));
     }
 
@@ -11166,7 +11245,7 @@ mod tests {
         let doomed_ino = stat(doomed.inode).unwrap().ino as u32;
         let (free_blocks0, free_inodes0) = (ext2_free_counts().0, ext2_free_counts().1);
         // Drop the name but keep the inode, as a crash would leave it.
-        inode_retain(doomed.inode);
+        inode_open_retain(doomed.inode);
         unlink("/mnt/ext2/sub/orphaned").unwrap();
         flush_ext2_dirty_blocks().unwrap();
         checkpoint_ext2_journal().unwrap();

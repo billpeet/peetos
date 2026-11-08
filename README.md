@@ -39,7 +39,8 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
   - Most kernel code is still serialised by a big kernel lock. The scheduler, PMM and heap have their own locks, so timer ticks and task switches keep running on every CPU even while one CPU holds the big lock in a long syscall.
   - See `docs/smp.md`.
 - Tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption).
-- libwayland 1.23.1 (with libffi 3.4.6) is ported as static musl libraries (`make -C wayland`). A dedicated QEMU smoke (`run-wayland-smoke`) runs a libwayland compositor and a separate libwayland client process that connect over `/tmp/wayland-0`, share a sealed memfd `wl_shm` pool, present two frames (growing the pool in between), and exercise `eventfd`, `timerfd`, `signalfd`, `flock`, `fallocate`, `mremap`, and `SO_PEERCRED`. See `docs/wayland.md`.
+- libwayland 1.23.1 (with libffi 3.4.6) is ported as static musl libraries (`make -C wayland`). A dedicated QEMU smoke (`run-wayland-smoke`) runs a libwayland compositor and a separate libwayland client process that connect over `/tmp/wayland-0`, share a sealed memfd `wl_shm` pool, present two frames (growing the pool in between), and exercise `eventfd`, `timerfd`, `signalfd`, `flock`, `fallocate`, `mremap`, and `SO_PEERCRED`. A second profile (`run-wayland-tests`, part of `make test`) runs 21 of upstream libwayland's own test binaries (131 cases) inside PeetOS. See `docs/wayland.md`.
+- `peetwl`, the Wayland compositor, runs xdg-shell clients on the framebuffer with seat input (real XKB keymaps via libxkbcommon; pick a layout with `--xkb-layout`), server-side decorations, click-to-focus, title-bar move and close: `make run-wayland-demo` for an interactive session, `make run-wlcomp-smoke` for the automated screendump-based test.
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
 - `fork` is copy-on-write, and `clone(CLONE_THREAD)` thread groups support musl pthreads, including `pthread_cancel`, timed waits and `execve` from any thread. Signals use the Linux `rt_sigframe` ABI (signals 1..=64, `siginfo_t`/`ucontext_t`) and interrupt blocking syscalls with `SA_RESTART`-aware restart (`make run-proc-smoke`; see `docs/process_model.md`).
 - ext4: stock `mkfs.ext4` images (`metadata_csum`, `64bit`, `flex_bg`, extents) mount read-write with extent trees, lazy-init groups, crc32c metadata checksums on every write, and a JBD2 csum-v3 journal (`tests/musl_ext4_csum_journal_smoke.sh` runs the QEMU crash/recovery smoke on such a root). Images without `metadata_csum` (`mke2fs -t ext4 -O ^metadata_csum,uninit_bg`, crc16 descriptor checksums) are writable too (`tests/musl_ext4_journal_smoke.sh`). Building the kernel with `KERNEL_FEATURES=ext2-ro-root` mounts the root read-only (`make run-ext4-ro-smoke`). Hashed (htree) directory indexes are used and maintained on ext3/ext4, so directories with thousands of entries work. Files may exceed 4 GiB (sparse growth), timestamps survive 2038, an unlinked file stays usable while open (orphan inodes are finished after a crash), and images with `orphan_file` (newer `mkfs.ext4` default) mount. See `docs/ext4_compat_plan.md`.
@@ -207,6 +208,9 @@ make run-micropython-smoke
 make run-dropbear-smoke
 make run-fpu-smoke
 make run-wayland-smoke
+make run-wayland-tests
+make run-wlcomp-smoke
+make run-wayland-demo
 make run-gui-smoke
 make run-gui-demo
 ```

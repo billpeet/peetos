@@ -13,7 +13,9 @@ pub(super) const LOCK_SH: u32 = 1;
 pub(super) const LOCK_EX: u32 = 2;
 pub(super) const LOCK_NB: u32 = 4;
 pub(super) const LOCK_UN: u32 = 8;
-pub(super) const FLOCK_MAX_ENTRIES: usize = 32;
+/// System-wide held `flock` locks. A libwayland compositor holds one lock
+/// per display socket (`wl_display_add_socket_auto` can hold 33).
+pub(super) const FLOCK_MAX_ENTRIES: usize = 128;
 
 /// One held lock. The lock owner is the `(tgid, fd)` pair that acquired it
 /// (Linux ties flock owners to the open file description instead; see the
@@ -324,7 +326,7 @@ pub(super) fn sys_fallocate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -ENODEV;
     }
 
-    let size = match fs::file_size(inode) {
+    let size = match vfs_file_size(inode) {
         Ok(size) => size,
         Err(err) => return -fs_to_errno(err),
     };
@@ -335,7 +337,7 @@ pub(super) fn sys_fallocate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if let Err(err) = seals_allow_resize(fd_seals(flags, inode), size, end) {
         return err;
     }
-    match fs::truncate_to(inode, end) {
+    match vfs_truncate_to(inode, end) {
         Ok(()) => {
             vm_page_cache_invalidate_inode(inode);
             sync_ext2_backing();

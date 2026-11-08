@@ -500,11 +500,85 @@ pub fn restore_mask(task: *mut Task, mask: u64) -> Result<(), i64> {
     Ok(())
 }
 
+/// `ITIMER_REAL` expiry check: `None` while `deadline` (ticks, non-zero) is
+/// still in the future, otherwise the next deadline (0 = one-shot, now
+/// disarmed). A periodic timer that fell several intervals behind fires once
+/// and is rescheduled from `now`, like Linux's coalesced overruns.
+pub fn itimer_real_next_deadline(deadline: u64, interval: u64, now: u64) -> Option<u64> {
+    if deadline == 0 || now < deadline {
+        return None;
+    }
+    if interval == 0 {
+        return Some(0);
+    }
+    let next = deadline.saturating_add(interval);
+    Some(if next > now { next } else { now.saturating_add(interval) })
+}
+
+/// Timer-tick bookkeeping for a process's `ITIMER_REAL`: if it expired,
+/// advance (or clear) the deadline and return true. The caller sends
+/// `SIGALRM` afterwards, outside the scheduler lock, because sending may wake
+/// the target (`sched::unblock`), which takes that lock. Only thread-group
+/// leaders carry the timer.
+pub fn itimer_real_take_expiry(task: *mut Task, now: u64) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    unsafe {
+        if crate::task::leader_of(task) != task {
+            return false;
+        }
+        if matches!((*task).state, TaskState::Zombie | TaskState::Dead) {
+            return false;
+        }
+        match itimer_real_next_deadline((*task).itimer_real_deadline, (*task).itimer_real_interval, now) {
+            Some(next) => {
+                (*task).itimer_real_deadline = next;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Deliver `SIGALRM` for a process whose `ITIMER_REAL` expired (see
+/// [`itimer_real_take_expiry`]). Must not be called with the scheduler lock
+/// held.
+pub fn itimer_real_fire(task: *mut Task) {
+    if !task.is_null() {
+        let _ = send_to_process(task, SIGALRM);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::task;
     use std::sync::Mutex;
+
+    #[test]
+    fn itimer_real_next_deadline_handles_one_shot_and_periodic() {
+        assert_eq!(itimer_real_next_deadline(0, 0, 100), None);
+        assert_eq!(itimer_real_next_deadline(50, 0, 49), None);
+        assert_eq!(itimer_real_next_deadline(50, 0, 50), Some(0));
+        assert_eq!(itimer_real_next_deadline(50, 10, 52), Some(60));
+        // Far behind: reschedule from now instead of firing a backlog.
+        assert_eq!(itimer_real_next_deadline(50, 10, 95), Some(105));
+    }
+
+    #[test]
+    fn itimer_real_tick_sends_sigalrm_on_expiry() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        let mut t = task::Task::for_test(1);
+        let ptr = &mut t as *mut task::Task;
+        t.itimer_real_deadline = 10;
+        assert!(!itimer_real_take_expiry(ptr, 9));
+        assert_eq!(t.sig_pending & signal_bit(SIGALRM), 0);
+        assert!(itimer_real_take_expiry(ptr, 10));
+        itimer_real_fire(ptr);
+        assert_ne!(t.sig_pending & signal_bit(SIGALRM), 0);
+        assert_eq!(t.itimer_real_deadline, 0);
+    }
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 

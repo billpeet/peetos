@@ -498,9 +498,13 @@ Progress (2026-11-08):
 - [x] Kernel prerequisites for libwayland 1.23: `eventfd`, `timerfd`, `signalfd` (which relies on the Linux sigset layout fix in the signals rework), `flock`, `fallocate`, memfd sealing, `mremap`, `SO_PEERCRED`, and correct `POLLIN` readiness on listening `AF_UNIX` sockets.
 - [x] libwayland 1.23.1 + libffi 3.4.6 build as static musl libraries with a host `wayland-scanner` (`make -C wayland`, `docs/wayland.md`).
 - [x] QEMU smoke: libwayland server + separate client process over `/tmp/wayland-0`, registry roundtrips, `wl_compositor`/`wl_shm` binding, sealed memfd pool, two presented frames with pool growth (`mremap`), frame callbacks, timer and signal event sources, clean disconnect (`make run-wayland-smoke`).
-- [ ] Turn the smoke compositor into the real compositor: present committed `wl_shm` buffers to `/dev/fb0`, route `/dev/input` events through `wl_seat`/`wl_pointer`/`wl_keyboard`, and replace the peet-gui demo paths.
-- [ ] Port `wayland-protocols` and implement `xdg_wm_base`/`xdg_surface`/`xdg_toplevel`.
-- [ ] Build and run upstream libwayland tests (or a subset) for protocol compliance.
+- [x] Real compositor (`peetwl`): presents committed `wl_shm` buffers to `/dev/fb0` with damage tracking and frame callbacks, routes `/dev/input` through `wl_seat`/`wl_pointer`/`wl_keyboard` with click-to-focus, and draws server-side decorations with title-bar move and a close box.
+- [x] wayland-protocols 1.38 ported (generated `xdg-shell` code in `libwlprotocols.a`); `xdg_wm_base`/`xdg_surface`/`xdg_toplevel` implemented (popups dismissed).
+- [x] Automated QEMU smoke with real PS/2 input and screendump pixel checks (`make run-wlcomp-smoke`), plus an interactive demo (`make run-wayland-demo`).
+- [x] Kernel work this needed: page-backed memfd objects up to 64 MiB (tmpfs files were capped at 32 KiB), shared mappings covering a file's partial last page, Linux-convention `REL_Y`, and `SIGCHLD` on child exit.
+- [x] Build and run upstream libwayland tests (or a subset) for protocol compliance: 21 of upstream's test binaries (131 cases) pass in QEMU in the `musl-ext2-wayland-tests` profile (`make run-wayland-tests`, part of `make test`). `os-wrappers-test` is skipped because it needs `dlsym(RTLD_NEXT)`. See `docs/wayland.md` ("Upstream Test Suite").
+- [x] libxkbcommon 1.7.0 ported with a verified xkeyboard-config subset; `peetwl` sends XKB_V1 keymaps and xkb_state modifiers, and the compositor smoke checks layout-aware text (German layout, Shift, Caps Lock).
+- [ ] Popups, interactive resize, subsurfaces, clipboard, and replacing the remaining peet-gui demo paths.
 
 Scope:
 
@@ -588,7 +592,7 @@ Use this table for ongoing updates:
 | 2 | Complete | TBD | 2026-03-07 | Shared-buffer (`memfd_create` + writable shared `mmap`) and baseline `epoll` support are in place with host unit coverage plus QEMU epoll/shared-buffer compositor-style smokes in `make test` |
 | 3 | Complete | TBD | 2026-03-07 | `/dev/fb0` metadata + shared framebuffer `mmap`, `/dev/input/event0`/`event1` pollable queues, explicit console-first vs compositor-first display ownership, and tracked compositor/init termination fallback to the kernel console are in place; `make test` now covers console-first shell workflows plus compositor-first framebuffer/input and compositor-failure fallback smoke paths |
 | 4 | Partial (see note) | TBD | 2026-11-08 | Review on 2026-11-08 found that no compositor in the tree matches the description below: `gui_compositor_smoke.c` is a single-process framebuffer/input helper, `peet_gui_compositor_smoke.c` simulates its clients in-process with `malloc` buffers, and the host tests in `kernel/src/gui_protocol.rs` exercise a Rust model rather than the shipped C code. Phase 5 now builds the real multi-process compositor on libwayland instead. Original entry: | Userspace compositor MVP is now closed: dedicated compositor plus bounded smoke clients over inherited `AF_UNIX` streams, shared-buffer attach/commit via `memfd_create` + `SCM_RIGHTS`, explicit clipped `DAMAGE` notifications, coalesced dirty redraw, hover pointer focus plus click-to-focus keyboard routing to an input-aware client, invalid-fd/stale-message rejection, disconnect-survival coverage, a separate compositor-first demo profile, and full-regression coverage in `make test` |
-| 5 | In progress | TBD | 2026-11-08 | libwayland 1.23.1 ported with all kernel prerequisites; end-to-end server/client smoke passes. Compositor presentation, input, and xdg-shell are next. |
+| 5 | In progress | TBD | 2026-11-08 | libwayland 1.23.1 + wayland-protocols 1.38 ported; the `peetwl` compositor presents xdg-shell toplevels to `/dev/fb0` with seat input, verified by a screendump-based QEMU smoke. The upstream libwayland test suite (21 binaries, 131 cases) passes in QEMU. Keymaps, popups and resize remain. |
 | 6 | Planned | TBD | 2026-02-28 | Near-compat target |
 
 ## Update Rules

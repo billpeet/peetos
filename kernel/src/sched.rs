@@ -387,6 +387,11 @@ pub fn tick() {
     if !is_running() {
         return;
     }
+    // Processes whose ITIMER_REAL expired this tick. SIGALRM is sent after
+    // SCHED_LOCK is released: sending can wake a sleeping target through
+    // `unblock`, which takes SCHED_LOCK itself.
+    let mut alarms = [task::INVALID_PID; task::MAX_TASKS];
+    let mut alarm_count = 0usize;
     let guard = lock();
     unsafe {
 
@@ -395,6 +400,10 @@ pub fn tick() {
         let now = pit::ticks();
         for idx in 0..task::MAX_TASKS {
             let t = task::get_by_index(idx);
+            if !t.is_null() && crate::signal::itimer_real_take_expiry(t, now) {
+                alarms[alarm_count] = (*t).pid;
+                alarm_count += 1;
+            }
             if !t.is_null() && (*t).state == TaskState::Sleeping {
                 if now >= (*t).sleep_until {
                     (*t).sleep_until = 0;
@@ -405,6 +414,10 @@ pub fn tick() {
         }
     }
     drop(guard);
+    for pid in alarms.iter().take(alarm_count) {
+        // Re-resolve by pid: the task table may have changed since the scan.
+        crate::signal::itimer_real_fire(task::get_by_pid(*pid));
+    }
     tick_local();
 }
 

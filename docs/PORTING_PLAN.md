@@ -179,6 +179,10 @@ current Rust kernel implementation and forward roadmap.
 ### Userspace Runtime Bring-Up
 
 - libwayland 1.23.1 and libffi 3.4.6 build as static musl libraries (`make -C wayland`), and the `musl-ext2-wayland-smoke` profile runs a libwayland compositor plus a separate libwayland client end to end in QEMU (`docs/wayland.md`).
+- 21 of upstream libwayland's own test binaries (131 cases, all but the `dlsym`-based `os-wrappers-test` and the host-only scanner/C++ checks) pass in QEMU in the `musl-ext2-wayland-tests` profile, part of `make test`. Getting there fixed several kernel gaps: `mkdir`/`rmdir`, `/dev/fd`, unlinked-but-open (and mapped) files, `fstat` on non-file fds, `setitimer`/`alarm`, `WIFSIGNALED` wait status, `MAP_SHARED | MAP_ANONYMOUS`, AF_UNIX path lifetime, and the fd/socket/flock/directory capacity limits. See `docs/wayland.md`.
+- The `peetwl` Wayland compositor (libwayland-server + xdg-shell from wayland-protocols 1.38) owns `/dev/fb0` and `/dev/input` in compositor-first mode, with server-side decorations, click-to-focus, title-bar move and close. `make run-wlcomp-smoke` verifies it with injected PS/2 input and screendumps; `make run-wayland-demo` is the interactive session.
+- memfd contents are now page-backed (up to 64 MiB) instead of being limited to tmpfs's 32 KiB inline files, and the kernel raises `SIGCHLD` when a child process exits.
+- libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the 32 region slots per task.
 
 - musl sysroot bootstrap is integrated.
 - toybox staging supports interactive shell and broad applet coverage,
