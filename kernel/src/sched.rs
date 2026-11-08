@@ -368,6 +368,11 @@ fn schedule_from(current_rsp: u64, requeue_current: bool) -> u64 {
             }
         }
 
+        // Kernel code is built without SSE, so the live x87/SSE registers
+        // still hold the outgoing task's user state here.
+        (*current).fpu.save();
+        (*next).fpu.restore();
+
         (*next).state = TaskState::Running;
         (*next).time_slice = DEFAULT_TIME_SLICE;
         CURRENT_TASK = next;

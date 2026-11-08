@@ -23,6 +23,7 @@ This document describes the baseline tasking and scheduler implementation. It su
 - Per-task program break tracking (`user_brk_start`, `user_brk`)
 - Per-task file descriptor table metadata (`kind`, inode handle, file offset, open flags)
 - Scheduling metadata (time slice, tick counters, sleep deadline)
+- Saved x87/SSE register image (`fpu`, a 16-byte-aligned 512-byte `FXSAVE` area)
 
 The boot task represents the current execution context and is created in `task::init()`.
 
@@ -53,11 +54,23 @@ The initial user program is a small dynamic ELF that writes to stdout then exits
 - Voluntary yield and block/sleep paths build a synthetic interrupt frame in assembly (`sched_yield_asm`, `sched_block_asm`) to reuse the same return path.
 - The scheduler updates `TSS.rsp0` on every task switch so user->kernel transitions have a valid kernel stack.
 
+**FPU/SSE State**
+- `crates/arch_x86_64/src/fpu.rs` wraps `FXSAVE`/`FXRSTOR` in `FxSaveArea`.
+- The kernel is compiled with `-mmx,-sse,-sse2`, so kernel code never touches the x87/SSE register file. The live registers therefore always hold the *current user task's* state, and no lazy or trap-based switching is needed.
+- `sched::schedule_from()` saves the outgoing task's registers into `Task::fpu` and restores the incoming task's image on every real switch (preemption, yield, block, sleep).
+- New tasks start from the ABI-default image (x87 control word `0x037F`, MXCSR `0x1F80`, data registers zero).
+- `fork`/`clone`/`vfork` snapshot the parent's live registers into the child.
+- `execve` loads the default image after the new address space is committed.
+- Signal delivery stores the interrupted registers in the kernel signal frame and enters the handler with the default image (as Linux does). `rt_sigreturn` restores the saved image after clearing MXCSR bits the CPU reports as reserved, so a corrupted frame cannot raise `#GP` in `FXRSTOR`.
+- `fpu::init()` runs during boot (before `task::init()`) to detect the CPU's MXCSR mask and load the default state.
+- Coverage: host unit tests for the image layout and MXCSR sanitising, plus the `musl-ext2-fpu-smoke` QEMU profile (`make run-fpu-smoke`, `tests/musl_ext2_fpu_smoke.sh`). That profile runs `user/fpu_context_smoke.c`, which checks XMM0-15, MXCSR and the x87 control word across preemption between four processes, across a signal handler that clobbers them, and across `execve`.
+
 **Initialization Order**
-1. `task::init()`
-2. `sched::init()`
-3. Register PIT tick hook and IDT post-handler hook
-4. `user::spawn_init()`
+1. `fpu::init()`
+2. `task::init()`
+3. `sched::init()`
+4. Register PIT tick hook and IDT post-handler hook
+5. `user::spawn_init()`
 
 Limitations / Simplifications
 - User mode is minimal: a single hardcoded user task with a fixed embedded ELF.
@@ -69,6 +82,9 @@ Limitations / Simplifications
 - Per-task FS-base TLS state is now tracked/restored (`arch_prctl` `ARCH_SET_FS`/`ARCH_GET_FS`), but GS-base handling and full TLS model compatibility are still incomplete.
 - Task metadata for user processes is tracked, but there is no `/proc` or userspace-visible tooling for inspecting it yet.
 - `user_clear_tid` zeroing now performs a best-effort futex wake for one waiter at thread exit, but robust-list semantics and thread-group teardown are not implemented yet.
-- No FPU/SSE save/restore per task.
+- FPU/SSE switching is eager: every context switch pays one `FXSAVE` plus one `FXRSTOR`, even for kernel threads that never use the FPU. Lazy switching (`CR0.TS` + `#NM`) is not implemented.
+- Only the legacy 512-byte `FXSAVE` image is managed. `CR4.OSXSAVE`/`XSAVE` is not enabled, so AVX/AVX-512 state cannot be used by userspace at all (CPUID reports OSXSAVE=0, so well-behaved code falls back to SSE).
+- The signal-frame FPU image uses the PeetOS-private frame layout, not Linux's `ucontext_t`/`_fpstate`, so handlers cannot inspect or edit the interrupted FPU state through `ucontext`.
+- `#XM`/`#MF` floating-point exceptions that userspace unmasks are not translated into `SIGFPE` with `FPE_*` codes.
 - Task cleanup is minimal; zombie tasks are not reaped automatically.
 - Run queue operations are protected only by interrupt masking (single-core assumption).

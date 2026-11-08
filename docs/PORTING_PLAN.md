@@ -21,6 +21,7 @@ current Rust kernel implementation and forward roadmap.
 ### Process and Syscall Layer
 
 - Preemptive scheduler, kernel threads, and user-mode bootstrap are active.
+- Per-task x87/SSE state is switched eagerly with `FXSAVE`/`FXRSTOR`, copied on fork, reset on exec, and saved/restored around signal handlers. The `musl-ext2-fpu-smoke` QEMU profile (`make run-fpu-smoke`) covers all three; before this, user XMM/MXCSR state leaked between preempted processes.
 - ELF loading supports `ET_EXEC` + `ET_DYN` bootstrap paths with `PT_INTERP`
   handoff and hardened segment validation.
 - Table-driven syscall dispatch is active across SYSCALL/int80 paths.
@@ -124,7 +125,8 @@ current Rust kernel implementation and forward roadmap.
 
 - Complete Linux-like `clone`/thread semantics (`CLONE_THREAD`, robust TLS/TID behavior, thread groups).
 - Harden job-control and controlling-tty behavior beyond current baseline.
-- Expand signal semantics (`sigaltstack`, richer `siginfo_t`/ucontext behavior, queued RT payloads).
+- Expand signal semantics (`sigaltstack`, richer `siginfo_t`/ucontext behavior including a Linux-compatible `_fpstate`, queued RT payloads).
+- Add `XSAVE`/AVX state support if userspace workloads need AVX (today only the legacy `FXSAVE` image is managed and `CR4.OSXSAVE` stays off).
 - Finish dynamic-linker/runtime completeness beyond current bootstrap path
   (relocations/symbol resolution and broader compatibility).
 

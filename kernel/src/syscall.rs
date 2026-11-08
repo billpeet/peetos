@@ -4,6 +4,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
+use arch_x86_64::fpu::{self, FxSaveArea};
 use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
 use arch_x86_64::pit;
@@ -2088,6 +2089,7 @@ struct UserSignalFrameSyscall {
     r11: u64,
     rcx: u64,
     rsp: u64,
+    fpu: FxSaveArea,
 }
 
 #[repr(C)]
@@ -2116,6 +2118,7 @@ struct UserSignalFrameInt80 {
     rflags: u64,
     rsp: u64,
     ss: u64,
+    fpu: FxSaveArea,
 }
 
 #[derive(Clone, Copy)]
@@ -5224,6 +5227,9 @@ fn create_fork_child(ctx: &SyscallContext, child_frame: &InterruptFrame) -> Resu
         (*child).user_envp = (*parent).user_envp;
         (*child).user_auxv = (*parent).user_auxv;
         (*child).user_fs_base = (*parent).user_fs_base;
+        // The parent is the running task, so the live registers are its
+        // user FPU/SSE state; the child resumes with an identical copy.
+        (*child).fpu.save();
         (*child).user_clear_tid = 0;
         (*child).user_brk_start = (*parent).user_brk_start;
         (*child).user_brk = (*parent).user_brk;
@@ -9883,11 +9889,14 @@ fn install_user_signal_frame_syscall(
         r11: frame.r11,
         rcx: frame.rcx,
         rsp: frame.rsp,
+        fpu: capture_user_fpu(),
     };
 
     write_struct_to_user(task_ptr, frame_rsp, &signal_frame)?;
     write_u64_to_user(task_ptr, return_rsp, delivery.restorer)?;
 
+    // Like Linux, the handler starts from a clean FPU/SSE state.
+    fpu::reset_current();
     frame.rcx = delivery.handler;
     frame.rsp = return_rsp;
     frame.rdi = delivery.signum as u64;
@@ -9930,11 +9939,14 @@ fn install_user_signal_frame_int80(
         rflags: frame.rflags,
         rsp: frame.rsp,
         ss: frame.ss,
+        fpu: capture_user_fpu(),
     };
 
     write_struct_to_user(task_ptr, frame_rsp, &signal_frame)?;
     write_u64_to_user(task_ptr, return_rsp, delivery.restorer)?;
 
+    // Like Linux, the handler starts from a clean FPU/SSE state.
+    fpu::reset_current();
     frame.rip = delivery.handler;
     frame.rsp = return_rsp;
     frame.rdi = delivery.signum as u64;
@@ -9972,6 +9984,7 @@ fn restore_user_signal_frame_syscall(task_ptr: *mut task::Task, frame: &mut Sysc
     frame.r11 = signal_frame.r11;
     frame.rcx = signal_frame.rcx;
     frame.rsp = signal_frame.rsp;
+    restore_user_fpu(signal_frame.fpu);
     0
 }
 
@@ -10010,7 +10023,22 @@ fn restore_user_signal_frame_int80(task_ptr: *mut task::Task, frame: &mut Interr
     frame.rflags = signal_frame.rflags;
     frame.rsp = signal_frame.rsp;
     frame.ss = signal_frame.ss;
+    restore_user_fpu(signal_frame.fpu);
     0
+}
+
+/// Snapshot the running task's live FPU/SSE registers for a signal frame.
+fn capture_user_fpu() -> FxSaveArea {
+    let mut area = FxSaveArea::new_default();
+    area.save();
+    area
+}
+
+/// Load FPU/SSE state from a user-controlled signal frame. Reserved MXCSR
+/// bits are cleared first so a corrupted frame cannot #GP in `FXRSTOR`.
+fn restore_user_fpu(mut area: FxSaveArea) {
+    area.sanitize();
+    area.restore();
 }
 
 fn can_process_pending_signals(current: *mut task::Task) -> bool {

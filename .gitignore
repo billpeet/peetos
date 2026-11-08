@@ -22,6 +22,8 @@
 /user/musl_execve_ext2_quickjs_smoke.elf
 /user/musl_execve_ext2_micropython_smoke.elf
 /user/musl_execve_ext2_dropbear_smoke.elf
+/user/musl_execve_ext2_fpu_smoke.elf
+/user/fpu_context_smoke.elf
 /user/hello.elf
 /user/hello_dyn.elf
 /user/qjs

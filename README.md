@@ -33,6 +33,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - GDT/IDT setup is wired with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, and serial exception reports.
 - PMM/VMM/kernel heap are active.
 - Tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption).
+- Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
 - ELF loading is hardened (header/segment validation, malformed `PT_INTERP` rejection, RWX rejection, entrypoint checks) with NXE enabled.
 - User bootstrap supports a minimal `PT_INTERP` flow (`AT_ENTRY`/`AT_BASE`) and Linux-style initial stack (`argc`/`argv`/`envp`/`auxv`).
 - Syscall dispatch is table-driven and shared by SYSCALL/int80 paths. Implemented syscalls include file/VFS operations, process control (`fork`/`clone`/`vfork`/`wait4`), VM mapping (`mmap`/`mprotect`/`munmap`), IPC (`pipe`/`futex`/`shm*`), signals (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`kill`), and core identity/time/process-group calls.
@@ -184,6 +185,7 @@ make run-unix-rights-smoke
 make run-quickjs-smoke
 make run-micropython-smoke
 make run-dropbear-smoke
+make run-fpu-smoke
 make run-gui-smoke
 make run-gui-demo
 ```

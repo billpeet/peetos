@@ -166,6 +166,9 @@ pub extern "C" fn kmain() -> ! {
 
     vfs::init();
 
+    arch_x86_64::fpu::init();
+    serial_println!("[FPU] FXSAVE context switching enabled (MXCSR mask {:#x})", arch_x86_64::fpu::mxcsr_mask());
+
     task::init();
     serial_println!("[TASK] Initialized");
 

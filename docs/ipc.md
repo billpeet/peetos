@@ -90,6 +90,7 @@ This document describes the current baseline IPC/synchronization implementation 
   - default actions currently implemented as terminate/ignore policy
   - user handlers are entered by writing a kernel signal frame on user stack and jumping to the configured handler with `RDI=signum`
   - user return is mediated through `SA_RESTORER`; `rt_sigreturn` restores saved registers and signal mask
+  - the signal frame also carries the interrupted x87/SSE state (`FXSAVE` image); handlers start with the default FPU state and `rt_sigreturn` restores the saved image, with reserved MXCSR bits masked off (see `docs/tasking.md`)
   - `SIGPIPE` is generated on broken-pipe write paths (`EPIPE`)
 
 **Unix-Domain Socket Ancillary FD Passing (Baseline)**

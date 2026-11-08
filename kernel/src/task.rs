@@ -2,6 +2,7 @@ use core::mem::{size_of, MaybeUninit};
 use core::ptr;
 
 use arch_x86_64::addr::VirtAddr;
+use arch_x86_64::fpu::FxSaveArea;
 use arch_x86_64::idt::InterruptFrame;
 use arch_x86_64::syscall as arch_syscall;
 
@@ -110,7 +111,13 @@ pub struct Task {
     pub(crate) sleep_until: u64,
     pub(crate) next: *mut Task,
     pub(crate) prev: *mut Task,
+    /// Saved user x87/SSE register state while the task is switched out.
+    /// While the task is running, the hardware registers are authoritative.
+    pub(crate) fpu: FxSaveArea,
 }
+
+// Tasks are allocated as a single physical page in `task_alloc`.
+const _: () = assert!(size_of::<Task>() <= 4096);
 
 static mut TASK_TABLE: [*mut Task; MAX_TASKS] = [ptr::null_mut(); MAX_TASKS];
 static mut TASK_COUNT: usize = 0;
@@ -206,6 +213,7 @@ pub fn init() {
             sleep_until: 0,
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
+            fpu: FxSaveArea::new_default(),
         };
         write_name(&mut boot.name, "kernel");
 
@@ -302,6 +310,7 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.sleep_until = 0;
         task.next = ptr::null_mut();
         task.prev = ptr::null_mut();
+        task.fpu = FxSaveArea::new_default();
         write_name(&mut task.name, name);
 
         TASK_TABLE[slot] = task_ptr;
@@ -546,6 +555,7 @@ impl Task {
             sleep_until: 0,
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
+            fpu: FxSaveArea::new_default(),
         }
     }
 
