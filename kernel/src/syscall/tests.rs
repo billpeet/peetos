@@ -1861,4 +1861,27 @@ fn ucred_layout_matches_linux() {
     assert_eq!(&bytes[0..4], &7i32.to_ne_bytes());
     assert_eq!(&bytes[4..8], &1000u32.to_ne_bytes());
     assert_eq!(&bytes[8..12], &100u32.to_ne_bytes());
+
+#[test]
+fn lock_free_syscalls_are_only_id_and_yield_calls() {
+    assert!(is_lock_free_syscall(SYS_YIELD));
+    assert!(is_lock_free_syscall(SYS_GETPID));
+    assert!(is_lock_free_syscall(SYS_GETTID));
+    assert!(is_lock_free_syscall(SYS_GETPPID));
+    // Anything touching user memory or shared kernel state stays locked.
+    assert!(!is_lock_free_syscall(SYS_EXECVE));
+    assert!(!is_lock_free_syscall(SYS_RT_SIGRETURN));
+    assert!(!is_lock_free_syscall(SYS_FORK));
+    assert!(!is_lock_free_syscall(SYS_WRITE));
+}
+
+#[test]
+fn lock_free_return_falls_back_for_signals_and_exit() {
+    assert!(!needs_locked_return(0, 0, 0));
+    // Pending but blocked: still lock-free.
+    assert!(!needs_locked_return(1 << 9, 1 << 9, 0));
+    // Pending and deliverable.
+    assert!(needs_locked_return(1 << 9, 0, 0));
+    // Told to exit by a sibling thread.
+    assert!(needs_locked_return(0, 0, task::TASK_FLAG_EXITING));
 }

@@ -74,6 +74,7 @@ RAII support:
 Limitations / Simplifications
 - Only 4 KB mappings are created; large pages are detected but not allocated.
 - Page table allocation is simple and not reference-counted; `destroy_address_space` only frees the PML4. Data frames carry a 16-bit PMM share count for copy-on-write; page-table frames are never shared.
+- Page-table updates are serialised by `VMM_LOCK`, an interrupt-safe spinlock taken at the public entry points. Internal calls use `*_locked` variants. `switch` and the getters take no lock. Lock order is heap, then VMM, then PMM.
 - TLB shootdown is coarse. Removing or downgrading a present mapping sends an IPI that makes every CPU using that address space (or every CPU, for kernel addresses) flush its whole TLB. Shootdowns are not batched across pages, and there is no PCID or other advanced address-space isolation.
 - `mremap` requires the old range to lie inside one existing mapping, does not support `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and refuses to resize framebuffer mappings.
 

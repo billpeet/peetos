@@ -191,7 +191,8 @@ extern "C" fn resched_ipi_handler(_frame: &mut InterruptFrame) {
 
 /// Make other CPUs drop stale TLB entries for address space `pml4`
 /// (`0` = kernel mapping: every online CPU). Waits until every target has
-/// flushed. Must be called with the BKL held (one initiator at a time).
+/// flushed. Called only by the VMM with `VMM_LOCK` held, which keeps
+/// initiators to one at a time.
 pub fn tlb_shootdown(pml4: u64) {
     if online_count() <= 1 {
         return;

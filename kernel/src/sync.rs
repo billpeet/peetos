@@ -25,6 +25,8 @@ impl<T> SpinLock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            // A TLB-shootdown initiator may be waiting on this CPU.
+            crate::smp::service_tlb_shootdown();
             spin_loop();
         }
         SpinLockGuard { lock: self }

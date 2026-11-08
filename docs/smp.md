@@ -7,7 +7,7 @@ lock (BKL) that lets every CPU run tasks.
 Status:
 - **Phase 1:** every CPU comes online, and IRQs go through the IOAPIC.
 - **Phase 2:** the scheduler runs on every CPU. The kernel is serialised by one big kernel lock owned by a CPU.
-- **Phase 3 (in progress):** the scheduler, PMM and heap have their own locks. Timer ticks, reschedule IPIs and context switches no longer take the big lock, and big-lock ownership follows tasks across switches.
+- **Phase 3 (in progress):** the scheduler, PMM, heap and VMM have their own locks. Timer ticks, reschedule IPIs, context switches and a few syscalls no longer take the big lock, and big-lock ownership follows tasks across switches.
 
 **Where It Lives**
 - `crates/arch_x86_64/src/acpi.rs`: RSDP/RSDT/XSDT/MADT parsing and ISA IRQ override resolution (pure, host-tested)
@@ -50,7 +50,7 @@ Status:
 - `smp` tracks each CPU's online flag, APIC id, active CR3, and pending TLB-flush flag.
 
 **Locks**
-Three locks matter for SMP. The lock order is BKL, then `SCHED_LOCK`, then heap, then PMM.
+The lock order is BKL, then `SCHED_LOCK`, then heap, then VMM, then PMM.
 
 - **Big kernel lock** (`kernel/src/bkl.rs`): a FIFO ticket lock that still serialises most kernel code (syscalls, device IRQs, exceptions). It is owned by a CPU, but logically it follows the task:
   - A task switched out while holding it records that in `Task::bkl_resume` and gives it up.
@@ -62,7 +62,10 @@ Three locks matter for SMP. The lock order is BKL, then `SCHED_LOCK`, then heap,
   - the scheduler-owned task state transitions.
 
   The scheduler never needs the big lock.
-- **PMM and heap locks**: interrupt-safe spinlocks taken at the public entry points (`alloc_page`, `free_page`, `kmalloc`, `kfree`, ...).
+- **PMM, heap and VMM locks**: interrupt-safe spinlocks taken at the public entry points (`alloc_page`, `free_page`, `kmalloc`, `kfree`, `map_page_in`, `unmap_page_in`, `clone_user_space`, ...).
+  - Internal calls use unlocked `*_locked` variants.
+  - `vmm::switch` and the read-only getters take no lock.
+  - TLB shootdowns are sent only while holding `VMM_LOCK`, which keeps initiators to one at a time.
 
 Big-lock rules:
 - **Acquire** whenever this CPU enters the kernel through a path that needs it without owning it:
@@ -82,6 +85,7 @@ Big-lock rules:
 - **`bkl::wait_for_interrupt()`** halts without the lock. The boot task's main loop uses it.
 
 Paths that never take the big lock:
+- The syscalls `sched_yield`, `getpid`, `gettid` and `getppid` (`syscall::lock_free_syscall`). They fall back to the locked dispatcher whenever a deliverable signal is pending or the task is exiting, because delivery on return needs the lock.
 - The PIT tick: the counter (a fast handler) and `sched::tick`, which runs sleeper wake-ups and the BSP time slice.
 - The LAPIC timer tick and the reschedule IPI (`idt::set_no_entry_lock`).
 - The test and TLB IPIs.
@@ -124,10 +128,10 @@ So timer preemption and task switching continue on every CPU even while another 
 - `make run QEMU_SMP=4` (or any `run*` target) boots with several CPUs.
 
 Limitations / Simplifications
-- **Big kernel lock still covers most kernel code.** Syscalls, device IRQs and exceptions are still serialised by it. Only scheduling, timer ticks and the PMM/heap run outside it, and kernel code that busy-waits without yielding still holds other syscalls out.
-  - Next: VMM, VFS, net, IPC and per-syscall locks, then removing the BKL from syscalls that do not need it (`sched_yield`, `getpid`, time queries).
-- **PMM/heap callers mostly still hold the big lock.** These modules are self-locked, but heap expansion calls `vmm::map_page` while holding the heap lock, and the VMM has no lock of its own yet. Heap callers outside the big lock must not race VMM users on kernel-half page tables.
-- **A task that marks itself a zombie before finishing its exit work** (`exit_current_thread`) can be lost if a timer preemption hits in between. The scheduler never resumes zombies. This is pre-existing and now more likely, because timer preemption no longer waits for the big lock.
+- **Big kernel lock still covers most kernel code.** All other syscalls, device IRQs and exceptions are serialised by it. Kernel code that busy-waits without yielding still holds other syscalls out.
+  - Next: give VFS, net and IPC their own locks, then move more syscalls to the lock-free path.
+- **Lock-free syscalls cannot touch user memory yet.** User copies translate one page at a time (`vmm::get_physical_in`) and then write through the direct map. A sibling thread's `munmap` under the big lock could free the page in between, so time queries such as `clock_gettime` stay locked until there is per-address-space locking or page pinning.
+- **Zombies in kernel mode are never preempted.** A task that has marked itself a zombie is still running its exit path in the kernel and leaves the CPU voluntarily, so `sched::isr_hook` skips it.
 - **One shared run queue.** No per-CPU queues, no load balancing, no CPU affinity. Tasks migrate freely.
 - **Device IRQs and the PIT go to the BSP only.** There is no IRQ balancing, no MSI/MSI-X, and no `_PRT`/AML evaluation. PCI devices use their legacy ISA line plus MADT overrides.
 - **Signals reach running tasks late.** A signal sent to a task running in user mode on another CPU is only noticed at that task's next syscall, which matches the single-core delivery point. Only `exit_group`/`execve` actively kick remote siblings.

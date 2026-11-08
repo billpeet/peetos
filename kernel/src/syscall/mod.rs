@@ -1419,10 +1419,64 @@ pub fn init() {
 /// SYSRET back to the same task.
 #[no_mangle]
 pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
+    if let Some(ret) = lock_free_syscall(frame.rax) {
+        return ret;
+    }
     crate::bkl::syscall_enter();
     let ret = syscall_dispatch(frame);
     crate::bkl::syscall_exit();
     ret
+}
+
+/// Syscalls served without the big kernel lock. Each one touches only
+/// state that is fixed for the calling task (its ids) or protected by the
+/// scheduler's own lock, and none touches user memory.
+pub(crate) const fn is_lock_free_syscall(nr: u64) -> bool {
+    matches!(nr, SYS_YIELD | SYS_GETPID | SYS_GETTID | SYS_GETPPID)
+}
+
+/// Whether returning from a syscall must go through the locked path anyway:
+/// a deliverable signal is pending (delivery needs the big kernel lock) or
+/// the task has been told to exit.
+pub(crate) const fn needs_locked_return(sig_pending: u64, signal_blocked: u64, flags: u32) -> bool {
+    (sig_pending & !signal_blocked) != 0 || (flags & task::TASK_FLAG_EXITING) != 0
+}
+
+/// Lock-free syscalls dispatched by [`syscall_handler`] (diagnostics).
+pub(crate) static LOCK_FREE_SYSCALLS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Fast path for [`is_lock_free_syscall`] numbers. Returns `None` to fall
+/// back to the normal, locked dispatcher.
+fn lock_free_syscall(nr: u64) -> Option<u64> {
+    if !is_lock_free_syscall(nr) {
+        return None;
+    }
+    let current = task::current();
+    if current.is_null() {
+        return None;
+    }
+    let (sig_pending, signal_blocked, flags) =
+        unsafe { ((*current).sig_pending, (*current).signal_blocked, (*current).flags) };
+    if needs_locked_return(sig_pending, signal_blocked, flags) {
+        return None;
+    }
+    let ret = match nr {
+        SYS_GETPID => unsafe { (*current).tgid as i64 },
+        SYS_GETTID => unsafe { (*current).pid as i64 },
+        SYS_GETPPID => unsafe { (*task::leader_of(current)).ppid as i64 },
+        SYS_YIELD => {
+            crate::sched::yield_now();
+            0
+        }
+        _ => return None,
+    };
+    LOCK_FREE_SYSCALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // A yield resumes with interrupts enabled. The SYSRET epilogue runs
+    // SWAPGS before SYSRETQ, and an interrupt between the two would enter
+    // the kernel with the user GS base.
+    arch_x86_64::interrupts::disable();
+    Some(to_sysret(ret))
 }
 
 fn syscall_dispatch(frame: &mut SyscallFrame) -> u64 {

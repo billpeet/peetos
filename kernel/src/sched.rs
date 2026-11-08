@@ -609,6 +609,15 @@ pub fn isr_hook(frame: &mut InterruptFrame, irq_acquired_bkl: bool) -> u64 {
         if !cpu.preempt_pending && !idle_with_work {
             return 0;
         }
+        // A task that marked itself a zombie is still running its exit path
+        // in the kernel (releasing resources, waking the parent) and leaves
+        // the CPU voluntarily when done. The scheduler never resumes zombies,
+        // so preempting it here would lose that work for good.
+        let zombie_in_kernel = unsafe { (*cpu.current).state } == TaskState::Zombie
+            && unsafe { ptr::read_unaligned(ptr::addr_of!(frame.cs)) } & 3 == 0;
+        if zombie_in_kernel {
+            return 0;
+        }
         cpu.preempt_pending = false;
     }
 

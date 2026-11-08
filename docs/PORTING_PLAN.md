@@ -160,8 +160,15 @@ current Rust kernel implementation and forward roadmap.
 
 ### 1a. SMP Phase 3 (Breaking Up the Big Kernel Lock)
 
-- Done: the IRQ-safe `IrqSpinLock`, plus self-locked PMM, heap and scheduler (run queue, task table, task-owned BKL hand-off).
-- Next: give the VMM, VFS, net stack, IPC and syscall globals their own locks. Then drop the BKL from syscalls that do not need it (`sched_yield`, `getpid`/`gettid`, time queries), and shrink it until it can be removed.
+- Done:
+  - the IRQ-safe `IrqSpinLock`,
+  - self-locked PMM, heap, VMM and scheduler (run queue, task table, task-owned BKL hand-off),
+  - lock-free `sched_yield`/`getpid`/`gettid`/`getppid`,
+  - zombies in kernel mode are never preempted.
+- Next:
+  - give the VFS, net stack, IPC and syscall globals their own locks,
+  - add per-address-space locking or page pinning so lock-free syscalls can copy to and from user memory (`clock_gettime`, `nanosleep`),
+  - shrink the BKL until it can be removed.
 - Move to per-CPU run queues with load balancing (and later affinity).
 - Batch TLB shootdowns per operation (`munmap` ranges, fork COW marking) and consider PCID.
 - Deliver signals to tasks running in user mode on another CPU promptly (kick them with a reschedule IPI).

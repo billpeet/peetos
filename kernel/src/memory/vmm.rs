@@ -4,6 +4,7 @@ use arch_x86_64::addr::{PhysAddr, VirtAddr, PAGE_SIZE};
 
 use crate::memory::pmm;
 use crate::serial_println;
+use crate::sync::IrqSpinLock;
 use crate::syscall;
 
 pub const VMM_ENTRIES_PER_TABLE: usize = 512;
@@ -38,6 +39,12 @@ static mut MAPPED_PAGES: u64 = 1;
 static mut TABLES_ALLOCATED: u64 = 1;
 static mut VMM_INITIALIZED: bool = false;
 static mut INIT_PML4_PHYS: PhysAddr = PhysAddr::new(0);
+/// Serialises page-table updates in every address space, plus the mapping
+/// counters. Interrupt-safe and independent of the big kernel lock.
+/// Lock order: heap -> VMM -> PMM. TLB shootdowns are sent while holding
+/// it, which also makes it the "one initiator at a time" guarantee they
+/// rely on. `switch` and the read-only getters do not take it.
+static VMM_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
 #[inline]
 pub const fn pml4_index(addr: u64) -> usize {
@@ -269,6 +276,11 @@ pub fn init() {
 }
 
 pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
+    let _guard = VMM_LOCK.lock();
+    map_page_locked(virt, phys, flags)
+}
+
+fn map_page_locked(virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
     unsafe {
         if !VMM_INITIALIZED {
             serial_println!("[VMM] ERROR: VMM not initialized!");
@@ -339,6 +351,11 @@ pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
 }
 
 pub fn unmap_page(virt: VirtAddr) -> i32 {
+    let _guard = VMM_LOCK.lock();
+    unmap_page_locked(virt)
+}
+
+fn unmap_page_locked(virt: VirtAddr) -> i32 {
     unsafe {
         if !VMM_INITIALIZED {
             return -1;
@@ -398,11 +415,16 @@ pub fn unmap_page(virt: VirtAddr) -> i32 {
 }
 
 pub fn map_range(virt_start: VirtAddr, phys_start: PhysAddr, count: usize, flags: u64) -> i32 {
+    let _guard = VMM_LOCK.lock();
+    map_range_locked(virt_start, phys_start, count, flags)
+}
+
+fn map_range_locked(virt_start: VirtAddr, phys_start: PhysAddr, count: usize, flags: u64) -> i32 {
     for i in 0..count {
         let virt = virt_start + (i as u64 * PAGE_SIZE);
         let phys = phys_start + (i as u64 * PAGE_SIZE);
-        if map_page(virt, phys, flags) != 0 {
-            unmap_range(virt_start, i);
+        if map_page_locked(virt, phys, flags) != 0 {
+            unmap_range_locked(virt_start, i);
             return -1;
         }
     }
@@ -410,10 +432,15 @@ pub fn map_range(virt_start: VirtAddr, phys_start: PhysAddr, count: usize, flags
 }
 
 pub fn unmap_range(virt_start: VirtAddr, count: usize) -> usize {
+    let _guard = VMM_LOCK.lock();
+    unmap_range_locked(virt_start, count)
+}
+
+fn unmap_range_locked(virt_start: VirtAddr, count: usize) -> usize {
     let mut unmapped = 0;
     for i in 0..count {
         let virt = virt_start + (i as u64 * PAGE_SIZE);
-        if unmap_page(virt) == 0 {
+        if unmap_page_locked(virt) == 0 {
             unmapped += 1;
         }
     }
@@ -425,6 +452,11 @@ pub fn get_physical(virt: VirtAddr) -> Option<PhysAddr> {
 }
 
 pub fn get_physical_in(target_pml4: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
+    let _guard = VMM_LOCK.lock();
+    get_physical_in_locked(target_pml4, virt)
+}
+
+fn get_physical_in_locked(target_pml4: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     let mut pml4 = target_pml4;
     if pml4.as_u64() == 0 {
         pml4 = unsafe { PML4_PHYS };
@@ -505,6 +537,11 @@ pub fn is_mapped(virt: VirtAddr) -> bool {
 }
 
 pub fn set_flags(virt: VirtAddr, flags: u64) -> i32 {
+    let _guard = VMM_LOCK.lock();
+    set_flags_locked(virt, flags)
+}
+
+fn set_flags_locked(virt: VirtAddr, flags: u64) -> i32 {
     unsafe {
         if !VMM_INITIALIZED {
             return -1;
@@ -570,6 +607,11 @@ pub fn switch(target_pml4: PhysAddr) {
 }
 
 pub fn create_address_space() -> PhysAddr {
+    let _guard = VMM_LOCK.lock();
+    create_address_space_locked()
+}
+
+fn create_address_space_locked() -> PhysAddr {
     let new_pml4 = alloc_page_table();
     if new_pml4.as_u64() == 0 {
         serial_println!("[VMM] ERROR: Failed to allocate PML4 for new address space");
@@ -666,6 +708,11 @@ pub fn create_address_space() -> PhysAddr {
 }
 
 pub fn destroy_address_space(target_pml4: PhysAddr) {
+    let _guard = VMM_LOCK.lock();
+    destroy_address_space_locked(target_pml4)
+}
+
+fn destroy_address_space_locked(target_pml4: PhysAddr) {
     if target_pml4.as_u64() == 0 || target_pml4 == unsafe { PML4_PHYS } {
         return;
     }
@@ -674,6 +721,11 @@ pub fn destroy_address_space(target_pml4: PhysAddr) {
 }
 
 pub fn map_page_in(target_pml4: PhysAddr, virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
+    let _guard = VMM_LOCK.lock();
+    map_page_in_locked(target_pml4, virt, phys, flags)
+}
+
+fn map_page_in_locked(target_pml4: PhysAddr, virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
     let mut pml4 = target_pml4;
     if pml4.as_u64() == 0 {
         pml4 = unsafe { PML4_PHYS };
@@ -721,6 +773,11 @@ pub fn map_page_in(target_pml4: PhysAddr, virt: VirtAddr, phys: PhysAddr, flags:
 }
 
 pub fn unmap_page_in(target_pml4: PhysAddr, virt: VirtAddr) -> i32 {
+    let _guard = VMM_LOCK.lock();
+    unmap_page_in_locked(target_pml4, virt)
+}
+
+fn unmap_page_in_locked(target_pml4: PhysAddr, virt: VirtAddr) -> i32 {
     unsafe {
         if !VMM_INITIALIZED {
             return -1;
@@ -865,6 +922,11 @@ fn leaf_pte_slot(pml4: PhysAddr, virt: u64) -> Option<(PhysAddr, usize)> {
 
 /// Break copy-on-write sharing for the page containing `virt`.
 pub fn resolve_cow_in(target_pml4: PhysAddr, virt: VirtAddr) -> CowResolve {
+    let _guard = VMM_LOCK.lock();
+    resolve_cow_in_locked(target_pml4, virt)
+}
+
+fn resolve_cow_in_locked(target_pml4: PhysAddr, virt: VirtAddr) -> CowResolve {
     let mut pml4 = target_pml4;
     if pml4.as_u64() == 0 {
         pml4 = unsafe { PML4_PHYS };
@@ -908,6 +970,15 @@ pub fn resolve_cow_in(target_pml4: PhysAddr, virt: VirtAddr) -> CowResolve {
 /// SysV shm, which are refaulted or re-attached instead. Frames the PMM cannot
 /// share (unmanaged memory, share-count overflow) are copied eagerly.
 pub fn clone_user_space(
+    src_pml4: PhysAddr,
+    dst_pml4: PhysAddr,
+    skip: &dyn Fn(u64) -> bool,
+) -> i32 {
+    let _guard = VMM_LOCK.lock();
+    clone_user_space_locked(src_pml4, dst_pml4, skip)
+}
+
+fn clone_user_space_locked(
     src_pml4: PhysAddr,
     dst_pml4: PhysAddr,
     skip: &dyn Fn(u64) -> bool,
@@ -966,7 +1037,7 @@ pub fn clone_user_space(
                         if shared != pte {
                             unsafe { ptr::write(pt_table.add(pt_idx), shared) };
                         }
-                        if map_page_in(
+                        if map_page_in_locked(
                             dst_pml4,
                             VirtAddr::new(virt),
                             src_phys,
@@ -993,7 +1064,7 @@ pub fn clone_user_space(
                         src_phys.to_virt().as_u64() as *const u8,
                         PAGE_SIZE as usize,
                     );
-                    if map_page_in(dst_pml4, VirtAddr::new(virt), dst_phys, pte & PTE_FLAGS_MASK)
+                    if map_page_in_locked(dst_pml4, VirtAddr::new(virt), dst_phys, pte & PTE_FLAGS_MASK)
                         != 0
                     {
                         serial_println!("[VMM] ERROR: Failed to map cloned page");
@@ -1019,6 +1090,11 @@ pub fn clone_user_space(
 }
 
 pub fn clear_user_space(target_pml4: PhysAddr) {
+    let _guard = VMM_LOCK.lock();
+    clear_user_space_locked(target_pml4)
+}
+
+fn clear_user_space_locked(target_pml4: PhysAddr) {
     if target_pml4.as_u64() == 0 || target_pml4 == unsafe { PML4_PHYS } {
         serial_println!("[VMM] ERROR: Cannot clear kernel address space");
         return;
