@@ -43,6 +43,9 @@ pub const USER_FD_KIND_SOCKET: u8 = 4;
 pub const USER_FD_KIND_PTY_MASTER: u8 = 5;
 pub const USER_FD_KIND_PTY_SLAVE: u8 = 6;
 pub const USER_FD_KIND_EPOLL: u8 = 7;
+pub const USER_FD_KIND_EVENTFD: u8 = 8;
+pub const USER_FD_KIND_TIMERFD: u8 = 9;
+pub const USER_FD_KIND_SIGNALFD: u8 = 10;
 pub const USER_FD_NONE: u16 = u16::MAX;
 
 pub const CTTY_NONE: u8 = 0;

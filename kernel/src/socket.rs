@@ -1,7 +1,6 @@
 use net::{Ipv4Addr, NetError};
 
 use crate::icmp;
-use crate::ipc;
 use crate::serial_println;
 use crate::task;
 use crate::{tcp, udp};
@@ -87,7 +86,28 @@ pub struct UnixRightsMessage {
 // Socket table entry
 // ---------------------------------------------------------------------------
 
+/// Process credentials recorded on an `AF_UNIX` endpoint for `SO_PEERCRED`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnixCred {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl UnixCred {
+    pub const NONE: Self = Self {
+        pid: 0,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+}
+
 struct SocketEntry {
+    /// Credentials of the peer process, captured when the connection formed.
+    unix_peer_cred: UnixCred,
+    unix_peer_cred_valid: bool,
+    /// Credentials of the process that called `listen()` (handed to clients).
+    unix_listen_cred: UnixCred,
     used: bool,
     refs: u16,
     protocol: u8,
@@ -118,6 +138,9 @@ struct SocketEntry {
 impl SocketEntry {
     const fn empty() -> Self {
         Self {
+            unix_peer_cred: UnixCred::NONE,
+            unix_peer_cred_valid: false,
+            unix_listen_cred: UnixCred::NONE,
             used: false,
             refs: 0,
             protocol: 0,
@@ -147,6 +170,9 @@ impl SocketEntry {
     }
 
     fn reset(&mut self) {
+        self.unix_peer_cred = UnixCred::NONE;
+        self.unix_peer_cred_valid = false;
+        self.unix_listen_cred = UnixCred::NONE;
         self.used = false;
         self.refs = 0;
         self.protocol = 0;
@@ -325,40 +351,13 @@ fn unix_rights_queue_pop(s: &mut SocketEntry) -> Option<UnixRightsQueueEntry> {
     }
 }
 
-#[inline]
-fn fd_flags_can_read(flags: u32) -> bool {
-    let mode = flags & 0x3;
-    mode == 0 || mode == 2
-}
-
-#[inline]
-fn fd_flags_can_write(flags: u32) -> bool {
-    let mode = flags & 0x3;
-    mode == 1 || mode == 2
-}
-
 fn unix_rights_retain_one(fd: &UnixRightsFd) -> Result<(), i64> {
     if fd.inode == task::USER_FD_NONE {
         return Err(-EINVAL);
     }
     match fd.kind {
-        task::USER_FD_KIND_VFS => Ok(()),
-        task::USER_FD_KIND_PIPE => ipc::pipe_retain(
-            fd.inode,
-            fd_flags_can_read(fd.flags),
-            fd_flags_can_write(fd.flags),
-        )
-        .map_err(|e| -e),
-        task::USER_FD_KIND_SOCKET => socket_retain(fd.inode),
-        task::USER_FD_KIND_PTY_MASTER => {
-            crate::pty::master_retain(fd.inode);
-            Ok(())
-        }
-        task::USER_FD_KIND_PTY_SLAVE => {
-            crate::pty::slave_retain(fd.inode);
-            Ok(())
-        }
-        _ => Err(-EOPNOTSUPP),
+        task::USER_FD_KIND_EMPTY | task::USER_FD_KIND_CONSOLE => Err(-EOPNOTSUPP),
+        kind => crate::syscall::fd_object_retain(kind, fd.inode, fd.flags),
     }
 }
 
@@ -367,20 +366,8 @@ fn unix_rights_release_one(fd: &UnixRightsFd) {
         return;
     }
     match fd.kind {
-        task::USER_FD_KIND_VFS => {}
-        task::USER_FD_KIND_PIPE => {
-            let _ = ipc::pipe_close(
-                fd.inode,
-                fd_flags_can_read(fd.flags),
-                fd_flags_can_write(fd.flags),
-            );
-        }
-        task::USER_FD_KIND_SOCKET => {
-            let _ = socket_close(fd.inode);
-        }
-        task::USER_FD_KIND_PTY_MASTER => crate::pty::master_close(fd.inode),
-        task::USER_FD_KIND_PTY_SLAVE => crate::pty::slave_close(fd.inode),
-        _ => {}
+        task::USER_FD_KIND_EMPTY | task::USER_FD_KIND_CONSOLE => {}
+        kind => crate::syscall::fd_object_release(kind, fd.inode, fd.flags),
     }
 }
 
@@ -980,6 +967,8 @@ pub fn socket_connect_unix(id: u16, path: &[u8], nonblocking: bool) -> Result<()
         client.state = STATE_CONNECTED;
         client.unix_peer = server_id;
         client.unix_peer_open = true;
+        client.unix_peer_cred = listener.unix_listen_cred;
+        client.unix_peer_cred_valid = true;
 
         if !unix_accept_queue_push(listener, server_id) {
             server.reset();
@@ -1586,6 +1575,14 @@ pub fn socket_poll_events(id: u16) -> u16 {
         }
         events |= POLLOUT;
     } else if s.protocol == PROTO_UNIX {
+        if s.state == STATE_LISTENING {
+            // Like Linux, a listener is readable while connections are queued
+            // for accept() and is never "hung up".
+            if s.unix_accept_q_len > 0 {
+                events |= POLLIN;
+            }
+            return events;
+        }
         if s.unix_rx_len > 0 {
             events |= POLLIN;
         }
@@ -1641,6 +1638,45 @@ pub fn socket_shutdown(id: u16, _how: i32) -> Result<(), i64> {
 }
 
 /// Retain a socket reference when an FD is duplicated/forked.
+/// Record the credentials of the process on the other end of `id`.
+pub fn socket_set_peer_cred(id: u16, cred: UnixCred) -> Result<(), i64> {
+    let s = get_socket(id)?;
+    if s.protocol != PROTO_UNIX {
+        return Err(-EOPNOTSUPP);
+    }
+    s.unix_peer_cred = cred;
+    s.unix_peer_cred_valid = true;
+    Ok(())
+}
+
+/// Record the credentials of the process listening on `id`.
+pub fn socket_set_listen_cred(id: u16, cred: UnixCred) -> Result<(), i64> {
+    let s = get_socket(id)?;
+    if s.protocol != PROTO_UNIX {
+        return Err(-EOPNOTSUPP);
+    }
+    s.unix_listen_cred = cred;
+    Ok(())
+}
+
+/// `SO_PEERCRED`: credentials of the connected peer process.
+pub fn socket_peer_cred(id: u16) -> Result<UnixCred, i64> {
+    let s = get_socket(id)?;
+    if s.protocol != PROTO_UNIX || !s.unix_peer_cred_valid {
+        return Err(-ENOTCONN);
+    }
+    Ok(s.unix_peer_cred)
+}
+
+/// The connected peer endpoint of an `AF_UNIX` stream socket, if any.
+pub fn socket_unix_peer(id: u16) -> Option<u16> {
+    let s = get_socket(id).ok()?;
+    if s.protocol != PROTO_UNIX || s.unix_peer == UNIX_NO_PEER {
+        return None;
+    }
+    Some(s.unix_peer)
+}
+
 pub fn socket_retain(id: u16) -> Result<(), i64> {
     let idx = id as usize;
     if idx >= MAX_SOCKETS {
@@ -1892,6 +1928,64 @@ mod tests {
         let _ = socket_close(server);
         let _ = socket_close(client);
         let _ = socket_close(listener);
+    }
+
+    #[test]
+    fn unix_listener_is_readable_only_while_connections_are_pending() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        reset_sockets();
+
+        let listener = socket_create(AF_UNIX, 1, 0).expect("listener create");
+        socket_bind_unix(listener, b"/tmp/wayland-poll").expect("bind");
+        socket_listen(listener, 4).expect("listen");
+        assert_eq!(socket_poll_events(listener), 0, "idle listener: not readable, not HUP");
+
+        let client = socket_create(AF_UNIX, 1, 0).expect("client create");
+        socket_connect_unix(client, b"/tmp/wayland-poll", true).expect("connect");
+        assert_eq!(socket_poll_events(listener), POLLIN);
+
+        let server = socket_accept_unix(listener, true).expect("accept");
+        assert_eq!(socket_poll_events(listener), 0, "queue drained after accept");
+        assert_eq!(socket_accept_unix(listener, true), Err(-EAGAIN));
+
+        for id in [server, client, listener] {
+            let _ = socket_close(id);
+        }
+    }
+
+    #[test]
+    fn unix_peer_credentials_follow_connect_and_socketpair() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        reset_sockets();
+
+        let server_cred = UnixCred { pid: 10, uid: 0, gid: 0 };
+        let client_cred = UnixCred { pid: 20, uid: 1000, gid: 100 };
+
+        let listener = socket_create(AF_UNIX, 1, 0).expect("listener create");
+        socket_bind_unix(listener, b"/tmp/wayland-cred").expect("bind");
+        socket_listen(listener, 4).expect("listen");
+        socket_set_listen_cred(listener, server_cred).expect("listen cred");
+        assert_eq!(socket_peer_cred(listener), Err(-ENOTCONN));
+
+        let client = socket_create(AF_UNIX, 1, 0).expect("client create");
+        socket_connect_unix(client, b"/tmp/wayland-cred", true).expect("connect");
+        let server_end = socket_unix_peer(client).expect("client has a peer");
+        socket_set_peer_cred(server_end, client_cred).expect("server peer cred");
+
+        let accepted = socket_accept_unix(listener, true).expect("accept");
+        assert_eq!(accepted, server_end);
+        assert_eq!(socket_peer_cred(client), Ok(server_cred));
+        assert_eq!(socket_peer_cred(accepted), Ok(client_cred));
+
+        let (a, b) = socket_create_unix_pair().expect("pair");
+        assert_eq!(socket_peer_cred(a), Err(-ENOTCONN));
+        socket_set_peer_cred(a, client_cred).expect("a cred");
+        socket_set_peer_cred(b, client_cred).expect("b cred");
+        assert_eq!(socket_peer_cred(b), Ok(client_cred));
+
+        for id in [a, b, accepted, client, listener] {
+            let _ = socket_close(id);
+        }
     }
 
     #[test]

@@ -254,23 +254,7 @@ pub(super) fn clone_parent_fds_for_child(
                 (*crate::task::leader_of(child)).user_fd_flags[idx],
             )
         };
-        if kind == task::USER_FD_KIND_PIPE && inode != task::USER_FD_NONE {
-            let retain_read = fd_can_read(flags);
-            let retain_write = fd_can_write(flags);
-            ipc::pipe_retain(inode, retain_read, retain_write).map_err(|err| -ipc_to_errno(err))?;
-        }
-        if kind == task::USER_FD_KIND_PTY_MASTER && inode != task::USER_FD_NONE {
-            crate::pty::master_retain(inode);
-        }
-        if kind == task::USER_FD_KIND_PTY_SLAVE && inode != task::USER_FD_NONE {
-            crate::pty::slave_retain(inode);
-        }
-        if kind == task::USER_FD_KIND_SOCKET && inode != task::USER_FD_NONE {
-            socket::socket_retain(inode)?;
-        }
-        if kind == task::USER_FD_KIND_EPOLL && inode != task::USER_FD_NONE {
-            epoll_retain(inode)?;
-        }
+        fd_object_retain(kind, inode, flags)?;
     }
 
     Ok(())

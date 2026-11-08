@@ -1134,6 +1134,11 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         let require_writable = is_shared && (prot & PROT_WRITE) != 0;
         match mmap_file_inode(ctx.current, fd, true, require_writable) {
             Ok((inode, fd_flags)) => {
+                if require_writable {
+                    if let Err(err) = seals_allow_write(fd_seals(fd_flags, inode)) {
+                        return err;
+                    }
+                }
                 let shared_can_write = is_shared && fd_can_write(fd_flags);
                 if fs::inode_is_framebuffer(inode) {
                     if let Err(err) = mmap_validate_framebuffer_window(offset, len, prot, is_shared)
@@ -1230,6 +1235,178 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
         Err(err) => err,
     }
+}
+
+pub(super) const MREMAP_MAYMOVE: u32 = 1;
+
+/// Move the present PTEs of `[old_start, old_start + len)` to `new_start`
+/// without copying or freeing the backing pages, so anonymous contents,
+/// page-cache pins (tracked by physical address), and dirty state all follow
+/// the mapping. On failure every page already moved is put back.
+pub(super) fn mremap_move_ptes(pml4: PhysAddr, old_start: u64, new_start: u64, len: u64) -> Result<(), i64> {
+    let mut off = 0u64;
+    while off < len {
+        let old_va = VirtAddr::new(old_start + off);
+        if let Some(pte) = vmm::get_pte_in(pml4, old_va) {
+            let phys = PhysAddr::new(pte & vmm::PTE_ADDR_MASK);
+            let flags = pte & vmm::PTE_FLAGS_MASK;
+            if vmm::map_page_in(pml4, VirtAddr::new(new_start + off), phys, flags) != 0 {
+                // Roll back the pages moved so far.
+                let mut back = 0u64;
+                while back < off {
+                    let new_va = VirtAddr::new(new_start + back);
+                    if let Some(moved) = vmm::get_pte_in(pml4, new_va) {
+                        let _ = vmm::map_page_in(
+                            pml4,
+                            VirtAddr::new(old_start + back),
+                            PhysAddr::new(moved & vmm::PTE_ADDR_MASK),
+                            moved & vmm::PTE_FLAGS_MASK,
+                        );
+                        let _ = vmm::unmap_page_in(pml4, new_va);
+                    }
+                    back += PAGE_SIZE;
+                }
+                return Err(-ENOMEM);
+            }
+            let _ = vmm::unmap_page_in(pml4, old_va);
+        }
+        off += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+/// `mremap(old_addr, old_size, new_size, flags)`. Supports shrinking, growing
+/// in place, and `MREMAP_MAYMOVE` relocation within a single existing mapping.
+/// `MREMAP_FIXED` and `MREMAP_DONTUNMAP` are not supported.
+pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let old_addr = call.arg(0);
+    let old_size = call.arg(1);
+    let new_size = call.arg(2);
+    let flags = call.arg(3) as u32;
+
+    if (flags & !MREMAP_MAYMOVE) != 0 {
+        return -EINVAL;
+    }
+    if (old_addr & (PAGE_SIZE - 1)) != 0 || old_addr < MMAP_BASE_ADDR {
+        return -EINVAL;
+    }
+    let old_len = match page_align_up(old_size) {
+        Some(v) if v > 0 => v,
+        _ => return -EINVAL,
+    };
+    let new_len = match page_align_up(new_size) {
+        Some(v) if v > 0 => v,
+        _ => return -EINVAL,
+    };
+    let old_end = match old_addr.checked_add(old_len) {
+        Some(v) if v < KERNEL_VIRT_BASE => v,
+        _ => return -EINVAL,
+    };
+
+    let pml4 = match ctx.user_pml4() {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let slot = match mmap_prepare_task_slot(ctx.current) {
+        Some(slot) => slot,
+        None => return -ESRCH,
+    };
+    let regions = unsafe { TASK_VM_MAPPINGS[slot] };
+    let region = match mmap_regions_find_mapping(&regions, old_addr) {
+        Some(region) => region,
+        None => return -EFAULT,
+    };
+    let region_end = region.start + region.len;
+    if old_end > region_end {
+        // The range must lie inside one mapping.
+        return -EFAULT;
+    }
+    if mmap_mapping_is_framebuffer(&region) && new_len != old_len {
+        return -EINVAL;
+    }
+
+    if new_len == old_len {
+        return old_addr as i64;
+    }
+
+    if new_len < old_len {
+        let mut next = regions;
+        if let Err(err) = mmap_regions_unmap_range(&mut next, old_addr + new_len, old_end) {
+            return err;
+        }
+        unmap_user_pages_in_regions(pml4, old_addr + new_len, old_end, Some(&regions));
+        unsafe {
+            TASK_VM_MAPPINGS[slot] = next;
+        }
+        return old_addr as i64;
+    }
+
+    // Growing: enforce the per-task page budget and file window rules.
+    let total = match mmap_regions_total_pages(&regions) {
+        Ok(pages) => pages,
+        Err(err) => return err,
+    };
+    if total.saturating_add((new_len - old_len) / PAGE_SIZE) > MMAP_MAX_PAGES_PER_TASK {
+        return -ENOMEM;
+    }
+    let is_file = region.file_inode != task::USER_FD_NONE;
+    let file_offset = if is_file {
+        region.file_offset + (old_addr - region.start)
+    } else {
+        0
+    };
+    if is_file && region.map_shared && (region.prot & PROT_WRITE) != 0 {
+        if let Err(err) = mmap_validate_shared_write_window(region.file_inode, file_offset, new_len) {
+            return err;
+        }
+    }
+    let mut piece = VmMapping {
+        start: old_addr,
+        len: new_len,
+        file_offset,
+        ..region
+    };
+
+    let grow_end = match old_addr.checked_add(new_len) {
+        Some(v) if v < KERNEL_VIRT_BASE => v,
+        _ => return -ENOMEM,
+    };
+    if old_end == region_end && mmap_range_available(ctx.current, pml4, old_end, grow_end) {
+        let mut next = regions;
+        if let Err(err) = mmap_regions_unmap_range(&mut next, old_addr, old_end) {
+            return err;
+        }
+        if let Err(err) = mmap_regions_insert(&mut next, piece) {
+            return err;
+        }
+        unsafe {
+            TASK_VM_MAPPINGS[slot] = next;
+        }
+        return old_addr as i64;
+    }
+
+    if (flags & MREMAP_MAYMOVE) == 0 {
+        return -ENOMEM;
+    }
+    let new_start = match mmap_find_range(ctx, pml4, 0, new_len) {
+        Ok(addr) => addr,
+        Err(err) => return err,
+    };
+    piece.start = new_start;
+    let mut next = regions;
+    if let Err(err) = mmap_regions_unmap_range(&mut next, old_addr, old_end) {
+        return err;
+    }
+    if let Err(err) = mmap_regions_insert(&mut next, piece) {
+        return err;
+    }
+    if let Err(err) = mremap_move_ptes(pml4, old_addr, new_start, old_len) {
+        return err;
+    }
+    unsafe {
+        TASK_VM_MAPPINGS[slot] = next;
+    }
+    new_start as i64
 }
 
 pub(super) fn sys_munmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {

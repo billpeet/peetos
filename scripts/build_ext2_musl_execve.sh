@@ -89,6 +89,12 @@ if [[ -f "${ROOT_DIR}/user/dropbear_ed25519_host_key" ]]; then
   chmod 0600 "${STAGE_ROOT}/etc/dropbear/dropbear_ed25519_host_key"
 fi
 
+# Stage libwayland server/client smoke helper when available.
+if [[ -x "${ROOT_DIR}/user/wayland_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/wayland_smoke.elf" "${STAGE_ROOT}/bin/wayland_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/wayland_smoke"
+fi
+
 # Stage FPU/SSE context-switch smoke helper when available.
 if [[ -x "${ROOT_DIR}/user/fpu_context_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/fpu_context_smoke.elf" "${STAGE_ROOT}/bin/fpu_context_smoke"
@@ -497,6 +503,23 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/unix_rights_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/wayland_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/wayland_smoke ]; then
+  echo [musl-ext2-wayland-smoke] missing bin/wayland_smoke
+  fail=1
+else
+  bin/wayland_smoke || fail=1
+fi
+
+echo [musl-ext2-wayland-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-wayland-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/wayland_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/fpu_smoke.sh" <<'EOS'
 fail=0

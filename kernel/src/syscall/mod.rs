@@ -72,6 +72,9 @@ const EOPNOTSUPP: i64 = 95;
 const EAFNOSUPPORT: i64 = 97;
 const EADDRINUSE: i64 = 98;
 const ENOTCONN: i64 = 107;
+const ENODEV: i64 = 19;
+const EFBIG: i64 = 27;
+const ENOLCK: i64 = 37;
 const ETIMEDOUT: i64 = 110;
 const ECONNREFUSED: i64 = 111;
 const EINPROGRESS: i64 = 115;
@@ -167,6 +170,16 @@ const SYS_FSTATFS: u64 = 138;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_MEMFD_CREATE: u64 = 319;
+const SYS_MREMAP: u64 = 25;
+const SYS_FLOCK: u64 = 73;
+const SYS_SIGNALFD: u64 = 282;
+const SYS_TIMERFD_CREATE: u64 = 283;
+const SYS_EVENTFD: u64 = 284;
+const SYS_FALLOCATE: u64 = 285;
+const SYS_TIMERFD_SETTIME: u64 = 286;
+const SYS_TIMERFD_GETTIME: u64 = 287;
+const SYS_SIGNALFD4: u64 = 289;
+const SYS_EVENTFD2: u64 = 290;
 const SYS_EPOLL_WAIT: u64 = 232;
 const SYS_EPOLL_PWAIT: u64 = 281;
 const SYS_EPOLL_CTL: u64 = 233;
@@ -329,6 +342,7 @@ const EPOLL_CTL_MOD: i32 = 3;
 // Socket option levels/names
 const SOL_SOCKET: u32 = 1;
 const SO_ERROR: u32 = 4;
+const SO_PEERCRED: u32 = 17;
 const SO_REUSEADDR: u32 = 2;
 const SO_KEEPALIVE: u32 = 9;
 const IPPROTO_ICMP: u32 = 1;
@@ -831,6 +845,31 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_memfd_create,
     ),
+    syscall_def(SYS_MREMAP, "mremap", SyscallMode::UserTask, sys_mremap),
+    syscall_def(SYS_FLOCK, "flock", SyscallMode::UserTask, sys_flock),
+    syscall_def(SYS_FALLOCATE, "fallocate", SyscallMode::UserTask, sys_fallocate),
+    syscall_def(SYS_EVENTFD, "eventfd", SyscallMode::UserTask, sys_eventfd),
+    syscall_def(SYS_EVENTFD2, "eventfd2", SyscallMode::UserTask, sys_eventfd2),
+    syscall_def(
+        SYS_TIMERFD_CREATE,
+        "timerfd_create",
+        SyscallMode::UserTask,
+        sys_timerfd_create,
+    ),
+    syscall_def(
+        SYS_TIMERFD_SETTIME,
+        "timerfd_settime",
+        SyscallMode::UserTask,
+        sys_timerfd_settime,
+    ),
+    syscall_def(
+        SYS_TIMERFD_GETTIME,
+        "timerfd_gettime",
+        SyscallMode::UserTask,
+        sys_timerfd_gettime,
+    ),
+    syscall_def(SYS_SIGNALFD, "signalfd", SyscallMode::UserTask, sys_signalfd),
+    syscall_def(SYS_SIGNALFD4, "signalfd4", SyscallMode::UserTask, sys_signalfd4),
     syscall_def(SYS_SYSINFO, "sysinfo", SyscallMode::UserTask, sys_sysinfo),
     syscall_def(
         SYS_PRLIMIT64,
@@ -1554,8 +1593,10 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
 
 // Syscall implementations, grouped by area. Each submodule pulls in this
 // module's shared types and helpers via `use super::*`.
+mod eventfds;
 mod fd;
 mod file;
+mod fileext;
 mod io;
 mod ioctl;
 mod misc;
@@ -1566,8 +1607,10 @@ mod sockets;
 mod uaccess;
 mod vm;
 
+use eventfds::*;
 use fd::*;
 use file::*;
+use fileext::*;
 use io::*;
 use ioctl::*;
 use misc::*;
@@ -1578,6 +1621,7 @@ use sockets::*;
 use uaccess::*;
 use vm::*;
 
+pub(crate) use fd::{fd_object_release, fd_object_retain};
 pub(crate) use vm::vm_page_cache_release_mapped_phys;
 pub use vm::{terminate_current_user_fault, try_handle_page_fault};
 

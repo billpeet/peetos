@@ -280,7 +280,11 @@ pub(super) fn sys_listen(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(e) => return e,
     };
 
-    match socket::socket_listen(sock_id, backlog) {
+    let listen_result = socket::socket_listen(sock_id, backlog);
+    if listen_result.is_ok() {
+        let _ = socket::socket_set_listen_cred(sock_id, current_unix_cred(ctx.current));
+    }
+    match listen_result {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -319,7 +323,15 @@ pub(super) fn sys_connect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 Ok(v) => v,
                 Err(e) => return e,
             };
-            match socket::socket_connect_unix(sock_id, &path_buf[..path_len], nb) {
+            let connect_result = socket::socket_connect_unix(sock_id, &path_buf[..path_len], nb);
+            if connect_result.is_ok() {
+                // The accepted (server-side) endpoint reports the connecting
+                // process as its peer.
+                if let Some(server_end) = socket::socket_unix_peer(sock_id) {
+                    let _ = socket::socket_set_peer_cred(server_end, current_unix_cred(ctx.current));
+                }
+            }
+            match connect_result {
                 Ok(()) => 0,
                 Err(e) => e,
             }
@@ -1013,7 +1025,13 @@ pub(super) fn sys_socketpair(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 
         return -EOPNOTSUPP;
     }
 
-    let (sock0, sock1) = match socket::socket_create_unix_pair() {
+    let pair = socket::socket_create_unix_pair();
+    if let Ok((a, b)) = pair {
+        let cred = current_unix_cred(ctx.current);
+        let _ = socket::socket_set_peer_cred(a, cred);
+        let _ = socket::socket_set_peer_cred(b, cred);
+    }
+    let (sock0, sock1) = match pair {
         Ok(pair) => pair,
         Err(e) => return e,
     };
@@ -1057,6 +1075,59 @@ pub(super) fn sys_setsockopt(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 
     0
 }
 
+pub(super) fn current_unix_cred(task_ptr: *mut task::Task) -> socket::UnixCred {
+    if task_ptr.is_null() {
+        return socket::UnixCred::NONE;
+    }
+    unsafe {
+        socket::UnixCred {
+            pid: (*task_ptr).pid,
+            uid: (*task_ptr).user_uid,
+            gid: (*task_ptr).user_gid,
+        }
+    }
+}
+
+/// Linux `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`.
+pub(super) fn ucred_bytes(cred: socket::UnixCred) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[0..4].copy_from_slice(&cred.pid.to_ne_bytes());
+    out[4..8].copy_from_slice(&cred.uid.to_ne_bytes());
+    out[8..12].copy_from_slice(&cred.gid.to_ne_bytes());
+    out
+}
+
+/// Copy an option value honouring the caller's `optlen` (truncating like
+/// Linux) and write back the stored length.
+pub(super) fn write_sockopt_bytes(
+    task_ptr: *mut task::Task,
+    optval_ptr: u64,
+    optlen_ptr: u64,
+    value: &[u8],
+) -> i64 {
+    if optlen_ptr == 0 {
+        return -EFAULT;
+    }
+    let mut len_raw = [0u8; 4];
+    if let Err(err) = copy_from_user_task(task_ptr, optlen_ptr, &mut len_raw) {
+        return -err;
+    }
+    let requested = i32::from_ne_bytes(len_raw);
+    if requested < 0 {
+        return -EINVAL;
+    }
+    let n = core::cmp::min(requested as usize, value.len());
+    if n > 0 {
+        if let Err(err) = copy_to_user_task(task_ptr, optval_ptr, &value[..n]) {
+            return -err;
+        }
+    }
+    if let Err(err) = copy_to_user_task(task_ptr, optlen_ptr, &(n as u32).to_ne_bytes()) {
+        return -err;
+    }
+    0
+}
+
 pub(super) fn sys_getsockopt(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let fd = call.arg(0) as i32;
     let level = call.arg(1) as u32;
@@ -1065,10 +1136,18 @@ pub(super) fn sys_getsockopt(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let optlen_ptr = call.arg(4);
 
     // Validate this is a socket
-    let _ = match fd_to_socket_id(ctx.current, fd) {
+    let (_, sock_id) = match fd_to_socket_id(ctx.current, fd) {
         Ok(v) => v,
         Err(e) => return e,
     };
+
+    if level == SOL_SOCKET && optname == SO_PEERCRED {
+        let cred = match socket::socket_peer_cred(sock_id) {
+            Ok(cred) => cred,
+            Err(err) => return err,
+        };
+        return write_sockopt_bytes(ctx.current, optval_ptr, optlen_ptr, &ucred_bytes(cred));
+    }
 
     // Return 0 for SO_ERROR and other common queries
     if level == SOL_SOCKET && optname == SO_ERROR {

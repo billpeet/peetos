@@ -176,6 +176,18 @@ pub(super) fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(v) => v,
         Err(_) => return -EINVAL,
     };
+    let (slot_kind, slot_inode, slot_flags) = unsafe {
+        (
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_flags[idx],
+        )
+    };
+    if is_evfd_kind(slot_kind) {
+        // eventfd/timerfd/signalfd reads are single atomic records, not a
+        // byte stream, so they bypass the chunked loop below.
+        return evfd_read(ctx, slot_kind, slot_inode, slot_flags, call.arg(1), len);
+    }
     if len == 0 {
         return 0;
     }
@@ -364,6 +376,20 @@ pub(super) fn write_from_user_fd(
                 return Err(-EINVAL);
             }
             let append = (fd_open_flags(flags) & fs::O_APPEND) != 0;
+            let seals = fd_seals(flags, inode);
+            if seals != 0 {
+                let size = fs::file_size(inode).unwrap_or(0);
+                let start = if append { size } else { offset };
+                let end = start.saturating_add(take as u64);
+                let sealed = seals_allow_write(seals)
+                    .and_then(|()| seals_allow_resize(seals, size, end.max(size)));
+                if let Err(err) = sealed {
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    return Err(err);
+                }
+            }
             let write_res = match fs::write(inode, offset, &chunk[..take], append) {
                 Ok(result) => result,
                 Err(err) => {
@@ -491,6 +517,17 @@ pub(super) fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(v) => v,
         Err(_) => return -EINVAL,
     };
+
+    let (slot_kind, slot_inode, slot_flags) = unsafe {
+        (
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_flags[idx],
+        )
+    };
+    if is_evfd_kind(slot_kind) {
+        return evfd_write(ctx, slot_kind, slot_inode, slot_flags, call.arg(1), len);
+    }
 
     let mut wrote_vfs = false;
     let written = match write_from_user_fd(ctx, idx, call.arg(1), len, &mut wrote_vfs) {

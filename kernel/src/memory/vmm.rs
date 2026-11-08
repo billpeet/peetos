@@ -444,6 +444,33 @@ pub fn get_physical_in(target_pml4: PhysAddr, virt: VirtAddr) -> Option<PhysAddr
     ))
 }
 
+/// Raw 4 KiB leaf page-table entry for `virt` in `target_pml4`, or `None` if
+/// the page is not present or is covered by a large page.
+pub fn get_pte_in(target_pml4: PhysAddr, virt: VirtAddr) -> Option<u64> {
+    let mut pml4 = target_pml4;
+    if pml4.as_u64() == 0 {
+        pml4 = unsafe { PML4_PHYS };
+    }
+    let v = virt.as_u64();
+    let pml4_entry = read_pte(pml4, pml4_index(v));
+    if !pte_present(pml4_entry) {
+        return None;
+    }
+    let pdpt_entry = read_pte(pte_addr(pml4_entry), pdpt_index(v));
+    if !pte_present(pdpt_entry) || (pdpt_entry & PTE_LARGE) != 0 {
+        return None;
+    }
+    let pd_entry = read_pte(pte_addr(pdpt_entry), pd_index(v));
+    if !pte_present(pd_entry) || (pd_entry & PTE_LARGE) != 0 {
+        return None;
+    }
+    let pt_entry = read_pte(pte_addr(pd_entry), pt_index(v));
+    if !pte_present(pt_entry) {
+        return None;
+    }
+    Some(pt_entry)
+}
+
 pub fn is_mapped(virt: VirtAddr) -> bool {
     get_physical(virt).is_some()
 }

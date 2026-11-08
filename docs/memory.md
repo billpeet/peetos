@@ -56,11 +56,17 @@ Key functions:
 - `map_page()`, `unmap_page()`
 - `map_range()`, `unmap_range()`
 - `get_physical()`, `get_physical_in()` and `is_mapped()`
+- `get_pte_in()` (raw 4 KiB leaf entry, used by `mremap` to move pages with their flags)
 - `set_flags()`
 - `create_address_space()`, `destroy_address_space()`
 - `clone_user_space()` (copy-on-write fork clone with a skip predicate) and `clear_user_space()`
 - `resolve_cow_in()` breaks copy-on-write sharing for one page; `cow_share_pte()` / `cow_adjust_flags()` are the pure PTE rules (see `docs/process_model.md`)
 - `switch()` and `invalidate_page()`
+
+User `mremap`:
+- `mremap(old, old_size, new_size, flags)` (`kernel/src/syscall/vm.rs`) shrinks in place, grows in place when the following range is free, or with `MREMAP_MAYMOVE` relocates the mapping.
+- Relocation moves the present page-table entries instead of copying, so anonymous memory, page-cache pins (tracked by physical address), and dirty state follow the mapping; if a page-table allocation fails midway, already-moved pages are put back.
+- Growing a shared writable file mapping re-validates the file window, and growth is counted against the per-task mapping budget.
 
 RAII support:
 - `MappingGuard` unmaps a range on drop (intended for temporary mappings).
@@ -69,6 +75,7 @@ Limitations / Simplifications
 - Only 4 KB mappings are created; large pages are detected but not allocated.
 - Page table allocation is simple and not reference-counted; `destroy_address_space` only frees the PML4. Data frames carry a 16-bit PMM share count for copy-on-write; page-table frames are never shared.
 - No TLB shootdown across CPUs, PCID, or advanced address-space isolation features.
+- `mremap` requires the old range to lie inside one existing mapping, does not support `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and refuses to resize framebuffer mappings.
 
 **Kernel Heap (kmalloc)**
 `kernel/src/memory/heap.rs` is a simple first-fit allocator:

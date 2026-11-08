@@ -68,6 +68,9 @@ Limitations / Simplifications
   - `SYS_BRK`
   - `SYS_MEMFD_CREATE` (tmpfs-backed shared-buffer fd create baseline)
   - `SYS_EPOLL_CREATE1`, `SYS_EPOLL_CTL`, `SYS_EPOLL_WAIT` (baseline level-triggered epoll)
+  - `SYS_EVENTFD`, `SYS_EVENTFD2`, `SYS_TIMERFD_CREATE`, `SYS_TIMERFD_SETTIME`, `SYS_TIMERFD_GETTIME`, `SYS_SIGNALFD`, `SYS_SIGNALFD4` (event fds; see `docs/ipc.md`)
+  - `SYS_FLOCK`, `SYS_FALLOCATE` (advisory locks and preallocation; see `docs/vfs.md`)
+  - `SYS_MREMAP` (resize/move mappings; see `docs/memory.md`)
 - `int 0x80` is retained as a compatibility path for current userspace bring-up and tooling.
 
 **Syscall Handler**
@@ -190,7 +193,9 @@ Limitations / Simplifications
 `kernel/src/syscall/` is split by area. `mod.rs` holds the syscall numbers and constants, the shared Linux ABI structs, per-task state tables, the `SYSCALL_TABLE`, errno conversion, dispatch, and the SYSCALL/int 0x80 entry handlers. Handlers and their helpers live in submodules:
 - `uaccess.rs`: copying data to and from user memory
 - `vm.rs`: `mmap`/`munmap`/`mprotect`/`msync`/`brk`, user page faults, and the file-backed page cache
-- `fd.rs`: fd table helpers, `close`/`dup*`/`fcntl`, pipes, `memfd_create`
+- `fd.rs`: fd table helpers, `close`/`dup*`/`fcntl`, pipes, `memfd_create`, and `fd_object_retain`/`fd_object_release` (the single place that maps each fd kind to its object refcount; used by dup, fork, close, and `SCM_RIGHTS`)
+- `fileext.rs`: `flock`, `fallocate`, memfd seals (`F_ADD_SEALS`/`F_GET_SEALS`)
+- `eventfds.rs`: `eventfd`, `timerfd`, `signalfd` syscalls and their read/write/poll hooks (object state lives in `kernel/src/evfd.rs`)
 - `file.rs`: path resolution, `open*`, metadata (`stat*`, `statfs`, `chmod`/`chown`, times), directory operations, `getdents64`, `truncate`/`sync`
 - `io.rs`: `read`/`write`/`readv`/`writev`/`pread64`/`pwrite64`/`lseek`/`copy_file_range`
 - `process.rs`: `fork`/`vfork`/`clone`, `execve`, `wait4`, `exit*`, ids and process groups, `arch_prctl`, `futex`

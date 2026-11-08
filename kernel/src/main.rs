@@ -12,6 +12,7 @@ mod block;
 mod display_mode;
 mod e1000;
 mod elf;
+mod evfd;
 mod ethernet;
 mod exception;
 mod framebuffer;

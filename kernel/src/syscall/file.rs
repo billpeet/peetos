@@ -1226,14 +1226,25 @@ pub(super) fn sys_ftruncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EBADF;
     }
 
-    let (kind, inode) = unsafe {
+    let (kind, inode, fd_flags) = unsafe {
         (
             (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
             (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_flags[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
         return -EBADF;
+    }
+    let seals = fd_seals(fd_flags, inode);
+    if seals != 0 {
+        let size = match fs::file_size(inode) {
+            Ok(size) => size,
+            Err(err) => return -fs_to_errno(err),
+        };
+        if let Err(err) = seals_allow_resize(seals, size, length) {
+            return err;
+        }
     }
 
     let result = if length == 0 {

@@ -33,6 +33,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - GDT/IDT setup is wired with interrupt stubs, PIC remap, PIT timer init, syscall MSR setup, and serial exception reports.
 - PMM/VMM/kernel heap are active.
 - Tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption).
+- libwayland 1.23.1 (with libffi 3.4.6) is ported as static musl libraries (`make -C wayland`). A dedicated QEMU smoke (`run-wayland-smoke`) runs a libwayland compositor and a separate libwayland client process that connect over `/tmp/wayland-0`, share a sealed memfd `wl_shm` pool, present two frames (growing the pool in between), and exercise `eventfd`, `timerfd`, `signalfd`, `flock`, `fallocate`, `mremap`, and `SO_PEERCRED`. See `docs/wayland.md`.
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
 - `fork` is copy-on-write, and `clone(CLONE_THREAD)` thread groups support musl pthreads, including `pthread_cancel`, timed waits and `execve` from any thread. Signals use the Linux `rt_sigframe` ABI (signals 1..=64, `siginfo_t`/`ucontext_t`) and interrupt blocking syscalls with `SA_RESTART`-aware restart (`make run-proc-smoke`; see `docs/process_model.md`).
 - ELF loading is hardened (header/segment validation, malformed `PT_INTERP` rejection, RWX rejection, entrypoint checks) with NXE enabled.
@@ -60,6 +61,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `docs/boot.md` Boot flow, entry sequence, and `kmain()` initialization order.
 - `docs/interrupts.md` GDT/IDT setup, PIC/PIT configuration, and interrupt handling.
 - `docs/memory.md` Typed addresses, PMM, VMM, and kernel heap allocator.
+- `docs/wayland.md` libwayland port: build, kernel interfaces it uses, and the end-to-end smoke test.
 - `docs/elf.md` ELF loading and initial userspace image handoff.
 - `docs/syscall.md` SYSCALL/MSR setup and dispatcher behavior.
 - `docs/tasking.md` Task structures, user bootstrap, and scheduler behavior.
@@ -190,6 +192,7 @@ make run-quickjs-smoke
 make run-micropython-smoke
 make run-dropbear-smoke
 make run-fpu-smoke
+make run-wayland-smoke
 make run-gui-smoke
 make run-gui-demo
 ```

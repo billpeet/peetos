@@ -612,10 +612,18 @@ fn accept4_flag_parsing_rejects_unsupported_bits() {
 }
 
 #[test]
-fn memfd_flag_validation_accepts_cloexec_and_rejects_unsupported() {
-    assert_eq!(memfd_validate_flags(0), Ok(false));
-    assert_eq!(memfd_validate_flags(MFD_CLOEXEC), Ok(true));
-    assert_eq!(memfd_validate_flags(MFD_ALLOW_SEALING), Err(-ENOSYS));
+fn memfd_flag_validation_accepts_cloexec_and_sealing() {
+    let flags = |cloexec, allow_sealing| MemfdFlags {
+        cloexec,
+        allow_sealing,
+    };
+    assert_eq!(memfd_validate_flags(0), Ok(flags(false, false)));
+    assert_eq!(memfd_validate_flags(MFD_CLOEXEC), Ok(flags(true, false)));
+    assert_eq!(memfd_validate_flags(MFD_ALLOW_SEALING), Ok(flags(false, true)));
+    assert_eq!(
+        memfd_validate_flags(MFD_CLOEXEC | MFD_ALLOW_SEALING),
+        Ok(flags(true, true))
+    );
     assert_eq!(memfd_validate_flags(0x1000), Err(-EINVAL));
 }
 
@@ -1669,4 +1677,188 @@ fn restart_rewinds_over_the_syscall_instruction() {
     restart_syscall(&mut frame, SYS_READ);
     assert_eq!(frame.rax, SYS_READ);
     assert_eq!(frame.rcx, 0x40_1000);
+}
+
+// ---------------------------------------------------------------------------
+// fd object refcounting, eventfd/timerfd/signalfd, flock, memfd seals
+// ---------------------------------------------------------------------------
+
+static EVFD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn evfd_test_setup() -> std::sync::MutexGuard<'static, ()> {
+    let guard = EVFD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_epoll_for_test();
+    ipc::init();
+    crate::evfd::reset_for_test();
+    flock_reset_for_test();
+    memfd_seals_reset_for_test();
+    guard
+}
+
+#[test]
+fn dup2_then_close_keeps_pipe_writer_alive() {
+    // Regression: dup/dup2 did not retain pipes, so the shell idiom
+    // `dup2(pipe_w, 1); close(pipe_w)` dropped the writer count to zero and
+    // readers saw EOF while fd 1 was still open.
+    let _guard = evfd_test_setup();
+    let mut task = task::Task::for_test(301);
+    let task_ptr = &mut task as *mut task::Task;
+    let pipe = ipc::pipe_open().expect("pipe open");
+    fd_write_slot(task_ptr, 3, task::USER_FD_KIND_PIPE, pipe, 0, fs::O_RDONLY);
+    fd_write_slot(task_ptr, 4, task::USER_FD_KIND_PIPE, pipe, 0, fs::O_WRONLY);
+
+    assert_eq!(fd_dup_to(task_ptr, 4, 1, false, false), Ok(1));
+    fd_close(task_ptr, 4).expect("close original writer");
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN) & POLLHUP, 0, "writer still open via fd 1");
+
+    fd_close(task_ptr, 1).expect("close dup'd writer");
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN) & POLLHUP, POLLHUP);
+    fd_close(task_ptr, 3).expect("close reader");
+}
+
+#[test]
+fn eventfd_slot_polls_and_survives_dup_until_last_close() {
+    let _guard = evfd_test_setup();
+    let mut task = task::Task::for_test(302);
+    let task_ptr = &mut task as *mut task::Task;
+    let id = crate::evfd::eventfd_create(0, false).expect("eventfd");
+    fd_write_slot(task_ptr, 3, task::USER_FD_KIND_EVENTFD, id, 0, fs::O_RDWR);
+
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN | POLLOUT), POLLOUT);
+    crate::evfd::eventfd_write(id, 2).expect("write");
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN | POLLOUT), POLLIN | POLLOUT);
+    assert!(epoll_target_kind_supported(task::USER_FD_KIND_EVENTFD));
+
+    assert_eq!(fd_dup_from(task_ptr, 3, 5, true), Ok(5));
+    fd_close(task_ptr, 3).expect("close original");
+    assert_eq!(crate::evfd::eventfd_read(id), Ok(2), "object alive through dup");
+    fd_close(task_ptr, 5).expect("close dup");
+    assert_eq!(crate::evfd::eventfd_read(id), Err(-EBADF), "freed on last close");
+}
+
+#[test]
+fn timerfd_slot_reports_readable_after_deadline() {
+    let _guard = evfd_test_setup();
+    let mut task = task::Task::for_test(303);
+    let task_ptr = &mut task as *mut task::Task;
+    let set_now = |ns: u64| EVFD_TEST_NOW_NS.store(ns, core::sync::atomic::Ordering::Relaxed);
+    set_now(1_000_000);
+    let id = crate::evfd::timerfd_create(CLOCK_MONOTONIC).expect("timerfd");
+    fd_write_slot(task_ptr, 3, task::USER_FD_KIND_TIMERFD, id, 0, fs::O_RDWR);
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN), 0, "disarmed");
+    crate::evfd::timerfd_settime(id, evfd_now_ns(), false, 5_000_000, 0).expect("arm");
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN), 0, "before deadline");
+    set_now(6_000_000);
+    // A timerfd is readable, never writable.
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN | POLLOUT), POLLIN);
+    set_now(0);
+}
+
+#[test]
+fn signalfd_reports_and_dequeues_pending_masked_signals() {
+    let _guard = evfd_test_setup();
+    let mut task = task::Task::for_test(304);
+    let task_ptr = &mut task as *mut task::Task;
+    // User mask for SIGUSR1 (bit 9 in the Linux sigset layout).
+    let mask = signalfd_mask_from_user(1u64 << (signal::SIGUSR1 - 1));
+    assert_eq!(mask, signal::signal_bit(signal::SIGUSR1));
+    assert_eq!(
+        signalfd_mask_from_user(u64::MAX) & signal::signal_bit(signal::SIGKILL),
+        0,
+        "SIGKILL is never readable"
+    );
+    let id = crate::evfd::signalfd_create(mask).expect("signalfd");
+    fd_write_slot(task_ptr, 3, task::USER_FD_KIND_SIGNALFD, id, 0, fs::O_RDWR);
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN), 0);
+
+    task.sig_pending = signal::signal_bit(signal::SIGTERM);
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN), 0, "SIGTERM not in mask");
+    task.sig_pending |= signal::signal_bit(signal::SIGUSR1);
+    assert_eq!(poll_fd_revents(task_ptr, 3, POLLIN), POLLIN);
+
+    assert_eq!(signalfd_dequeue(task_ptr, mask), Some(signal::SIGUSR1));
+    assert_eq!(task.sig_pending, signal::signal_bit(signal::SIGTERM));
+    assert_eq!(signalfd_dequeue(task_ptr, mask), None);
+
+    let info = signalfd_siginfo_bytes(signal::SIGUSR1);
+    assert_eq!(u32::from_ne_bytes([info[0], info[1], info[2], info[3]]), signal::SIGUSR1);
+    assert!(info[4..].iter().all(|b| *b == 0));
+}
+
+#[test]
+fn timespec_conversion_validates_nanoseconds() {
+    assert_eq!(timespec_parts_to_ns(1, 500), Ok(1_000_000_500));
+    assert_eq!(timespec_parts_to_ns(0, 1_000_000_000), Err(-EINVAL));
+    assert_eq!(timespec_parts_to_ns(-1, 0), Err(-EINVAL));
+    assert_eq!(ns_to_timespec_parts(2_000_000_001), (2, 1));
+}
+
+#[test]
+fn flock_exclusive_conflicts_and_releases_on_unlock() {
+    let _guard = evfd_test_setup();
+    assert_eq!(flock_try_acquire(7, 1, 3, true), Ok(()));
+    assert_eq!(flock_try_acquire(7, 1, 3, true), Ok(()), "re-lock by owner");
+    assert_eq!(flock_try_acquire(7, 2, 4, false), Err(-EAGAIN));
+    assert_eq!(flock_try_acquire(8, 2, 4, true), Ok(()), "other inode");
+    flock_release_fd(1, 3);
+    assert_eq!(flock_try_acquire(7, 2, 4, false), Ok(()));
+    assert_eq!(flock_try_acquire(7, 3, 5, false), Ok(()), "shared + shared");
+    assert_eq!(flock_try_acquire(7, 1, 3, true), Err(-EAGAIN));
+    // Downgrading/upgrading your own lock only conflicts with others.
+    flock_release_fd(3, 5);
+    assert_eq!(flock_try_acquire(7, 2, 4, true), Ok(()));
+}
+
+#[test]
+fn flock_is_released_when_the_fd_closes() {
+    let _guard = evfd_test_setup();
+    let mut task = task::Task::for_test(305);
+    let task_ptr = &mut task as *mut task::Task;
+    fd_write_slot(task_ptr, 3, task::USER_FD_KIND_VFS, 9, 0, fs::O_RDWR);
+    assert_eq!(flock_try_acquire(9, 305, 3, true), Ok(()));
+    assert_eq!(flock_try_acquire(9, 999, 4, true), Err(-EAGAIN));
+    fd_close(task_ptr, 3).expect("close");
+    assert_eq!(flock_try_acquire(9, 999, 4, true), Ok(()));
+}
+
+#[test]
+fn memfd_seals_follow_allow_sealing_and_block_resizes() {
+    let _guard = evfd_test_setup();
+    memfd_seals_register(40, false);
+    assert_eq!(memfd_seals_get(40), F_SEAL_SEAL);
+    assert_eq!(memfd_seals_add(40, F_SEAL_SHRINK), Err(-EPERM));
+
+    memfd_seals_register(41, true);
+    assert_eq!(memfd_seals_get(41), 0);
+    memfd_seals_add(41, F_SEAL_SHRINK).expect("add shrink seal");
+    let seals = memfd_seals_get(41);
+    assert_eq!(seals_allow_resize(seals, 4096, 8192), Ok(()));
+    assert_eq!(seals_allow_resize(seals, 4096, 0), Err(-EPERM));
+    assert_eq!(seals_allow_write(seals), Ok(()));
+
+    memfd_seals_add(41, F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL).expect("add more");
+    let seals = memfd_seals_get(41);
+    assert_eq!(seals_allow_resize(seals, 4096, 8192), Err(-EPERM));
+    assert_eq!(seals_allow_write(seals), Err(-EPERM));
+    assert_eq!(memfd_seals_add(41, F_SEAL_SHRINK), Err(-EPERM), "sealed seals");
+    assert_eq!(memfd_seals_add(41, 0x100), Err(-EINVAL));
+
+    // Re-registering an inode (a new memfd reusing it) resets its seals.
+    memfd_seals_register(41, true);
+    assert_eq!(memfd_seals_get(41), 0);
+    // Non-memfd fds are never sealed.
+    assert_eq!(fd_seals(fs::O_RDWR, 41), 0);
+    assert_eq!(fd_seals(FD_INTERNAL_MEMFD, 41), 0);
+}
+
+#[test]
+fn ucred_layout_matches_linux() {
+    let bytes = ucred_bytes(socket::UnixCred {
+        pid: 7,
+        uid: 1000,
+        gid: 100,
+    });
+    assert_eq!(&bytes[0..4], &7i32.to_ne_bytes());
+    assert_eq!(&bytes[4..8], &1000u32.to_ne_bytes());
+    assert_eq!(&bytes[8..12], &100u32.to_ne_bytes());
 }

@@ -61,10 +61,14 @@ This document describes the current baseline IPC/synchronization implementation 
 **Shared Buffer FDs (`memfd_create`-style baseline)**
 - `memfd_create(name, flags)` is now available for compositor/client buffer sharing.
 - Backing objects are created as controlled tmpfs regular files in an internal namespace (`/temp/.memfd/...`) and returned as VFS fds.
-- Supported baseline flags:
+- Supported flags:
   - `MFD_CLOEXEC` (maps to `FD_CLOEXEC` on returned descriptor)
-- Unsupported baseline flags:
-  - `MFD_ALLOW_SEALING` currently returns `-ENOSYS` (sealing semantics deferred)
+  - `MFD_ALLOW_SEALING` (enables `F_ADD_SEALS`; without it the object starts with `F_SEAL_SEAL`)
+- Seals (`fcntl(F_ADD_SEALS / F_GET_SEALS)`, implemented in `kernel/src/syscall/fileext.rs`):
+  - `F_SEAL_SHRINK` / `F_SEAL_GROW` are enforced on `ftruncate`, `fallocate`, and writes that would extend the file
+  - `F_SEAL_WRITE` / `F_SEAL_FUTURE_WRITE` are enforced on `write` and on new writable `MAP_SHARED` mappings
+  - `F_SEAL_SEAL` makes the seal set immutable (`-EPERM` on further adds)
+  - `F_GET_SEALS` / `F_ADD_SEALS` on non-memfd descriptors return `-EINVAL`
 - Descriptor lifecycle follows existing fd-table semantics (`dup*`, `fork`, `exec` close-on-exec handling, close).
 - `mmap` now supports baseline writable shared mappings (`MAP_SHARED` + `PROT_WRITE`) on these fds with shared page-cache backing, so peer mappings observe writes predictably across tasks.
 - Shared-buffer objects are now capped per task (`16` unique memfd inodes) as a resource-hardening guard.
@@ -75,6 +79,12 @@ This document describes the current baseline IPC/synchronization implementation 
 - `epoll_ctl(epfd, op, fd, event)` supports `EPOLL_CTL_ADD`/`MOD`/`DEL` with duplicate/add/remove validation.
 - `epoll_wait(epfd, events, maxevents, timeout)` supports timeout waiting, level-triggered readiness delivery, and returns `-EINTR` when interrupted by pending unblocked signals.
 - Per-task epoll watch ownership is capped (`64` watches across all instances), and task teardown now drops owner watches defensively.
+
+**Event FDs (`eventfd`, `timerfd`, `signalfd`)**
+- Object state lives in `kernel/src/evfd.rs` (refcounted tables: 32 eventfds, 32 timerfds, 16 signalfds); syscalls and read/write/poll hooks are in `kernel/src/syscall/eventfds.rs`. Each is its own fd kind (`USER_FD_KIND_EVENTFD`/`_TIMERFD`/`_SIGNALFD`) and works with `poll`/`select`/`epoll`, `dup*`, `fork`, `fcntl(F_SETFL, O_NONBLOCK)`, and close-on-exec.
+- `eventfd`/`eventfd2(initval, flags)`: 64-bit counter. `read` returns and clears it (or decrements by one with `EFD_SEMAPHORE`), `write` adds to it. Readable while non-zero; writable while below `0xffff_ffff_ffff_fffe`. Blocks unless `EFD_NONBLOCK`/`O_NONBLOCK`.
+- `timerfd_create(clock, flags)` accepts `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, and `CLOCK_BOOTTIME` (all backed by the same boot-relative PIT clock that `clock_gettime` uses). `timerfd_settime` supports relative and `TFD_TIMER_ABSTIME` deadlines, intervals, disarm, and returns the old setting; `timerfd_gettime` reports remaining time. `read` returns the number of expirations since the last read, counting missed periods.
+- `signalfd`/`signalfd4(fd, mask, 8, flags)`: creates a signalfd or updates an existing one's mask. Reading dequeues pending signals in the mask from the calling task and returns one 128-byte `signalfd_siginfo` per signal (only `ssi_signo` is filled). `SIGKILL`/`SIGSTOP` are never reported. As on Linux, callers block the signals first so they stay pending instead of being delivered.
 
 **Signals (Baseline + User Handlers)**
 - Per-task signal state:
@@ -144,10 +154,13 @@ Limitations / Simplifications
 - Pipe semantics are baseline only: `O_NONBLOCK` plus `poll`/`select`/`epoll` integration are now supported, but there is still no `splice`/`tee`.
 - Futex support covers `WAIT`/`WAKE` (with timeouts), `WAIT_BITSET`/`WAKE_BITSET` (bitsets not used for filtering) and `REQUEUE`/`CMP_REQUEUE`; there is no `WAKE_OP`, priority inheritance or robust-list handling. See `docs/process_model.md`.
 - Shared memory is a baseline System V subset only: no permission checks, no `IPC_STAT`/`IPC_SET`, no `SHM_REMAP`/`SHM_EXEC`. Attachments are inherited by `fork`; `execve` does not detach them yet.
-- `memfd_create` is baseline-only: tmpfs-backed internal-path objects, no sealing (`F_ADD_SEALS`/`F_GET_SEALS`) support yet, no hugepage variants, and per-task shared-buffer object caps (`16`) are enforced.
+- `memfd_create` is baseline-only: tmpfs-backed internal-path objects, no hugepage variants, and per-task shared-buffer object caps (`16`) are enforced. memfd backing files are never unlinked from the internal namespace, so they persist after the last fd closes.
+- memfd seals are tracked per inode in a fixed 64-entry table. `F_SEAL_WRITE` does not check for existing writable mappings (Linux returns `-EBUSY`) and does not revoke them; it only blocks new ones and `write`. If the table is full, new memfds behave as if created without `MFD_ALLOW_SEALING`.
+- Event fds are baseline-only: object tables are fixed-size, timer resolution is the 10 ms PIT tick, `TFD_TIMER_CANCEL_ON_SET` is accepted but ignored (there is no settable realtime clock), blocking reads busy-yield instead of sleeping on a wait queue, `signalfd_siginfo` carries only the signal number, and eventfd/timerfd/signalfd descriptors cannot be passed over `SCM_RIGHTS` yet.
 - Signal handling: delivery happens at syscall-return boundaries and requires `SA_RESTORER`. Handlers get a Linux `rt_sigframe` (`siginfo_t`, `ucontext_t`), signals 1..=64 are supported, and blocking waits are interrupted with `SA_RESTART`-aware restart. There are no alternate signal stacks or queued real-time payloads. See `docs/process_model.md`.
 - Unix ancillary coverage is baseline-only:
   - `SCM_RIGHTS` is implemented, but `SCM_CREDENTIALS` is not
+  - `SO_PEERCRED` reports the peer's pid/uid/gid captured when the connection formed (`socketpair`, or `connect` against a listener, which records the listening process's credentials at `listen`)
   - ancillary/data atomicity is simplified for stream sockets
   - Unix abstract-namespace addresses are not implemented
 - `epoll` coverage is baseline-only:

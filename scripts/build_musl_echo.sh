@@ -4,16 +4,19 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="${ROOT_DIR}/user/musl_echo.c"
 OUT="${ROOT_DIR}/user/musl_echo.elf"
+EXTRA_ARGS=()
 MUSL_CC="${MUSL_CC:-${ROOT_DIR}/musl/sysroot/bin/musl-gcc}"
 
 usage() {
   cat <<'USAGE'
-Usage: build_musl_echo.sh [--src <c-file>] [--out <elf-file>]
+Usage: build_musl_echo.sh [--src <c-file>] [--out <elf-file>] [-- <extra cc args>]
 
 Build a small static musl user binary.
 Defaults:
   --src user/musl_echo.c
   --out user/musl_echo.elf
+Arguments after `--` are passed to the compiler after the source file
+(for example include paths and static libraries).
 USAGE
 }
 
@@ -26,6 +29,11 @@ while [[ $# -gt 0 ]]; do
     --out)
       OUT="$2"
       shift 2
+      ;;
+    --)
+      shift
+      EXTRA_ARGS=("$@")
+      break
       ;;
     --help|-h)
       usage
@@ -64,7 +72,8 @@ fi
   -no-pie \
   -Wl,-z,max-page-size=0x1000 \
   -o "${OUT}" \
-  "${SRC}"
+  "${SRC}" \
+  "${EXTRA_ARGS[@]}"
 
 if command -v readelf >/dev/null 2>&1; then
   if ! readelf -h "${OUT}" | rg -q "Type:\s+EXEC"; then

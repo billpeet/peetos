@@ -57,6 +57,9 @@ current Rust kernel implementation and forward roadmap.
 
 ### IPC and Signals
 
+- `eventfd`, `timerfd`, and `signalfd` are implemented as pollable fd kinds (`kernel/src/evfd.rs`), alongside `flock`, `fallocate`, memfd sealing, `mremap`, and `SO_PEERCRED`, which together cover everything libwayland 1.23 needs from the kernel.
+- Every fd duplication path (dup, fork, `SCM_RIGHTS`) now retains the underlying object through one helper. Before, `dup`/`dup2` did not retain pipes, so `dup2(pipe, 1); close(pipe)` dropped the pipe's writer or reader count early.
+
 - In-kernel `SpinLock`, `Mutex`, and `Semaphore` primitives are active.
 - Pipes, futex wait/wake baseline, System V shared memory baseline, and
   user-handler signal delivery (`SA_RESTORER`) are wired.
@@ -121,6 +124,8 @@ current Rust kernel implementation and forward roadmap.
   fd transfer plus malformed ancillary/error-path behavior.
 
 ### Userspace Runtime Bring-Up
+
+- libwayland 1.23.1 and libffi 3.4.6 build as static musl libraries (`make -C wayland`), and the `musl-ext2-wayland-smoke` profile runs a libwayland compositor plus a separate libwayland client end to end in QEMU (`docs/wayland.md`).
 
 - musl sysroot bootstrap is integrated.
 - toybox staging supports interactive shell and broad applet coverage,

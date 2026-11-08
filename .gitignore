@@ -15,6 +15,11 @@
 /dropbear/dropbear-src
 /dropbear/out
 /dropbear/dropbear-*.tar.bz2
+/wayland/wayland-src
+/wayland/libffi-src
+/wayland/out
+/wayland/wayland-*.tar.xz
+/wayland/libffi-*.tar.gz
 /user/qjs
 /user/micropython
 /user/dropbear
