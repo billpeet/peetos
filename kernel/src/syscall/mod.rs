@@ -1715,6 +1715,7 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
 
 // Syscall implementations, grouped by area. Each submodule pulls in this
 // module's shared types and helpers via `use super::*`.
+mod drmdev;
 mod eventfds;
 mod fd;
 mod file;
@@ -1729,6 +1730,7 @@ mod sockets;
 mod uaccess;
 mod vm;
 
+use drmdev::*;
 use eventfds::*;
 use fd::*;
 use file::*;

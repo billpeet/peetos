@@ -246,6 +246,7 @@ enum NodeBackend {
     DevPtsSlave = 12,
     DevFramebuffer = 13,
     DevInputEvent = 14,
+    DevDrm = 15,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +258,7 @@ pub struct OpenResult {
     pub is_ptmx: bool,
     pub is_pts_slave: bool,
     pub is_framebuffer: bool,
+    pub is_drm: bool,
     pub pts_id: u16,
 }
 
@@ -1059,6 +1061,8 @@ fn ensure_init(state: &mut VfsState) {
     let _ = create_virtual_file_inner(state, "/dev/tty", NodeBackend::DevTty);
     let _ = create_virtual_file_inner(state, "/dev/ptmx", NodeBackend::DevPtmx);
     let _ = create_virtual_file_inner(state, "/dev/fb0", NodeBackend::DevFramebuffer);
+    let _ = mkdir_virtual_inner(state, "/dev/dri");
+    let _ = create_virtual_file_inner(state, "/dev/dri/card0", NodeBackend::DevDrm);
     // Listing is synthesized per process by the kernel (getdents64).
     let _ = mkdir_virtual_inner(state, "/dev/fd");
     let _ = mkdir_virtual_inner(state, "/dev/input");
@@ -1624,7 +1628,8 @@ fn create_virtual_file_inner(
             | NodeBackend::DevTty
             | NodeBackend::DevPtmx
             | NodeBackend::DevPtsSlave
-            | NodeBackend::DevFramebuffer => (STAT_S_IFREG | 0o666) as u16,
+            | NodeBackend::DevFramebuffer
+            | NodeBackend::DevDrm => (STAT_S_IFREG | 0o666) as u16,
             NodeBackend::DevInputEvent => (STAT_S_IFREG | 0o444) as u16,
             _ => node.mode,
         };
@@ -5588,6 +5593,7 @@ fn open_at_inner(
                 | NodeBackend::DevPtmx
                 | NodeBackend::DevPtsSlave
                 | NodeBackend::DevFramebuffer
+                | NodeBackend::DevDrm
                 | NodeBackend::DevInputEvent => {}
                 _ => return Err(EROFS),
             }
@@ -5640,6 +5646,7 @@ fn open_at_inner(
         is_ptmx: inode_backend == NodeBackend::DevPtmx,
         is_pts_slave: inode_backend == NodeBackend::DevPtsSlave,
         is_framebuffer: inode_backend == NodeBackend::DevFramebuffer,
+        is_drm: inode_backend == NodeBackend::DevDrm,
         pts_id,
     })
 }
@@ -7034,6 +7041,7 @@ pub fn read(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
                 | NodeBackend::DevPtmx
                 | NodeBackend::DevPtsSlave
                 | NodeBackend::DevFramebuffer
+                | NodeBackend::DevDrm
                 | NodeBackend::DevInputEvent => 0,
             }
         };
@@ -7143,6 +7151,7 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
             | NodeBackend::DevPtmx
             | NodeBackend::DevPtsSlave
             | NodeBackend::DevFramebuffer
+            | NodeBackend::DevDrm
             | NodeBackend::DevInputEvent => {
                 let next = offset.saturating_add(src.len() as u64);
                 WriteResult {
@@ -7198,6 +7207,7 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
             | NodeBackend::DevPtmx
             | NodeBackend::DevPtsSlave
             | NodeBackend::DevFramebuffer
+            | NodeBackend::DevDrm
             | NodeBackend::DevInputEvent => current,
         };
 
@@ -7241,6 +7251,7 @@ pub fn seek(inode: u16, current: u64, offset: i64, whence: u32) -> Result<u64, i
             | NodeBackend::DevPtmx
             | NodeBackend::DevPtsSlave
             | NodeBackend::DevFramebuffer
+            | NodeBackend::DevDrm
             | NodeBackend::DevInputEvent => {
                 if target > u64::MAX as i128 {
                     return Err(EINVAL);
@@ -7288,6 +7299,7 @@ pub fn file_size(inode: u16) -> Result<u64, i64> {
             | NodeBackend::DevPtmx
             | NodeBackend::DevPtsSlave
             | NodeBackend::DevFramebuffer
+            | NodeBackend::DevDrm
             | NodeBackend::DevInputEvent => 0,
         };
 
@@ -8107,6 +8119,9 @@ mod tests {
 
         let fb = open("/dev/fb0", O_RDWR, 0).expect("open /dev/fb0");
         assert!(fb.is_framebuffer);
+        assert!(!fb.is_drm);
+        let card = open("/dev/dri/card0", O_RDWR, 0).expect("open /dev/dri/card0");
+        assert!(card.is_drm && !card.is_framebuffer);
         assert!(!fb.is_console);
         assert!(inode_is_framebuffer(fb.inode));
 

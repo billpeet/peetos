@@ -168,6 +168,7 @@ pub(super) fn fd_write_slot(
             || kind == task::USER_FD_KIND_EVENTFD
             || kind == task::USER_FD_KIND_TIMERFD
             || kind == task::USER_FD_KIND_SIGNALFD
+            || kind == task::USER_FD_KIND_DRM
         {
             inode
         } else {
@@ -212,6 +213,7 @@ pub(crate) fn fd_object_retain(kind: u8, inode: u16, flags: u32) -> Result<(), i
             fs::inode_open_retain(inode);
             Ok(())
         }
+        task::USER_FD_KIND_DRM => drm_retain(inode),
         _ => Ok(()),
     }
 }
@@ -236,6 +238,7 @@ pub(crate) fn fd_object_release(kind: u8, inode: u16, flags: u32) {
         task::USER_FD_KIND_EVENTFD | task::USER_FD_KIND_TIMERFD | task::USER_FD_KIND_SIGNALFD => {
             crate::evfd::release(evfd_kind(kind), inode);
         }
+        task::USER_FD_KIND_DRM => drm_release(inode),
         task::USER_FD_KIND_VFS => {
             // Last close of an unlinked file frees it.
             if fs::inode_open_release(inode) {
@@ -443,7 +446,8 @@ pub(super) fn fcntl_setfl_mutable_mask(kind: u8) -> u32 {
         | task::USER_FD_KIND_PTY_SLAVE
         | task::USER_FD_KIND_EVENTFD
         | task::USER_FD_KIND_TIMERFD
-        | task::USER_FD_KIND_SIGNALFD => O_NONBLOCK,
+        | task::USER_FD_KIND_SIGNALFD
+        | task::USER_FD_KIND_DRM => O_NONBLOCK,
         _ => 0,
     }
 }

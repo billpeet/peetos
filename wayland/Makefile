@@ -12,6 +12,8 @@
 #                              (xdg-shell), headers in include/
 #   lib/libxkbcommon.a         keymap compiler/state machine, headers in
 #                              include/xkbcommon/
+#   lib/libdrm.a, libdrm.so.2 libdrm core (xf86drm, xf86drmMode); headers in
+#                              include/ (xf86drm*.h) and include/libdrm/
 #   lib/lib*.so.N, lib/lib*.so shared builds of libffi, libwayland-server,
 #                              libwayland-client and libxkbcommon (need
 #                              ../musl/shared from `make -C musl shared`)
@@ -29,13 +31,13 @@ all: build
 fetch:
 	./fetch-wayland.sh
 
-wayland-src libffi-src wayland-protocols-src libxkbcommon-src:
+wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src:
 	$(MAKE) fetch
 
 ../musl/shared/lib/libc.so:
 	$(MAKE) -C ../musl shared
 
-build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src ../musl/shared/lib/libc.so
+build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src ../musl/shared/lib/libc.so
 	../scripts/build_wayland.sh \
 		--wayland-src "$(CURDIR)/wayland-src" \
 		--libffi-src "$(CURDIR)/libffi-src" \
@@ -46,12 +48,16 @@ build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src ../musl/sha
 		--xkbcommon-src "$(CURDIR)/libxkbcommon-src" \
 		--out "$(OUT_DIR)" \
 		--musl-cc "$(MUSL_CC)"
+	../scripts/build_libdrm.sh \
+		--libdrm-src "$(CURDIR)/libdrm-src" \
+		--out "$(OUT_DIR)" \
+		--musl-cc "$(MUSL_CC)"
 
 clean:
 	rm -rf "$(OUT_DIR)" build
 
 distclean: clean
-	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz
+	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz
 
 info:
 	@echo "OUT_DIR=$(OUT_DIR)"

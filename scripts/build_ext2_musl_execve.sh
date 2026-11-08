@@ -110,6 +110,11 @@ if compgen -G "${ROOT_DIR}/wayland/out/lib/*.so.[0-9]*" >/dev/null; then
   cp -L "${ROOT_DIR}"/wayland/out/lib/*.so.[0-9]* "${STAGE_ROOT}/usr/lib/"
 fi
 
+if [[ -x "${ROOT_DIR}/user/drm_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/drm_smoke.elf" "${STAGE_ROOT}/bin/drm_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/drm_smoke"
+fi
+
 # Stage the verified xkeyboard-config subset (scripts/build_xkbcommon.sh) at
 # libxkbcommon's default root when it has been built.
 if [[ -f "${ROOT_DIR}/wayland/out/share/X11/xkb/rules/evdev" ]]; then
@@ -561,6 +566,23 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/unix_rights_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/drm_smoke ] || [ ! -f /usr/lib/libdrm.so.2 ]; then
+  echo [musl-ext2-drm-smoke] missing bin/drm_smoke or /usr/lib/libdrm.so.2
+  fail=1
+else
+  bin/drm_smoke || fail=1
+fi
+
+echo [musl-ext2-drm-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-drm-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/drm_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/dynlink_smoke.sh" <<'EOS'
 fail=0

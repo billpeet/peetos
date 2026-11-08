@@ -64,8 +64,13 @@ later.
 
 ### 2. A real display interface
 
-- [ ] **Minimal DRM/KMS** for QEMU's `bochs-display` or `virtio-gpu`: mode
-  setting (any resolution), dumb buffers, page flips, vblank events.
+- [x] **Minimal DRM/KMS.** `/dev/dri/card0` is a simpledrm-style device over
+  the boot framebuffer. It supports legacy mode setting, dumb buffers, page
+  flips with completion events, DIRTYFB and PRIME, and libdrm 2.4.123 is
+  ported. `peetwl` presents through it with page flips. See `docs/drm.md`.
+- [ ] A real display driver: QEMU `bochs-display` or `virtio-gpu`, for mode
+  switching (any resolution), real vblank and a hardware cursor. Atomic KMS,
+  which wlroots prefers, also needs adding.
 - [ ] Later: `virtio-gpu` with virgl for host-accelerated GL.
 
 ### 3. Software rendering stack
@@ -105,8 +110,8 @@ later.
 ## Near-Term Order
 
 1. ~~Dynamic linking end to end (musl loader, a shared library, `dlopen`, TLS).~~ Done.
-2. Lift the platform limits, starting with the VM region-table stack copies.
-3. DRM/KMS minimum: mode setting, dumb buffers, page flips.
+2. ~~Lift the platform limits, starting with the VM region-table stack copies.~~ Done.
+3. ~~DRM/KMS minimum: mode setting, dumb buffers, page flips.~~ Done (legacy KMS over the boot framebuffer).
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports.

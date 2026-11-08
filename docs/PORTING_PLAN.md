@@ -192,6 +192,7 @@ current Rust kernel implementation and forward roadmap.
   - Tasks: 256.
   - Sockets: 256.
   - User-range checks now stop at the end of the lower canonical half, so user mappings can't reach the shared kernel half.
+- DRM/KMS: `/dev/dri/card0` is a simpledrm-style device over the boot framebuffer (`docs/drm.md`). It supports legacy mode setting, dumb buffers, page flips with completion events, DIRTYFB and PRIME. libdrm 2.4.123 is ported (`make -C wayland`). `peetwl` now presents through DRM page flips and paces frame callbacks on flip completion. `make run-drm-smoke` covers it, and `make run-wlcomp-smoke` covers it through the compositor.
 - The path from here to a full desktop is tracked in `docs/desktop_roadmap.md`.
 - libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the region slots per task (32 then, 256 now).
 

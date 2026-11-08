@@ -246,6 +246,9 @@ pub(super) fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         // byte stream, so they bypass the chunked loop below.
         return evfd_read(ctx, slot_kind, slot_inode, slot_flags, call.arg(1), len);
     }
+    if slot_kind == task::USER_FD_KIND_DRM {
+        return drm_read(ctx, slot_inode, slot_flags, call.arg(1), len);
+    }
     if len == 0 {
         return 0;
     }
@@ -585,6 +588,9 @@ pub(super) fn sys_write(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
     if is_evfd_kind(slot_kind) {
         return evfd_write(ctx, slot_kind, slot_inode, slot_flags, call.arg(1), len);
+    }
+    if slot_kind == task::USER_FD_KIND_DRM {
+        return -EINVAL;
     }
 
     let mut wrote_vfs = false;

@@ -271,6 +271,8 @@ pub(super) fn sys_ioctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         ioctl_pty(ctx, inode, request, argp)
     } else if kind == task::USER_FD_KIND_VFS && fs::inode_is_framebuffer(inode) {
         ioctl_framebuffer(ctx, request, argp)
+    } else if kind == task::USER_FD_KIND_DRM {
+        ioctl_drm(ctx, inode, request, argp)
     } else {
         -ENOTTY
     }

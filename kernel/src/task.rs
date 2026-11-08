@@ -52,6 +52,8 @@ pub const USER_FD_KIND_EPOLL: u8 = 7;
 pub const USER_FD_KIND_EVENTFD: u8 = 8;
 pub const USER_FD_KIND_TIMERFD: u8 = 9;
 pub const USER_FD_KIND_SIGNALFD: u8 = 10;
+/// `/dev/dri/card0` open file (object index into `crate::drm`).
+pub const USER_FD_KIND_DRM: u8 = 11;
 pub const USER_FD_NONE: u16 = u16::MAX;
 
 pub const CTTY_NONE: u8 = 0;

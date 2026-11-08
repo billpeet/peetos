@@ -6,8 +6,8 @@ usage() {
 Usage: fetch-wayland.sh [options]
 
 Download, verify, and extract pinned libwayland, libffi, wayland-protocols,
-and libxkbcommon source releases into wayland-src/, libffi-src/,
-wayland-protocols-src/, and libxkbcommon-src/.
+libxkbcommon and libdrm source releases into wayland-src/, libffi-src/,
+wayland-protocols-src/, libxkbcommon-src/ and libdrm-src/.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -35,6 +35,10 @@ PROTOCOLS_SHA256="ff17292c05159d2b20ce6cacfe42d7e31a28198fa1429a769b03af7c38581d
 XKBCOMMON_VERSION="1.7.0"
 XKBCOMMON_URL="https://xkbcommon.org/download/libxkbcommon-${XKBCOMMON_VERSION}.tar.xz"
 XKBCOMMON_SHA256="65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863b247"
+
+LIBDRM_VERSION="2.4.123"
+LIBDRM_URL="https://dri.freedesktop.org/libdrm/libdrm-${LIBDRM_VERSION}.tar.xz"
+LIBDRM_SHA256="a2b98567a149a74b0f50e91e825f9c0315d86e7be9b74394dae8b298caadb79e"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -103,3 +107,5 @@ fetch_one "wayland-protocols ${PROTOCOLS_VERSION}" "${PROTOCOLS_URL}" "${PROTOCO
   "${OUTPUT_DIR}/wayland-protocols-src" "wayland-protocols-${PROTOCOLS_VERSION}.tar.xz"
 fetch_one "libxkbcommon ${XKBCOMMON_VERSION}" "${XKBCOMMON_URL}" "${XKBCOMMON_SHA256}" \
   "${OUTPUT_DIR}/libxkbcommon-src" "libxkbcommon-${XKBCOMMON_VERSION}.tar.xz"
+fetch_one "libdrm ${LIBDRM_VERSION}" "${LIBDRM_URL}" "${LIBDRM_SHA256}" \
+  "${OUTPUT_DIR}/libdrm-src" "libdrm-${LIBDRM_VERSION}.tar.xz"

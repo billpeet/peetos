@@ -11,6 +11,7 @@ mod arp;
 mod bkl;
 mod block;
 mod display_mode;
+mod drm;
 mod e1000;
 mod elf;
 mod evfd;

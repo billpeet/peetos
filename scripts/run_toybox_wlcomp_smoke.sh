@@ -72,6 +72,11 @@ if [[ "${driver_status}" -ne 0 ]]; then
   cat "${LOG_FILE}" >&2
   exit 1
 fi
+if ! grep -qE '\[peetwl\] drm flips=[1-9]' "${LOG_FILE}"; then
+  echo "peetwl compositor smoke did not present through DRM page flips" >&2
+  cat "${LOG_FILE}" >&2
+  exit 1
+fi
 if ! grep -q '\[musl-ext2-wlcomp-smoke\] done' "${LOG_FILE}" \
   || grep -q '\[musl-ext2-wlcomp-smoke\] failures' "${LOG_FILE}"; then
   echo "peetwl compositor smoke payload did not finish cleanly" >&2

@@ -190,6 +190,7 @@ def expect_pixel(img, point, color, what):
 
 
 def run(d):
+    d.wait_for(r"\[peetwl\] output drm \d+x\d+", timeout=90)
     d.wait_for(r"\[peetwl\] keymap layout=German", timeout=90)
     for name in COLORS:
         d.wait_for(r"\[wl-demo:%s\] xkb keymap loaded \(\d+ bytes, layout German\)" % name,

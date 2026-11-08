@@ -783,8 +783,14 @@ pub(super) fn vm_sync_inode_pins() {
 }
 
 /// Temporary open reference on a freshly created hidden file; dropping it
-/// frees the file unless a mapping pinned it meanwhile.
-struct HiddenFileRef(u16);
+/// frees the file unless a mapping (or another owner) took a reference.
+pub(super) struct HiddenFileRef(u16);
+
+impl HiddenFileRef {
+    pub(super) fn inode(&self) -> u16 {
+        self.0
+    }
+}
 
 impl Drop for HiddenFileRef {
     fn drop(&mut self) {
@@ -799,12 +805,18 @@ impl Drop for HiddenFileRef {
 /// `fork`ed children see the same memory. The returned guard holds the only
 /// reference until `vm_sync_inode_pins` pins the new mapping.
 fn mmap_shared_anon_backing(task_ptr: *mut task::Task, len: u64) -> Result<HiddenFileRef, i64> {
+    shmem_hidden_file(task_ptr, len, b"shared-anon")
+}
+
+/// An unlinked, page-backed (`crate::shmem`) tmpfs file of `len` bytes in the
+/// memfd storage dir. The guard holds the only open reference.
+pub(super) fn shmem_hidden_file(task_ptr: *mut task::Task, len: u64, label: &[u8]) -> Result<HiddenFileRef, i64> {
     memfd_storage_dir_ready()?;
     let pid = unsafe { (*task_ptr).pid };
     let mut path_buf = [0u8; fs::VFS_MAX_PATH];
     for _ in 0..MEMFD_CREATE_MAX_RETRIES {
         let sequence = MEMFD_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = memfd_build_path(pid, sequence, b"shared-anon", &mut path_buf)?;
+        let path = memfd_build_path(pid, sequence, label, &mut path_buf)?;
         let opened = match fs::open(path, fs::O_CREAT | fs::O_EXCL | fs::O_RDWR, 0o600) {
             Ok(opened) => opened,
             Err(fs::EEXIST) => continue,
@@ -1203,6 +1215,32 @@ pub(super) fn mmap_find_range(
     Err(-ENOMEM)
 }
 
+/// mmap of a DRM card fd maps a dumb buffer (shared only): `None` if `fd`
+/// is not a card fd.
+fn mmap_drm_target(
+    task_ptr: *mut task::Task,
+    fd: i32,
+    offset: u64,
+    len: u64,
+    is_shared: bool,
+) -> Option<Result<(u16, u64), i64>> {
+    let idx = fd_index(fd).ok()?;
+    if !fd_slot_is_open(task_ptr, idx) {
+        return None;
+    }
+    let (kind, file) = unsafe {
+        let leader = crate::task::leader_of(task_ptr);
+        ((*leader).user_fd_kind[idx], (*leader).user_fd_inode[idx])
+    };
+    if kind != task::USER_FD_KIND_DRM {
+        return None;
+    }
+    if !is_shared {
+        return Some(Err(-EINVAL));
+    }
+    Some(drm_mmap_target(file, offset, len))
+}
+
 pub(super) fn mmap_file_inode(
     task_ptr: *mut task::Task,
     fd: i32,
@@ -1397,6 +1435,12 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
         let fd = fd_raw as i32;
         let require_writable = is_shared && (prot & PROT_WRITE) != 0;
+        if let Some(target) = mmap_drm_target(ctx.current, fd, offset, len, is_shared) {
+            match target {
+                Ok((inode, within)) => Some((inode, within, true)),
+                Err(err) => return err,
+            }
+        } else {
         match mmap_file_inode(ctx.current, fd, true, require_writable) {
             Ok((inode, fd_flags)) => {
                 if require_writable {
@@ -1418,6 +1462,7 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 Some((inode, offset, shared_can_write))
             }
             Err(err) => return err,
+        }
         }
     };
 

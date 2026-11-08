@@ -275,6 +275,8 @@ pub(super) fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16
         }
     } else if is_evfd_kind(kind) {
         revents = evfd_poll_revents(task_ptr, kind, inode, requested);
+    } else if kind == task::USER_FD_KIND_DRM {
+        revents = drm_poll_revents(inode, requested);
     }
 
     revents
@@ -491,6 +493,7 @@ pub(super) fn epoll_target_kind_supported(kind: u8) -> bool {
         || kind == task::USER_FD_KIND_SOCKET
         || kind == task::USER_FD_KIND_PTY_MASTER
         || kind == task::USER_FD_KIND_PTY_SLAVE
+        || kind == task::USER_FD_KIND_DRM
         || is_evfd_kind(kind)
 }
 

@@ -17,6 +17,7 @@ kernel interfaces it relies on, and how it is tested. Roadmap context lives in
 - libffi `3.4.6` (used by libwayland to dispatch requests/events to listener functions)
 - wayland-protocols `1.38` (currently only `stable/xdg-shell` is built)
 - libxkbcommon `1.7.0` (keymap compiler and keyboard state machine)
+- libdrm `2.4.123` (core `xf86drm`/`xf86drmMode` only, built by `scripts/build_libdrm.sh`; see `docs/drm.md`)
 - Release archives are pinned by SHA-256 in `wayland/fetch-wayland.sh`.
 
 **Build**
@@ -88,7 +89,7 @@ make run-wayland-smoke   # or: tests/musl_ext2_wayland_smoke.sh
 
 **peetwl Compositor**
 `user/peetwl.c` is the PeetOS Wayland compositor, built on libwayland-server:
-- Output: maps `/dev/fb0` (`FBIOGETINFO` + `mmap`), composites into a back buffer, and copies the damaged rectangle to the framebuffer at most every 16 ms. Frame callbacks fire after each repaint.
+- Output: DRM/KMS by default (`docs/drm.md`). It composites into a back buffer, copies the frame into one of two dumb buffers and page-flips to it, then sends frame callbacks when the flip-complete event arrives (60 Hz pacing). With `--fbdev`, or when `/dev/dri/card0` is unusable, it maps `/dev/fb0` instead and copies the damaged rectangle at most every 16 ms, with frame callbacks after each repaint.
 - Globals: `wl_compositor` v4, `wl_shm` (XRGB8888/ARGB8888), `wl_seat` v5 (pointer + keyboard), `wl_output` v3, `xdg_wm_base` v6.
 - xdg-shell: toplevels get an initial configure, must `ack_configure` before attaching a buffer, and receive `activated` state changes on focus. `xdg_toplevel.move` starts an interactive move. Popups are created and immediately dismissed (`popup_done`); positioners are accepted and ignored.
 - Window management: new toplevels are cascaded and focused. Server-side decorations (title bar with the toplevel title, focus-coloured border, close box) are drawn by the compositor. Clicking raises and focuses a window, dragging the title bar moves it, and the close box sends `xdg_toplevel.close`.

@@ -226,6 +226,11 @@ pub(super) fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     // /dev/ptmx → allocate a new PTY, return master FD
+    // /dev/dri/card0: a new DRM file (per-open GEM handles and events)
+    if opened.is_drm {
+        return drm_open_fd(ctx, fd_flags);
+    }
+
     if opened.is_ptmx {
         let pty_id = match crate::pty::pty_alloc() {
             Ok(id) => id,
@@ -976,6 +981,7 @@ pub(super) fn synthetic_fd_stat_identity(kind: u8) -> Option<(u64, u32, u64)> {
         task::USER_FD_KIND_CONSOLE => Some((0x6, S_IFCHR | 0o620, (5 << 8) | 1)),
         task::USER_FD_KIND_PTY_MASTER => Some((0x6, S_IFCHR | 0o666, (5 << 8) | 2)),
         task::USER_FD_KIND_PTY_SLAVE => Some((0x6, S_IFCHR | 0o620, 136 << 8)),
+        task::USER_FD_KIND_DRM => Some((0x6, S_IFCHR | 0o666, DRM_CARD0_RDEV)),
         _ => None,
     }
 }

@@ -1,6 +1,7 @@
 /*
  * peetwl: the PeetOS Wayland compositor (libwayland-server, software
- * rendering to /dev/fb0).
+ * rendering through DRM/KMS on /dev/dri/card0 with page flips, or to
+ * /dev/fb0 with --fbdev or when no DRM device is available).
  *
  * Globals: wl_compositor (v4), wl_shm, wl_seat (v5, pointer + keyboard),
  * wl_output (v3), xdg_wm_base (v6; toplevels, popups are dismissed).
@@ -43,7 +44,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <drm_fourcc.h>
 #include <wayland-server.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
 #include <xkbcommon/xkbcommon.h>
 #include "xdg-shell-server-protocol.h"
 
@@ -158,7 +162,18 @@ struct server {
     struct wl_event_loop *loop;
     int smoke;
 
-    /* output */
+    /* output: DRM/KMS (two dumb buffers, page flips) or /dev/fb0 */
+    int use_drm;
+    int drm_fd;
+    uint32_t drm_crtc;
+    struct drm_buf {
+        uint32_t handle, pitch, fb_id;
+        uint64_t size;
+        uint32_t *map;
+    } drm_buf[2];
+    int drm_front;
+    int flip_pending;
+    uint32_t flips;
     int fb_fd;
     uint32_t *fb;
     uint32_t *back;
@@ -372,7 +387,28 @@ static void draw_cursor(struct server *srv, struct box clip) {
     }
 }
 
+/* Copy the whole back buffer into the off-screen dumb buffer and flip to
+ * it. Frame callbacks go out when the flip completes (on_drm_event), so
+ * clients are paced by the display's 60 Hz cadence. */
+static void present_drm(struct server *srv) {
+    struct drm_buf *target = &srv->drm_buf[!srv->drm_front];
+    for (int y = 0; y < srv->height; y++) {
+        memcpy((char *)target->map + (size_t)y * target->pitch, srv->back + (size_t)y * srv->width,
+               (size_t)srv->width * 4);
+    }
+    if (drmModePageFlip(srv->drm_fd, srv->drm_crtc, target->fb_id, DRM_MODE_PAGE_FLIP_EVENT, srv) == 0) {
+        srv->flip_pending = 1;
+        srv->drm_front = !srv->drm_front;
+    } else {
+        printf("[peetwl] page flip failed errno=%d\n", errno);
+    }
+}
+
 static void repaint(struct server *srv) {
+    if (srv->use_drm && srv->flip_pending) {
+        /* Damage and frame callbacks wait for the flip to complete. */
+        return;
+    }
     if (srv->dirty_set) {
         struct box clip = srv->dirty;
         fill(srv, clip, clip, COLOR_BG);
@@ -383,12 +419,19 @@ static void repaint(struct server *srv) {
             }
         }
         draw_cursor(srv, clip);
-        for (int y = clip.y; y < clip.y + clip.h; y++) {
-            memcpy(srv->fb + (size_t)y * srv->stride_px + clip.x,
-                   srv->back + (size_t)y * srv->width + clip.x, (size_t)clip.w * 4);
+        if (srv->use_drm) {
+            present_drm(srv);
+        } else {
+            for (int y = clip.y; y < clip.y + clip.h; y++) {
+                memcpy(srv->fb + (size_t)y * srv->stride_px + clip.x,
+                       srv->back + (size_t)y * srv->width + clip.x, (size_t)clip.w * 4);
+            }
         }
         srv->dirty_set = 0;
         srv->frame_count++;
+        if (srv->use_drm && srv->flip_pending) {
+            return;
+        }
     }
 
     uint32_t t = now_ms();
@@ -397,6 +440,21 @@ static void repaint(struct server *srv) {
         wl_callback_send_done(cb, t);
         wl_resource_destroy(cb);
     }
+}
+
+static void on_page_flip(int fd, unsigned seq, unsigned sec, unsigned usec, void *data) {
+    (void)fd; (void)seq; (void)sec; (void)usec;
+    struct server *srv = data;
+    srv->flip_pending = 0;
+    srv->flips++;
+    repaint(srv);
+}
+
+static int on_drm_event(int fd, uint32_t mask, void *data) {
+    (void)mask; (void)data;
+    drmEventContext ev = {.version = 2, .page_flip_handler = on_page_flip};
+    drmHandleEvent(fd, &ev);
+    return 0;
 }
 
 static int on_repaint_timer(void *data) {
@@ -1712,6 +1770,72 @@ static void setup_keymap(struct server *srv, const char *layout, const char *var
            n_layouts == 1 ? "" : "s", srv->keymap_size);
 }
 
+static int drm_make_buf(int fd, uint32_t w, uint32_t h, struct drm_buf *b) {
+    if (drmModeCreateDumbBuffer(fd, w, h, 32, 0, &b->handle, &b->pitch, &b->size) != 0) {
+        return -1;
+    }
+    uint64_t offset = 0;
+    if (drmModeMapDumbBuffer(fd, b->handle, &offset) != 0) {
+        return -1;
+    }
+    b->map = mmap(NULL, b->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)offset);
+    if (b->map == MAP_FAILED) {
+        return -1;
+    }
+    uint32_t handles[4] = {b->handle}, pitches[4] = {b->pitch}, offsets[4] = {0};
+    return drmModeAddFB2(fd, w, h, DRM_FORMAT_XRGB8888, handles, pitches, offsets, &b->fb_id, 0);
+}
+
+/* Legacy KMS: first connected connector, its preferred mode, its encoder's
+ * CRTC, two dumb buffers. Returns -1 (and leaves fbdev to the caller) if
+ * there is no usable DRM device. */
+static int open_drm(struct server *srv) {
+    int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    drmModeResPtr res = drmModeGetResources(fd);
+    drmModeConnectorPtr conn = NULL;
+    for (int i = 0; res && i < res->count_connectors && conn == NULL; i++) {
+        conn = drmModeGetConnector(fd, res->connectors[i]);
+        if (conn && (conn->connection != DRM_MODE_CONNECTED || conn->count_modes < 1)) {
+            drmModeFreeConnector(conn);
+            conn = NULL;
+        }
+    }
+    drmModeEncoderPtr enc = conn ? drmModeGetEncoder(fd, conn->encoder_id) : NULL;
+    if (res == NULL || conn == NULL || enc == NULL || enc->crtc_id == 0) {
+        printf("[peetwl] no usable DRM connector; using fbdev\n");
+        close(fd);
+        return -1;
+    }
+    drmModeModeInfo mode = conn->modes[0];
+    srv->drm_fd = fd;
+    srv->drm_crtc = enc->crtc_id;
+    srv->width = mode.hdisplay;
+    srv->height = mode.vdisplay;
+    if (drm_make_buf(fd, mode.hdisplay, mode.vdisplay, &srv->drm_buf[0]) != 0 ||
+        drm_make_buf(fd, mode.hdisplay, mode.vdisplay, &srv->drm_buf[1]) != 0) {
+        printf("[peetwl] FAIL DRM dumb buffers errno=%d\n", errno);
+        return -2;
+    }
+    memset(srv->drm_buf[0].map, 0, srv->drm_buf[0].size);
+    if (drmModeSetCrtc(fd, srv->drm_crtc, srv->drm_buf[0].fb_id, 0, 0, &conn->connector_id, 1, &mode) != 0) {
+        printf("[peetwl] FAIL drmModeSetCrtc errno=%d\n", errno);
+        return -2;
+    }
+    srv->back = calloc((size_t)srv->width * (size_t)srv->height, 4);
+    if (srv->back == NULL) {
+        return -2;
+    }
+    srv->use_drm = 1;
+    printf("[peetwl] output drm %dx%d (%s, 2 dumb buffers, page flips)\n", srv->width, srv->height, mode.name);
+    drmModeFreeEncoder(enc);
+    drmModeFreeConnector(conn);
+    drmModeFreeResources(res);
+    return 0;
+}
+
 static int open_framebuffer(struct server *srv) {
     srv->fb_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
     if (srv->fb_fd < 0) {
@@ -1736,6 +1860,7 @@ static int open_framebuffer(struct server *srv) {
     if (srv->back == NULL) {
         return -1;
     }
+    printf("[peetwl] output fbdev %dx%d\n", srv->width, srv->height);
     return 0;
 }
 
@@ -1745,6 +1870,7 @@ int main(int argc, char **argv) {
     const char *clients[MAX_CLIENTS];
     int nclients = 0;
     const char *xkb_layout = NULL, *xkb_variant = NULL, *xkb_options = NULL;
+    int force_fbdev = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--smoke") == 0) {
@@ -1757,8 +1883,10 @@ int main(int argc, char **argv) {
             xkb_variant = argv[++i];
         } else if (strcmp(argv[i], "--xkb-options") == 0 && i + 1 < argc) {
             xkb_options = argv[++i];
+        } else if (strcmp(argv[i], "--fbdev") == 0) {
+            force_fbdev = 1;
         } else {
-            printf("usage: peetwl [--smoke] [--xkb-layout L] [--xkb-variant V] "
+            printf("usage: peetwl [--smoke] [--fbdev] [--xkb-layout L] [--xkb-variant V] "
                    "[--xkb-options O] [--client \"cmd args\"]...\n");
             return 2;
         }
@@ -1770,7 +1898,8 @@ int main(int argc, char **argv) {
     wl_list_init(&srv.pointers);
     wl_list_init(&srv.keyboards);
 
-    if (open_framebuffer(&srv) != 0) {
+    int drm_status = force_fbdev ? -1 : open_drm(&srv);
+    if (drm_status == -2 || (drm_status != 0 && open_framebuffer(&srv) != 0)) {
         return 1;
     }
     srv.cursor_x = srv.width / 2;
@@ -1798,6 +1927,9 @@ int main(int argc, char **argv) {
     wl_global_create(srv.display, &xdg_wm_base_interface, 6, &srv, bind_wm_base);
 
     srv.repaint_timer = wl_event_loop_add_timer(srv.loop, on_repaint_timer, &srv);
+    if (srv.use_drm) {
+        wl_event_loop_add_fd(srv.loop, srv.drm_fd, WL_EVENT_READABLE, on_drm_event, &srv);
+    }
     wl_event_loop_add_signal(srv.loop, SIGCHLD, on_sigchld, &srv);
     wl_event_loop_add_signal(srv.loop, SIGTERM, on_terminate, &srv);
     wl_event_loop_add_signal(srv.loop, SIGINT, on_terminate, &srv);
@@ -1836,6 +1968,9 @@ int main(int argc, char **argv) {
     wl_display_destroy_clients(srv.display);
     wl_display_destroy(srv.display);
     printf("[peetwl] exit frames=%u\n", srv.frame_count);
+    if (srv.use_drm) {
+        printf("[peetwl] drm flips=%u\n", srv.flips);
+    }
     if (srv.smoke) {
         if (srv.failed || srv.children_failed != 0) {
             printf("[peetwl] FAIL\n");
