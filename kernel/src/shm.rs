@@ -1,6 +1,6 @@
 #[cfg(not(test))]
 use arch_x86_64::addr::VirtAddr;
-use arch_x86_64::addr::{PhysAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
+use arch_x86_64::addr::{PhysAddr, USER_SPACE_END, PAGE_SIZE};
 
 #[cfg(not(test))]
 use crate::memory::{pmm, vmm};
@@ -103,14 +103,14 @@ fn free_phys_page(_page: u64) {}
 
 #[inline]
 fn user_range_ok(start: u64, len: u64) -> bool {
-    if len == 0 || start >= KERNEL_VIRT_BASE {
+    if len == 0 || start >= USER_SPACE_END {
         return false;
     }
     let end = match start.checked_add(len.saturating_sub(1)) {
         Some(v) => v,
         None => return false,
     };
-    end < KERNEL_VIRT_BASE
+    end < USER_SPACE_END
 }
 
 fn find_by_key_locked(state: &ShmState, key: i32) -> Option<usize> {

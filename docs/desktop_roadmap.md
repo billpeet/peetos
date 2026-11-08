@@ -41,13 +41,23 @@ later.
   `make run-dynlink-smoke`, see "Dynamic Linking" in `docs/elf.md`. libwayland,
   libffi and libxkbcommon also build as `.so` files, and `peetwl`/`wl_demo`
   link against them.)*
-- [ ] **Process and memory limits.** ~~Remove whole-table stack copies in the
-  VM syscalls so the region table can grow past 32 slots~~ (done: 256 slots,
-  see `docs/memory.md`). Still to do: raise the per-task mapping budget
-  (32 MiB), memfd size cap (64 MiB), task limit (64), socket limit (96); lift
-  the ext2 64-entries-per-directory limit. The kernel image is also close to
-  the boot disk's 10 MiB payload limit (`DISK_SECTORS`), mostly because of
-  embedded smoke-test ELFs.
+- [x] **Process and memory limits.** Done:
+  - Physical memory: up to 4 GiB, through a new kernel direct map (was 128 MiB).
+  - VM region table: 256 slots (was 32).
+  - Per-process mapping budget: 256 MiB (was 32 MiB).
+  - memfd size: 256 MiB (was 64 MiB).
+  - Tasks: 256 (was 64).
+  - Sockets: 256, with 128 `AF_UNIX` bindings (was 96 and 48).
+  - Directory size: the ext4 work removed the 64-entries-per-directory limit.
+
+  `make run-dynlink-smoke` checks the new limits in QEMU with 512 MiB.
+
+  Still static and worth raising when something hits them:
+  - 128 fds per process
+  - 32 fds per `poll` call (the array is on the stack)
+  - 64 epoll watches per instance
+  - 64 pipes, 64 shmem objects
+  - 32 eventfds and 32 timerfds
 - [ ] **System information.** A usable `/proc` (and parts of `/sys`), a real-time
   clock, and the input ioctls libinput needs (`EVIOCGNAME`, `EVIOCGBIT`,
   `EVIOCGABS`, ...).

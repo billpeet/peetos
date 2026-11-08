@@ -152,7 +152,7 @@ Limitations / Simplifications
 - Ext2 still uses its own sparse block cache for on-disk block residency/dirty tracking, but syscall-level file reads and file-backed `MAP_SHARED` faults now share a kernel VM inode-page cache path. Full fs-wide VM page-cache integration (including writable shared mmap writeback and unified reclaim policy) remains pending.
 - ext2 mount-from-block currently probes whole-device LBA0 ext2 images only; partition parsing (MBR/GPT) is not implemented.
 - `flock` lock owners are `(pid, fd)` pairs, not open file descriptions: a `dup`ed fd or a forked child does not share its parent's lock as it would on Linux, and the system-wide lock table holds at most 128 locks.
-- Capacities are static: 256 VFS nodes in total, 128 entries per directory node (`VFS_MAX_CHILDREN`), and ext2 directories import at most 64 entries when first loaded (the import buffers names on the kernel stack).
+- Capacities are static: `VFS_MAX_INODES` (32768) live VFS nodes in total. The per-directory child cap (`VFS_MAX_CHILDREN`) and the 64-entry ext2 import limit were lifted by the ext4 work (`docs/ext4_compat_plan.md`).
 - `/dev/fd/N` cannot be opened (there is no reopen-by-descriptor), and `/proc/self/fd` does not exist.
 - Orphaned (unlinked but open) ext2 files are freed only at last close; if the system stops first, the on-disk inode stays allocated with zero links, since there is no ext2 orphan list or fsck-style recovery.
 - File offsets live in the per-process fd slot, so `dup`ed descriptors do not share an offset as Linux open file descriptions do.

@@ -3,7 +3,7 @@ use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
+use arch_x86_64::addr::{PhysAddr, VirtAddr, USER_SPACE_END, PAGE_SIZE};
 use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
 use arch_x86_64::pit;
@@ -919,14 +919,14 @@ fn user_range_ok(start: u64, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if start >= KERNEL_VIRT_BASE {
+    if start >= USER_SPACE_END {
         return false;
     }
     let end = match start.checked_add((len as u64).saturating_sub(1)) {
         Some(v) => v,
         None => return false,
     };
-    end < KERNEL_VIRT_BASE
+    end < USER_SPACE_END
 }
 
 fn write_user_bytes(pml4: PhysAddr, user_dst: u64, src: &[u8]) -> bool {

@@ -27,8 +27,9 @@ const ENFILE: i64 = 23;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const SHMEM_MAX_OBJECTS: usize = 64;
-/// Largest memfd size (64 MiB).
-pub const SHMEM_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest memfd / shared-anonymous object (256 MiB). Pages are allocated
+/// on demand; this only sizes each object's index (128 slots).
+pub const SHMEM_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const ENTRIES_PER_INDEX: usize = (PAGE_SIZE as usize) / 8;
 pub const MAX_INDEX_PAGES: usize =
     (SHMEM_MAX_BYTES / PAGE_SIZE) as usize / ENTRIES_PER_INDEX;

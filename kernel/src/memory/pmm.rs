@@ -19,7 +19,13 @@ const MMAP_MAX_ENTRIES: usize = 32;
 #[cfg(target_os = "none")]
 const MMAP_TYPE_USABLE: u32 = 1;
 
-const PMM_MAX_MEMORY: u64 = 128 * 1024 * 1024;
+/// Highest physical address managed. RAM above it (QEMU places memory
+/// beyond ~3.5 GiB above 4 GiB) is ignored.
+pub const PMM_MAX_MEMORY: u64 = 4 * 1024 * 1024 * 1024;
+/// RAM the bootloader's higher-half window maps (phys + KERNEL_VIRT_BASE).
+/// Only this part is handed out until `vmm::init` has built the direct map;
+/// `release_high_memory` adds the rest.
+pub const PMM_EARLY_LIMIT: u64 = 128 * 1024 * 1024;
 const PMM_MAX_PAGES: u64 = PMM_MAX_MEMORY / PAGE_SIZE;
 const PMM_BITMAP_SIZE: usize = (PMM_MAX_PAGES / 8) as usize;
 
@@ -53,6 +59,12 @@ static mut LAST_USABLE_PFN: u64 = 0;
 static mut SEARCH_HINT: u64 = 0;
 static mut DEBUG_TRACKED_PAGE: u64 = 0;
 static mut PMM_INITIALIZED: bool = false;
+/// Usable RAM at or above `PMM_EARLY_LIMIT`, freed by `release_high_memory`.
+static mut HIGH_RANGES: [(u64, u64); MMAP_RANGES_MAX] = [(0, 0); MMAP_RANGES_MAX];
+static mut HIGH_RANGE_COUNT: usize = 0;
+/// End of the highest usable RAM range (clipped to `PMM_MAX_MEMORY`).
+static mut USABLE_END: u64 = 0;
+const MMAP_RANGES_MAX: usize = 32;
 /// Serialises all bitmap/refcount/counter updates. The PMM is called from
 /// paths that do not hold the big kernel lock (and from IRQ context), so it
 /// has its own interrupt-safe lock. Lock order: heap -> PMM.
@@ -110,6 +122,20 @@ pub fn init() {
             if region_start >= region_end {
                 continue;
             }
+            if region_end > USABLE_END {
+                USABLE_END = region_end;
+            }
+
+            let (early, high) = split_usable_region(region_start, region_end, PMM_EARLY_LIMIT);
+            if let Some((hs, he)) = high {
+                if HIGH_RANGE_COUNT < MMAP_RANGES_MAX {
+                    HIGH_RANGES[HIGH_RANGE_COUNT] = (hs, he);
+                    HIGH_RANGE_COUNT += 1;
+                }
+            }
+            let Some((region_start, region_end)) = early else {
+                continue;
+            };
 
             mark_range_free(region_start, region_end);
 
@@ -150,6 +176,61 @@ pub fn init() {
 
 #[cfg(not(target_os = "none"))]
 pub fn init() {}
+
+/// Split usable range `[start, end)` at `limit` into the part below it and
+/// the part at or above it.
+pub(crate) fn split_usable_region(
+    start: u64,
+    end: u64,
+    limit: u64,
+) -> (Option<(u64, u64)>, Option<(u64, u64)>) {
+    if start >= end {
+        return (None, None);
+    }
+    let early = if start < limit { Some((start, end.min(limit))) } else { None };
+    let high = if end > limit { Some((start.max(limit), end)) } else { None };
+    (early, high)
+}
+
+/// End of the highest usable RAM range, for sizing the direct map.
+pub fn usable_end() -> u64 {
+    unsafe { USABLE_END }
+}
+
+/// Hand RAM above `PMM_EARLY_LIMIT` to the allocator. Call once, after
+/// `vmm::init` has mapped all of `usable_end()` in the direct map.
+#[cfg(target_os = "none")]
+pub fn release_high_memory() {
+    let _guard = PMM_LOCK.lock();
+    unsafe {
+        let mut added = 0u64;
+        for i in 0..HIGH_RANGE_COUNT {
+            let (start, end) = HIGH_RANGES[i];
+            let before = FREE_PAGE_COUNT;
+            mark_range_free(start, end);
+            added += FREE_PAGE_COUNT - before;
+            let start_pfn = addr_to_pfn(start);
+            let end_pfn = addr_to_pfn(end);
+            if FIRST_USABLE_PFN == 0 || start_pfn < FIRST_USABLE_PFN {
+                FIRST_USABLE_PFN = start_pfn;
+            }
+            if end_pfn > LAST_USABLE_PFN {
+                LAST_USABLE_PFN = end_pfn;
+            }
+            TOTAL_PAGE_COUNT = TOTAL_PAGE_COUNT.saturating_add(end_pfn - start_pfn);
+        }
+        HIGH_RANGE_COUNT = 0;
+        let free = FREE_PAGE_COUNT;
+        serial_println!(
+            "[PMM] Released {} MiB above the boot window; free pages: {}",
+            added * PAGE_SIZE / (1024 * 1024),
+            free
+        );
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn release_high_memory() {}
 
 #[cfg(feature = "musl-ext2-cmd-smoke")]
 pub fn debug_track_page(addr: PhysAddr) {
@@ -574,6 +655,21 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
+    #[test]
+    fn split_usable_region_at_boot_window() {
+        let mib = 1024 * 1024;
+        assert_eq!(split_usable_region(mib, 64 * mib, 128 * mib), (Some((mib, 64 * mib)), None));
+        assert_eq!(
+            split_usable_region(mib, 512 * mib, 128 * mib),
+            (Some((mib, 128 * mib)), Some((128 * mib, 512 * mib)))
+        );
+        assert_eq!(
+            split_usable_region(256 * mib, 512 * mib, 128 * mib),
+            (None, Some((256 * mib, 512 * mib)))
+        );
+        assert_eq!(split_usable_region(5, 5, 128 * mib), (None, None));
+    }
+
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_tests() -> MutexGuard<'static, ()> {
@@ -684,7 +780,7 @@ mod tests {
         let _guard = lock_tests();
         let phys = PhysAddr::new(0x2000);
         let virt = phys.to_virt();
-        assert_eq!(virt.as_u64(), 0xFFFF_FFFF_8000_2000);
+        assert_eq!(virt.as_u64(), 0xFFFF_8000_0000_2000); // direct map (DIRECT_MAP_BASE)
         let round = virt.to_phys();
         assert_eq!(round, phys);
     }

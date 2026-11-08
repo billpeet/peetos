@@ -11,6 +11,8 @@
  *   - fork + execve of itself (a dynamic program exec'ing a dynamic program)
  *   - many distinct mappings at once (well past the old 32-region limit) on
  *     top of the loaded libraries, and an mprotect split + restore
+ *   - platform limits: 192 MiB of memory (old physical limit 128 MiB), 100
+ *     concurrent child processes (old task limit 64), 120 sockets (old 96)
  *
  * Output: "[dynlink] <check> ok", "[dynlink] FAIL ...", and "[dynlink] pass".
  */
@@ -21,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -98,6 +101,106 @@ static int mprotect_split_restore(void) {
     return ok;
 }
 
+#define BIG_MAP_MIB 192
+
+/* Map and touch more memory than the kernel's old 128 MiB physical limit
+ * (the runner gives QEMU 512 MiB), in 32 MiB pieces. */
+static int big_allocation(void) {
+    enum { CHUNKS = BIG_MAP_MIB / 32, CHUNK = 32 << 20 };
+    unsigned char *chunks[CHUNKS];
+    int ok = 1, mapped = 0;
+    for (; mapped < CHUNKS; mapped++) {
+        chunks[mapped] = mmap(NULL, CHUNK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (chunks[mapped] == MAP_FAILED) {
+            printf("[dynlink] big mmap chunk %d failed\n", mapped);
+            ok = 0;
+            break;
+        }
+        for (size_t off = 0; off < CHUNK; off += 4096) {
+            chunks[mapped][off] = (unsigned char)(mapped + off / 4096);
+        }
+    }
+    for (int i = 0; ok && i < mapped; i++) {
+        for (size_t off = 0; off < CHUNK; off += 4096) {
+            if (chunks[i][off] != (unsigned char)(i + off / 4096)) {
+                ok = 0;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < mapped; i++) {
+        munmap(chunks[i], CHUNK);
+    }
+    return ok;
+}
+
+#define MANY_CHILDREN 100
+
+/* MANY_CHILDREN processes alive at once, each blocked reading a pipe until
+ * the parent releases them all. */
+static int many_processes(void) {
+    int go[2];
+    if (pipe(go) != 0) {
+        return 0;
+    }
+    pid_t pids[MANY_CHILDREN];
+    int started = 0, ok = 1;
+    for (; started < MANY_CHILDREN; started++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            char c;
+            close(go[1]);
+            _exit(read(go[0], &c, 1) == 1 ? 0 : 1);
+        }
+        if (pid < 0) {
+            printf("[dynlink] fork %d failed\n", started);
+            ok = 0;
+            break;
+        }
+        pids[started] = pid;
+    }
+    close(go[0]);
+    char release[MANY_CHILDREN];
+    memset(release, 'x', sizeof(release));
+    if (write(go[1], release, (size_t)started) != started) {
+        ok = 0;
+    }
+    close(go[1]);
+    for (int i = 0; i < started; i++) {
+        int status = 0;
+        if (waitpid(pids[i], &status, 0) != pids[i] || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+#define MANY_SOCKETPAIRS 60
+
+/* 2 * MANY_SOCKETPAIRS AF_UNIX sockets open at once, each pair passing a byte. */
+static int many_sockets(void) {
+    int sv[MANY_SOCKETPAIRS][2];
+    int opened = 0, ok = 1;
+    for (; opened < MANY_SOCKETPAIRS; opened++) {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv[opened]) != 0) {
+            printf("[dynlink] socketpair %d failed\n", opened);
+            ok = 0;
+            break;
+        }
+    }
+    for (int i = 0; ok && i < opened; i++) {
+        char out = (char)i, in = 0;
+        if (write(sv[i][0], &out, 1) != 1 || read(sv[i][1], &in, 1) != 1 || in != out) {
+            ok = 0;
+        }
+    }
+    for (int i = 0; i < opened; i++) {
+        close(sv[i][0]);
+        close(sv[i][1]);
+    }
+    return ok;
+}
+
 struct thread_result {
     int lib_tls;
     int plugin_tls;
@@ -160,6 +263,9 @@ int main(int argc, char **argv) {
 
     check(many_mappings(), "120 distinct mappings alongside shared libraries");
     check(mprotect_split_restore(), "mprotect split and restore");
+    check(big_allocation(), "192 MiB anonymous memory (beyond the old 128 MiB limit)");
+    check(many_processes(), "100 concurrent child processes");
+    check(many_sockets(), "120 open sockets");
 
     fflush(stdout);
     pid_t pid = fork();

@@ -16,7 +16,10 @@ pub const INVALID_PID: Pid = -1;
 pub const TASK_NAME_MAX: usize = 32;
 pub const KERNEL_STACK_SIZE: u64 = 16 * 1024;
 pub const KERNEL_STACK_PAGES: usize = (KERNEL_STACK_SIZE / 4096) as usize;
-pub const MAX_TASKS: usize = 64;
+/// Task slots (processes plus threads). Task structs and kernel stacks are
+/// allocated on demand; per-slot static tables (`TASK_TABLE`, the 8 KiB VM
+/// region tables) cost about 2 MiB of .bss at 256.
+pub const MAX_TASKS: usize = 256;
 /// Per-process descriptor limit. libwayland compositors hold a listening
 /// socket and lock file per display socket plus one fd per client, so 32
 /// was too small (upstream `socket-test` alone opens ~70).

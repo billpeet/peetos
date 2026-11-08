@@ -3,7 +3,7 @@ use core::mem::{offset_of, size_of, MaybeUninit};
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
+use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE, USER_SPACE_END};
 use arch_x86_64::fpu::{self, FxSaveArea};
 use arch_x86_64::gdt;
 use arch_x86_64::idt::InterruptFrame;
@@ -392,7 +392,9 @@ const UTS_FIELD_LEN: usize = 65;
 /// `RegionScratch`, and everything else works on `TASK_VM_MAPPINGS` in place
 /// (borrow with `task_regions`, copy slots with `region_table_copy`).
 const MMAP_MAX_REGIONS_PER_TASK: usize = 256;
-const MMAP_MAX_PAGES_PER_TASK: u64 = 8192;
+/// Per-process mmap budget (256 MiB). A guard against runaway mappings, not
+/// an accounting of physical memory; the PMM can manage up to 4 GiB.
+const MMAP_MAX_PAGES_PER_TASK: u64 = 65536;
 const VM_PAGE_CACHE_MAX_PAGES: usize = 1024;
 const USER_VM_RECLAIM_TARGET_PAGES: usize = 16;
 const MEMFD_MAX_BUFFERS_PER_TASK: usize = 16;

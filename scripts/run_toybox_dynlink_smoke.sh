@@ -22,7 +22,10 @@ trap cleanup EXIT
 
 make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES=musl-ext2-dynlink-smoke
 
+# 512 MiB of RAM: the smoke allocates 192 MiB, which only fits if the kernel
+# manages memory above its 128 MiB boot window.
 qemu-system-x86_64 \
+  -m "${DYNLINK_SMOKE_MEM:-512M}" \
   -drive id=disk0,file="${IMAGE}",if=none,format=raw \
   -device ich9-ahci,id=ahci \
   -device ide-hd,drive=disk0,bus=ahci.0 \
@@ -69,6 +72,10 @@ for marker in \
   '\[dynlink\] fork + exec of a dynamic program ok' \
   '\[dynlink\] 120 distinct mappings alongside shared libraries ok' \
   '\[dynlink\] mprotect split and restore ok' \
+  '\[dynlink\] 192 MiB anonymous memory (beyond the old 128 MiB limit) ok' \
+  '\[dynlink\] 100 concurrent child processes ok' \
+  '\[dynlink\] 120 open sockets ok' \
+  '\[PMM\] Released' \
   '\[dynlink\] pass'; do
   if ! grep -q "${marker}" "${LOG_FILE}"; then
     echo "dynamic-linking smoke is missing marker: ${marker}" >&2

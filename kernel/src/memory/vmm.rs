@@ -1,6 +1,8 @@
 use core::ptr;
 
-use arch_x86_64::addr::{PhysAddr, VirtAddr, PAGE_SIZE};
+use arch_x86_64::addr::{PhysAddr, VirtAddr, DIRECT_MAP_BASE, PAGE_SIZE};
+#[cfg(target_os = "none")]
+use arch_x86_64::addr::KERNEL_VIRT_BASE;
 
 use crate::memory::pmm;
 use crate::serial_println;
@@ -268,12 +270,84 @@ pub fn init() {
         PML4_PHYS = pml4_phys;
         MAPPED_PAGES = 512 + (63 * 512);
         TABLES_ALLOCATED = 4;
+    }
+    build_direct_map(pml4_phys);
+    unsafe {
         VMM_INITIALIZED = true;
     }
 
     serial_println!("[VMM] PML4 phys = 0x{:x}", pml4_phys.as_u64());
     serial_println!("[VMM] Initial mappings: {} pages", unsafe { MAPPED_PAGES });
 }
+
+const GIB: u64 = 1 << 30;
+const TWO_MIB: u64 = 1 << 21;
+
+/// Number of 1 GiB direct-map slices (one page directory each) needed to
+/// cover physical memory up to `ram_end`.
+pub const fn direct_map_gib_count(ram_end: u64) -> u64 {
+    let gib = (ram_end + GIB - 1) / GIB;
+    if gib == 0 { 1 } else { gib }
+}
+
+/// Page-directory entry mapping the 2 MiB physical page at `phys` in the
+/// direct map: present, writable, large, supervisor-only. No NX bit: EFER.NXE
+/// is only enabled later in boot, and setting NX before that faults.
+pub const fn direct_map_pde(phys: u64) -> u64 {
+    (phys & !(TWO_MIB - 1)) | PTE_PRESENT | PTE_WRITE | PTE_LARGE
+}
+
+/// Map all usable RAM at `DIRECT_MAP_BASE` with 2 MiB pages, in PML4 slot 256
+/// of the kernel page tables. Every address space created later copies the
+/// kernel half (slots 256..511), so they all share it.
+///
+/// Runs before the direct map exists, so the new tables are reached through
+/// the boot window (phys + KERNEL_VIRT_BASE). The PMM only hands out frames
+/// below `PMM_EARLY_LIMIT` at this point, all inside that window.
+#[cfg(target_os = "none")]
+fn build_direct_map(pml4_phys: PhysAddr) {
+    let early = |phys: PhysAddr| -> *mut u64 {
+        debug_assert!(phys.as_u64() < pmm::PMM_EARLY_LIMIT);
+        (phys.as_u64() + KERNEL_VIRT_BASE) as *mut u64
+    };
+    let alloc_zeroed = || -> PhysAddr {
+        let frame = pmm::alloc_page();
+        if frame.as_u64() == 0 || frame.as_u64() >= pmm::PMM_EARLY_LIMIT {
+            panic!("[VMM] cannot allocate direct-map page table");
+        }
+        unsafe { ptr::write_bytes(early(frame), 0, VMM_ENTRIES_PER_TABLE) };
+        frame
+    };
+
+    let ram_end = pmm::usable_end().max(pmm::PMM_EARLY_LIMIT);
+    let gib_count = direct_map_gib_count(ram_end);
+    let pdpt = alloc_zeroed();
+    for g in 0..gib_count {
+        let pd = alloc_zeroed();
+        let pd_table = early(pd);
+        for i in 0..VMM_ENTRIES_PER_TABLE as u64 {
+            unsafe { ptr::write(pd_table.add(i as usize), direct_map_pde(g * GIB + i * TWO_MIB)) };
+        }
+        unsafe { ptr::write(early(pdpt).add(g as usize), pd.as_u64() | PTE_PRESENT | PTE_WRITE) };
+    }
+    unsafe {
+        ptr::write(
+            early(pml4_phys).add(pml4_index(DIRECT_MAP_BASE)),
+            pdpt.as_u64() | PTE_PRESENT | PTE_WRITE,
+        );
+        MAPPED_PAGES += gib_count * 512 * 512;
+        TABLES_ALLOCATED += 1 + gib_count;
+    }
+    write_cr3(read_cr3());
+    serial_println!(
+        "[VMM] Direct map: {} GiB of physical memory at 0x{:x}",
+        gib_count,
+        DIRECT_MAP_BASE
+    );
+}
+
+#[cfg(not(target_os = "none"))]
+fn build_direct_map(_pml4_phys: PhysAddr) {}
 
 pub fn map_page(virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
     let _guard = VMM_LOCK.lock();
@@ -1266,6 +1340,21 @@ impl Drop for MappingGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_map_sizing_and_entries() {
+        let mib = 1u64 << 20;
+        assert_eq!(direct_map_gib_count(0), 1);
+        assert_eq!(direct_map_gib_count(128 * mib), 1);
+        assert_eq!(direct_map_gib_count(1024 * mib), 1);
+        assert_eq!(direct_map_gib_count(1024 * mib + 1), 2);
+        assert_eq!(direct_map_gib_count(4096 * mib), 4);
+        let pde = direct_map_pde(0x4020_0000);
+        assert_eq!(pde & PTE_ADDR_MASK, 0x4020_0000);
+        assert_ne!(pde & PTE_LARGE, 0);
+        assert_eq!(pde & (PTE_USER | PTE_NO_EXECUTE), 0, "supervisor-only, no NX before NXE");
+        assert_eq!(pml4_index(DIRECT_MAP_BASE), 256);
+    }
 
     #[test]
     fn index_helpers() {

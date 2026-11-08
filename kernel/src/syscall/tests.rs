@@ -2361,4 +2361,7 @@ fn mprotect_target_classifies_exec_image_and_mmap_ranges() {
     assert_eq!(mprotect_target(0, PAGE_SIZE), Err(-EINVAL));
     assert_eq!(mprotect_target(0x40_1001, PAGE_SIZE), Err(-EINVAL));
     assert_eq!(mprotect_target(KERNEL_VIRT_BASE - PAGE_SIZE, PAGE_SIZE), Err(-EINVAL));
+    // The kernel half, including the shared direct map, is never user memory.
+    assert_eq!(mprotect_target(arch_x86_64::addr::DIRECT_MAP_BASE, PAGE_SIZE), Err(-EINVAL));
+    assert_eq!(mprotect_target(USER_SPACE_END - PAGE_SIZE, 2 * PAGE_SIZE), Err(-EINVAL));
 }

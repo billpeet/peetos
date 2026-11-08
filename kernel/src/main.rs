@@ -157,6 +157,8 @@ pub extern "C" fn kmain() -> ! {
 
     vmm::init();
     serial_println!("[VMM] Initialized");
+    // All RAM is in the direct map now; let the PMM hand out the rest.
+    pmm::release_high_memory();
 
     heap::init();
     serial_println!("[KMALLOC] Initialized");

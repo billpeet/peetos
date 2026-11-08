@@ -2,7 +2,7 @@ use core::cmp;
 use core::mem::size_of;
 use core::ptr;
 
-use arch_x86_64::addr::{PhysAddr, VirtAddr, KERNEL_VIRT_BASE, PAGE_SIZE};
+use arch_x86_64::addr::{PhysAddr, VirtAddr, USER_SPACE_END, PAGE_SIZE};
 
 use crate::memory::{pmm, vmm};
 
@@ -392,7 +392,7 @@ fn init_result() -> ElfLoadResult {
 }
 
 fn is_user_range(start: u64, end: u64) -> bool {
-    start < end && end <= KERNEL_VIRT_BASE
+    start < end && end <= USER_SPACE_END
 }
 
 pub fn validate(data: &[u8]) -> bool {

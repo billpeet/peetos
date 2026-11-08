@@ -1188,7 +1188,7 @@ pub(super) fn mmap_find_range(
             Some(end) => end,
             None => break,
         };
-        if end > search_end || end >= KERNEL_VIRT_BASE || cursor < PAGE_SIZE {
+        if end > search_end || end >= USER_SPACE_END || cursor < PAGE_SIZE {
             break;
         }
         if mmap_range_available(ctx.current, pml4, cursor, end) {
@@ -1302,7 +1302,7 @@ pub(super) fn set_program_break(ctx: &SyscallContext, requested: u64) -> i64 {
     }
 
     let heap_limit = stack_bottom.saturating_sub(PAGE_SIZE);
-    if requested < start || requested >= heap_limit || requested >= KERNEL_VIRT_BASE {
+    if requested < start || requested >= heap_limit || requested >= USER_SPACE_END {
         return current as i64;
     }
 
@@ -1438,7 +1438,7 @@ pub(super) fn sys_mmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             Some(v) => v,
             None => return -EINVAL,
         };
-        if end >= KERNEL_VIRT_BASE {
+        if end >= USER_SPACE_END {
             return -EINVAL;
         }
 
@@ -1559,7 +1559,7 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         _ => return -EINVAL,
     };
     let old_end = match old_addr.checked_add(old_len) {
-        Some(v) if v < KERNEL_VIRT_BASE => v,
+        Some(v) if v < USER_SPACE_END => v,
         _ => return -EINVAL,
     };
 
@@ -1629,7 +1629,7 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
 
     let grow_end = match old_addr.checked_add(new_len) {
-        Some(v) if v < KERNEL_VIRT_BASE => v,
+        Some(v) if v < USER_SPACE_END => v,
         _ => return -ENOMEM,
     };
     if old_end == region_end && mmap_range_available(ctx.current, pml4, old_end, grow_end) {
@@ -1691,7 +1691,7 @@ pub(super) fn sys_munmap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Some(v) => v,
         None => return -EINVAL,
     };
-    if end >= KERNEL_VIRT_BASE {
+    if end >= USER_SPACE_END {
         return -EINVAL;
     }
 
@@ -1820,7 +1820,7 @@ pub(super) fn mprotect_target(addr: u64, length: u64) -> Result<MprotectTarget, 
         _ => return Err(-EINVAL),
     };
     let end = addr.checked_add(len).ok_or(-EINVAL)?;
-    if end >= KERNEL_VIRT_BASE {
+    if end >= USER_SPACE_END {
         return Err(-EINVAL);
     }
     if addr >= MMAP_BASE_ADDR {
@@ -2002,7 +2002,7 @@ fn try_handle_cow_fault(fault_addr: u64, error_code: u64) -> bool {
     if (error_code & write_to_present) != write_to_present {
         return false;
     }
-    if fault_addr >= KERNEL_VIRT_BASE || fault_addr > USER_CANON_MAX {
+    if fault_addr >= USER_SPACE_END || fault_addr > USER_CANON_MAX {
         return false;
     }
     let current = task::current();
@@ -2036,7 +2036,7 @@ pub fn try_handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
     if (error_code & PAGE_FAULT_ERROR_PRESENT) != 0 {
         return false;
     }
-    if fault_addr < PAGE_SIZE || fault_addr >= KERNEL_VIRT_BASE || fault_addr > USER_CANON_MAX {
+    if fault_addr < PAGE_SIZE || fault_addr >= USER_SPACE_END || fault_addr > USER_CANON_MAX {
         return false;
     }
 
@@ -2136,7 +2136,7 @@ pub(super) fn sys_msync(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Some(v) => v,
         None => return -EINVAL,
     };
-    if end >= KERNEL_VIRT_BASE {
+    if end >= USER_SPACE_END {
         return -EINVAL;
     }
 

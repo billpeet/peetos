@@ -13,18 +13,23 @@ This document summarizes the current memory management implementation: typed add
 **Typed Addresses**
 `crates/arch_x86_64/src/addr.rs` provides:
 - `PhysAddr` and `VirtAddr` newtypes with alignment helpers.
-- Constants for `PAGE_SIZE` and the higher-half base (`0xFFFF_FFFF_8000_0000`).
-- Conversions between physical and higher-half virtual addresses.
+- Constants for `PAGE_SIZE`, the kernel image base (`KERNEL_VIRT_BASE`, `0xFFFF_FFFF_8000_0000`), the direct map (`DIRECT_MAP_BASE`, `0xFFFF_8000_0000_0000`) and the end of user space (`USER_SPACE_END`, `0x0000_8000_0000_0000`).
+- `PhysAddr::to_virt` returns the direct-map address of any physical page. `VirtAddr::to_phys` accepts both direct-map addresses and kernel image / boot window addresses.
+
+**Direct map**
+The bootloader maps only the first 128 MiB of RAM, at `KERNEL_VIRT_BASE`. The framebuffer window and the heap sit right after it, so that window cannot grow. `vmm::init` therefore builds a separate direct map of all usable RAM (up to 4 GiB) at `DIRECT_MAP_BASE` with 2 MiB pages, in PML4 slot 256. New address spaces copy kernel slots 256..511, so every process shares it. Its page tables come from frames below 128 MiB, reached through the boot window, because the PMM hands out only that range until `pmm::release_high_memory()` runs right after `vmm::init`. User-range checks (mmap family, shm, ELF loading, user copies) are bounded by `USER_SPACE_END`, so user mappings can never reach the shared kernel half.
 
 These types are used throughout PMM/VMM/heap to avoid mixing address spaces.
 
 Limitations / Simplifications
 - `PhysAddr`/`VirtAddr` do not validate canonicality or bounds; they are lightweight wrappers only.
-- Physical-to-virtual conversion assumes a fixed higher-half direct mapping.
+- The direct map covers RAM up to the highest usable E820 address, rounded up to 1 GiB, with 2 MiB pages. It includes any holes below that and maps them as normal write-back memory; nothing reads them through the direct map, and MMIO goes through its own window.
+- Direct-map entries carry no NX bit, because `EFER.NXE` is enabled later in boot than the map is built. They are supervisor-only.
 
 **Physical Memory Manager (PMM)**
-`kernel/src/memory/pmm.rs` implements a bitmap allocator with a 128 MB cap:
-- Bitmap size: 128MB / 4KB = 32768 pages -> 4096-byte bitmap.
+`kernel/src/memory/pmm.rs` implements a bitmap allocator for up to 4 GiB of RAM (`PMM_MAX_MEMORY`):
+- Bitmap size: 4 GiB / 4 KiB = 1M pages, so a 128 KiB bitmap plus a 2 MiB array of 16-bit share counts (both in `.bss`).
+- Usable RAM below `PMM_EARLY_LIMIT` (128 MiB, the boot window) is available from `init()`. RAM above it is recorded and only freed by `release_high_memory()`, once the direct map covers it.
 - E820 memory map is read from the bootloader at:
   - Entries: `0xFFFF_FFFF_8000_0500`
   - Count: `0xFFFF_FFFF_8000_07F0`
@@ -39,7 +44,7 @@ Public API:
 - `get_stats()` and `is_managed()`
 
 Limitations / Simplifications
-- Hard cap of 128 MB managed memory; higher RAM is ignored.
+- Hard cap of 4 GiB managed memory; RAM above that (QEMU places memory beyond about 3.5 GiB above 4 GiB) is ignored. At most 32 E820 ranges above 128 MiB are recorded.
 - E820 is read from fixed bootloader-provided addresses without additional validation.
 - Protected by its own interrupt-safe spinlock (`PMM_LOCK`), taken at every public entry point. It is independent of the big kernel lock. There are no per-CPU freelists.
 - Only reserves low 1MB and the kernel image range by default. SMP bring-up relies on that reservation: it reuses physical `0x8000-0xBFFF` for the AP trampoline and its transitional page tables (see `docs/smp.md`).
@@ -83,10 +88,10 @@ Limitations / Simplifications
 - Each task has 256 region slots. Inserting a region merges it in place with adjacent regions that have the same protection, sharing, and backing (contiguous offsets for file mappings), as Linux merges VMAs, so allocators that map many small adjacent areas (musl's mallocng, for example while libxkbcommon compiles a keymap) use few slots. Before merging existed, such programs ran out of slots and `mmap` returned `ENOMEM`. `mprotect` also re-merges the pieces it splits once their protections match again (as after musl's RELRO), and a split that would need more slots than are free fails before the table changes.
 - Shared writable file mappings may cover the partial page at the end of the file (the window is checked against the file size rounded up to a page), matching Linux.
 - A table is 8 KiB, half the 16 KiB kernel stack, so it is never copied onto the stack. `mmap`, `mremap` and `munmap` build the new table in a heap copy (`RegionScratch`, about 8 KiB of kmalloc per call) and commit it once every step has succeeded. Everything else borrows `TASK_VM_MAPPINGS` in place (`task_regions`, `region_table_copy`). An earlier attempt at 128 slots, still with stack copies, overflowed the stack in `mmap`.
-- The tables are a static 512 KiB array (64 tasks x 256 slots), zero-initialised so it sits in `.bss` rather than in the kernel image. Threads share their leader's table, so the thread slots' tables go unused.
+- The tables are a static 2 MiB array (256 task slots x 256 region slots), zero-initialised so it sits in `.bss` rather than in the kernel image. Threads share their leader's table, so the thread slots' tables go unused.
 - `mremap` requires the old range to lie inside one existing mapping, does not support `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and refuses to resize framebuffer mappings.
-- `MAP_SHARED | MAP_ANONYMOUS` regions are backed by a hidden, unlinked tmpfs inode whose contents live in a shmem object (up to 64 MiB, the same storage as memfd). Each region uses one VFS node and one of the 64 shmem objects until it is unmapped everywhere.
-- Inode pins are recomputed by scanning every task's region table (64 tasks x 256 regions, 16384 entries) after each `mmap`/`munmap`/teardown. That is linear; a per-inode mapping count would avoid it if it shows up in profiles.
+- `MAP_SHARED | MAP_ANONYMOUS` regions are backed by a hidden, unlinked tmpfs inode whose contents live in a shmem object (up to 256 MiB, the same storage as memfd). Each region uses one VFS node and one of the 64 shmem objects until it is unmapped everywhere.
+- Inode pins are recomputed by scanning every task's region table (256 tasks x 256 regions, 65536 entries) after each `mmap`/`munmap`/teardown. That is linear; a per-inode mapping count would avoid it if it shows up in profiles.
 
 **Kernel Heap (kmalloc)**
 `kernel/src/memory/heap.rs` is a simple first-fit allocator:
@@ -119,10 +124,10 @@ This order is enforced in `kernel/src/main.rs`.
 **Status Notes**
 - PMM and VMM are functional but still conservative about large pages.
 - Heap is suitable for early kernel allocations; there is no slab/buddy layer yet.
-- memfd contents live in page-backed shmem objects (`kernel/src/shmem.rs`): up to 64 MiB per object in lazily allocated pages tracked through index pages. Each user mapping of a shmem page takes a PMM share reference (`pmm::page_share`) that the normal unmap/exit paths drop with `pmm::free_page`, so mapped pages outlive the object.
+- memfd contents live in page-backed shmem objects (`kernel/src/shmem.rs`): up to 256 MiB per object in lazily allocated pages tracked through index pages. Each user mapping of a shmem page takes a PMM share reference (`pmm::page_share`) that the normal unmap/exit paths drop with `pmm::free_page`, so mapped pages outlive the object.
 - Shared-buffer bring-up now includes `memfd_create` fd objects for
   userspace sharing workflows, plus baseline writable shared `mmap`
   reliability for compositor/client buffer exchange; per-task VMA mapping
-  coverage now has an explicit hardening cap (currently 8192 pages / 32 MiB
+  coverage now has an explicit hardening cap (currently 65536 pages / 256 MiB
   virtual range) while broader VM policy work remains tracked separately in the
   GUI roadmap.

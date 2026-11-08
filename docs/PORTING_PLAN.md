@@ -185,6 +185,13 @@ current Rust kernel implementation and forward roadmap.
 - Dynamic linking works: musl's shared `libc.so` runs as `/lib/ld-musl-x86_64.so.1` and loads `NEEDED` libraries, `dlopen` plugins and shared-object TLS (`make run-dynlink-smoke`, part of `make test`; see "Dynamic Linking" in `docs/elf.md`). `mprotect` now covers the execve-loaded program/loader range for RELRO, and `kfree` of `kmalloc_aligned` buffers no longer misreads stale bytes as a block header.
 - libwayland, libffi and libxkbcommon also build as shared libraries (staged in `/usr/lib`), and `peetwl`/`wl_demo` now link dynamically against them; `make run-wlcomp-smoke` covers it.
 - The VM region table grew from 32 to 256 slots per task. The table is no longer copied onto the kernel stack: transactional updates use a heap scratch copy, and `mprotect` re-merges the regions it splits. `make run-dynlink-smoke` checks 120 separate mappings alongside the loaded shared libraries.
+- Platform limits raised for desktop workloads:
+  - The kernel now has a direct map of all RAM, so the PMM manages up to 4 GiB (it was capped at the bootloader's 128 MiB window).
+  - Per-process mapping budget: 256 MiB.
+  - memfd objects: up to 256 MiB.
+  - Tasks: 256.
+  - Sockets: 256.
+  - User-range checks now stop at the end of the lower canonical half, so user mappings can't reach the shared kernel half.
 - The path from here to a full desktop is tracked in `docs/desktop_roadmap.md`.
 - libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the region slots per task (32 then, 256 now).
 

@@ -60,7 +60,7 @@ This document describes the current baseline IPC/synchronization implementation 
 
 **Shared Buffer FDs (`memfd_create`-style baseline)**
 - `memfd_create(name, flags)` is now available for compositor/client buffer sharing.
-- Each memfd is a tmpfs inode in an internal namespace (`/temp/.memfd/...`), returned as a VFS fd, but its contents live in a page-backed shmem object (`kernel/src/shmem.rs`) rather than in tmpfs, so objects can grow to 64 MiB. Pages are allocated zero-filled on first touch.
+- Each memfd is a tmpfs inode in an internal namespace (`/temp/.memfd/...`), returned as a VFS fd, but its contents live in a page-backed shmem object (`kernel/src/shmem.rs`) rather than in tmpfs, so objects can grow to 256 MiB. Pages are allocated zero-filled on first touch.
 - `read`/`write`/`pread64`/`pwrite64`/`lseek`/`fstat`/`ftruncate`/`fallocate` and `MAP_SHARED` faults on a memfd all go through the shmem object (`vfs_*` wrappers in `kernel/src/syscall/io.rs`). Shared mappings map the object's pages directly, each holding a PMM share reference, so pages stay valid after the fd is closed (the libwayland server closes pool fds right after `mmap`).
 - `memfd_create` unlinks the tmpfs file immediately, as Linux memfds have no name. The inode, and with it the shmem object, then lives exactly as long as VFS open references hold it: one per fd (taken in `fd_alloc` and `fd_object_retain`) and one per mapped inode (`vm_sync_inode_pins`). The last release frees the inode and `vfs_inode_freed` destroys the shmem object.
 - Supported flags:
@@ -74,7 +74,7 @@ This document describes the current baseline IPC/synchronization implementation 
 - Descriptor lifecycle follows existing fd-table semantics (`dup*`, `fork`, `exec` close-on-exec handling, close).
 - `mmap` now supports baseline writable shared mappings (`MAP_SHARED` + `PROT_WRITE`) on these fds with shared page-cache backing, so peer mappings observe writes predictably across tasks.
 - Shared-buffer objects are now capped per task (`16` unique memfd inodes) as a resource-hardening guard.
-- Task VMA coverage is now capped (`8192` pages, currently 32 MiB virtual coverage) to bound shared-buffer/event-loop mapping pressure.
+- Task VMA coverage is now capped (`65536` pages, currently 256 MiB virtual coverage) to bound shared-buffer/event-loop mapping pressure.
 
 **Event Loop FDs (`epoll` baseline)**
 - `epoll_create1(flags)` supports baseline instance creation with `EPOLL_CLOEXEC`.
@@ -156,7 +156,7 @@ Limitations / Simplifications
 - Pipe semantics are baseline only: `O_NONBLOCK` plus `poll`/`select`/`epoll` integration are now supported, but there is still no `splice`/`tee`.
 - Futex support covers `WAIT`/`WAKE` (with timeouts), `WAIT_BITSET`/`WAKE_BITSET` (bitsets not used for filtering) and `REQUEUE`/`CMP_REQUEUE`; there is no `WAKE_OP`, priority inheritance or robust-list handling. See `docs/process_model.md`.
 - Shared memory is a baseline System V subset only: no permission checks, no `IPC_STAT`/`IPC_SET`, no `SHM_REMAP`/`SHM_EXEC`. Attachments are inherited by `fork`; `execve` does not detach them yet.
-- `memfd_create` is baseline-only: at most 64 shmem objects system-wide, 64 MiB per object, no hugepage variants, and per-task shared-buffer object caps (`16`) are enforced. Shrinking a memfd drops the object's pages beyond the new size, but pages already mapped stay mapped (Linux would raise `SIGBUS` on access beyond EOF); faults beyond the current size fail.
+- `memfd_create` is baseline-only: at most 64 shmem objects system-wide, 256 MiB per object, no hugepage variants, and per-task shared-buffer object caps (`16`) are enforced. Shrinking a memfd drops the object's pages beyond the new size, but pages already mapped stay mapped (Linux would raise `SIGBUS` on access beyond EOF); faults beyond the current size fail.
 - memfd seals are tracked per inode in a fixed 64-entry table. `F_SEAL_WRITE` does not check for existing writable mappings (Linux returns `-EBUSY`) and does not revoke them; it only blocks new ones and `write`. If the table is full, new memfds behave as if created without `MFD_ALLOW_SEALING`.
 - Event fds are baseline-only: object tables are fixed-size, timer resolution is the 10 ms PIT tick, `TFD_TIMER_CANCEL_ON_SET` is accepted but ignored (there is no settable realtime clock), blocking reads busy-yield instead of sleeping on a wait queue, `signalfd_siginfo` carries only the signal number, and eventfd/timerfd/signalfd descriptors cannot be passed over `SCM_RIGHTS` yet.
 - Signal handling: delivery happens at syscall-return boundaries and requires `SA_RESTORER`. Handlers get a Linux `rt_sigframe` (`siginfo_t`, `ucontext_t`), signals 1..=64 are supported, and blocking waits are interrupted with `SA_RESTART`-aware restart. There are no alternate signal stacks or queued real-time payloads. See `docs/process_model.md`.
@@ -169,5 +169,5 @@ Limitations / Simplifications
   - level-triggered `epoll_create1`/`epoll_ctl`/`epoll_wait` is implemented
   - per-task watch ownership is capped (`64`) for hardening
   - advanced flags/variants (`EPOLLET`, `EPOLLONESHOT`, `epoll_pwait*`) are deferred
-- Socket tables are static: 96 sockets system-wide (`MAX_SOCKETS`) and 48 `AF_UNIX` pathname bindings. A bound socket's filesystem node is a regular file (`stat` does not report `S_IFSOCK`).
+- Socket tables are static: 256 sockets system-wide (`MAX_SOCKETS`, about 2.3 KiB each including the 2 KiB stream buffer) and 128 `AF_UNIX` pathname bindings. A bound socket's filesystem node is a regular file (`stat` does not report `S_IFSOCK`).
 - No message-queue IPC primitives are implemented yet.

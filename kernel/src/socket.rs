@@ -12,12 +12,12 @@ use crate::{tcp, udp};
 /// Socket table size. A libwayland compositor holds one listening socket
 /// per display socket (`wl_display_add_socket_auto` tries up to 33) plus
 /// one per client.
-const MAX_SOCKETS: usize = 96;
+const MAX_SOCKETS: usize = 256;
 const TCP_TIMEOUT_MS: u64 = 30_000;
 const UNIX_STREAM_BUF_SIZE: usize = 2048;
 const UNIX_NO_PEER: u16 = u16::MAX;
 const UNIX_PATH_MAX: usize = 108;
-const UNIX_BINDINGS_MAX: usize = 48;
+const UNIX_BINDINGS_MAX: usize = 128;
 const UNIX_ACCEPT_QUEUE_SIZE: usize = 8;
 const UNIX_RIGHTS_QUEUE_SIZE: usize = 8;
 pub const UNIX_RIGHTS_MAX_FDS: usize = 8;

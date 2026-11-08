@@ -156,7 +156,7 @@ Kernel gaps these tests found (all fixed, with host unit tests):
 - `setitimer`/`getitimer`/`alarm` were missing, so upstream's per-test `alarm()` timeouts never fired.
 - `wait4` reported processes killed by a signal as `exit(128 + sig)`, so `WIFSIGNALED` was never true (upstream checks that crashing clients die with `SIGABRT`).
 - `mmap(MAP_SHARED | MAP_ANONYMOUS)` returned `EINVAL` (`display-test` shares memory with a forked child).
-- Capacity limits that a compositor hits: 32 fds per process (now 128; `Task` is now two pages), 32 sockets (now 96), 16 `AF_UNIX` bindings (now 48), 32 `flock` locks (now 128), and 64 entries per directory (now 128). `wl_display_add_socket_auto` alone can hold 33 sockets and 33 lock files.
+- Capacity limits that a compositor hits: 32 fds per process (now 128; `Task` is now two pages), 32 sockets (now 256), 16 `AF_UNIX` bindings (now 128), 32 `flock` locks (now 128), and 64 entries per directory (no per-directory cap since the ext4 work). `wl_display_add_socket_auto` alone can hold 33 sockets and 33 lock files.
 - Closing a bound `AF_UNIX` socket unlinked its path. Linux leaves the node until `unlink`, and upstream's `absolute_socket_path` checks that.
 
 Limitations / Simplifications

@@ -3,6 +3,14 @@ pub const PAGE_SHIFT: u8 = 12;
 pub const PAGE_OFFSET_MASK: u64 = PAGE_SIZE - 1;
 
 pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+/// Base of the kernel's direct map of all physical RAM (PML4 slot 256, the
+/// start of the kernel half). `PhysAddr::to_virt` points here. Built by
+/// `vmm::init`; the boot mapping at `KERNEL_VIRT_BASE` only covers 128 MiB.
+pub const DIRECT_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
+/// Exclusive end of user space (lower canonical half). Every user range
+/// check must stay below this: the kernel half, including the direct map,
+/// is shared by all address spaces.
+pub const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PhysAddr(u64);
@@ -45,7 +53,7 @@ impl PhysAddr {
     }
 
     pub const fn to_virt(self) -> VirtAddr {
-        VirtAddr(self.0 + KERNEL_VIRT_BASE)
+        VirtAddr(self.0 + DIRECT_MAP_BASE)
     }
 }
 
@@ -79,8 +87,15 @@ impl VirtAddr {
         self.0 & PAGE_OFFSET_MASK
     }
 
+    /// Physical address behind a kernel virtual address in either linear
+    /// mapping: the kernel image / boot window at `KERNEL_VIRT_BASE`, or the
+    /// direct map at `DIRECT_MAP_BASE` (what `PhysAddr::to_virt` returns).
     pub const fn to_phys(self) -> PhysAddr {
-        PhysAddr(self.0 - KERNEL_VIRT_BASE)
+        if self.0 >= KERNEL_VIRT_BASE {
+            PhysAddr(self.0 - KERNEL_VIRT_BASE)
+        } else {
+            PhysAddr(self.0 - DIRECT_MAP_BASE)
+        }
     }
 }
 
@@ -119,6 +134,19 @@ impl core::ops::Sub<u64> for VirtAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_map_and_kernel_window_round_trip() {
+        // to_virt goes through the direct map, beyond the old 128 MiB window.
+        let high = PhysAddr::new(0x1_2345_6000);
+        assert_eq!(high.to_virt().as_u64(), DIRECT_MAP_BASE + 0x1_2345_6000);
+        assert_eq!(high.to_virt().to_phys(), high);
+        // Kernel image / boot window addresses still translate.
+        let kernel = VirtAddr::new(KERNEL_VIRT_BASE + 0x10_0000);
+        assert_eq!(kernel.to_phys().as_u64(), 0x10_0000);
+        // The direct map is kernel-half, above all user space.
+        assert!(DIRECT_MAP_BASE >= USER_SPACE_END);
+    }
 
     #[test]
     fn phys_align_helpers() {
