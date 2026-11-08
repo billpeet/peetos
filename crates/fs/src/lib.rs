@@ -27,7 +27,9 @@ pub use ext2_api::{
     mark_ext2_blocks_synced, mount_ext2_block_backend, set_ext2_block_backend,
     set_ext2_cache_policy,
 };
-pub use ext2_backend::{Ext2BackendKind, Ext2BlockBackend, Ext2BlockReadFn, Ext2BlockWriteFn};
+pub use ext2_backend::{
+    Ext2BackendKind, Ext2BlockBackend, Ext2BlockFlushFn, Ext2BlockReadFn, Ext2BlockWriteFn,
+};
 
 pub const VFS_MAX_PATH: usize = 256;
 pub const VFS_MAX_NAME: usize = 64;
@@ -63,6 +65,8 @@ pub const EROFS: i64 = 30;
 pub const ENAMETOOLONG: i64 = 36;
 pub const EBUSY: i64 = 16;
 pub const ENOTEMPTY: i64 = 39;
+pub const EFBIG: i64 = 27;
+pub const EOVERFLOW: i64 = 75;
 
 const ROOT_INODE: u16 = 0;
 const PROCFS_BUFFER_MAX: usize = 512;
@@ -103,16 +107,21 @@ const EXT2_FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
 const EXT2_FEATURE_COMPAT_DIR_PREALLOC: u32 = 0x0001;
 #[cfg(test)]
 const EXT2_FEATURE_COMPAT_IMAGIC_INODES: u32 = 0x0002;
-#[cfg(test)]
 const EXT2_FEATURE_COMPAT_EXT_ATTR: u32 = 0x0008;
-#[cfg(test)]
 const EXT2_FEATURE_COMPAT_RESIZE_INO: u32 = 0x0010;
-#[cfg(test)]
 const EXT2_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
-// Keep the compat allowlist intentionally narrow. Other ext2/ext3-era compat
-// bits are still parsed for tests and explicit rejection, but the runtime code
-// does not implement their operational semantics yet.
-const EXT2_FEATURE_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_COMPAT_HAS_JOURNAL;
+// The compat allowlist covers the stock `mke2fs -t ext3` feature set. Each bit
+// here has explicit handling (see docs/ext3_parity_audit.md):
+// - EXT_ATTR: xattr blocks are counted in i_blocks and released on delete.
+// - RESIZE_INO: reserved GDT blocks are already marked in-use in the bitmaps,
+//   and the kernel never resizes, so the reservation is preserved untouched.
+// - DIR_INDEX: htree directories are read linearly; the first entry insert
+//   clears EXT2_INDEX_FL so the stale index is never trusted afterwards.
+// DIR_PREALLOC and IMAGIC_INODES remain rejected.
+const EXT2_FEATURE_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_COMPAT_HAS_JOURNAL
+    | EXT2_FEATURE_COMPAT_EXT_ATTR
+    | EXT2_FEATURE_COMPAT_RESIZE_INO
+    | EXT2_FEATURE_COMPAT_DIR_INDEX;
 
 const EXT2_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const EXT2_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
@@ -122,9 +131,21 @@ const EXT2_FEATURE_INCOMPAT_SUPPORTED: u32 = EXT2_FEATURE_INCOMPAT_FILETYPE
     | EXT2_FEATURE_INCOMPAT_JOURNAL_DEV;
 
 const EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
-#[cfg(test)]
+// LARGE_FILE: regular files may carry i_size_high. Files whose size does not
+// fit in 32 bits are detected and refused (EOVERFLOW/EFBIG) rather than
+// silently truncated; stat still reports their full 64-bit size.
 const EXT2_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
-const EXT2_FEATURE_RO_COMPAT_SUPPORTED: u32 = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER;
+#[cfg(test)]
+const EXT2_FEATURE_RO_COMPAT_BTREE_DIR: u32 = 0x0004;
+const EXT2_FEATURE_RO_COMPAT_SUPPORTED: u32 =
+    EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT2_FEATURE_RO_COMPAT_LARGE_FILE;
+
+/// Inode flag: directory uses a hashed b-tree (htree) index.
+const EXT2_INDEX_FL: u32 = 0x0000_1000;
+/// Magic at the start of an external extended-attribute block.
+const EXT2_XATTR_MAGIC: u32 = 0xEA02_0000;
+/// Symlink targets shorter than this may live inline in `i_block`.
+const EXT2_FAST_SYMLINK_MAX: usize = 60;
 
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
@@ -334,6 +355,17 @@ struct Ext2JournalState {
     tx_descriptor_fs_block: u32,
     tx_data_fs_block: u32,
     tx_commit_fs_block: u32,
+    /// Whether the on-disk superblock currently carries INCOMPAT_RECOVER.
+    /// Set before the first commit lands in an empty journal and cleared once
+    /// a checkpoint empties it again, so e2fsck/Linux see "needs recovery"
+    /// exactly while committed-but-uncheckpointed transactions exist.
+    recover_marked: bool,
+    /// JBD2 COMPAT_CHECKSUM: commit blocks carry a CRC32 over the
+    /// transaction's descriptor and journaled blocks, verified on replay.
+    checksum: bool,
+    /// A commit record was written but no barrier has made it durable yet.
+    /// Settled before checkpoint home writes and before flush/sync returns.
+    commit_barrier_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,6 +397,9 @@ impl Ext2JournalState {
             tx_descriptor_fs_block: 0,
             tx_data_fs_block: 0,
             tx_commit_fs_block: 0,
+            recover_marked: false,
+            checksum: false,
+            commit_barrier_pending: false,
         }
     }
 }
@@ -474,6 +509,7 @@ enum Ext2JournalPhaseKind {
     FreeInodeClear,
     IndirectLink,
     IndirectUnlink,
+    XattrRelease,
 }
 
 #[derive(Clone, Copy)]
@@ -635,6 +671,12 @@ struct Ext2Inode {
     gid: u16,
     block_count_512: u32,
     blocks: [u32; 15],
+    /// `i_flags` (offset 32). Read-only here: only dedicated helpers mutate it.
+    flags: u32,
+    /// `i_file_acl` (offset 104): external xattr block, or 0.
+    file_acl: u32,
+    /// `i_size_high` / `i_dir_acl` (offset 108). Read-only here.
+    size_high: u32,
 }
 
 fn with_state<R>(f: impl FnOnce(&mut VfsState) -> R) -> R {
@@ -1829,6 +1871,15 @@ fn ext2_cache_evict_one_clock(state: &mut VfsState) -> Result<(), i64> {
             }
             ext2_cache_flush_block(state, block)?;
         }
+        // Clean now, but possibly newer than its home copy (committed, not yet
+        // checkpointed): make the home copy current before dropping it.
+        ext2_journal::checkpoint_through_block(state, block)?;
+        if idx >= state.ext2_cached_blocks.len()
+            || state.ext2_cached_blocks[idx].block_index != block
+            || state.ext2_cached_blocks[idx].dirty
+        {
+            continue;
+        }
 
         state.ext2_cached_blocks.remove(idx);
         if state.ext2_cached_blocks.is_empty() || idx >= state.ext2_cached_blocks.len() {
@@ -2724,7 +2775,9 @@ fn ext2_recalc_inode_block_count_512(
         3,
     )?);
 
-    Ok(used_blocks.saturating_mul(sectors_per_block))
+    Ok(used_blocks
+        .saturating_mul(sectors_per_block)
+        .saturating_add(ext2_inode_acl_sectors(meta, inode)))
 }
 
 fn ext2_count_indirect_tree_blocks_state(
@@ -2794,7 +2847,135 @@ fn ext2_recalc_inode_block_count_512_state(
         3,
     )?);
 
-    Ok(used_blocks.saturating_mul(sectors_per_block))
+    Ok(used_blocks
+        .saturating_mul(sectors_per_block)
+        .saturating_add(ext2_inode_acl_sectors(&meta, inode)))
+}
+
+/// 512-byte sectors charged to `i_blocks` for the inode's external xattr block.
+fn ext2_inode_acl_sectors(meta: &Ext2Meta, inode: &Ext2Inode) -> u32 {
+    if inode.file_acl != 0 {
+        (meta.block_size / 512) as u32
+    } else {
+        0
+    }
+}
+
+/// Mirrors Linux `ext2_inode_is_fast_symlink`: a symlink whose target lives
+/// inline in `i_block` owns no data blocks (an xattr block does not count).
+fn ext2_inode_is_fast_symlink(meta: &Ext2Meta, inode: &Ext2Inode) -> bool {
+    (inode.mode & EXT2_S_IFMT) == EXT2_S_IFLNK
+        && inode.block_count_512 == ext2_inode_acl_sectors(meta, inode)
+        && (inode.size as usize) < EXT2_FAST_SYMLINK_MAX
+}
+
+/// True when a regular file's size needs `i_size_high`, which the 32-bit
+/// in-memory size paths cannot represent.
+fn ext2_inode_size_exceeds_u32(inode: &Ext2Inode) -> bool {
+    (inode.mode & EXT2_S_IFMT) == EXT2_S_IFREG && inode.size_high != 0
+}
+
+/// Full on-disk size: `i_size_high` only extends regular files (for
+/// directories the same field is the legacy `i_dir_acl`).
+fn ext2_inode_size64(inode: &Ext2Inode) -> u64 {
+    if (inode.mode & EXT2_S_IFMT) == EXT2_S_IFREG {
+        ((inode.size_high as u64) << 32) | inode.size as u64
+    } else {
+        inode.size as u64
+    }
+}
+
+/// Stores a short symlink target inline in `i_block` of a freshly created
+/// (block-less) symlink inode.
+fn ext2_write_fast_symlink_target(state: &mut VfsState, ino: u32, target: &[u8]) -> Result<(), i64> {
+    if target.is_empty() || target.len() >= EXT2_FAST_SYMLINK_MAX {
+        return Err(EINVAL);
+    }
+    let mut inode = ext2_read_inode_from_state(state, ino)?;
+    if (inode.mode & EXT2_S_IFMT) != EXT2_S_IFLNK || inode.block_count_512 != 0 {
+        return Err(EINVAL);
+    }
+    let mut inline = [0u8; EXT2_FAST_SYMLINK_MAX];
+    inline[..target.len()].copy_from_slice(target);
+    let mut i = 0usize;
+    while i < 15 {
+        inode.blocks[i] = u32::from_le_bytes([
+            inline[i * 4],
+            inline[i * 4 + 1],
+            inline[i * 4 + 2],
+            inline[i * 4 + 3],
+        ]);
+        i += 1;
+    }
+    inode.size = target.len() as u32;
+    let now = fs_time_tick(state) as u32;
+    inode.mtime = now;
+    inode.ctime = now;
+    ext2_write_inode_to_state(state, ino, &inode)?;
+    ext2_refresh_alias_nodes(state, ino, &inode);
+    Ok(())
+}
+
+/// Clears `mask` from the on-disk `i_flags` of `ino`. Kept separate from
+/// `ext2_write_inode_to_state` so stale in-memory inode copies can never
+/// resurrect a cleared flag.
+fn ext2_clear_inode_flags_state(state: &mut VfsState, ino: u32, mask: u32) -> Result<(), i64> {
+    let meta = state.ext2_meta;
+    let inode_offset = ext2_inode_offset_in_state(state, &meta, ino)?;
+    ext2_ensure_range_resident(state, inode_offset, meta.inode_size)?;
+    let flags = ext2_read_u32_state(state, inode_offset + 32)?;
+    if (flags & mask) != 0 {
+        ext2_write_u32_state(state, inode_offset + 32, flags & !mask)?;
+    }
+    Ok(())
+}
+
+/// Drops this inode's reference on its external xattr block, freeing the
+/// block when the last reference goes away. A block without the xattr magic
+/// is left allocated rather than freeing something we do not understand.
+fn ext2_release_xattr_block(
+    state: &mut VfsState,
+    journal_handle: Option<Ext2JournalHandle>,
+    inode: &mut Ext2Inode,
+) -> Result<(), i64> {
+    let block = inode.file_acl;
+    if block == 0 {
+        return Ok(());
+    }
+    inode.file_acl = 0;
+    let meta = state.ext2_meta;
+    if block < meta.first_data_block || block >= meta.total_blocks {
+        return Ok(());
+    }
+
+    let free_block = ext2_journal::with_handle_restartable_phase(
+        state,
+        journal_handle,
+        Ext2JournalPhaseKind::XattrRelease,
+        EXT2_JOURNAL_CREDITS_HELPER_XATTR_RELEASE,
+        |state| {
+            let (magic, refcount) = {
+                let blk = ext2_block_slice_state(state, block)?;
+                (read_u32_le(blk, 0)?, read_u32_le(blk, 4)?)
+            };
+            if magic != EXT2_XATTR_MAGIC {
+                return Ok(false);
+            }
+            if refcount > 1 {
+                {
+                    let blk = ext2_block_slice_mut_state(state, block)?;
+                    write_u32_le(blk, 4, refcount - 1)?;
+                }
+                ext2_mark_dirty_block(state, block)?;
+                return Ok(false);
+            }
+            Ok(true)
+        },
+    )?;
+    if free_block {
+        ext2_free_block(state, journal_handle, block)?;
+    }
+    Ok(())
 }
 
 fn ext2_read_inode_from_state(state: &mut VfsState, ino: u32) -> Result<Ext2Inode, i64> {
@@ -2821,6 +3002,9 @@ fn ext2_read_inode_from_state(state: &mut VfsState, ino: u32) -> Result<Ext2Inod
     let gid = ext2_read_u16_state(state, inode_offset + 24)?;
     let links_count = ext2_read_u16_state(state, inode_offset + 26)?;
     let block_count_512 = ext2_read_u32_state(state, inode_offset + 28)?;
+    let flags = ext2_read_u32_state(state, inode_offset + 32)?;
+    let file_acl = ext2_read_u32_state(state, inode_offset + 104)?;
+    let size_high = ext2_read_u32_state(state, inode_offset + 108)?;
 
     let mut blocks = [0u32; 15];
     let mut i = 0usize;
@@ -2840,6 +3024,9 @@ fn ext2_read_inode_from_state(state: &mut VfsState, ino: u32) -> Result<Ext2Inod
         gid,
         block_count_512,
         blocks,
+        flags,
+        file_acl,
+        size_high,
     })
 }
 
@@ -3265,9 +3452,25 @@ fn ext2_read_file(
 
     let meta = state.ext2_meta;
     let inode = ext2_read_inode_from_state(state, ino)?;
+    if ext2_inode_size_exceeds_u32(&inode) {
+        return Err(EOVERFLOW);
+    }
     let size = inode.size as usize;
     if offset as usize >= size {
         return Ok(0);
+    }
+
+    if ext2_inode_is_fast_symlink(&meta, &inode) {
+        let mut inline = [0u8; EXT2_FAST_SYMLINK_MAX];
+        let mut i = 0usize;
+        while i < 15 {
+            inline[i * 4..i * 4 + 4].copy_from_slice(&inode.blocks[i].to_le_bytes());
+            i += 1;
+        }
+        let start = offset as usize;
+        let count = core::cmp::min(dst.len(), size - start);
+        dst[..count].copy_from_slice(&inline[start..start + count]);
+        return Ok(count);
     }
 
     let mut copied = 0usize;
@@ -3308,6 +3511,9 @@ fn ext2_write_file(
     let journal_handle = ext2_journal::current_handle(state);
 
     let mut inode = ext2_read_inode_from_state(state, ino)?;
+    if ext2_inode_size_exceeds_u32(&inode) {
+        return Err(EFBIG);
+    }
     let start = if append {
         inode.size as usize
     } else {
@@ -3445,6 +3651,9 @@ fn ext2_free_indirect_tree_blocks(
 
 fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
     let mut inode = ext2_read_inode_from_state(state, ino)?;
+    if ext2_inode_size_exceeds_u32(&inode) {
+        return Err(EFBIG);
+    }
     let journal_handle = ext2_journal::current_handle(state);
 
     let mut i = 0usize;
@@ -3477,7 +3686,7 @@ fn ext2_truncate_to_zero(state: &mut VfsState, ino: u32) -> Result<(), i64> {
     }
 
     inode.size = 0;
-    inode.block_count_512 = 0;
+    inode.block_count_512 = ext2_inode_acl_sectors(&state.ext2_meta, &inode);
     let now = fs_time_tick(state) as u32;
     inode.mtime = now;
     inode.ctime = now;
@@ -3501,6 +3710,9 @@ fn ext2_truncate_to_length(state: &mut VfsState, ino: u32, length: usize) -> Res
     }
 
     let mut inode = ext2_read_inode_from_state(state, ino)?;
+    if ext2_inode_size_exceeds_u32(&inode) {
+        return Err(EFBIG);
+    }
     let journal_handle = ext2_journal::current_handle(state);
     let old_size = inode.size as usize;
 
@@ -3618,6 +3830,16 @@ where
 
 fn ext2_free_inode_blocks(state: &mut VfsState, inode: &mut Ext2Inode) -> Result<(), i64> {
     let journal_handle = ext2_journal::current_handle(state);
+    let meta = state.ext2_meta;
+    if ext2_inode_is_fast_symlink(&meta, inode) {
+        // i_block holds the inline target text, not block pointers.
+        inode.blocks = [0; 15];
+        ext2_release_xattr_block(state, journal_handle, inode)?;
+        inode.size = 0;
+        inode.block_count_512 = 0;
+        return Ok(());
+    }
+    ext2_release_xattr_block(state, journal_handle, inode)?;
     let mut idx = 0usize;
     while idx < EXT2_INODE_DIRECT_COUNT {
         let block = inode.blocks[idx];
@@ -3720,6 +3942,9 @@ fn ext2_create_child_on_disk(
         gid: 0,
         block_count_512: 0,
         blocks: [0; 15],
+        flags: 0,
+        file_acl: 0,
+        size_high: 0,
     };
 
     if is_dir {
@@ -4130,6 +4355,7 @@ const EXT2_JOURNAL_CREDITS_HELPER_FREE_INODE_BOOKKEEPING: usize = 3;
 const EXT2_JOURNAL_CREDITS_HELPER_FREE_INODE_CLEAR: usize = 1;
 const EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_LINK: usize = 1;
 const EXT2_JOURNAL_CREDITS_HELPER_INDIRECT_UNLINK: usize = 1;
+const EXT2_JOURNAL_CREDITS_HELPER_XATTR_RELEASE: usize = 1;
 
 struct Ext2JournalCreditPlan {
     initial_credits: usize,
@@ -4579,7 +4805,7 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
         stat.uid = ext.uid as u32;
         stat.gid = ext.gid as u32;
         stat.nlink = core::cmp::max(1, ext.links_count as u32);
-        stat.size = ext.size as u64;
+        stat.size = ext2_inode_size64(&ext);
         stat.blksize = state.ext2_meta.block_size as u32;
         stat.blocks = ext.block_count_512 as u64;
         stat.atime = ext.atime as u64;
@@ -5003,7 +5229,16 @@ fn symlink_at_inner(
                 FileType::Symlink,
             )?;
 
-            if !target_bytes.is_empty() {
+            if !target_bytes.is_empty() && target_bytes.len() < EXT2_FAST_SYMLINK_MAX {
+                // Like Linux ext2/ext3, short targets live inline in i_block
+                // (a "fast" symlink); e2fsck rejects short slow symlinks.
+                if let Err(err) = ext2_write_fast_symlink_target(state, ext2_ino, target_bytes) {
+                    let _ =
+                        ext2_remove_dir_entry(state, journal_handle, parent_ino, &name[..name_len]);
+                    let _ = ext2_free_inode(state, journal_handle, ext2_ino, false);
+                    return Err(err);
+                }
+            } else if !target_bytes.is_empty() {
                 let wrote = match ext2_write_file(state, ext2_ino, 0, target_bytes, false) {
                     Ok(w) => w,
                     Err(err) => {
@@ -5932,7 +6167,14 @@ mod tests {
         image: std::vec::Vec<u8>,
         reads: usize,
         writes: usize,
+        flushes: usize,
         fail_write_after: Option<usize>,
+    }
+
+    fn test_ext2_backend_flush(ctx: u64) -> Result<(), i64> {
+        let ctx = unsafe { &mut *(ctx as *mut TestBackendCtx) };
+        ctx.flushes = ctx.flushes.saturating_add(1);
+        Ok(())
     }
 
     fn test_ext2_backend_read(ctx: u64, block_index: u32, out: &mut [u8]) -> Result<(), i64> {
@@ -5977,12 +6219,14 @@ mod tests {
             image: std::vec::Vec::from(image),
             reads: 0,
             writes: 0,
+            flushes: 0,
             fail_write_after: None,
         });
         let backend = Ext2BlockBackend {
             ctx: (&mut *ctx as *mut TestBackendCtx) as u64,
             read_block: test_ext2_backend_read,
             write_block: test_ext2_backend_write,
+            flush: Some(test_ext2_backend_flush),
         };
         set_ext2_block_backend(backend).expect("set block backend");
         let head_len = core::cmp::min(head_len, image.len());
@@ -6000,12 +6244,14 @@ mod tests {
             image: std::vec::Vec::from(image),
             reads: 0,
             writes: 0,
+            flushes: 0,
             fail_write_after: None,
         });
         let backend = Ext2BlockBackend {
             ctx: (&mut *ctx as *mut TestBackendCtx) as u64,
             read_block: test_ext2_backend_read,
             write_block: test_ext2_backend_write,
+            flush: Some(test_ext2_backend_flush),
         };
         set_ext2_block_backend(backend).expect("set block backend");
         let head_len = core::cmp::min(head_len, image.len());
@@ -6074,6 +6320,9 @@ mod tests {
             gid: 0,
             block_count_512: ((journal_blocks.len() * block_size) / 512) as u32,
             blocks: [0; 15],
+            flags: 0,
+            file_acl: 0,
+            size_high: 0,
         };
         for (idx, block) in journal_blocks.iter().enumerate() {
             journal_inode.blocks[idx] = *block;
@@ -6165,6 +6414,9 @@ mod tests {
             gid: 0,
             block_count_512: ((journal_blocks.len() * block_size) / 512) as u32,
             blocks: [0; 15],
+            flags: 0,
+            file_acl: 0,
+            size_high: 0,
         };
         for (idx, block) in journal_blocks.iter().enumerate() {
             journal_inode.blocks[idx] = *block;
@@ -6626,6 +6878,9 @@ mod tests {
             gid: 0,
             block_count_512: 0,
             blocks: [0; 15],
+            flags: 0,
+            file_acl: 0,
+            size_high: 0,
         };
 
         inode.blocks[0] = 2;
@@ -7489,7 +7744,15 @@ mod tests {
             assert_eq!(wrote.written, payload.len());
             ext2_journal::end_mutation_scope(state).expect("end restartable write scope");
 
-            assert!(state.ext2_journal_pending_txs.len() >= 2);
+            // Earlier segments may already have been committed by dirty-pressure
+            // writeback during the write (they used to pile up behind an empty
+            // sealed segment that wedged the queue); either way the operation
+            // must have been split, and its tail must be the closeout segment.
+            assert!(!state.ext2_journal_pending_txs.is_empty());
+            assert!(
+                state.ext2_journal_pending_txs.len() >= 2
+                    || !state.ext2_journal_committed_txs.is_empty()
+            );
             let first_op = state.ext2_journal_pending_txs[0].op_id;
             assert_eq!(first_op, tx_id);
             let last = state.ext2_journal_pending_txs.last().expect("last pending tx");
@@ -7611,6 +7874,9 @@ mod tests {
 
         let (image, _target_block, _payload) = build_internal_journal_replay_image();
         let _ctx = mount_ext2_backend_image(&image, 4096);
+        // Keep dirty-pressure writeback from committing earlier transactions
+        // so the create/write/truncate transactions are all still pending.
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
 
         let file = open("/mnt/ext2/revoke.bin", O_CREAT | O_RDWR, 0).expect("create file");
         let payload = [0xABu8; 2048];
@@ -7631,6 +7897,9 @@ mod tests {
 
         let (image, _target_block, _payload) = build_internal_journal_replay_image();
         let ctx = mount_ext2_backend_image(&image, 4096);
+        // Keep dirty-pressure writeback from committing the create before the
+        // chmod seals, so both sealed transactions are still pending together.
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
 
         let file = open("/mnt/ext2/snapshot.txt", O_CREAT | O_RDWR, 0).expect("create file");
         chmod(file.inode, 0o600).expect("chmod file");
@@ -7852,7 +8121,8 @@ mod tests {
         let commit_off = 43usize * block_size;
         let target_off = (target_block as usize) * block_size;
 
-        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 57);
+        // s_sequence names the oldest live transaction (the one at s_start).
+        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 56);
         assert_eq!(read_u32_be(&ctx.image, journal_super_off + 28), 1);
 
         assert_eq!(read_u32_be(&ctx.image, descriptor_off), 0xC03B_3998);
@@ -7926,7 +8196,8 @@ mod tests {
         let first_target_off = (target_block as usize) * block_size;
         let second_target_off = (second_block as usize) * block_size;
 
-        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 57);
+        // s_sequence names the oldest live transaction (the one at s_start).
+        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 56);
         assert_eq!(read_u32_be(&ctx.image, journal_super_off + 28), 1);
 
         assert_eq!(read_u32_be(&ctx.image, descriptor_off), 0xC03B_3998);
@@ -8008,7 +8279,8 @@ mod tests {
         let second_commit_off = 46usize * block_size;
         let target_off = (target_block as usize) * block_size;
 
-        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 58);
+        // s_sequence names the oldest live transaction (the one at s_start).
+        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 56);
         assert_eq!(read_u32_be(&ctx.image, journal_super_off + 28), 1);
 
         assert_eq!(read_u32_be(&ctx.image, first_descriptor_off), 0xC03B_3998);
@@ -8101,7 +8373,8 @@ mod tests {
         let first_target_off = (target_block as usize) * block_size;
         let second_target_off = (second_block as usize) * block_size;
 
-        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 58);
+        // s_sequence names the oldest live transaction (the one at s_start).
+        assert_eq!(read_u32_be(&ctx.image, journal_super_off + 24), 57);
         assert_eq!(read_u32_be(&ctx.image, journal_super_off + 28), 4);
 
         assert_eq!(read_u32_be(&ctx.image, descriptor_off), 0xC03B_3998);
@@ -8284,9 +8557,6 @@ mod tests {
         let unsupported_compat = [
             EXT2_FEATURE_COMPAT_DIR_PREALLOC,
             EXT2_FEATURE_COMPAT_IMAGIC_INODES,
-            EXT2_FEATURE_COMPAT_EXT_ATTR,
-            EXT2_FEATURE_COMPAT_RESIZE_INO,
-            EXT2_FEATURE_COMPAT_DIR_INDEX,
         ];
 
         for feature in unsupported_compat {
@@ -8311,7 +8581,7 @@ mod tests {
         write_u32_le(
             &mut bad,
             ro_compat_off,
-            ro_compat | EXT2_FEATURE_RO_COMPAT_LARGE_FILE,
+            ro_compat | EXT2_FEATURE_RO_COMPAT_BTREE_DIR,
         )
         .expect("set unsupported ro compat");
 
@@ -8593,6 +8863,7 @@ mod tests {
             ctx: 0xA5A5,
             read_block: dummy_ext2_backend_read,
             write_block: dummy_ext2_backend_write,
+            flush: None,
         };
 
         set_ext2_block_backend(backend).expect("set block backend");
@@ -8940,5 +9211,950 @@ mod tests {
             open("/mnt/ext2/todir", O_RDONLY | O_DIRECTORY, 0).unwrap_err(),
             ENOENT
         );
+    }
+
+    // ---- Stock `mke2fs -t ext3` image (user/sample_ext3.img) ----
+    //
+    // Built by scripts/build_ext3_sample.sh with the default ext3 feature set:
+    // has_journal ext_attr resize_inode dir_index filetype sparse_super
+    // large_file. Contents: hello.txt, sub/nested.txt, bigdir/ (50 entries,
+    // htree-indexed), xattr_block.txt (external xattr block),
+    // xattr_inline.txt (in-inode xattr), large.bin (sparse 5 GiB), and
+    // fastlink -> hello.txt (inline fast symlink).
+
+    static SAMPLE_EXT3: &[u8] = include_bytes!("../../../user/sample_ext3.img");
+    const EXT3_BIGDIR_ENTRIES: usize = 50;
+    /// 70 bytes: too long for i_block, so it must become a slow symlink.
+    const EXT3_LONG_SYMLINK_TARGET: &str =
+        "../bigdir/entry_with_a_fairly_long_name_001/../../sub/nested.txt/x/y/z";
+
+    fn mount_sample_ext3() -> std::boxed::Box<TestBackendCtx> {
+        mount_ext2_backend_image(SAMPLE_EXT3, 4096)
+    }
+
+    fn ext2_raw_inode_for_path(path: &str) -> (u32, Ext2Inode) {
+        let node = lookup(path).expect("lookup ext2 path");
+        let ino = stat(node).expect("stat ext2 path").ino as u32;
+        let inode = with_state(|state| ext2_read_inode_from_state(state, ino)).expect("read inode");
+        (ino, inode)
+    }
+
+    fn ext2_free_counts() -> (u32, u32) {
+        with_state(|state| {
+            let blocks = ext2_read_u32_state(state, EXT2_SUPERBLOCK_OFFSET + 12)?;
+            let inodes = ext2_read_u32_state(state, EXT2_SUPERBLOCK_OFFSET + 16)?;
+            Ok::<_, i64>((blocks, inodes))
+        })
+        .expect("read superblock free counts")
+    }
+
+    fn ext2_block_in_use(block: u32) -> bool {
+        with_state(|state| {
+            let meta = state.ext2_meta;
+            let (group, bit) = ext2_block_group_and_bit(&meta, block)?;
+            let bitmap_block = ext2_group_block_bitmap_block_state(state, &meta, group)?;
+            let bitmap = ext2_block_slice_state(state, bitmap_block)?;
+            ext2_bitmap_get(bitmap, bit)
+        })
+        .expect("read block bitmap")
+    }
+
+    fn count_dir_entries(path: &str) -> usize {
+        let dir = open(path, O_RDONLY | O_DIRECTORY, 0).expect("open dir");
+        let mut offset = 0u64;
+        let mut count = 0usize;
+        while let Some(entry) = readdir(dir.inode, offset).expect("readdir") {
+            let name = &entry.name[..entry.name_len];
+            if name != b"." && name != b".." {
+                count += 1;
+            }
+            offset = entry.next_offset;
+        }
+        count
+    }
+
+    fn read_whole(path: &str) -> std::vec::Vec<u8> {
+        let opened = open(path, O_RDONLY, 0).expect("open for read");
+        let mut buf = std::vec![0u8; 256];
+        let n = read(opened.inode, 0, &mut buf).expect("read file");
+        buf.truncate(n);
+        buf
+    }
+
+    #[test]
+    fn ext3_stock_image_mounts_with_default_feature_set() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        let compat = read_u32_le(SAMPLE_EXT3, EXT2_SUPERBLOCK_OFFSET + 92).unwrap();
+        let ro_compat = read_u32_le(SAMPLE_EXT3, EXT2_SUPERBLOCK_OFFSET + 100).unwrap();
+        for bit in [
+            EXT2_FEATURE_COMPAT_HAS_JOURNAL,
+            EXT2_FEATURE_COMPAT_EXT_ATTR,
+            EXT2_FEATURE_COMPAT_RESIZE_INO,
+            EXT2_FEATURE_COMPAT_DIR_INDEX,
+        ] {
+            assert_ne!(compat & bit, 0, "fixture missing compat bit {bit:#x}");
+        }
+        assert_ne!(ro_compat & EXT2_FEATURE_RO_COMPAT_LARGE_FILE, 0);
+
+        let _ctx = mount_sample_ext3();
+        assert!(ext2_has_journal());
+        assert_eq!(read_whole("/mnt/ext2/hello.txt"), b"hello ext3\n");
+        assert_eq!(read_whole("/mnt/ext2/sub/nested.txt"), b"nested\n");
+        assert_eq!(read_whole("/mnt/ext2/xattr_block.txt"), b"xattr block file\n");
+        assert_eq!(read_whole("/mnt/ext2/xattr_inline.txt"), b"xattr inline file\n");
+    }
+
+    #[test]
+    fn ext3_htree_directory_reads_linearly() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext3();
+
+        let (_, bigdir) = ext2_raw_inode_for_path("/mnt/ext2/bigdir");
+        assert_ne!(bigdir.flags & EXT2_INDEX_FL, 0, "fixture dir should be htree-indexed");
+        assert!(bigdir.size as usize > 1024, "fixture dir should span several blocks");
+
+        assert_eq!(count_dir_entries("/mnt/ext2/bigdir"), EXT3_BIGDIR_ENTRIES);
+        assert_eq!(
+            read_whole("/mnt/ext2/bigdir/entry_with_a_fairly_long_name_037"),
+            b"37\n"
+        );
+    }
+
+    #[test]
+    fn ext3_htree_insert_clears_index_flag_and_persists() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext3();
+
+        let created = open("/mnt/ext2/bigdir/added_after_mount", O_CREAT | O_RDWR, 0)
+            .expect("create in htree dir");
+        let _ = write(created.inode, 0, b"new", false).expect("write new entry");
+
+        let (_, bigdir) = ext2_raw_inode_for_path("/mnt/ext2/bigdir");
+        assert_eq!(bigdir.flags & EXT2_INDEX_FL, 0, "insert must drop the stale htree index");
+
+        let mut exported = std::vec![0u8; SAMPLE_EXT3.len()];
+        let image_len = export_ext2_image(&mut exported).expect("export");
+        init();
+        let _ctx2 = mount_ext2_backend_image(&exported[..image_len], 4096);
+        assert_eq!(count_dir_entries("/mnt/ext2/bigdir"), EXT3_BIGDIR_ENTRIES + 1);
+        assert_eq!(read_whole("/mnt/ext2/bigdir/added_after_mount"), b"new");
+        assert_eq!(
+            read_whole("/mnt/ext2/bigdir/entry_with_a_fairly_long_name_001"),
+            b"1\n"
+        );
+    }
+
+    #[test]
+    fn ext3_xattr_block_is_counted_and_released_on_unlink() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext3();
+
+        let (_, inode) = ext2_raw_inode_for_path("/mnt/ext2/xattr_block.txt");
+        let xattr_block = inode.file_acl;
+        assert_ne!(xattr_block, 0, "fixture file should own an xattr block");
+        assert!(ext2_block_in_use(xattr_block));
+
+        // O_TRUNC + rewrite must keep the xattr block charged in i_blocks.
+        let opened = open("/mnt/ext2/xattr_block.txt", O_WRONLY | O_TRUNC, 0).expect("trunc");
+        let after_trunc = stat(opened.inode).expect("stat after trunc");
+        assert_eq!(after_trunc.blocks, 2, "1 KiB xattr block = 2 sectors");
+        let _ = write(opened.inode, 0, b"rewritten", false).expect("rewrite");
+        assert_eq!(stat(opened.inode).unwrap().blocks, 4);
+        let (_, inode) = ext2_raw_inode_for_path("/mnt/ext2/xattr_block.txt");
+        assert_eq!(inode.file_acl, xattr_block, "rewrite must keep i_file_acl");
+
+        let (free_blocks_before, _) = ext2_free_counts();
+        unlink("/mnt/ext2/xattr_block.txt").expect("unlink xattr file");
+        assert!(!ext2_block_in_use(xattr_block), "xattr block should be freed");
+        let (free_blocks_after, _) = ext2_free_counts();
+        assert_eq!(free_blocks_after, free_blocks_before + 2, "data block + xattr block");
+    }
+
+    #[test]
+    fn ext3_shared_xattr_block_only_drops_refcount() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        // Find the xattr block in the raw fixture and mark it shared (refcount 2).
+        let _ctx = mount_sample_ext3();
+        let (_, inode) = ext2_raw_inode_for_path("/mnt/ext2/xattr_block.txt");
+        let xattr_block = inode.file_acl;
+        init();
+        let mut image = std::vec::Vec::from(SAMPLE_EXT3);
+        let off = xattr_block as usize * 1024;
+        assert_eq!(read_u32_le(&image, off).unwrap(), EXT2_XATTR_MAGIC);
+        assert_eq!(read_u32_le(&image, off + 4).unwrap(), 1);
+        write_u32_le(&mut image, off + 4, 2).unwrap();
+
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        unlink("/mnt/ext2/xattr_block.txt").expect("unlink");
+        assert!(ext2_block_in_use(xattr_block), "shared xattr block must stay allocated");
+        let refcount = with_state(|state| {
+            let blk = ext2_block_slice_state(state, xattr_block)?;
+            read_u32_le(blk, 4)
+        })
+        .unwrap();
+        assert_eq!(refcount, 1);
+    }
+
+    #[test]
+    fn ext3_fast_symlink_reads_inline_target_and_unlinks_without_freeing_blocks() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext3();
+
+        let mut buf = [0u8; 64];
+        let n = readlinkat(root_inode(), "/mnt/ext2/fastlink", &mut buf).expect("readlink");
+        assert_eq!(&buf[..n], b"hello.txt");
+
+        let (free_blocks_before, free_inodes_before) = ext2_free_counts();
+        unlink("/mnt/ext2/fastlink").expect("unlink fast symlink");
+        let (free_blocks_after, free_inodes_after) = ext2_free_counts();
+        assert_eq!(free_blocks_after, free_blocks_before, "fast symlink owns no blocks");
+        assert_eq!(free_inodes_after, free_inodes_before + 1);
+        assert_eq!(read_whole("/mnt/ext2/hello.txt"), b"hello ext3\n");
+
+        // Short symlinks the kernel creates must be fast too (no data block).
+        let (free_blocks_before, _) = ext2_free_counts();
+        symlinkat(root_inode(), "sub/nested.txt", "/mnt/ext2/newfast").expect("symlink");
+        assert_eq!(ext2_free_counts().0, free_blocks_before, "fast symlink allocates no block");
+        let n = readlinkat(root_inode(), "/mnt/ext2/newfast", &mut buf).expect("readlink new");
+        assert_eq!(&buf[..n], b"sub/nested.txt");
+        unlink("/mnt/ext2/newfast").expect("unlink new fast symlink");
+        assert_eq!(ext2_free_counts().0, free_blocks_before);
+    }
+
+    #[test]
+    fn ext3_large_file_reports_full_size_and_refuses_32bit_io() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext3();
+
+        let opened = open("/mnt/ext2/large.bin", O_RDONLY, 0).expect("open large file");
+        assert_eq!(stat(opened.inode).unwrap().size, 5 * 1024 * 1024 * 1024);
+        let mut buf = [0u8; 8];
+        assert_eq!(read(opened.inode, 0, &mut buf).unwrap_err(), EOVERFLOW);
+        let writer = open("/mnt/ext2/large.bin", O_WRONLY, 0).expect("open large for write");
+        assert_eq!(write(writer.inode, 0, b"x", false).unwrap_err(), EFBIG);
+        assert_eq!(
+            open("/mnt/ext2/large.bin", O_WRONLY | O_TRUNC, 0).unwrap_err(),
+            EFBIG
+        );
+
+        // Unlink walks the block tree (1 data block + 3 indirect tables).
+        let (free_blocks_before, _) = ext2_free_counts();
+        unlink("/mnt/ext2/large.bin").expect("unlink large file");
+        let (free_blocks_after, _) = ext2_free_counts();
+        assert_eq!(free_blocks_after, free_blocks_before + 4);
+    }
+
+    /// Regression: freeing blocks that were dirtied in the same ordered
+    /// transaction (large.bin's indirect tables) used to leave a revoke-only
+    /// remainder in the pending queue, so a later batched flush failed with
+    /// EIO. Freed blocks are now forgotten (revoke only) and the queue drains.
+    #[test]
+    fn ext3_freed_dirty_blocks_do_not_wedge_pending_transactions() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext3();
+
+        unlink("/mnt/ext2/large.bin").expect("unlink large file");
+        let (freed_revokes, freed_tracked) = with_state(|state| {
+            let tx = state.ext2_journal_pending_txs.last().expect("sealed unlink tx");
+            (tx.revoke_blocks.len(), tx.metadata_blocks.clone())
+        });
+        assert_eq!(freed_revokes, 4, "1 data block + 3 indirect tables revoked");
+        let revoked =
+            with_state(|state| state.ext2_journal_pending_txs.last().unwrap().revoke_blocks.clone());
+        for block in &revoked {
+            assert!(
+                !freed_tracked.contains(block),
+                "freed block {block} must not also be journaled"
+            );
+        }
+
+        mkdir("/mnt/ext2/sub/after_free").expect("mkdir reusing freed blocks");
+        flush_ext2_dirty_blocks().expect("batched flush must not wedge");
+        assert!(with_state(|state| state.ext2_journal_pending_txs.is_empty()));
+        checkpoint_ext2_journal().expect("checkpoint");
+    }
+
+    fn image_incompat(image: &[u8]) -> u32 {
+        read_u32_le(image, EXT2_SUPERBLOCK_OFFSET + 96).unwrap()
+    }
+
+    /// Journal superblock `s_start` straight from a raw image (the journal
+    /// superblock is the first block of the journal inode, inode 8).
+    fn image_journal_start(image: &[u8]) -> u32 {
+        let meta = ext2_parse_meta_with_len(image, image.len(), true).unwrap();
+        let ino_off = ext2_inode_offset_in_image(image, &meta, meta.journal_inode).unwrap();
+        let first_block = read_u32_le(image, ino_off + 40).unwrap() as usize;
+        read_u32_be(image, first_block * meta.block_size + 28)
+    }
+
+    #[test]
+    fn ext3_recover_flag_tracks_live_journal_transactions() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+        assert_eq!(image_incompat(&ctx.image) & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+
+        let created = open("/mnt/ext2/recover.txt", O_CREAT | O_RDWR, 0).expect("create");
+        let _ = write(created.inode, 0, b"journaled", false).expect("write");
+        flush_ext2_dirty_blocks().expect("flush");
+
+        // Committed but not checkpointed: disk must say "needs recovery".
+        assert_ne!(image_journal_start(&ctx.image), 0);
+        assert_ne!(image_incompat(&ctx.image) & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+        assert!(with_state(|state| ext2_journal::recover_marked(state)));
+
+        checkpoint_ext2_journal().expect("checkpoint");
+        assert_eq!(image_journal_start(&ctx.image), 0);
+        assert_eq!(image_incompat(&ctx.image) & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+        assert!(!with_state(|state| ext2_journal::recover_marked(state)));
+
+        // A later commit marks it again.
+        let _ = write(created.inode, 0, b"journaled again", false).expect("rewrite");
+        flush_ext2_dirty_blocks().expect("flush again");
+        assert_ne!(image_incompat(&ctx.image) & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+    }
+
+    /// Simulated crash: commit transactions to the journal but never
+    /// checkpoint, then treat the backend image as the disk after power loss.
+    /// The kernel's own mount must replay it; when `PEETOS_EXT3_CRASH_IMAGE`
+    /// is set the image is written there so tests/ext3_fsck.sh can have
+    /// e2fsck (Linux's jbd2 recovery code) replay it too.
+    #[test]
+    fn ext3_crash_image_needs_recovery_and_replays() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+
+        let created = open("/mnt/ext2/bigdir/crash_new", O_CREAT | O_RDWR, 0).expect("create");
+        let _ = write(created.inode, 0, b"survives crash", false).expect("write");
+        unlink("/mnt/ext2/xattr_block.txt").expect("unlink xattr file");
+        unlink("/mnt/ext2/large.bin").expect("unlink large file");
+        mkdir("/mnt/ext2/sub/crash_dir").expect("mkdir");
+        symlinkat(root_inode(), "../hello.txt", "/mnt/ext2/sub/crash_link").expect("symlink");
+        flush_ext2_dirty_blocks().expect("flush without checkpoint");
+
+        let crashed = ctx.image.clone();
+        assert_ne!(image_incompat(&crashed) & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+        assert_ne!(image_journal_start(&crashed), 0);
+        if let Ok(path) = std::env::var("PEETOS_EXT3_CRASH_IMAGE") {
+            std::fs::write(&path, &crashed).expect("write crash image");
+        }
+
+        init();
+        let ctx2 = mount_ext2_backend_image(&crashed, 4096);
+        assert_eq!(image_incompat(&ctx2.image) & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+        assert_eq!(image_journal_start(&ctx2.image), 0);
+        assert_eq!(read_whole("/mnt/ext2/bigdir/crash_new"), b"survives crash");
+        assert_eq!(open("/mnt/ext2/xattr_block.txt", O_RDONLY, 0).unwrap_err(), ENOENT);
+        assert_eq!(open("/mnt/ext2/large.bin", O_RDONLY, 0).unwrap_err(), ENOENT);
+        let _ = open("/mnt/ext2/sub/crash_dir", O_RDONLY | O_DIRECTORY, 0).expect("dir replayed");
+        let mut buf = [0u8; 32];
+        let n = readlinkat(root_inode(), "/mnt/ext2/sub/crash_link", &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"../hello.txt");
+    }
+
+    fn ext2_inode_in_use(ino: u32) -> bool {
+        with_state(|state| {
+            let meta = state.ext2_meta;
+            let (group, bit) = ext2_inode_group_and_bit(&meta, ino)?;
+            let bitmap_block = ext2_group_inode_bitmap_block_state(state, &meta, group)?;
+            let bitmap = ext2_block_slice_state(state, bitmap_block)?;
+            ext2_bitmap_get(bitmap, bit)
+        })
+        .expect("read inode bitmap")
+    }
+
+    fn flush_pending_txs(count: usize) {
+        with_state(|state| {
+            let target = state.ext2_journal_pending_txs.len().saturating_sub(count);
+            while state.ext2_journal_pending_txs.len() > target {
+                let flushed = ext2_journal::flush_oldest_ordered_pending_tx(state, 64)
+                    .expect("flush oldest pending tx");
+                assert!(flushed > 0, "pending queue must make progress");
+            }
+        });
+    }
+
+    /// Risk: committing an older transaction used to strip shared metadata
+    /// blocks (inode bitmap, group descriptors, superblock, parent directory)
+    /// from every *newer* pending transaction, so the newer transaction
+    /// committed without its own changes to them. A crash right after that
+    /// commit replayed a file whose inode was not marked in-use.
+    #[test]
+    fn ext3_newer_transaction_keeps_its_snapshot_of_shared_blocks() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+        // Hold both sealed transactions in the pending queue until the test
+        // flushes them explicitly.
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+
+        let a = open("/mnt/ext2/sub/shared_a", O_CREAT | O_RDWR, 0).expect("create a");
+        let b = open("/mnt/ext2/sub/shared_b", O_CREAT | O_RDWR, 0).expect("create b");
+        let b_ino = stat(b.inode).unwrap().ino as u32;
+        let _ = a;
+
+        let inode_bitmap = with_state(|state| {
+            let meta = state.ext2_meta;
+            let (group, _) = ext2_inode_group_and_bit(&meta, b_ino).unwrap();
+            ext2_group_inode_bitmap_block_state(state, &meta, group).unwrap()
+        });
+        let owners = with_state(|state| {
+            state
+                .ext2_journal_pending_txs
+                .iter()
+                .filter(|tx| tx.metadata_blocks.binary_search(&inode_bitmap).is_ok())
+                .count()
+        });
+        assert_eq!(owners, 2, "both creates must journal the shared inode bitmap");
+
+        flush_pending_txs(1);
+        let newer_still_owns = with_state(|state| {
+            state.ext2_journal_pending_txs.iter().any(|tx| {
+                tx.metadata_blocks.binary_search(&inode_bitmap).is_ok()
+                    && tx.metadata_snapshots.iter().any(|s| s.home_block == inode_bitmap)
+            })
+        });
+        assert!(newer_still_owns, "newer transaction lost its inode bitmap snapshot");
+
+        // Commit the newer transaction too, then "crash" before any further
+        // writeback or checkpoint.
+        flush_pending_txs(1);
+        let crashed = ctx.image.clone();
+        init();
+        let _ctx2 = mount_ext2_backend_image(&crashed, 4096);
+        let _ = open("/mnt/ext2/sub/shared_b", O_RDONLY, 0).expect("b replayed");
+        assert!(ext2_inode_in_use(b_ino), "replayed inode must be marked in the bitmap");
+    }
+
+    /// Risk: a block journaled by an older committed transaction, then freed
+    /// (revoked) and reused as ordered file data by a newer one, used to be
+    /// overwritten with the stale journaled copy when the older transaction
+    /// was checkpointed.
+    #[test]
+    fn ext3_checkpoint_does_not_overwrite_reused_freed_block() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+
+        // f1 spills into an indirect table (journaled metadata).
+        let f1 = open("/mnt/ext2/sub/reuse_f1", O_CREAT | O_RDWR, 0).expect("create f1");
+        let _ = write(f1.inode, 0, &[0x11u8; 13 * 1024], false).expect("write f1");
+        flush_ext2_dirty_blocks().expect("commit f1");
+        let (_, f1_inode) = ext2_raw_inode_for_path("/mnt/ext2/sub/reuse_f1");
+        let table_block = f1_inode.blocks[12];
+        assert_ne!(table_block, 0);
+        let journaled = with_state(|state| {
+            state
+                .ext2_journal_committed_txs
+                .iter()
+                .any(|tx| tx.updates.iter().any(|u| u.home_block == table_block))
+        });
+        assert!(journaled, "indirect table should sit in a committed, uncheckpointed tx");
+
+        // Free everything (revokes the table), then reuse the freed range as
+        // file data. A 1-block file first shifts allocation by one so the old
+        // table block becomes a *data* block of f2.
+        unlink("/mnt/ext2/sub/reuse_f1").expect("unlink f1");
+        let f0 = open("/mnt/ext2/sub/reuse_f0", O_CREAT | O_RDWR, 0).expect("create f0");
+        let _ = write(f0.inode, 0, b"x", false).expect("write f0");
+        let f2 = open("/mnt/ext2/sub/reuse_f2", O_CREAT | O_RDWR, 0).expect("create f2");
+        let _ = write(f2.inode, 0, &[0x22u8; 13 * 1024], false).expect("write f2");
+        flush_ext2_dirty_blocks().expect("commit reuse");
+
+        let (_, f2_inode) = ext2_raw_inode_for_path("/mnt/ext2/sub/reuse_f2");
+        assert!(
+            f2_inode.blocks[..12].contains(&table_block),
+            "test setup: old table block {table_block} should be reused as f2 data"
+        );
+
+        checkpoint_ext2_journal().expect("checkpoint");
+        let mut buf = std::vec![0u8; 13 * 1024];
+        let reopened = open("/mnt/ext2/sub/reuse_f2", O_RDONLY, 0).unwrap();
+        let n = read(reopened.inode, 0, &mut buf).unwrap();
+        assert_eq!(n, buf.len());
+        assert!(buf.iter().all(|&b| b == 0x22), "live view corrupted by checkpoint");
+
+        let synced = ctx.image.clone();
+        init();
+        let _ctx2 = mount_ext2_backend_image(&synced, 4096);
+        let reopened = open("/mnt/ext2/sub/reuse_f2", O_RDONLY, 0).unwrap();
+        let n = read(reopened.inode, 0, &mut buf).unwrap();
+        assert_eq!(n, buf.len());
+        assert!(buf.iter().all(|&b| b == 0x22), "on-disk f2 data overwritten by checkpoint");
+    }
+
+    /// One transaction larger than a descriptor block's 126 tags must commit
+    /// atomically as a single journal transaction with several descriptor
+    /// blocks (it used to be torn into independent commits), and replay.
+    #[test]
+    fn ext3_large_transaction_spans_descriptor_blocks_and_replays() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+
+        const COUNT: usize = 200;
+        let mut targets = std::vec::Vec::new();
+        let mut block = 2047u32;
+        while targets.len() < COUNT {
+            if !ext2_block_in_use(block) {
+                targets.push(block);
+            }
+            block -= 1;
+        }
+        targets.sort_unstable();
+        let pattern = |b: u32| (b % 251) as u8 ^ 0x5A;
+
+        with_state(|state| {
+            for &b in &targets {
+                ext2_block_slice_mut_state(state, b).unwrap().fill(pattern(b));
+                ext2_mark_dirty_block(state, b).unwrap();
+            }
+            let committed = ext2_journal::flush_dirty_batch(state, 1000).expect("commit");
+            assert_eq!(committed, COUNT);
+            assert_eq!(state.ext2_journal_committed_txs.len(), 1, "one atomic transaction");
+            // 200 data blocks + 2 descriptors (126 tags each) + 1 commit.
+            assert_eq!(state.ext2_journal_committed_txs[0].log_block_count, 203);
+        });
+
+        let crashed = ctx.image.clone();
+        if let Ok(path) = std::env::var("PEETOS_EXT3_MULTIDESC_IMAGE") {
+            std::fs::write(&path, &crashed).expect("write multi-descriptor image");
+            let list: std::string::String = targets
+                .iter()
+                .map(|b| std::format!("{} {}\n", b, pattern(*b)))
+                .collect();
+            std::fs::write(std::format!("{path}.blocks"), list).expect("write block list");
+        }
+
+        init();
+        let ctx2 = mount_ext2_backend_image(&crashed, 4096);
+        for &b in &targets {
+            let off = b as usize * 1024;
+            assert!(
+                ctx2.image[off..off + 1024].iter().all(|&x| x == pattern(b)),
+                "block {b} not replayed"
+            );
+        }
+    }
+
+    // ---- Journal checksums, features, and barrier cost ----
+
+    fn image_journal_super_off(image: &[u8]) -> usize {
+        let meta = ext2_parse_meta_with_len(image, image.len(), true).unwrap();
+        let ino_off = ext2_inode_offset_in_image(image, &meta, meta.journal_inode).unwrap();
+        read_u32_le(image, ino_off + 40).unwrap() as usize * meta.block_size
+    }
+
+    #[test]
+    fn ext3_crc32_be_matches_jbd2_definition() {
+        // CRC-32/MPEG-2 check value: Linux crc32_be(~0, "123456789").
+        assert_eq!(ext2_journal::crc32_be_for_test(!0, b"123456789"), 0x0376_E6E7);
+    }
+
+    #[test]
+    fn ext3_mount_enables_journal_checksums_and_commits_carry_crc32() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let jsb = image_journal_super_off(SAMPLE_EXT3);
+        assert_eq!(read_u32_be(SAMPLE_EXT3, jsb + 36) & 1, 0, "stock journal has no checksum");
+
+        let ctx = mount_sample_ext3();
+        assert!(with_state(|state| ext2_journal::checksum_enabled_for_test(state)));
+        assert_eq!(read_u32_be(&ctx.image, jsb + 36) & 1, 1, "COMPAT_CHECKSUM persisted");
+
+        let created = open("/mnt/ext2/csum.txt", O_CREAT | O_RDWR, 0).expect("create");
+        let _ = write(created.inode, 0, b"checksummed", false).expect("write");
+        flush_ext2_dirty_blocks().expect("flush");
+
+        // Recompute each committed transaction's CRC from the raw log and
+        // compare with its commit block.
+        let txs: std::vec::Vec<(u32, u32)> = with_state(|state| {
+            state
+                .ext2_journal_committed_txs
+                .iter()
+                .map(|tx| (tx.descriptor_jblock, tx.log_block_count))
+                .collect()
+        });
+        assert!(!txs.is_empty());
+        for (descriptor_jblock, log_blocks) in txs {
+            let mut crc = !0u32;
+            let mut commit_fs = 0u32;
+            for i in 0..log_blocks {
+                let fs_block = with_state(|state| {
+                    ext2_journal::journal_fs_block_for_test(state, descriptor_jblock + i)
+                })
+                .unwrap() as usize;
+                let blk = &ctx.image[fs_block * 1024..fs_block * 1024 + 1024];
+                let block_type = read_u32_be(blk, 4);
+                if i + 1 == log_blocks {
+                    assert_eq!(block_type, 2, "last log block is the commit");
+                    commit_fs = fs_block as u32;
+                } else if block_type != 5 {
+                    // Descriptors and journaled data count; revoke blocks don't.
+                    crc = ext2_journal::crc32_be_for_test(crc, blk);
+                }
+            }
+            let commit = &ctx.image[commit_fs as usize * 1024..commit_fs as usize * 1024 + 1024];
+            assert_eq!(commit[12], 1, "h_chksum_type = JBD2_CRC32_CHKSUM");
+            assert_eq!(commit[13], 4, "h_chksum_size");
+            assert_eq!(read_u32_be(commit, 16), crc, "commit CRC32");
+        }
+    }
+
+    /// A journaled block damaged after its commit (a torn or misdirected
+    /// write the barrier could not prevent) must stop replay at that
+    /// transaction instead of writing garbage home.
+    #[test]
+    fn ext3_corrupted_journal_block_stops_replay_at_that_transaction() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+
+        let a = open("/mnt/ext2/sub/csum_a", O_CREAT | O_RDWR, 0).expect("create a");
+        let _ = write(a.inode, 0, b"intact", false).expect("write a");
+        flush_ext2_dirty_blocks().expect("commit a");
+        let before_b = with_state(|state| state.ext2_journal_committed_txs.len());
+
+        let _b = open("/mnt/ext2/sub/csum_b", O_CREAT | O_RDWR, 0).expect("create b");
+        flush_ext2_dirty_blocks().expect("commit b");
+        let victim_fs = with_state(|state| {
+            let tx = &state.ext2_journal_committed_txs[before_b];
+            let jblock = tx.updates[0].journal_block;
+            ext2_journal::journal_fs_block_for_test(state, jblock)
+        })
+        .unwrap() as usize;
+
+        let mut crashed = ctx.image.clone();
+        crashed[victim_fs * 1024 + 100] ^= 0xFF;
+        if let Ok(path) = std::env::var("PEETOS_EXT3_CORRUPT_IMAGE") {
+            std::fs::write(&path, &crashed).expect("write corrupt image");
+        }
+
+        init();
+        let _ctx2 = mount_ext2_backend_image(&crashed, 4096);
+        assert_eq!(read_whole("/mnt/ext2/sub/csum_a"), b"intact", "earlier tx replays");
+        assert_eq!(
+            open("/mnt/ext2/sub/csum_b", O_RDONLY, 0).unwrap_err(),
+            ENOENT,
+            "transaction with a bad checksum must not replay"
+        );
+    }
+
+    #[test]
+    fn ext3_mount_rejects_unknown_journal_incompat_features() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        for bit in [0x2u32, 0x4, 0x8, 0x10] {
+            init();
+            let mut image = std::vec::Vec::from(SAMPLE_EXT3);
+            let jsb = image_journal_super_off(&image);
+            let incompat = read_u32_be(&image, jsb + 40);
+            image[jsb + 40..jsb + 44].copy_from_slice(&(incompat | bit).to_be_bytes());
+            assert_eq!(mount_ext2_backend_image_expect_err(&image, 4096), EINVAL, "bit {bit:#x}");
+        }
+    }
+
+    /// The post-commit barrier is deferred to the end of the flush: N commits
+    /// cost N + 1 device flushes instead of 2N.
+    #[test]
+    fn ext3_flush_issues_one_barrier_per_commit_plus_one() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+        for name in ["/mnt/ext2/sub/bar_1", "/mnt/ext2/sub/bar_2", "/mnt/ext2/sub/bar_3"] {
+            let _ = open(name, O_CREAT | O_RDWR, 0).expect("create");
+        }
+        let commits_before = with_state(|state| state.ext2_journal.sequence);
+        let flushes_before = ctx.flushes;
+        flush_ext2_dirty_blocks().expect("flush");
+        let commits = with_state(|state| state.ext2_journal.sequence) - commits_before;
+        assert!(commits >= 3);
+        assert_eq!(ctx.flushes - flushes_before, commits as usize + 1);
+        assert!(!with_state(|state| state.ext2_journal.commit_barrier_pending));
+    }
+
+    fn ext2_data_blocks_of(path: &str) -> std::vec::Vec<u32> {
+        let (_, inode) = ext2_raw_inode_for_path(path);
+        inode.blocks[..12].iter().copied().filter(|&b| b != 0).collect()
+    }
+
+    /// Found by the QEMU journal smoke: with commits running ahead of
+    /// checkpoints, checkpointing only the oldest transaction copied its
+    /// older bitmap snapshot back into the (clean, newer) cache, and the next
+    /// allocation reused inodes/blocks that a later transaction owned.
+    #[test]
+    fn ext3_partial_checkpoint_does_not_roll_back_cached_bitmaps() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext3();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+
+        let f1 = open("/mnt/ext2/sub/roll_1", O_CREAT | O_RDWR, 0).expect("create 1");
+        let _ = write(f1.inode, 0, &[1u8; 2048], false).expect("write 1");
+        flush_ext2_dirty_blocks().expect("commit 1");
+        let committed_after_first = with_state(|state| state.ext2_journal_committed_txs.len());
+        let f2 = open("/mnt/ext2/sub/roll_2", O_CREAT | O_RDWR, 0).expect("create 2");
+        let _ = write(f2.inode, 0, &[2u8; 2048], false).expect("write 2");
+        flush_ext2_dirty_blocks().expect("commit 2");
+
+        // Journal-full style partial checkpoint: only the first file's txs.
+        with_state(|state| ext2_journal::checkpoint_oldest_for_test(state, committed_after_first))
+            .expect("partial checkpoint");
+
+        let f3 = open("/mnt/ext2/sub/roll_3", O_CREAT | O_RDWR, 0).expect("create 3");
+        let _ = write(f3.inode, 0, &[3u8; 2048], false).expect("write 3");
+        let inos = [f1, f2, f3].map(|f| stat(f.inode).unwrap().ino);
+        assert!(inos[0] != inos[1] && inos[1] != inos[2] && inos[0] != inos[2], "{inos:?}");
+        let b2 = ext2_data_blocks_of("/mnt/ext2/sub/roll_2");
+        let b3 = ext2_data_blocks_of("/mnt/ext2/sub/roll_3");
+        assert!(b3.iter().all(|b| !b2.contains(b)), "roll_3 reused roll_2 blocks: {b2:?} {b3:?}");
+    }
+
+    /// Same corruption through cache eviction: a clean block whose newest
+    /// version is only in the journal was dropped and re-read stale from its
+    /// home location.
+    #[test]
+    fn ext3_evicting_uncheckpointed_block_does_not_resurrect_stale_bitmap() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let _ctx = mount_sample_ext3();
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("cache policy");
+
+        let f1 = open("/mnt/ext2/sub/evict_1", O_CREAT | O_RDWR, 0).expect("create 1");
+        let _ = write(f1.inode, 0, &[1u8; 2048], false).expect("write 1");
+        flush_ext2_dirty_blocks().expect("commit 1");
+        assert!(with_state(|state| !state.ext2_journal_committed_txs.is_empty()));
+
+        // Squeeze the cache so the committed (clean) bitmaps get evicted.
+        set_ext2_cache_policy(4, 100).expect("tiny cache");
+        set_ext2_cache_policy(EXT2_CACHE_MAX_BLOCKS_DEFAULT, 100).expect("restore cache");
+
+        let f2 = open("/mnt/ext2/sub/evict_2", O_CREAT | O_RDWR, 0).expect("create 2");
+        let _ = write(f2.inode, 0, &[2u8; 2048], false).expect("write 2");
+        assert_ne!(stat(f1.inode).unwrap().ino, stat(f2.inode).unwrap().ino);
+        let b1 = ext2_data_blocks_of("/mnt/ext2/sub/evict_1");
+        let b2 = ext2_data_blocks_of("/mnt/ext2/sub/evict_2");
+        assert!(b2.iter().all(|b| !b1.contains(b)), "evict_2 reused evict_1 blocks");
+        let mut buf = std::vec![0u8; 4096];
+        let reopened = open("/mnt/ext2/sub/evict_1", O_RDONLY, 0).unwrap();
+        let n = read(reopened.inode, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &[1u8; 2048][..]);
+    }
+
+    // ---- Volatile write-cache crash model ----
+
+    enum VolatileEvent {
+        Write(u32, std::vec::Vec<u8>),
+        Barrier,
+    }
+
+    /// Backend whose writes sit in a volatile cache until a barrier drains
+    /// them. `current` serves reads; `events` lets a test rebuild the durable
+    /// state and the undrained writes at any point in time.
+    struct VolatileCtx {
+        current: std::vec::Vec<u8>,
+        events: std::vec::Vec<VolatileEvent>,
+    }
+
+    fn volatile_read(ctx: u64, block: u32, out: &mut [u8]) -> Result<(), i64> {
+        let ctx = unsafe { &mut *(ctx as *mut VolatileCtx) };
+        let start = block as usize * out.len();
+        out.copy_from_slice(ctx.current.get(start..start + out.len()).ok_or(EIO)?);
+        Ok(())
+    }
+
+    fn volatile_write(ctx: u64, block: u32, data: &[u8]) -> Result<(), i64> {
+        let ctx = unsafe { &mut *(ctx as *mut VolatileCtx) };
+        let start = block as usize * data.len();
+        ctx.current
+            .get_mut(start..start + data.len())
+            .ok_or(EIO)?
+            .copy_from_slice(data);
+        ctx.events.push(VolatileEvent::Write(block, std::vec::Vec::from(data)));
+        Ok(())
+    }
+
+    fn volatile_flush(ctx: u64) -> Result<(), i64> {
+        let ctx = unsafe { &mut *(ctx as *mut VolatileCtx) };
+        ctx.events.push(VolatileEvent::Barrier);
+        Ok(())
+    }
+
+    /// Disk contents after a crash at event `t`, where the cache managed to
+    /// write back only the newest `keep_newest` undrained writes.
+    fn volatile_crash_image(
+        base: &[u8],
+        events: &[VolatileEvent],
+        t: usize,
+        keep_newest: usize,
+    ) -> std::vec::Vec<u8> {
+        let mut durable = std::vec::Vec::from(base);
+        let mut pending: std::vec::Vec<(u32, &[u8])> = std::vec::Vec::new();
+        for event in &events[..t] {
+            match event {
+                VolatileEvent::Write(block, data) => pending.push((*block, data.as_slice())),
+                VolatileEvent::Barrier => {
+                    for (block, data) in pending.drain(..) {
+                        let off = block as usize * data.len();
+                        durable[off..off + data.len()].copy_from_slice(data);
+                    }
+                }
+            }
+        }
+        let skip = pending.len().saturating_sub(keep_newest);
+        for (block, data) in &pending[skip..] {
+            let off = *block as usize * data.len();
+            durable[off..off + data.len()].copy_from_slice(data);
+        }
+        durable
+    }
+
+    fn undrained_at(events: &[VolatileEvent], t: usize) -> usize {
+        let mut pending = 0usize;
+        for event in &events[..t] {
+            match event {
+                VolatileEvent::Write(..) => pending += 1,
+                VolatileEvent::Barrier => pending = 0,
+            }
+        }
+        pending
+    }
+
+    /// Crash at every backend write of a create/write/unlink/mkdir + sync
+    /// sequence, with a reordering cache that may persist only the newest
+    /// undrained writes. Every crash image must mount, recover, and show each
+    /// operation either fully applied or not at all. With the journal's write
+    /// barriers this holds; without them a commit record can reach the disk
+    /// ahead of the journaled blocks it seals.
+    #[test]
+    fn ext3_crash_at_every_write_with_reordering_cache_stays_consistent() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let mut vctx = std::boxed::Box::new(VolatileCtx {
+            current: std::vec::Vec::from(SAMPLE_EXT3),
+            events: std::vec::Vec::new(),
+        });
+        set_ext2_block_backend(Ext2BlockBackend {
+            ctx: (&mut *vctx as *mut VolatileCtx) as u64,
+            read_block: volatile_read,
+            write_block: volatile_write,
+            flush: Some(volatile_flush),
+        })
+        .expect("volatile backend");
+        mount_ext2_block_backend("/mnt/ext2", SAMPLE_EXT3.len(), &SAMPLE_EXT3[..4096])
+            .expect("mount volatile");
+        let payload = b"crash-consistent payload";
+        let created = open("/mnt/ext2/sub/crash_v", O_CREAT | O_RDWR, 0).expect("create");
+        let _ = write(created.inode, 0, payload, false).expect("write");
+        unlink("/mnt/ext2/xattr_block.txt").expect("unlink");
+        mkdir("/mnt/ext2/sub/crash_vdir").expect("mkdir");
+        flush_ext2_dirty_blocks().expect("flush");
+        checkpoint_ext2_journal().expect("checkpoint");
+        let events = std::mem::take(&mut vctx.events);
+        assert!(events.iter().any(|e| matches!(e, VolatileEvent::Barrier)));
+
+        let dump_dir = std::env::var("PEETOS_EXT3_CRASH_DIR").ok();
+        let mut images = 0usize;
+        for t in 0..=events.len() {
+            if t > 0 && !matches!(events[t - 1], VolatileEvent::Write(..)) {
+                continue;
+            }
+            let undrained = undrained_at(&events, t);
+            let mut choices = std::vec![0, undrained, undrained / 2, 1];
+            choices.retain(|&k| k <= undrained);
+            choices.sort_unstable();
+            choices.dedup();
+            for keep in choices {
+                let crashed = volatile_crash_image(SAMPLE_EXT3, &events, t, keep);
+                init();
+                let ctx = mount_ext2_backend_image(&crashed, 4096);
+                match open("/mnt/ext2/sub/crash_v", O_RDONLY, 0) {
+                    Ok(opened) => {
+                        let mut buf = [0u8; 64];
+                        let n = read(opened.inode, 0, &mut buf).expect("read crash_v");
+                        assert!(
+                            n == 0 || &buf[..n] == payload,
+                            "t={t} keep={keep}: torn file contents {:?}",
+                            &buf[..n]
+                        );
+                        let ino = stat(opened.inode).unwrap().ino as u32;
+                        assert!(ext2_inode_in_use(ino), "t={t} keep={keep}: inode not in bitmap");
+                    }
+                    Err(err) => assert_eq!(err, ENOENT, "t={t} keep={keep}"),
+                }
+                if let Some(dir) = &dump_dir {
+                    std::fs::write(std::format!("{dir}/crash_{t:04}_{keep:03}.img"), &ctx.image)
+                        .expect("dump recovered image");
+                }
+                images += 1;
+            }
+        }
+        assert!(images > 20, "expected many crash points, got {images}");
+    }
+
+    /// Applies a representative mutation mix to the stock ext3 image, syncs
+    /// it, and checks it remounts. When `PEETOS_EXT3_FSCK_IMAGE` is set the
+    /// synced image is written there so tests/ext3_fsck.sh can run
+    /// `e2fsck -fn` on it.
+    #[test]
+    fn ext3_stock_image_mutations_sync_and_remount() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext3();
+
+        let created = open("/mnt/ext2/bigdir/fsck_new", O_CREAT | O_RDWR, 0).expect("create");
+        let _ = write(created.inode, 0, b"fsck", false).expect("write");
+        unlink("/mnt/ext2/bigdir/entry_with_a_fairly_long_name_010").expect("unlink in htree");
+        unlink("/mnt/ext2/xattr_block.txt").expect("unlink xattr block file");
+        let inline = open("/mnt/ext2/xattr_inline.txt", O_WRONLY | O_TRUNC, 0).expect("trunc");
+        let _ = write(inline.inode, 0, b"inline rewritten", false).expect("rewrite inline");
+        unlink("/mnt/ext2/fastlink").expect("unlink fast symlink");
+        unlink("/mnt/ext2/large.bin").expect("unlink large file");
+        mkdir("/mnt/ext2/sub/newdir").expect("mkdir");
+        symlinkat(root_inode(), "../hello.txt", "/mnt/ext2/sub/newlink").expect("symlink");
+        symlinkat(root_inode(), EXT3_LONG_SYMLINK_TARGET, "/mnt/ext2/sub/longlink")
+            .expect("slow symlink");
+        renameat(
+            root_inode(),
+            "/mnt/ext2/sub/nested.txt",
+            root_inode(),
+            "/mnt/ext2/bigdir/nested_moved.txt",
+        )
+        .expect("rename into htree dir");
+
+        flush_ext2_dirty_blocks().expect("flush");
+        checkpoint_ext2_journal().expect("checkpoint");
+        let synced = ctx.image.clone();
+
+        if let Ok(path) = std::env::var("PEETOS_EXT3_FSCK_IMAGE") {
+            std::fs::write(&path, &synced).expect("write fsck image");
+        }
+
+        init();
+        let _ctx2 = mount_ext2_backend_image(&synced, 4096);
+        assert_eq!(read_whole("/mnt/ext2/bigdir/fsck_new"), b"fsck");
+        assert_eq!(read_whole("/mnt/ext2/bigdir/nested_moved.txt"), b"nested\n");
+        assert_eq!(read_whole("/mnt/ext2/xattr_inline.txt"), b"inline rewritten");
+        let mut link_buf = [0u8; 64];
+        let n = readlinkat(root_inode(), "/mnt/ext2/sub/newlink", &mut link_buf).unwrap();
+        assert_eq!(&link_buf[..n], b"../hello.txt");
+        let mut long_buf = [0u8; 128];
+        let n = readlinkat(root_inode(), "/mnt/ext2/sub/longlink", &mut long_buf).unwrap();
+        assert_eq!(&long_buf[..n], EXT3_LONG_SYMLINK_TARGET.as_bytes());
+        assert_eq!(count_dir_entries("/mnt/ext2/bigdir"), EXT3_BIGDIR_ENTRIES + 1);
+        assert_eq!(open("/mnt/ext2/large.bin", O_RDONLY, 0).unwrap_err(), ENOENT);
     }
 }

@@ -68,6 +68,44 @@ current Rust kernel implementation and forward roadmap.
 - Internal ext journal handling (surfaced as ext3 mounts) supports mount-time
   replay plus runtime journal transaction emission with deferred checkpointing
   and revoke handling, with baseline runtime journal abort-on-I/O-fault state.
+- Images formatted with stock `mke2fs -t ext3` defaults now mount read-write:
+  `ext_attr`, `resize_inode`, `dir_index`, and `large_file` are accepted, each
+  with explicit handling (xattr block accounting and release, linear htree reads
+  with the index dropped on insert, and refusal of >4 GiB file I/O). Fast
+  symlinks are read and created inline. `tests/ext3_fsck.sh` requires
+  `e2fsck -fn` to stay clean after kernel-side mutations of a stock ext3 image.
+- Ordered-journal fixes: freeing a block dirtied in the same transaction now
+  "forgets" it (revoke only, as in JBD), reuse cancels a pending revoke, and
+  sealed transactions left with only revokes (or nothing at all) no longer wedge
+  the pending queue, which previously made batched flushes fail with `EIO`.
+- Crash consistency: the runtime used to write the next transaction ID into the
+  journal superblock while `s_start` pointed at an older live transaction, so
+  recovery replayed nothing after a crash. `s_sequence` now follows JBD, and
+  `INCOMPAT_RECOVER` is set while the log holds committed transactions.
+  `tests/ext3_fsck.sh` makes `e2fsck` replay a kernel-written crash image.
+- Transaction atomicity: each sealed ordered transaction now commits as one
+  journal transaction (dirty-pressure writeback used to tear it into one-block
+  commits), newer transactions keep their own snapshots of shared metadata
+  blocks, and committed revokes remove freed blocks from older checkpoint
+  lists so checkpointing cannot overwrite reused file data.
+- The runtime musl image (`scripts/build_ext2_musl_execve.sh`) is now built
+  with stock `mke2fs` features (no `-O ^dir_index,...` overrides).
+- Journal write barriers: the ext2 backend has a flush hook, implemented in the
+  kernel by `block::flush_device` (block-cache drain + AHCI `FLUSH CACHE EXT`).
+  The journal issues barriers around each commit record and before retiring
+  checkpointed log space, and mount-time recovery retires the log only after
+  replayed blocks are durable. `sync`/`fsync`/`msync` now also flush the drive
+  cache. Transactions may span several descriptor blocks, so sealed
+  transactions commit atomically up to the size of the journal. A
+  reordering-write-cache crash test checks ~230 crash points with `e2fsck`.
+- ext3 runtime semantics: mutating syscalls commit (durable) and `sync`/`fsync`
+  checkpoint. Commits carry JBD2 CRC32 checksums, journals with unknown JBD2
+  incompat features are refused, and each commit costs one barrier. A new
+  QEMU smoke (`make run-journal-smoke`, `tests/musl_ext3_journal_smoke.sh`)
+  SIGKILLs QEMU mid-workload on an ext3 root and checks recovery by both
+  `e2fsck` and the kernel; it found two stale-cache bugs (partial checkpoint
+  rolling back cached bitmaps, eviction of uncheckpointed blocks) that caused
+  double allocation, both fixed.
 - Block cache residency is bounded with CLOCK eviction and dirty-pressure flush.
 
 ### IPC and Signals

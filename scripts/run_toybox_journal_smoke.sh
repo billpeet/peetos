@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# QEMU crash/recovery smoke for the ext3 journal on real (emulated) AHCI I/O.
+#
+#  1. Convert a copy of the runtime musl image to ext3 (tune2fs -j).
+#  2. Boot 1: bin/journal_smoke.sh syncs a baseline file, writes files until
+#     dirty-pressure commits sit uncheckpointed in the journal, and prints a
+#     crash point. QEMU is SIGKILLed there: everything still in the PeetOS
+#     block write-back cache is lost, as on power failure.
+#  3. A copy of the crashed image must say needs_recovery, and e2fsck (Linux
+#     jbd2 recovery, including commit-block CRC32 checks) must replay it into
+#     a clean filesystem.
+#  4. Boot 2 on the crashed image: the kernel replays the journal itself, the
+#     script verifies the baseline and that every surviving file is a byte
+#     prefix of what was written, then syncs; e2fsck -fn must find the result
+#     clean.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${ROOT_DIR}/build/peetos.img"
+EXT2_IMG="${ROOT_DIR}/user/sample_ext2_musl.img"
+WORK_DIR="$(mktemp -d)"
+EXT3_IMG="${WORK_DIR}/ext3.img"
+LOG1="${WORK_DIR}/boot1.log"
+LOG2="${WORK_DIR}/boot2.log"
+
+source "${ROOT_DIR}/tests/rust_build_compat_env.bash"
+setup_rust_build_compat "${ROOT_DIR}"
+
+QEMU_PID=""
+cleanup() {
+  if [[ -n "${QEMU_PID}" ]]; then
+    kill -9 "${QEMU_PID}" 2>/dev/null || true
+  fi
+  rm -rf "${WORK_DIR}"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "[journal-smoke] $1" >&2
+  for log in "${LOG1}" "${LOG2}"; do
+    if [[ -f "${log}" ]]; then
+      echo "----- $(basename "${log}") -----" >&2
+      cat "${log}" >&2
+    fi
+  done
+  exit 1
+}
+
+for tool in tune2fs resize2fs e2fsck dumpe2fs debugfs; do
+  command -v "${tool}" >/dev/null 2>&1 || fail "${tool} not found; install e2fsprogs"
+done
+
+make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES=musl-ext3-journal-smoke
+
+# Grow the runtime image so a 1 MiB journal fits, then add the journal.
+cp "${EXT2_IMG}" "${EXT3_IMG}"
+truncate -s +3M "${EXT3_IMG}"
+e2fsck -fy "${EXT3_IMG}" >/dev/null 2>&1 || true
+resize2fs -f "${EXT3_IMG}" >/dev/null 2>&1
+tune2fs -j -J size=1 "${EXT3_IMG}" >/dev/null
+dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -q has_journal || fail "tune2fs did not add a journal"
+
+# Boots the kernel with the ext3 image as disk1; returns once `marker`
+# appears in the serial log (QEMU is then killed) or the timeout expires.
+boot_until() {
+  local log="$1" marker="$2" timeout_s="$3"
+  qemu-system-x86_64 \
+    -drive id=disk0,file="${IMAGE}",if=none,format=raw \
+    -device ich9-ahci,id=ahci \
+    -device ide-hd,drive=disk0,bus=ahci.0 \
+    -drive id=disk1,file="${EXT3_IMG}",if=none,format=raw \
+    -device ide-hd,drive=disk1,bus=ahci.1 \
+    -serial stdio \
+    -display none \
+    -no-reboot \
+    -no-shutdown \
+    > "${log}" 2>&1 &
+  QEMU_PID=$!
+  local waited=0
+  while (( waited < timeout_s * 10 )); do
+    if grep -aq -- "${marker}" "${log}"; then
+      break
+    fi
+    if ! kill -0 "${QEMU_PID}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  # SIGKILL: no orderly shutdown, nothing flushed beyond what the guest
+  # already handed to the virtual disk.
+  kill -9 "${QEMU_PID}" 2>/dev/null || true
+  wait "${QEMU_PID}" 2>/dev/null || true
+  QEMU_PID=""
+  grep -aq -- "${marker}" "${log}"
+}
+
+boot_until "${LOG1}" "[ext3-journal-smoke] crash-point" 60 \
+  || fail "boot 1 never reached the crash point"
+grep -aq "\[VFS\] Mounted ext3 from block dev1" "${LOG1}" || fail "boot 1 did not mount the image as ext3"
+grep -aq "\[ext3-journal-smoke\] baseline synced" "${LOG1}" || fail "boot 1 did not sync the baseline"
+
+# Debug aid: PEETOS_JOURNAL_SMOKE_KEEP=<dir> keeps the crashed image and the
+# boot 1 serial log for offline inspection.
+if [[ -n "${PEETOS_JOURNAL_SMOKE_KEEP:-}" ]]; then
+  mkdir -p "${PEETOS_JOURNAL_SMOKE_KEEP}"
+  cp "${EXT3_IMG}" "${PEETOS_JOURNAL_SMOKE_KEEP}/crashed.img"
+  cp "${LOG1}" "${PEETOS_JOURNAL_SMOKE_KEEP}/boot1.log"
+fi
+
+# The crash must leave committed-but-uncheckpointed transactions behind,
+# otherwise this test would not exercise recovery at all.
+dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "filesystem features" | grep -q needs_recovery \
+  || fail "crashed image has no needs_recovery flag (nothing left in the journal)"
+dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "journal features" | grep -q journal_checksum \
+  || fail "kernel did not enable journal_checksum"
+
+# Linux-side recovery of the AHCI-written journal, on a copy.
+LINUX_IMG="${WORK_DIR}/linux_recovered.img"
+cp "${EXT3_IMG}" "${LINUX_IMG}"
+set +e
+e2fsck -fy "${LINUX_IMG}" > "${WORK_DIR}/linux_replay.txt" 2>&1
+linux_rc=$?
+set -e
+if [[ "${linux_rc}" -gt 1 ]]; then
+  cat "${WORK_DIR}/linux_replay.txt" >&2
+  fail "e2fsck could not recover the crashed image (rc=${linux_rc})"
+fi
+grep -q "recovering journal" "${WORK_DIR}/linux_replay.txt" || fail "e2fsck did not replay the journal"
+e2fsck -fn "${LINUX_IMG}" > "${WORK_DIR}/linux_check.txt" 2>&1 \
+  || { cat "${WORK_DIR}/linux_check.txt" >&2; fail "filesystem not clean after e2fsck recovery"; }
+debugfs -R "cat /jsmoke/baseline" "${LINUX_IMG}" 2>/dev/null | grep -q "file baseline line 63" \
+  || fail "synced baseline missing after e2fsck recovery"
+
+# Kernel-side recovery: boot the crashed image again.
+boot_until "${LOG2}" "[ext3-journal-smoke] done" 60 || fail "boot 2 did not finish verification"
+grep -aq "\[ext3-journal-smoke\] recovery boot" "${LOG2}" || fail "boot 2 did not take the recovery path"
+if grep -aq "\[ext3-journal-smoke\] failures" "${LOG2}"; then
+  fail "boot 2 found damaged files after kernel journal recovery"
+fi
+grep -aE "\[ext3-journal-smoke\] verified [0-9]+ surviving files" "${LOG2}" >&2 || true
+
+e2fsck -fn "${EXT3_IMG}" > "${WORK_DIR}/kernel_check.txt" 2>&1 \
+  || { cat "${WORK_DIR}/kernel_check.txt" >&2; fail "filesystem not clean after kernel recovery"; }
+if dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "filesystem features" | grep -q needs_recovery; then
+  fail "needs_recovery still set after kernel recovery and sync"
+fi
+
+echo "ext3 journal crash/recovery smoke completed successfully."

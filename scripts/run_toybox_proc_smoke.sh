@@ -61,6 +61,12 @@ if ! grep -q '\[proc-smoke\] pass' "${LOG_FILE}"; then
   fail "process-model smoke did not report userspace pass marker"
 fi
 
+# The AHCI write barrier (ATA FLUSH CACHE EXT) used by the ext3 journal and
+# sync/fsync must complete on real (emulated) hardware.
+if ! grep -q '\[BLK\] dev0 flush ok' "${LOG_FILE}"; then
+  fail "AHCI FLUSH CACHE EXT barrier did not complete"
+fi
+
 # fork must share private pages copy-on-write rather than copying them.
 if ! grep -Eq '\[VMM\] Fork: [1-9][0-9]* pages shared copy-on-write, 0 copied' "${LOG_FILE}"; then
   fail "fork did not share pages copy-on-write"

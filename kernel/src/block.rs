@@ -77,17 +77,23 @@ pub type BlockReadOp =
     fn(BlockOpContext, &BlockDevice, lba: u64, out: &mut [u8]) -> Result<(), BlockIoError>;
 pub type BlockWriteOp =
     fn(BlockOpContext, &BlockDevice, lba: u64, data: &[u8]) -> Result<(), BlockIoError>;
+/// Flushes the device's own volatile write cache (for example ATA FLUSH CACHE
+/// EXT). After it returns `Ok`, every completed write is on stable media.
+pub type BlockFlushOp = fn(BlockOpContext, &BlockDevice) -> Result<(), BlockIoError>;
 
 #[derive(Clone, Copy)]
 pub struct BlockOps {
     pub read: Option<BlockReadOp>,
     pub write: Option<BlockWriteOp>,
+    /// `None` for devices without a volatile write cache to drain.
+    pub flush: Option<BlockFlushOp>,
 }
 
 impl BlockOps {
     pub const NONE: Self = Self {
         read: None,
         write: None,
+        flush: None,
     };
 }
 
@@ -497,6 +503,19 @@ pub fn flush_cached_device(index: usize) -> Result<(), BlockIoError> {
     })
 }
 
+/// Durability barrier for one device: write back its dirty block-cache lines,
+/// then flush the device's own write cache. Everything written to the device
+/// before this call is on stable media once it returns `Ok`, so it orders
+/// earlier writes before later ones (used by the ext3 journal).
+pub fn flush_device(index: usize) -> Result<(), BlockIoError> {
+    flush_cached_device(index)?;
+    let entry = lookup_entry(index)?;
+    match entry.ops.flush {
+        Some(flush_op) => flush_op(entry.ctx, &entry.device),
+        None => Ok(()),
+    }
+}
+
 #[allow(dead_code)]
 pub fn flush_cached_all() -> Result<(), BlockIoError> {
     with_cache_mut(|cache| {
@@ -750,6 +769,7 @@ mod tests {
             BlockOps {
                 read: Some(test_read),
                 write: Some(test_write),
+                flush: None,
             },
             BlockOpContext {
                 opaque0: 0x55AA,
@@ -795,6 +815,7 @@ mod tests {
             BlockOps {
                 read: Some(cache_test_read),
                 write: Some(cache_test_write),
+                flush: None,
             },
             BlockOpContext::EMPTY,
         )
@@ -829,6 +850,7 @@ mod tests {
             BlockOps {
                 read: Some(cache_test_read),
                 write: Some(cache_test_write),
+                flush: None,
             },
             BlockOpContext::EMPTY,
         )
@@ -865,6 +887,7 @@ mod tests {
             BlockOps {
                 read: Some(cache_test_read),
                 write: Some(cache_test_write),
+                flush: None,
             },
             BlockOpContext::EMPTY,
         )
@@ -880,5 +903,71 @@ mod tests {
         let stats = cache_stats();
         assert!(stats.hits >= 1);
         assert!(stats.misses >= 1);
+    }
+
+    static FLUSH_CALLS: AtomicU64 = AtomicU64::new(0);
+    static WRITES_SEEN_AT_FLUSH: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    fn flush_test_flush(_ctx: BlockOpContext, _dev: &BlockDevice) -> Result<(), BlockIoError> {
+        FLUSH_CALLS.fetch_add(1, Ordering::Relaxed);
+        WRITES_SEEN_AT_FLUSH.store(CACHE_WRITE_CALLS.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[test]
+    fn flush_device_writes_back_cache_before_device_flush() {
+        let _guard = global_registry_lock().lock().unwrap();
+        reset();
+        CACHE_WRITE_CALLS.store(0, Ordering::Relaxed);
+        FLUSH_CALLS.store(0, Ordering::Relaxed);
+        WRITES_SEEN_AT_FLUSH.store(u64::MAX, Ordering::Relaxed);
+
+        let index = register_with_ops(
+            BlockDevice {
+                sectors: 4096,
+                ..BlockDevice::EMPTY
+            },
+            BlockOps {
+                read: Some(cache_test_read),
+                write: Some(cache_test_write),
+                flush: Some(flush_test_flush),
+            },
+            BlockOpContext::EMPTY,
+        )
+        .unwrap();
+
+        write_cached(index, 16, &[3u8; 1024]).expect("cache line a");
+        write_cached(index, 32, &[4u8; 1024]).expect("cache line b");
+        assert_eq!(CACHE_WRITE_CALLS.load(Ordering::Relaxed), 0);
+
+        flush_device(index).expect("barrier");
+        assert_eq!(FLUSH_CALLS.load(Ordering::Relaxed), 1);
+        // Both dirty lines reached the device before the device flush ran.
+        assert_eq!(WRITES_SEEN_AT_FLUSH.load(Ordering::Relaxed), 2);
+        assert_eq!(cache_stats().dirty_lines, 0);
+    }
+
+    #[test]
+    fn flush_device_without_flush_op_only_drains_cache() {
+        let _guard = global_registry_lock().lock().unwrap();
+        reset();
+        CACHE_WRITE_CALLS.store(0, Ordering::Relaxed);
+        let index = register_with_ops(
+            BlockDevice {
+                sectors: 4096,
+                ..BlockDevice::EMPTY
+            },
+            BlockOps {
+                read: Some(cache_test_read),
+                write: Some(cache_test_write),
+                flush: None,
+            },
+            BlockOpContext::EMPTY,
+        )
+        .unwrap();
+        write_cached(index, 8, &[5u8; 512]).expect("cache line");
+        flush_device(index).expect("barrier without device flush");
+        assert_eq!(CACHE_WRITE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(flush_device(99), Err(BlockIoError::InvalidDevice));
     }
 }

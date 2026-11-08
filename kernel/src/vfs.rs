@@ -123,7 +123,23 @@ fn write_runtime_fstab() {
     let _ = fs::write(fd.inode, 0, KERNEL_FSTAB_TEXT, false);
 }
 
+/// Called after every mutating syscall. On journaled (ext3) mounts this
+/// *commits*: dirty metadata becomes a durable journal transaction (ordered
+/// data first, write barriers around the commit record), which is all crash
+/// safety needs. Checkpointing to home locations is left to `sync`/`fsync`
+/// (`sync_ext2_to_block_and_checkpoint`) and to the journal itself when log
+/// space runs out, as in ext3.
 pub fn sync_ext2_to_block() -> bool {
+    sync_ext2_to_block_mode(false)
+}
+
+/// `sync`/`fsync`: commit, then checkpoint every committed transaction so the
+/// log is empty and home locations are current.
+pub fn sync_ext2_to_block_and_checkpoint() -> bool {
+    sync_ext2_to_block_mode(true)
+}
+
+fn sync_ext2_to_block_mode(checkpoint: bool) -> bool {
     let backing = unsafe { EXT2_BLOCK_BACKING };
     if !backing.active || backing.image_len == 0 {
         return false;
@@ -137,6 +153,9 @@ pub fn sync_ext2_to_block() -> bool {
                 return false;
             }
         };
+        if !checkpoint {
+            return flushed > 0;
+        }
         let checkpointed = match fs::checkpoint_ext2_journal() {
             Ok(count) => count,
             Err(err) => {
@@ -245,7 +264,9 @@ pub fn flush_ext2_block_cache() -> bool {
         return false;
     }
 
-    match block::flush_cached_device(backing.device_index) {
+    // sync/fsync/msync: drain the kernel block cache *and* the drive's own
+    // write cache, so the data is on stable media when the syscall returns.
+    match block::flush_device(backing.device_index) {
         Ok(()) => true,
         Err(err) => {
             serial_println!(
@@ -301,6 +322,7 @@ fn try_mount_ext2_from_block() -> bool {
                 ctx: index as u64,
                 read_block: ext2_block_backend_read,
                 write_block: ext2_block_backend_write,
+                flush: Some(ext2_block_backend_flush),
             };
             if fs::set_ext2_block_backend(backend).is_ok() {
                 let probe = core::slice::from_raw_parts(probe_ptr, PROBE_SIZE);
@@ -372,6 +394,13 @@ fn ext2_block_backend_write(ctx: u64, block_index: u32, data: &[u8]) -> Result<(
     let device_index = ctx as usize;
 
     block::write_cached(device_index, lba, data).map_err(map_block_io_to_errno)
+}
+
+/// Journal write barrier for the ext2/ext3 backing device: drain the kernel
+/// block write-back cache for this device, then ask the device to flush its
+/// own volatile write cache (ATA FLUSH CACHE EXT on AHCI).
+fn ext2_block_backend_flush(ctx: u64) -> Result<(), i64> {
+    block::flush_device(ctx as usize).map_err(map_block_io_to_errno)
 }
 
 fn map_block_io_to_errno(err: block::BlockIoError) -> i64 {

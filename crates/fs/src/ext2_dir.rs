@@ -1,5 +1,5 @@
 use super::{
-    ext2_block_slice_mut_state, ext2_data_block_for_logical_index_state, ext2_ensure_data_block,
+    ext2_block_slice_mut_state, ext2_clear_inode_flags_state, EXT2_INDEX_FL, ext2_data_block_for_logical_index_state, ext2_ensure_data_block,
     ext2_for_each_dir_entry_state, ext2_logical_blocks_for_size, ext2_mark_dirty_block,
     ext2_max_addressable_file_size, ext2_mode_to_filetype, ext2_read_inode_from_state,
     ext2_recalc_inode_block_count_512_state, ext2_write_inode_to_state, read_u16_le,
@@ -69,6 +69,14 @@ pub(super) fn ext2_add_dir_entry(
     let mut parent = ext2_read_inode_from_state(state, parent_ino)?;
     if ext2_mode_to_filetype(parent.mode) != Some(FileType::Directory) {
         return Err(ENOTDIR);
+    }
+    if (parent.flags & EXT2_INDEX_FL) != 0 {
+        // Linear insertion can overwrite htree interior/root data (stored in
+        // dirents with inode 0 or in the ".." record's slack). Drop the index
+        // first, as Linux does when it falls back to linear mode, so nothing
+        // trusts the stale tree afterwards; e2fsck -D can rebuild it.
+        ext2_clear_inode_flags_state(state, parent_ino, EXT2_INDEX_FL)?;
+        parent.flags &= !EXT2_INDEX_FL;
     }
 
     let needed = ext2_dirent_len(name.len());

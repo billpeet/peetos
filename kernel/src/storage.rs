@@ -31,6 +31,7 @@ const ATA_SR_BSY: u8 = 1 << 7;
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
 const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
 
 const ATA_DRIVE_MASTER: u8 = 0xA0;
 const ATA_DRIVE_SLAVE: u8 = 0xB0;
@@ -220,6 +221,7 @@ fn probe_ahci(ctrl: &storage::StorageController, dev: &pci::DeviceInfo) {
             block::BlockOps {
                 read: Some(ahci_block_read),
                 write: Some(ahci_block_write),
+                flush: Some(ahci_block_flush),
             },
             block::BlockOpContext {
                 opaque0: base as u64,
@@ -386,6 +388,27 @@ fn ahci_block_write(
     Ok(())
 }
 
+/// ATA FLUSH CACHE EXT: returns once the drive has written its volatile write
+/// cache to media (with QEMU's default cache=writeback this reaches the host
+/// file, matching what fsync would guarantee there).
+fn ahci_block_flush(
+    ctx: block::BlockOpContext,
+    device: &block::BlockDevice,
+) -> Result<(), block::BlockIoError> {
+    if device.transport != block::BlockTransport::AhciDma {
+        return Err(block::BlockIoError::Unsupported);
+    }
+    if !ahci_exec_nodata(
+        ctx.opaque0 as *mut u8,
+        ctx.opaque1 as u8,
+        ctx.opaque2 as u8,
+        ATA_CMD_FLUSH_CACHE_EXT,
+    ) {
+        return Err(block::BlockIoError::IoFault);
+    }
+    Ok(())
+}
+
 fn ahci_block_read_transfer(
     ctx: block::BlockOpContext,
     device: &block::BlockDevice,
@@ -517,6 +540,50 @@ fn ahci_exec_dma(
         }
     }
 
+    free_ahci_port_buffers(buffers);
+    success
+}
+
+/// Issues a non-data ATA command (no PRDT entries) and waits for completion.
+fn ahci_exec_nodata(base: *mut u8, port: u8, max_slots: u8, command: u8) -> bool {
+    if base.is_null() || max_slots == 0 {
+        return false;
+    }
+    let Some(buffers) = alloc_ahci_port_buffers(ATA_IDENTIFY_BYTES) else {
+        return false;
+    };
+
+    let port_base = ahci::port_offset(port, 0);
+    let mut success = false;
+    if !ahci_stop_command_engine(base, port_base) {
+        free_ahci_port_buffers(buffers);
+        return false;
+    }
+    ahci_configure_port_dma(base, port_base, &buffers);
+    ahci_start_command_engine(base, port_base);
+
+    if ahci_wait_port_ready(base, port_base, AHCI_ENGINE_TIMEOUT) {
+        let ci = mmio_read32(base, port_base + ahci::AHCI_PORT_CI);
+        let sact = mmio_read32(base, port_base + ahci::AHCI_PORT_SACT);
+        if let Some(slot) = ahci::find_free_command_slot(ci, sact, max_slots) {
+            let headers = buffers.cmd_list.virt as *mut ahci::AhciCommandHeader;
+            unsafe {
+                let header = &mut *headers.add(slot as usize);
+                *header = ahci::AhciCommandHeader::EMPTY;
+                header.flags = AHCI_H2D_FIS_DWORDS;
+                header.prdtl = 0;
+                header.prdbc = 0;
+                header.ctba = buffers.cmd_table.phys as u32;
+                header.ctbau = (buffers.cmd_table.phys >> 32) as u32;
+                let table = buffers.cmd_table.virt as *mut ahci::AhciCommandTable1;
+                *table = ahci::AhciCommandTable1::EMPTY;
+                fill_h2d_cfis(&mut (*table).cfis, command, 0, 0);
+            }
+            success = ahci_issue_slot(base, port_base, slot);
+        }
+    }
+
+    let _ = ahci_stop_command_engine(base, port_base);
     free_ahci_port_buffers(buffers);
     success
 }
@@ -880,6 +947,16 @@ fn run_block_io_probe() {
         }
 
         let _ = block::write(index, 0, &[]);
+        // Exercise the write barrier the ext3 journal and sync/fsync rely on
+        // (block-cache drain + ATA FLUSH CACHE EXT).
+        match block::flush_device(index) {
+            Ok(()) => serial_println!("[BLK] dev{} flush ok", index),
+            Err(err) => serial_println!(
+                "[BLK] dev{} flush failed err={}",
+                index,
+                block::io_error_name(err)
+            ),
+        }
         break;
     }
 }

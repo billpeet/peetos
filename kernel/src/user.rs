@@ -42,7 +42,8 @@ const EXEC_MAX_INTERP_IMAGE: usize = 2 * 1024 * 1024;
     feature = "musl-ext2-dropbear-smoke",
     feature = "musl-ext2-fpu-smoke",
     feature = "musl-ext2-proc-smoke",
-    feature = "musl-ext2-wayland-smoke"
+    feature = "musl-ext2-wayland-smoke",
+    feature = "musl-ext3-journal-smoke"
 ))]
 const INIT_ARGV0: &[u8] = b"/init-ext2\0";
 #[cfg(all(
@@ -63,6 +64,7 @@ const INIT_ARGV0: &[u8] = b"/init-ext2\0";
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     feature = "musl-smoke"
 ))]
 const INIT_ARGV0: &[u8] = b"/bin/echo\0";
@@ -84,6 +86,7 @@ const INIT_ARGV0: &[u8] = b"/bin/echo\0";
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-smoke")
 ))]
 const INIT_ARGV0: &[u8] = b"/init\0";
@@ -115,16 +118,23 @@ const EACCES: i64 = 13;
 
 static INIT_PID: AtomicI32 = AtomicI32::new(task::INVALID_PID);
 
-#[cfg(feature = "musl-ext2-wayland-smoke")]
+#[cfg(feature = "musl-ext3-journal-smoke")]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext3_journal_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext3-journal-smoke"),
+    feature = "musl-ext2-wayland-smoke"
+))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_wayland_smoke.elf");
 #[cfg(all(
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     feature = "musl-ext2-proc-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_proc_smoke.elf");
 #[cfg(all(
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     feature = "musl-ext2-fpu-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_fpu_smoke.elf");
@@ -132,6 +142,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_fpu_smoke.e
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     feature = "musl-ext2-dropbear-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_dropbear_smoke.elf");
@@ -140,6 +151,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_dropbear_sm
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     feature = "musl-ext2-micropython-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_micropython_smoke.elf");
@@ -148,6 +160,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_micropython
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     feature = "musl-ext2-quickjs-smoke"
 ))]
@@ -157,6 +170,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_quickjs_smo
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     feature = "musl-ext2-ping-smoke"
@@ -167,6 +181,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_ping_smoke.
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -178,6 +193,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_shared_buff
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -190,6 +206,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_epoll_smoke
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -203,6 +220,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_console_fir
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -218,6 +236,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_gui_demo.el
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -233,6 +252,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_gui_smoke.e
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -249,6 +269,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_peet_gui_sm
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -266,6 +287,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_peet_shell_
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -284,6 +306,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_unix_rights
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -304,6 +327,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_smoke.elf")
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
@@ -336,6 +360,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2.elf");
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     feature = "musl-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
@@ -357,6 +382,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
     not(feature = "musl-ext2-fpu-smoke"),
     not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-wayland-smoke"),
+    not(feature = "musl-ext3-journal-smoke"),
     not(feature = "musl-smoke")
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/hello_dyn.elf");
@@ -986,7 +1012,9 @@ fn populate_user_stack<const ARGC: usize, const ENVC: usize, const AUXC: usize>(
 
 pub fn spawn_init() -> bool {
     serial_println!("[USER] Setting up initial user task...");
-    if cfg!(feature = "musl-ext2-proc-smoke") {
+    if cfg!(feature = "musl-ext3-journal-smoke") {
+        serial_println!("[USER] musl-ext3-journal-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-proc-smoke") {
         serial_println!("[USER] musl-ext2-proc-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-dropbear-smoke") {
         serial_println!("[USER] musl-ext2-dropbear-smoke init image selected");

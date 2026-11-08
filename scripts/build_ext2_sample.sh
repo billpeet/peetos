@@ -18,9 +18,9 @@ trap cleanup EXIT
 
 # Keep the embedded image small enough for the current stage bootloader path.
 # 128 KiB ext2 image, 1 KiB blocks, and explicit inode count so create/mkdir tests have space.
-# The feature set is intentionally minimal so the runtime only mounts images
-# whose on-disk semantics it actually understands today. `mke2fs` enables
-# several ext2/ext3-era defaults unless they are explicitly disabled.
+# The feature set is intentionally minimal so this fixture exercises plain
+# ext2 (no xattr blocks, htree, or resize inode). The stock ext3 feature set is
+# covered separately by user/sample_ext3.img (scripts/build_ext3_sample.sh).
 mke2fs -q -t ext2 -F -b 1024 -I 256 -N 64 \
   -O ^dir_index,^resize_inode,^ext_attr,^large_file \
   -L PEETOS_EXT2 -d "${SRC_DIR}" "${TMP_IMG}" 128

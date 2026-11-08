@@ -52,13 +52,14 @@ A minimal kernel block layer now provides:
 - device inventory/registration
 - per-device read/write callback dispatch (`block::read`, `block::write`)
 - a bounded page-sized write-back cache for block I/O (`block::write_cached`, `block::read_cached`, `block::flush_cached_device`)
+- an optional per-device `BlockOps.flush` (AHCI: ATA `FLUSH CACHE EXT`, issued as a non-data command) and `block::flush_device(index)`, a durability barrier that writes back the device's dirty cache lines and then flushes the drive's volatile write cache. The ext3 journal uses it to order log, commit, and checkpoint writes, and `sync`/`fsync`/`msync` use it so data reaches stable media before returning.
 
 The registry records discovered disks from both paths:
 - transport (`ata-pio` or `ahci-dma`)
 - controller BDF + target (IDE drive slot or AHCI port)
 - logical block size + total sectors + LBA48 capability
 
-Boot logs include per-device registration lines, an aggregated `[BLK] Inventory` summary, and a best-effort AHCI LBA0 read probe when AHCI devices are present.
+Boot logs include per-device registration lines, an aggregated `[BLK] Inventory` summary, and a best-effort AHCI LBA0 read probe plus a `flush_device` barrier probe (`[BLK] devN flush ok`) when AHCI devices are present; `scripts/run_toybox_proc_smoke.sh` asserts the flush line.
 
 **Keyboard + TTY Input Baseline**
 - Keyboard IRQ1 is registered in the IDT and unmasked on the PIC during bring-up.
@@ -123,6 +124,7 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
 
 Limitations / Simplifications
 - AHCI command execution is polling-based; interrupts and async completion are not wired.
+- Barriers are full drains (all dirty lines of the device plus a device flush); there is no FUA or tagged ordering, so each journal commit costs two device flushes.
 - AHCI DMA transfer size is currently capped to one page (`4 KiB`) per command through a bounce buffer.
 - ATA (`ata-pio`) devices are inventory-only for now; read/write callbacks are currently wired for AHCI devices.
 - VFS now mounts ext2 through a native block backend with sparse/lazy block residency and dirty-run sync-back; it no longer preloads a full image into RAM at mount.

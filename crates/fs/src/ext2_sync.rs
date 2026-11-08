@@ -89,6 +89,10 @@ pub(crate) fn flush_all_dirty(state: &mut VfsState) -> Result<usize, i64> {
         super::ext2_cache_flush_block(state, block)?;
         flushed = flushed.saturating_add(1);
     }
+    if state.ext2_journal.present && !state.ext2_journal.replaying {
+        // An explicit flush promises durability of everything it committed.
+        super::ext2_journal::settle_commit_barrier(state)?;
+    }
     Ok(flushed)
 }
 

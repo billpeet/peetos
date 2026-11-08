@@ -1,11 +1,19 @@
 pub type Ext2BlockReadFn = fn(ctx: u64, block_index: u32, out: &mut [u8]) -> Result<(), i64>;
 pub type Ext2BlockWriteFn = fn(ctx: u64, block_index: u32, data: &[u8]) -> Result<(), i64>;
+/// Write barrier: when it returns `Ok`, every block previously passed to
+/// `write_block` is on stable storage (no write cache can still reorder or
+/// drop it). The journal relies on this between log blocks and the commit
+/// record, after the commit record, and before retiring checkpointed log
+/// space.
+pub type Ext2BlockFlushFn = fn(ctx: u64) -> Result<(), i64>;
 
 #[derive(Clone, Copy)]
 pub struct Ext2BlockBackend {
     pub ctx: u64,
     pub read_block: Ext2BlockReadFn,
     pub write_block: Ext2BlockWriteFn,
+    /// `None` means writes are durable as soon as `write_block` returns.
+    pub flush: Option<Ext2BlockFlushFn>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

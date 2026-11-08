@@ -7,6 +7,12 @@ pub(super) fn sync_ext2_backing() {
     let _ = crate::vfs::sync_ext2_to_block();
 }
 
+/// sync/fsync: commit and checkpoint the journal (no-op difference on ext2).
+#[inline]
+pub(super) fn sync_ext2_backing_and_checkpoint() {
+    let _ = crate::vfs::sync_ext2_to_block_and_checkpoint();
+}
+
 #[inline]
 pub(super) fn flush_ext2_backing() {
     let _ = crate::vfs::flush_ext2_block_cache();
@@ -1495,7 +1501,7 @@ pub(super) fn sys_sync(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     if let Err(err) = vm_page_cache_writeback_all() {
         return err;
     }
-    sync_ext2_backing();
+    sync_ext2_backing_and_checkpoint();
     flush_ext2_backing();
     0
 }
@@ -1520,7 +1526,7 @@ pub(super) fn sys_fsync(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         if let Err(err) = vm_page_cache_writeback_inode(inode) {
             return err;
         }
-        sync_ext2_backing();
+        sync_ext2_backing_and_checkpoint();
         flush_ext2_backing();
         return 0;
     }

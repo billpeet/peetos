@@ -101,6 +101,12 @@ if [[ -x "${ROOT_DIR}/user/fpu_context_smoke.elf" ]]; then
   chmod 0755 "${STAGE_ROOT}/bin/fpu_context_smoke"
 fi
 
+# Stage ext3 journal crash/recovery workload helper when available.
+if [[ -x "${ROOT_DIR}/user/journal_smoke_helper.elf" ]]; then
+  cp "${ROOT_DIR}/user/journal_smoke_helper.elf" "${STAGE_ROOT}/bin/journal_workload"
+  chmod 0755 "${STAGE_ROOT}/bin/journal_workload"
+fi
+
 # Stage process-model (COW fork / pthreads) smoke helper when available.
 if [[ -x "${ROOT_DIR}/user/proc_model_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/proc_model_smoke.elf" "${STAGE_ROOT}/bin/proc_model_smoke"
@@ -554,6 +560,21 @@ fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/proc_smoke.sh"
 
+# ext3 journal workload (musl-ext3-journal-smoke); the logic lives in the
+# bin/journal_workload helper (user/journal_smoke_helper.c). Boot 2 sees the
+# baseline written by boot 1 and switches to verification.
+cat > "${STAGE_ROOT}/bin/journal_smoke.sh" <<'EOS'
+if [ ! -x bin/journal_workload ]; then
+  echo [ext3-journal-smoke] missing bin/journal_workload
+  echo [ext3-journal-smoke] failures
+elif [ -f jsmoke/baseline ]; then
+  bin/journal_workload verify
+else
+  bin/journal_workload write
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/journal_smoke.sh"
+
 cat > "${STAGE_ROOT}/bin/epoll_smoke.sh" <<'EOS'
 fail=0
 
@@ -708,8 +729,10 @@ img_kib=$((payload_kib + 1024))
 if [[ "${img_kib}" -lt 3072 ]]; then
   img_kib=3072
 fi
+# Stock mke2fs ext2 features (ext_attr, resize_inode, dir_index, filetype,
+# sparse_super, large_file): the kernel implements all of them, so the runtime
+# image no longer needs feature overrides.
 mke2fs -q -t ext2 -F -b 1024 -I 256 -N 384 \
-  -O ^dir_index,^resize_inode,^ext_attr,^large_file \
   -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" "${img_kib}"
 
 mv "${TMP_IMG}" "${OUT_IMG}"

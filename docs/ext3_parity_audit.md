@@ -1,4 +1,4 @@
-# Ext3 Journal Status Audit (2026-04-12)
+# Ext3 Journal Status Audit (2026-04-12, updated 2026-11-08)
 
 ## Scope
 
@@ -18,7 +18,8 @@ Rust currently implements a partial ext3-compatible path on top of the ext2 moun
 5. Revoke parsing/emission, including wrapped transaction sequence ordering.
 6. Mount-table/runtime labeling of journaled mounts as `ext3`.
 7. Runtime journal abort state on I/O fault with fail-fast behavior.
-8. Narrow feature-bit acceptance with explicit rejection of unknown incompat/ro-compat combinations.
+8. Feature-bit acceptance matching the stock `mke2fs -t ext3` set, with explicit
+   rejection of everything else.
 9. An ordered-mode transaction scaffold with explicit mutation scopes, sealed
    pending transactions, bounded credit reservations, segmented restart for
    variable-size mutators, and deterministic ordered writeback.
@@ -35,6 +36,28 @@ Rust currently implements a partial ext3-compatible path on top of the ext2 moun
 14. The same internal handle token now reaches the main fixed-shape ext2
     metadata mutators and directory-entry helpers, including create/mkdir,
     unlink/rmdir, rename, link, and symlink paths.
+15. Stock ext3 images mount read-write: `ext_attr`, `resize_inode`,
+    `dir_index`, and `large_file` are implemented (see section 6), fast
+    symlinks are read and created inline, and an `e2fsck -fn` cross-check
+    (`tests/ext3_fsck.sh`) guards the on-disk results.
+16. JBD-style forget/cancel-revoke semantics in the running ordered
+    transaction, plus a fix for revoke-only or empty sealed transactions that
+    used to wedge the pending queue (section 7).
+17. Crash-consistent journal superblock: `s_sequence` now names the oldest live
+    transaction and `INCOMPAT_RECOVER` tracks whether the log holds committed
+    transactions (section 8). A simulated crash image is replayed both by the
+    kernel and by `e2fsck` (Linux jbd2 recovery code).
+18. Transaction atomicity and checkpoint safety (section 9): a sealed
+    transaction commits as one journal transaction, newer transactions keep
+    their own snapshots of shared blocks, and committed revokes remove freed
+    blocks from older checkpoint lists.
+19. Write barriers and multi-descriptor commits (section 10): journal I/O is
+    ordered through a backend flush hook (block-cache drain + ATA FLUSH CACHE
+    EXT), mount-time recovery retires the log only after replayed blocks are
+    durable, and a transaction may span several descriptor blocks.
+20. Commit checksums, journal feature validation, ext3 commit semantics, and
+    a QEMU crash/recovery smoke on real AHCI I/O (section 11), which found and
+    fixed two cache-staleness bugs.
 
 Key code paths:
 
@@ -68,6 +91,30 @@ Representative tests:
 - `ext2_ordered_mode_restartable_phase_helper_groups_work_into_named_subhandles`
 - `ext2_ordered_mode_handle_phase_rejects_stale_handle`
 - `ext2_ordered_mode_public_metadata_mutator_reserves_bounded_credits`
+- `ext3_stock_image_mounts_with_default_feature_set`
+- `ext3_htree_directory_reads_linearly`
+- `ext3_htree_insert_clears_index_flag_and_persists`
+- `ext3_xattr_block_is_counted_and_released_on_unlink`
+- `ext3_shared_xattr_block_only_drops_refcount`
+- `ext3_fast_symlink_reads_inline_target_and_unlinks_without_freeing_blocks`
+- `ext3_large_file_reports_full_size_and_refuses_32bit_io`
+- `ext3_freed_dirty_blocks_do_not_wedge_pending_transactions`
+- `ext3_stock_image_mutations_sync_and_remount` (also feeds `tests/ext3_fsck.sh`)
+- `ext3_recover_flag_tracks_live_journal_transactions`
+- `ext3_crash_image_needs_recovery_and_replays` (also feeds `tests/ext3_fsck.sh`)
+- `ext3_newer_transaction_keeps_its_snapshot_of_shared_blocks`
+- `ext3_checkpoint_does_not_overwrite_reused_freed_block`
+- `ext3_large_transaction_spans_descriptor_blocks_and_replays` (also feeds `tests/ext3_fsck.sh`)
+- `ext3_crash_at_every_write_with_reordering_cache_stays_consistent` (also feeds `tests/ext3_fsck.sh`)
+- kernel: `flush_device_writes_back_cache_before_device_flush`, `flush_device_without_flush_op_only_drains_cache`
+- `ext3_crc32_be_matches_jbd2_definition`
+- `ext3_mount_enables_journal_checksums_and_commits_carry_crc32`
+- `ext3_corrupted_journal_block_stops_replay_at_that_transaction` (also feeds `tests/ext3_fsck.sh`)
+- `ext3_mount_rejects_unknown_journal_incompat_features`
+- `ext3_flush_issues_one_barrier_per_commit_plus_one`
+- `ext3_partial_checkpoint_does_not_roll_back_cached_bitmaps`
+- `ext3_evicting_uncheckpointed_block_does_not_resurrect_stale_bitmap`
+- QEMU: `tests/musl_ext3_journal_smoke.sh` (`make run-journal-smoke`)
 
 All of the above are in `crates/fs/src/lib.rs` test module.
 
@@ -224,17 +271,181 @@ All of the above are in `crates/fs/src/lib.rs` test module.
 - Checkpoint failure no longer drops queued committed transactions from
   in-memory state before a successful checkpoint pass.
 
-### 6. Conservative feature acceptance
+### 6. Feature acceptance (stock ext3 set)
 
-- The mount parser accepts a small, explicit set of ext2/ext3-era feature bits
-  and rejects unknown incompat/ro-compat combinations instead of attempting a
-  best-effort mount.
-- The allowlist is now intentionally tightened further:
-  - compat: `HAS_JOURNAL` only
+- The allowlist matches what `mke2fs -t ext3` enables by default:
+  - compat: `HAS_JOURNAL`, `EXT_ATTR`, `RESIZE_INO`, `DIR_INDEX`
   - incompat: `FILETYPE`, `RECOVER`, `JOURNAL_DEV`
-  - ro-compat: `SPARSE_SUPER` only
+  - ro-compat: `SPARSE_SUPER`, `LARGE_FILE`
+- Each accepted bit has explicit handling:
+  - `EXT_ATTR`: `i_file_acl` is parsed, counted in `i_blocks` recalculation
+    (so truncate/rewrite keep the xattr block charged), and released on final
+    unlink. The block's `h_refcount` is decremented, and the block is freed
+    (with a revoke) when it reaches zero. Blocks without the xattr magic are
+    left allocated. In-inode xattrs survive because inode writes only touch
+    the fields the kernel owns.
+  - `RESIZE_INO`: reserved GDT blocks are pre-marked in the bitmaps and the
+    resize inode is never modified; the kernel does not resize.
+  - `DIR_INDEX`: htree directories are scanned linearly. The first insert
+    clears `EXT2_INDEX_FL` via a dedicated flag-clear helper, so later inode
+    writes from stale in-memory copies cannot restore it. Linear insertion may
+    overwrite dx interior data, which is safe once the flag is gone. Removes
+    keep the index, as Linux does.
+  - `LARGE_FILE`: `i_size_high` is parsed; `stat` reports 64-bit sizes for
+    regular files; reads return `EOVERFLOW` and writes/truncates `EFBIG` for
+    files that do not fit in 32 bits. Unlink still frees the full block tree.
+- Fast symlinks (`i_blocks` minus the xattr block equal to zero, size < 60) are
+  read from `i_block` and freed without treating the target text as block
+  pointers. Before this, unlinking a fast symlink from an `mke2fs -d` image
+  would have freed arbitrary blocks. `symlinkat` writes short targets as fast
+  symlinks, which modern `e2fsck` requires.
 - Journaled mounts require an internal journal inode and reject `journal_dev`
   / external-journal topology.
+
+### 7. Ordered-journal revoke and queue fixes
+
+- Freeing a block that the running ordered transaction already tracks (for
+  example an indirect table emptied during unlink) now removes it from the
+  transaction's metadata/data sets and clears its dirty state ("forget"), so
+  only the revoke is committed. Previously the stale contents were journaled
+  and the revoke was dropped as superseded.
+- Tracking a block that has a pending revoke in the running transaction or the
+  global revoke set cancels that revoke ("cancel revoke"), so reuse in a later
+  commit is never suppressed by an older free.
+- When a commit journals a block that also has a revoke in the same pending
+  transaction, the revoke is now retired along with it instead of lingering.
+- Sealed transactions can lose all their blocks when an older transaction
+  commits a shared metadata block (`drop_pending_tx_blocks` strips it from every
+  pending transaction). A transaction left with only revokes, or with nothing,
+  used to make `flush_oldest_ordered_pending_tx` return 0 forever, so
+  `flush_dirty_block` failed with `EIO` and dirty-pressure writeback stalled.
+  Such transactions now fold their revokes into the next pending transaction
+  (or the global revoke set) and are retired.
+
+### 8. Crash consistency of the journal superblock
+
+- Runtime commits and checkpoints used to write the *next* transaction ID
+  into the journal superblock's `s_sequence` while `s_start` still pointed at
+  the oldest uncheckpointed transaction. Recovery (ours and Linux's) requires
+  the transaction at `s_start` to carry `s_sequence`, so it hit a mismatch at
+  the first descriptor and replayed nothing: a crash between commit and
+  checkpoint lost every committed transaction. `s_sequence` is now the
+  oldest live transaction's ID, or the next ID when the log is empty.
+- `INCOMPAT_RECOVER` is written to the on-disk superblock before the commit
+  record that makes an empty log non-empty, and cleared after a checkpoint
+  writes `s_start = 0`. Only that bit is changed on disk (the cached superblock
+  may hold uncommitted counters), and every later home write of the
+  superblock block is patched to the current marker so a stale cached or
+  journaled copy cannot flip it. Linux keeps the flag set for the whole
+  read-write mount; tracking actual log contents instead means a synced
+  image is immediately clean for `e2fsck`.
+- `tests/ext3_fsck.sh` exports a crash image (committed, not checkpointed),
+  requires `needs_recovery`, lets `e2fsck -fy` replay it, then requires a
+  clean `e2fsck -fn` and the committed file contents.
+
+### 9. Transaction atomicity and checkpoint safety
+
+- **Whole-transaction commits.** Dirty-pressure writeback passed its soft
+  budget (`cached_blocks / 8`, often 1) as the commit size, so one sealed
+  ordered transaction (a single create, say) was committed as several
+  one-block journal transactions; a crash between them replayed half an
+  operation. `flush_oldest_ordered_pending_tx` now commits the oldest sealed
+  transaction's metadata as one journal transaction, limited only by the
+  journal's per-transaction capacity.
+- **Newer transactions keep shared blocks.** Committing (or writing ordered data
+  home for) the oldest pending transaction used to remove those blocks from
+  *every* pending transaction and from the running one. Shared metadata such as
+  bitmaps, group descriptors, the superblock, and parent directory blocks
+  vanished from newer transactions, which then committed without their own
+  changes to them; a crash right after replayed, for example, a file whose
+  inode was not marked in the inode bitmap. Each release now names its source
+  (`TxSource::PendingHead` or `TxSource::Running`) and only that transaction
+  gives the blocks up; the cache stays dirty while a newer owner exists.
+- **Checkpoint after reuse.** Once a commit carrying revoke records is on disk,
+  those blocks are removed from older committed transactions' checkpoint
+  lists, as JBD does. Previously a block journaled by T0, freed in T1, and
+  reused as ordered file data by T2 (written straight home) was overwritten
+  with T0's stale copy when T0 was checkpointed. The drop happens only after
+  the revoke is durable, so a crash can never leave checkpointed metadata
+  pointing at a block that missed its journaled contents.
+
+### 10. Write barriers and multi-descriptor transactions
+
+- `Ext2BlockBackend` has an optional `flush` hook: after it returns, every
+  earlier `write_block` is on stable storage. The kernel implements it with
+  `block::flush_device` (write back the device's dirty block-cache lines, then
+  ATA `FLUSH CACHE EXT` on AHCI). Before this, journal blocks went into the
+  kernel's LRU write-back cache and reached the disk in eviction order, so a
+  commit record could become durable before the blocks it sealed.
+- Barrier points, matching JBD:
+  1. Before the commit record: descriptors, journaled copies, revoke blocks,
+     ordered file data, and the `INCOMPAT_RECOVER` marker are durable.
+  2. After the commit record: the commit is durable before any checkpoint
+     write of that transaction's blocks.
+  3. In checkpoint: home blocks are durable before the journal tail moves,
+     and the empty tail is durable before `INCOMPAT_RECOVER` is cleared.
+- Mount-time recovery used to zero the journal tail *before* flushing the
+  replayed home blocks (replay only dirtied them in the cache). A crash in
+  between lost the replayed transactions and emptied the log. It now keeps
+  `INCOMPAT_RECOVER` set, flushes replayed blocks, barriers, retires the log,
+  barriers, and only then clears the marker.
+- The pre-commit journal superblock write also used the wrong `s_sequence`
+  when older transactions were still live; it now uses the same
+  oldest-live-transaction rule as the post-commit and checkpoint writes.
+- A transaction now uses as many descriptor blocks as it needs
+  (`[desc, data..., desc, data..., revoke..., commit]`), so its capacity is the
+  journal window rather than one descriptor's tag count (126 for 1 KiB
+  blocks). Larger sealed transactions are no longer split into independent
+  commits; replay in both this kernel and e2fsck already handled multiple
+  descriptors per transaction.
+- `ext3_crash_at_every_write_with_reordering_cache_stays_consistent` models a
+  volatile write cache that may persist only the newest undrained writes, and
+  crashes after every backend write of a create/write/unlink/mkdir/sync
+  sequence. Every crash image must mount and show each operation all-or-
+  nothing, and `tests/ext3_fsck.sh` runs `e2fsck -fn` on all ~230 recovered
+  images. With the commit barriers removed, the test finds a torn file
+  (correct size, zeroed contents).
+
+### 11. Checksums, journal features, commit semantics, QEMU crash testing
+
+- **Commit checksums.** The kernel enables JBD2 `COMPAT_CHECKSUM` on mount
+  (v2 journal superblocks, only once the log is empty) and writes a CRC32
+  (`crc32_be`, seed `~0`) over each transaction's descriptor and journaled
+  blocks into the commit block (`h_chksum_type = 1`, `h_chksum_size = 4`).
+  Replay verifies it with jbd2's rules: a mismatch ends the log at that
+  transaction; an all-zero checksum is accepted only before the first
+  checksummed commit. `e2fsck` checks the same CRCs, so the fsck script proves
+  both that our CRCs are right (it replays them) and that a damaged block is
+  rejected (it refuses that transaction).
+- **Journal feature validation.** Journal superblock features used to be
+  ignored entirely. JBD2 incompat bits other than `REVOKE` (64-bit tags,
+  `ASYNC_COMMIT`, `CSUM_V2/V3`, ...) and any ro-compat bit now make the mount
+  fail with `EINVAL` instead of misparsing the log.
+- **One barrier per commit.** The post-commit barrier is deferred
+  (`commit_barrier_pending`) and settled before checkpoint home writes and at
+  the end of an explicit flush/sync; the next commit's pre-commit barrier also
+  settles it. N commits in one flush cost N + 1 device flushes instead of 2N.
+- **ext3 commit semantics.** Mutating syscalls used to flush *and checkpoint*,
+  emptying the log after every call. They now only commit (durable before the
+  syscall returns); `sync`/`fsync` checkpoint, and the journal checkpoints by
+  itself when log space runs out.
+- **QEMU crash/recovery smoke** (`scripts/run_toybox_journal_smoke.sh`, profile
+  `musl-ext3-journal-smoke`, helper `user/journal_smoke_helper.c`): boot an
+  ext3 copy of the runtime image, sync a baseline, write 48 files, SIGKILL
+  QEMU (losing the PeetOS block cache), require `needs_recovery` and
+  `journal_checksum`, let `e2fsck` recover a copy cleanly, then boot the
+  crashed image again so the kernel recovers it, verify every surviving file
+  byte for byte, and require a clean `e2fsck -fn`.
+- **Bugs this found** (both latent while every syscall checkpointed, and both
+  invisible to the host tests until checkpoints lagged commits):
+  1. `write_checkpoint_home_block` copied a checkpointed (older) snapshot into
+     a clean cache entry. A partial checkpoint after a newer commit rolled
+     cached bitmaps back, so the allocator reused blocks and inodes that a
+     later transaction owned (e2fsck: multiply-claimed blocks). Checkpoint
+     writes no longer touch cached contents.
+  2. CLOCK eviction dropped clean blocks whose newest version was only in the
+     journal, so re-reads came from a stale home copy. Eviction now
+     checkpoints through the last transaction that journaled the block.
 
 ## Gaps
 
@@ -263,18 +474,16 @@ All of the above are in `crates/fs/src/lib.rs` test module.
 
 ### 3. Feature coverage limits
 
-- Superblock feature acceptance is intentionally narrow; unknown incompat and
-  ro-compat bits are rejected.
-- Several ext2/ext3-era feature bits are now rejected on purpose until their
-  operational semantics are implemented:
-  - `EXT_ATTR`
-  - `DIR_INDEX`
-  - `RESIZE_INO`
-  - `IMAGIC_INODES`
-  - `DIR_PREALLOC`
-  - `LARGE_FILE`
-- This is safer than silent misbehavior, but it means many ext3 and ext4-era
-  images remain unsupported or only partially compatible.
+- Stock ext3 images mount, but support for some features is partial:
+  - xattrs are preserved/released, not exposed (`getxattr`/`setxattr` absent),
+    and POSIX ACLs stored in them are not enforced.
+  - htree indexes are dropped on the first insert rather than maintained, so
+    large directories degrade to linear lookups until `e2fsck -D`.
+  - files over 4 GiB are read-only-by-refusal (no 64-bit I/O path).
+- `IMAGIC_INODES`, `DIR_PREALLOC`, and all ext4-era bits (extents, flex_bg,
+  64bit, metadata_csum, huge_file, ...) are still rejected.
+- Sharing of xattr blocks is only honored on release; the kernel never creates
+  or deduplicates xattr blocks.
 
 ### 4. Broader filesystem integration still incomplete
 
@@ -295,8 +504,18 @@ All of the above are in `crates/fs/src/lib.rs` test module.
   committing/newly started transaction pair.
 - Full fs-wide VM page-cache integration and broader hardening are still
   pending.
-- There is no dedicated QEMU crash/recovery suite exercising ext3 replay across
-  actual reboot/failure scenarios.
+- The QEMU crash smoke kills QEMU at one point (after the workload). Finer
+  crash points are covered by the host reordering-cache test, not under QEMU.
+- `user/journal_smoke_helper.c` uses `mkdirat`: musl's `mkdir()` issues the
+  legacy `mkdir` syscall, which the kernel does not implement (`ENOSYS`).
+- Crash testing is host-side. The reordering-cache model treats individual
+  block writes as atomic; torn sector writes inside one block are not
+  modeled, and commit records carry no checksum (no `journal_checksum`) to
+  detect them.
+- A sealed transaction is only split if it exceeds the entire journal window
+  (descriptors + data + commit must fit in the log). The credit planner keeps
+  segments far smaller, so this only affects tiny synthetic test journals.
+  There is no JBD-style cap of a quarter of the journal per transaction.
 
 ## Ordered Patch Checklist
 
@@ -362,9 +581,20 @@ to something materially closer to full ext3 parity.
      mapped-file writeback.
 
 10. Expand the supported ext3 feature set deliberately.
-   - Once the core journaling model is correct, add or validate operational
-     support for accepted ext3-era feature bits.
-   - Only then consider broader compatibility beyond the current narrow matrix.
+   - Done for the stock `mke2fs -t ext3` set (`ext_attr`, `resize_inode`,
+     `dir_index`, `large_file`), validated against a real mkfs image plus
+     `e2fsck -fn` after kernel-side mutation.
+   - Remaining: maintain htree indexes on insert, expose xattrs, 64-bit file
+     I/O, and only then consider anything beyond the ext3 matrix.
+
+11. Done: `INCOMPAT_RECOVER` tracks live journal contents and `s_sequence`
+    follows JBD semantics (section 8); checkpoint-after-reuse and shared-block
+    snapshot loss are fixed (section 9); journal writes are ordered by write
+    barriers and transactions can span several descriptor blocks (section 10).
+    Commit checksums, journal feature validation, and a QEMU crash/recovery
+    smoke are done (section 11). Remaining hardening: maintaining htree
+    indexes, exposing xattrs, 64-bit file I/O, and a JBD-style per-transaction
+    size cap.
 
 ## Historical Comparison (`peetos_c`)
 
@@ -380,3 +610,6 @@ to something materially closer to full ext3 parity.
 - Test coverage is currently strong at host-unit level for replay, flush,
   checkpoint, revoke, and abort mechanics, but there is no dedicated QEMU
   integration suite focused on ext3 crash scenarios yet.
+- On-disk compatibility for a stock ext3 image is cross-checked with
+  `e2fsck` for a clean (checkpointed) state and for one committed-but-not-
+  checkpointed crash state; torn writes are not modeled.
