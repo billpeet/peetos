@@ -325,24 +325,22 @@ fn try_mount_ext2_from_block() -> bool {
                 flush: Some(ext2_block_backend_flush),
             };
             if fs::set_ext2_block_backend(backend).is_ok() {
+                fs::set_ext2_diag_hook(Some(ext2_diag));
                 let probe = core::slice::from_raw_parts(probe_ptr, PROBE_SIZE);
                 if fs::mount_ext2_block_backend(EXT2_MOUNT_POINT, image_len, probe).is_ok() {
-                    let fs_name = if fs::ext2_has_journal() {
-                        "ext3"
-                    } else {
-                        "ext2"
-                    };
+                    let fs_name = fs::ext2_fs_name();
                     EXT2_BLOCK_BACKING = Ext2BlockBacking {
                         active: true,
                         device_index: index,
                         image_len,
                     };
                     serial_println!(
-                        "[VFS] Mounted {} from block dev{} at {} ({} KiB, lazy cache)",
+                        "[VFS] Mounted {} from block dev{} at {} ({} KiB, lazy cache{})",
                         fs_name,
                         index,
                         EXT2_MOUNT_POINT,
-                        image_len / 1024
+                        image_len / 1024,
+                        if fs::ext2_mount_read_only() { ", read-only" } else { "" }
                     );
                     mounted = true;
                 } else {
@@ -401,6 +399,11 @@ fn ext2_block_backend_write(ctx: u64, block_index: u32, data: &[u8]) -> Result<(
 /// own volatile write cache (ATA FLUSH CACHE EXT on AHCI).
 fn ext2_block_backend_flush(ctx: u64) -> Result<(), i64> {
     block::flush_device(ctx as usize).map_err(map_block_io_to_errno)
+}
+
+/// fs crate diagnostics (ext4 checksum failures and similar).
+fn ext2_diag(what: &'static str, id: u64) {
+    serial_println!("[EXT4] {} mismatch (id {})", what, id);
 }
 
 fn map_block_io_to_errno(err: block::BlockIoError) -> i64 {

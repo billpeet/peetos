@@ -33,6 +33,9 @@ const SB_UUID: usize = 0x68;
 const SB_INODE_SIZE: usize = 0x58;
 const SB_DESC_SIZE: usize = 0xFE;
 const SB_CHECKSUM_SEED: usize = 0x270;
+const SB_CREATOR_OS: usize = 0x48;
+/// `s_creator_os` value for Linux; ext4 only checksums inodes it created.
+const EXT4_OS_LINUX: u32 = 0;
 const SB_CHECKSUM: usize = 0x3FC;
 
 /// Group descriptor field offsets.
@@ -125,6 +128,8 @@ pub(super) struct Ext4Csum {
     pub seed: u32,
     pub uuid: [u8; 16],
     pub metadata_csum: bool,
+    /// Inode checksums are only maintained for Linux-created filesystems.
+    pub inode_csums: bool,
     pub gdt_csum: bool,
     pub desc_size: usize,
     pub inode_size: usize,
@@ -156,10 +161,12 @@ impl Ext4Csum {
         if desc_size < 32 || inode_size < GOOD_OLD_INODE_SIZE {
             return Err(EINVAL);
         }
+        let metadata_csum = (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0;
         Ok(Self {
             seed,
             uuid,
-            metadata_csum: (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0,
+            metadata_csum,
+            inode_csums: metadata_csum && read_u32_le(sb, SB_CREATOR_OS)? == EXT4_OS_LINUX,
             gdt_csum: (ro_compat & EXT4_FEATURE_RO_COMPAT_GDT_CSUM) != 0,
             desc_size,
             inode_size,
@@ -207,8 +214,11 @@ impl Ext4Csum {
 
     /// Per-inode seed: crc32c(crc32c(fs seed, ino), i_generation).
     pub(super) fn inode_seed(&self, ino: u32, raw: &[u8]) -> Result<u32, i64> {
-        let generation = read_u32_le(raw, INODE_GENERATION)?;
-        Ok(crc32c(crc32c(self.seed, &ino.to_le_bytes()), &generation.to_le_bytes()))
+        Ok(self.inode_seed_for(ino, read_u32_le(raw, INODE_GENERATION)?))
+    }
+
+    pub(super) fn inode_seed_for(&self, ino: u32, generation: u32) -> u32 {
+        crc32c(crc32c(self.seed, &ino.to_le_bytes()), &generation.to_le_bytes())
     }
 
     fn checksum_hi_fits(&self, raw: &[u8]) -> Result<bool, i64> {

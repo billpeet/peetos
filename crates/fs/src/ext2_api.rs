@@ -4,8 +4,8 @@ use super::{
     ext2_read_inode_from_state, ext2_reset_dirty_tracking,
     ext2_set_cache_policy as ext2_set_cache_policy_state, ext2_set_image_len, ext2_sync,
     mount_table_set, prune_root_overlays_after_ext2_mount, rollback_ext2_mount_import, with_state,
-    Ext2BackendKind, Ext2BlockBackend, Ext2DirtyRun, FileType, NodeBackend, EBUSY, EEXIST, EINVAL,
-    EIO, ENOENT, ENOSPC, ENOTDIR, EXT2_ROOT_INODE, ROOT_INODE,
+    Ext2BackendKind, Ext2BlockBackend, Ext2DiagFn, Ext2DirtyRun, FileType, NodeBackend, EBUSY,
+    EEXIST, EINVAL, EIO, ENOENT, ENOSPC, ENOTDIR, EXT2_ROOT_INODE, ROOT_INODE,
 };
 
 pub fn mount_ext2_block_backend(
@@ -63,9 +63,17 @@ pub fn mount_ext2_block_backend(
         state.ext2_meta = meta;
         state.ext2_mounted = true;
         state.ext2_mount_inode = mount_inode;
+        state.ext2_read_only = meta.ext4_read_only;
+        state.ext4_csum = None;
         ext2_reset_dirty_tracking(state)?;
         let resident_len = (head_len / meta.block_size) * meta.block_size;
         ext2_mark_resident_range(state, 0, resident_len)?;
+        // ext4 checksums are verified before journal recovery, against the
+        // home copies (Linux checks the superblock and descriptors first too).
+        if let Err(err) = super::ext2_verify_mount_checksums(state) {
+            rollback_ext2_mount_import(state, mount_inode);
+            return Err(err);
+        }
         if let Err(err) = ext2_journal::prepare_mount(state) {
             rollback_ext2_mount_import(state, mount_inode);
             return Err(err);
@@ -95,12 +103,9 @@ pub fn mount_ext2_block_backend(
         mount.atime = root.atime as u64;
         mount.mtime = root.mtime as u64;
         mount.ctime = root.ctime as u64;
-        let fs_name = if state.ext2_journal.present {
-            "ext3"
-        } else {
-            "ext2"
-        };
-        if let Err(err) = mount_table_set(state, mount_inode, mount_path, fs_name, false) {
+        let fs_name = super::ext2_fs_name_for(state);
+        let read_only = state.ext2_read_only;
+        if let Err(err) = mount_table_set(state, mount_inode, mount_path, fs_name, read_only) {
             rollback_ext2_mount_import(state, mount_inode);
             return Err(err);
         }
@@ -185,6 +190,37 @@ pub fn ext2_next_dirty_run(start_block: u32) -> Result<Option<Ext2DirtyRun>, i64
             return Err(ENOENT);
         }
         ext2_sync::next_dirty_run(state, start_block)
+    })
+}
+
+/// Filesystem type of the mounted ext2-family image: `ext4` when it uses
+/// ext4 features, otherwise `ext3` with a journal, else `ext2`.
+pub fn ext2_fs_name() -> &'static str {
+    with_state(|state| {
+        ensure_init(state);
+        if state.ext2_mounted {
+            super::ext2_fs_name_for(state)
+        } else {
+            "none"
+        }
+    })
+}
+
+/// True when the mounted ext2-family filesystem is read-only (ext4 images
+/// until write support lands, docs/ext4_compat_plan.md).
+pub fn ext2_mount_read_only() -> bool {
+    with_state(|state| {
+        ensure_init(state);
+        state.ext2_mounted && state.ext2_read_only
+    })
+}
+
+/// Registers a callback for filesystem diagnostics such as checksum
+/// failures (the kernel prints them on serial).
+pub fn set_ext2_diag_hook(hook: Option<Ext2DiagFn>) {
+    with_state(|state| {
+        ensure_init(state);
+        state.ext2_diag = hook;
     })
 }
 

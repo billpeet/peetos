@@ -159,3 +159,19 @@ if [[ "${checked}" -eq 0 ]]; then
   exit 1
 fi
 echo "[ext3-fsck] ${checked} recovered crash-point images are e2fsck clean"
+
+# ext4: the kernel recovers a Linux-format journal (64bit + csum v3, written
+# by debugfs) on a read-only mount; the result, including the superblock and
+# journal superblock checksums it rewrote, must be clean for e2fsck.
+EXT4_IMG="${WORK_DIR}/ext4_replayed.img"
+PEETOS_EXT4_REPLAYED_IMAGE="${EXT4_IMG}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::ext4_linux_format_journal_replays_on_read_only_mount
+if [[ ! -s "${EXT4_IMG}" ]]; then
+  echo "[ext3-fsck] ext4 replay test did not export an image" >&2
+  exit 1
+fi
+if ! e2fsck -fn "${EXT4_IMG}"; then
+  echo "[ext3-fsck] ext4 image not clean after kernel journal recovery" >&2
+  exit 1
+fi
+echo "[ext3-fsck] e2fsck accepts the kernel's recovery of a csum-v3 ext4 journal"

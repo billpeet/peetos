@@ -42,6 +42,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - libwayland 1.23.1 (with libffi 3.4.6) is ported as static musl libraries (`make -C wayland`). A dedicated QEMU smoke (`run-wayland-smoke`) runs a libwayland compositor and a separate libwayland client process that connect over `/tmp/wayland-0`, share a sealed memfd `wl_shm` pool, present two frames (growing the pool in between), and exercise `eventfd`, `timerfd`, `signalfd`, `flock`, `fallocate`, `mremap`, and `SO_PEERCRED`. See `docs/wayland.md`.
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
 - `fork` is copy-on-write, and `clone(CLONE_THREAD)` thread groups support musl pthreads, including `pthread_cancel`, timed waits and `execve` from any thread. Signals use the Linux `rt_sigframe` ABI (signals 1..=64, `siginfo_t`/`ucontext_t`) and interrupt blocking syscalls with `SA_RESTART`-aware restart (`make run-proc-smoke`; see `docs/process_model.md`).
+- Stock `mkfs.ext4` images mount read-only (extents, 64-bit descriptors, flex_bg, `metadata_csum` verification, Linux journal recovery); `make run-ext4-ro-smoke` boots QEMU from an ext4 root. Write support is planned in `docs/ext4_compat_plan.md`.
 - ext3 (journaled) roots are crash-safe: `make run-journal-smoke` boots an ext3 copy of the runtime image, kills QEMU mid-workload, then checks that both `e2fsck` and the kernel recover it (needs `e2fsprogs`; see `docs/ext3_parity_audit.md`).
 - ELF loading is hardened (header/segment validation, malformed `PT_INTERP` rejection, RWX rejection, entrypoint checks) with NXE enabled.
 - User bootstrap supports a minimal `PT_INTERP` flow (`AT_ENTRY`/`AT_BASE`) and Linux-style initial stack (`argc`/`argv`/`envp`/`auxv`).
@@ -163,6 +164,7 @@ scripts/run_toybox_ping_smoke.sh
 scripts/run_toybox_unix_rights_smoke.sh
 scripts/run_toybox_proc_smoke.sh
 scripts/run_toybox_journal_smoke.sh
+scripts/run_toybox_ext4_ro_smoke.sh
 ```
 
 quickjs:
@@ -199,6 +201,7 @@ make run-ping-smoke
 make run-unix-rights-smoke
 make run-proc-smoke
 make run-journal-smoke
+make run-ext4-ro-smoke
 make run-quickjs-smoke
 make run-micropython-smoke
 make run-dropbear-smoke

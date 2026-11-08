@@ -131,6 +131,64 @@ Exit: every file in the stock fixture reads back identical to what
 `debugfs -R dump` produces; corrupted-checksum fixtures return `EIO`; a QEMU
 smoke boots with an ext4 root mounted read-only and lists/reads files.
 
+**Status: done.**
+- **Mount policy.** `extent 64bit flex_bg csum_seed` (incompat) and
+  `huge_file gdt_csum dir_nlink extra_isize metadata_csum` (ro-compat) are
+  accepted and force `ext2_read_only`. Every VFS mutation on that mount
+  returns `EROFS` (`backend_mutable` is state-aware; create, mkdir and
+  `write` gained explicit guards). `/proc/mounts` shows `ext4 ... ro`, and
+  `fs::ext2_fs_name()`/`ext2_mount_read_only()` feed the kernel's mount log.
+  `gdt_csum` together with `metadata_csum` is rejected.
+- **Extents.** `ext2_bmap.rs` walks extent trees of any depth up to 5 with
+  bounds/depth/magic checks. Unwritten extents and holes read as zeros, and
+  each tree block's checksum is verified. 48-bit physical blocks with
+  non-zero high bits are refused (`EIO`).
+- **Inodes.** `Ext2Inode` carries `ino`, `i_generation` and
+  `l_i_blocks_high`. `stat` reports `huge_file` `i_blocks`, including
+  `EXT4_HUGE_FILE_FL` (counted in filesystem blocks).
+- **Checksums (EIO on mismatch + diagnostics hook).** The superblock and
+  every group descriptor (crc32c or crc16) are checked at mount, before
+  journal recovery. Inodes, extent tree blocks and directory leaf blocks are
+  checked when read. `fs::set_ext2_diag_hook` lets the kernel print
+  `[EXT4] <structure> checksum mismatch (id N)`.
+- **Block 0.** With 4 KiB blocks, block 0 holds the superblock
+  (`s_first_data_block = 0`) and is now a valid metadata block (latent ext2
+  bug: every earlier fixture used 1 KiB blocks).
+- **JBD2 recovery formats.** `64BIT`, `CSUM_V2` and `CSUM_V3` are understood:
+  tag sizes follow `journal_tag_bytes`, 64-bit revoke records, descriptor
+  and revoke tails, per-block data checksums, commit checksums, and journal
+  superblock checksums (verified at mount, recomputed on write). Rules follow
+  jbd2: a bad descriptor/revoke/data checksum fails recovery (here before
+  anything is written), and a bad commit checksum ends the log. Transactions
+  may start with a revoke block: a revoke-only transaction used to end replay
+  early (latent bug). Journals with these features mount only read-only,
+  because the writer emits the classic format. Read-only mounts never modify
+  the journal superblock's features.
+- **Superblock upkeep.** Every home write of the superblock block (journal
+  checkpoints and plain cache writeback now share `backend_write_block_raw`)
+  recomputes `s_checksum` on `metadata_csum` filesystems, so recovery leaves
+  a valid superblock.
+- **Tests.** Both fixtures read back completely (htree directory, depth-1
+  extent file with holes, xattr file, fast symlink, 5 GiB sparse file);
+  every mutation is refused with zero backend writes; one-byte corruptions
+  of the superblock, descriptors (crc32c and crc16), an inode, an extent leaf
+  and a directory block return `EIO`; `user/sample_ext4_journal.img`
+  (debugfs-written `journal_64bit` + `journal_checksum_v3`, with a
+  revoke-only transaction) replays to the same result as `e2fsck`, with
+  corruption cases for data, descriptor, commit and journal superblock;
+  `tests/ext3_fsck.sh` runs `e2fsck -fn` on the kernel-recovered image;
+  `tests/musl_ext4_ro_smoke.sh` (`make run-ext4-ro-smoke`) boots QEMU from a
+  stock ext4 root and checks reads, refusal of writes, `/proc/mounts`, and a
+  byte-identical disk afterwards.
+- **Deviations / gaps.** `stat` still reports whole seconds (nanoseconds and
+  `crtime` are not decoded). htree `dx_tail` checksums and bitmap checksums
+  are not verified (directory indexes are read linearly; bitmaps are only
+  read by the allocator, which a read-only mount never runs). When a data
+  block checksum fails, jbd2 still writes the other blocks before failing;
+  this implementation fails before writing anything. The runtime `/etc/fstab`
+  still says `ext3`. The QEMU smoke reuses the `musl-ext3-journal-smoke`
+  init, whose staged script the runner replaces.
+
 ### M2 - Read-write on ext4 without `metadata_csum`
 
 Target images: `mke2fs -t ext4 -O ^metadata_csum,uninit_bg`, the pre-1.43

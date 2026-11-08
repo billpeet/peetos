@@ -228,6 +228,9 @@ current Rust kernel implementation and forward roadmap.
   mount first, then extent writes, then `metadata_csum` writes). M0 is done:
   ext4 fixtures, 64-byte group descriptor support, crc32c/crc16 checksum
   verifiers validated against `mkfs.ext4` output, and the block-map seam.
+  M1 is done: stock ext4 images mount read-only with extent reads,
+  `metadata_csum` verification, and recovery of Linux `64bit`/`csum_v3`
+  journals; a QEMU smoke boots from an ext4 root (`make run-ext4-ro-smoke`).
 - Add additional filesystem support (for example FAT-family support) as needed.
 - Improve durability guarantees around writeback scheduling and crash handling.
 

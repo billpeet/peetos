@@ -86,3 +86,33 @@ build_image "${OUT_IMG}"
 # group descriptor checksums and lazy-init groups without crc32c, the M2
 # target format. (On 1.47, ^metadata_csum alone does not add uninit_bg.)
 build_image "${ROOT_DIR}/user/sample_ext4_nocsum.img" "^metadata_csum,uninit_bg"
+
+# Unrecovered journal in the format Linux writes on metadata_csum ext4
+# (journal_64bit + journal_checksum_v3), produced by debugfs's journal
+# writer. Three transactions on free blocks of group 3:
+#   tx1: 3500 <- 'J' x 4096, 3501 <- 'K' x 4096
+#   tx2: revoke 3501 (a revoke-only transaction)
+#   tx3: 3502 <- 'L' x 4096
+# After recovery: 3500 = J, 3501 = unchanged (zeros, revoked), 3502 = L.
+JIMG="${WORK_DIR}/journal.img"
+cp "${OUT_IMG}" "${JIMG}"
+{ head -c 4096 /dev/zero | tr '\0' 'J'; head -c 4096 /dev/zero | tr '\0' 'K'; } \
+  > "${WORK_DIR}/jk.bin"
+head -c 4096 /dev/zero | tr '\0' 'L' > "${WORK_DIR}/l.bin"
+cat > "${WORK_DIR}/journal.cmds" <<EOF
+jo -c
+jw -b 3500,3501 ${WORK_DIR}/jk.bin
+jc
+jo
+jw -r 3501
+jw -b 3502 ${WORK_DIR}/l.bin
+jc
+EOF
+debugfs -w -f "${WORK_DIR}/journal.cmds" "${JIMG}" >/dev/null 2>&1
+dumpe2fs -h "${JIMG}" 2>/dev/null | grep -q needs_recovery \
+  || { echo "journal fixture lacks needs_recovery" >&2; exit 1; }
+dumpe2fs -h "${JIMG}" 2>/dev/null | grep -i "journal features" | grep -q journal_checksum_v3 \
+  || { echo "journal fixture lacks journal_checksum_v3" >&2; exit 1; }
+mv "${JIMG}" "${ROOT_DIR}/user/sample_ext4_journal.img"
+chmod 0644 "${ROOT_DIR}/user/sample_ext4_journal.img"
+echo "Built ${ROOT_DIR}/user/sample_ext4_journal.img"

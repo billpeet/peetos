@@ -28,6 +28,7 @@ use ext2_dir::{
 };
 
 pub use ext2_api::{
+    ext2_fs_name, ext2_mount_read_only, set_ext2_diag_hook,
     checkpoint_ext2_journal, clear_ext2_block_backend, copy_ext2_blocks, export_ext2_image,
     ext2_backend_kind, ext2_has_journal, ext2_next_dirty_run, flush_ext2_dirty_blocks,
     mark_ext2_blocks_synced, mount_ext2_block_backend, set_ext2_block_backend,
@@ -109,6 +110,9 @@ const EXT2_GROUP_DESC_SIZE: usize = 32;
 const EXT4_MIN_DESC_SIZE_64BIT: usize = 64;
 /// Upper bound accepted for `s_desc_size` (Linux: EXT4_MAX_DESC_SIZE).
 const EXT4_MAX_DESC_SIZE: usize = 1024;
+/// Largest inode size checksummed in place (ext4 allows up to the block size;
+/// e2fsprogs creates at most 1024).
+const EXT4_MAX_INODE_SIZE: usize = 1024;
 /// Offset of a descriptor field's high half (`bg_*_hi`) relative to its low
 /// half, for the fields that have one, when descriptors are >= 64 bytes.
 const EXT4_GD_HI_DELTA: usize = 0x20;
@@ -142,6 +146,28 @@ const EXT2_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
 const EXT2_FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
 /// ext4 `64bit`: 64-bit block numbers and `s_desc_size`-byte descriptors.
 const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
+const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
+const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
+const EXT4_FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
+/// ext4 incompat features that mount, but only read-only for now
+/// (docs/ext4_compat_plan.md M1): reads understand them, writes do not yet.
+const EXT4_FEATURE_INCOMPAT_READ_ONLY: u32 = EXT4_FEATURE_INCOMPAT_EXTENTS
+    | EXT4_FEATURE_INCOMPAT_64BIT
+    | EXT4_FEATURE_INCOMPAT_FLEX_BG
+    | EXT4_FEATURE_INCOMPAT_CSUM_SEED;
+const EXT4_FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
+const EXT4_FEATURE_RO_COMPAT_GDT_CSUM: u32 = 0x0010;
+const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
+const EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
+/// ext4 ro-compat features that likewise force a read-only mount for now.
+const EXT4_FEATURE_RO_COMPAT_READ_ONLY: u32 = EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+    | EXT4_FEATURE_RO_COMPAT_GDT_CSUM
+    | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
+    | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE
+    | EXT4_FEATURE_RO_COMPAT_METADATA_CSUM;
+/// `i_flags`: `i_blocks` counts filesystem blocks instead of 512-byte sectors.
+const EXT4_HUGE_FILE_FL: u32 = 0x0004_0000;
 const EXT2_FEATURE_INCOMPAT_SUPPORTED: u32 = EXT2_FEATURE_INCOMPAT_FILETYPE
     | EXT2_FEATURE_INCOMPAT_RECOVER
     | EXT2_FEATURE_INCOMPAT_JOURNAL_DEV;
@@ -358,6 +384,8 @@ struct Ext2JournalState {
     mode: Ext2JournalMode,
     inode: u32,
     inode_blocks: [u32; 15],
+    inode_flags: u32,
+    inode_generation: u32,
     superblock_block: u32,
     block_size: u32,
     max_len: u32,
@@ -379,6 +407,9 @@ struct Ext2JournalState {
     /// JBD2 COMPAT_CHECKSUM: commit blocks carry a CRC32 over the
     /// transaction's descriptor and journaled blocks, verified on replay.
     checksum: bool,
+    /// The journal uses JBD2 CSUM_V2/V3 (recovery-only here): journal
+    /// superblock writes must keep `s_checksum` valid.
+    csum_v2_or_v3: bool,
     /// A commit record was written but no barrier has made it durable yet.
     /// Settled before checkpoint home writes and before flush/sync returns.
     commit_barrier_pending: bool,
@@ -400,6 +431,8 @@ impl Ext2JournalState {
             mode: Ext2JournalMode::Disabled,
             inode: 0,
             inode_blocks: [0; 15],
+            inode_flags: 0,
+            inode_generation: 0,
             superblock_block: 0,
             block_size: 0,
             max_len: 0,
@@ -415,6 +448,7 @@ impl Ext2JournalState {
             tx_commit_fs_block: 0,
             recover_marked: false,
             checksum: false,
+            csum_v2_or_v3: false,
             commit_barrier_pending: false,
         }
     }
@@ -569,6 +603,12 @@ struct VfsState {
     ext2_journal_committed_txs: Vec<Ext2JournalCommittedTx>,
     ext2_journal_pending_revokes: Vec<u32>,
     ext2_journal_next_tx_id: u64,
+    /// The mounted ext2-family filesystem refuses VFS mutations (`EROFS`).
+    ext2_read_only: bool,
+    /// ext4 `metadata_csum` parameters when the mounted image has it.
+    ext4_csum: Option<ext4_csum::Ext4Csum>,
+    /// Optional diagnostics sink (checksum failures).
+    ext2_diag: Option<Ext2DiagFn>,
     prng_state: u64,
 }
 
@@ -602,6 +642,9 @@ impl VfsState {
             ext2_journal_committed_txs: Vec::new(),
             ext2_journal_pending_revokes: Vec::new(),
             ext2_journal_next_tx_id: 1,
+            ext2_read_only: false,
+            ext4_csum: None,
+            ext2_diag: None,
             prng_state: 0,
         }
     }
@@ -653,6 +696,9 @@ struct Ext2Meta {
     feature_incompat: u32,
     /// On-disk group descriptor size: 32, or `s_desc_size` with `64bit`.
     desc_size: usize,
+    feature_ro_compat: u32,
+    /// The image uses ext4 features that only mount read-only so far.
+    ext4_read_only: bool,
     journal_inode: u32,
     journal_dev: u32,
 }
@@ -672,6 +718,8 @@ impl Ext2Meta {
             feature_compat: 0,
             feature_incompat: 0,
             desc_size: EXT2_GROUP_DESC_SIZE,
+            feature_ro_compat: 0,
+            ext4_read_only: false,
             journal_inode: 0,
             journal_dev: 0,
         }
@@ -696,6 +744,14 @@ struct Ext2Inode {
     file_acl: u32,
     /// `i_size_high` / `i_dir_acl` (offset 108). Read-only here.
     size_high: u32,
+    /// Inode number this copy was read from (0 for synthetic inodes). With
+    /// `i_generation` it seeds ext4 per-inode checksums (extent and
+    /// directory blocks).
+    ino: u32,
+    /// `i_generation` (offset 0x64).
+    generation: u32,
+    /// `l_i_blocks_high` (offset 0x74): bits 32..47 of `i_blocks` (huge_file).
+    blocks_hi: u16,
 }
 
 fn with_state<R>(f: impl FnOnce(&mut VfsState) -> R) -> R {
@@ -1304,7 +1360,7 @@ fn create_regular_at_inner(state: &mut VfsState, start: u16, path: &str) -> Resu
     let (parent, name_len) = resolve_parent_from_inner(state, start, path, &mut name)?;
 
     let parent_backend = state.inodes[parent as usize].backend;
-    if !matches!(parent_backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
+    if !backend_mutable(state, parent_backend) {
         return Err(EROFS);
     }
 
@@ -1365,7 +1421,7 @@ fn mkdir_at_inner(state: &mut VfsState, start: u16, path: &str) -> Result<(), i6
     let (parent, name_len) = resolve_parent_from_inner(state, start, path, &mut name)?;
 
     let parent_backend = state.inodes[parent as usize].backend;
-    if !matches!(parent_backend, NodeBackend::Tmpfs | NodeBackend::Ext2) {
+    if !backend_mutable(state, parent_backend) {
         return Err(EROFS);
     }
 
@@ -1660,18 +1716,26 @@ fn ext2_parse_meta_with_len(
     logical_image_len: usize,
     require_gdt_resident: bool,
 ) -> Result<Ext2Meta, i64> {
-    let meta = ext2_parse_layout_with_len(image, logical_image_len, require_gdt_resident)?;
-    let sb = EXT2_SUPERBLOCK_OFFSET;
-    let feature_ro_compat = read_u32_le(image, sb + 100)?;
+    let mut meta = ext2_parse_layout_with_len(image, logical_image_len, require_gdt_resident)?;
     if (meta.feature_compat & !EXT2_FEATURE_COMPAT_SUPPORTED) != 0 {
         return Err(EINVAL);
     }
-    if (meta.feature_incompat & !EXT2_FEATURE_INCOMPAT_SUPPORTED) != 0 {
+    let incompat_ok = EXT2_FEATURE_INCOMPAT_SUPPORTED | EXT4_FEATURE_INCOMPAT_READ_ONLY;
+    if (meta.feature_incompat & !incompat_ok) != 0 {
         return Err(EINVAL);
     }
-    if (feature_ro_compat & !EXT2_FEATURE_RO_COMPAT_SUPPORTED) != 0 {
+    let ro_compat_ok = EXT2_FEATURE_RO_COMPAT_SUPPORTED | EXT4_FEATURE_RO_COMPAT_READ_ONLY;
+    if (meta.feature_ro_compat & !ro_compat_ok) != 0 {
         return Err(EINVAL);
     }
+    // Two checksum schemes for group descriptors cannot both be active.
+    if (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_GDT_CSUM) != 0
+        && (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0
+    {
+        return Err(EINVAL);
+    }
+    meta.ext4_read_only = (meta.feature_incompat & EXT4_FEATURE_INCOMPAT_READ_ONLY) != 0
+        || (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_READ_ONLY) != 0;
     Ok(meta)
 }
 
@@ -1761,6 +1825,8 @@ fn ext2_parse_layout_with_len(
         feature_compat,
         feature_incompat,
         desc_size,
+        feature_ro_compat: read_u32_le(image, sb + 100)?,
+        ext4_read_only: false,
         journal_inode,
         journal_dev,
     })
@@ -1840,15 +1906,10 @@ fn ext2_cache_flush_block(state: &mut VfsState, block: u32) -> Result<(), i64> {
         return ext2_journal::flush_dirty_block(state, block);
     }
 
-    let backend = match state.ext2_backend {
-        ext2_backend::Ext2Backend::None => return Err(EIO),
-        ext2_backend::Ext2Backend::BlockOps(backend) => backend,
-    };
-    (backend.write_block)(
-        backend.ctx,
-        block,
-        state.ext2_cached_blocks[idx].data.as_slice(),
-    )?;
+    // Same raw write path as the journal: superblock-block writes get the
+    // recovery-marker and metadata_csum checksum fixups there.
+    let data = state.ext2_cached_blocks[idx].data.clone();
+    ext2_journal::backend_write_block_raw(state, block, data.as_slice())?;
     state.ext2_cached_blocks[idx].dirty = false;
     ext2_unmark_dirty_block(state, block);
     Ok(())
@@ -2240,8 +2301,16 @@ fn ext2_group_inode_table_block(image: &[u8], meta: &Ext2Meta, group: u32) -> Re
 }
 
 #[allow(dead_code)]
+/// Block 0 is a valid metadata block (it holds the superblock) when
+/// `s_first_data_block` is 0, i.e. with blocks larger than 1 KiB; with 1 KiB
+/// blocks it is the boot block and never part of the filesystem. Callers that
+/// use 0 to mean "no block" (holes, unset pointers) check before slicing.
+fn ext2_block_is_null(meta: &Ext2Meta, block: u32) -> bool {
+    block == 0 && meta.first_data_block != 0
+}
+
 fn ext2_block_slice<'a>(image: &'a [u8], meta: &Ext2Meta, block: u32) -> Result<&'a [u8], i64> {
-    if block == 0 {
+    if ext2_block_is_null(meta, block) {
         return Err(EIO);
     }
     let start = (block as usize).checked_mul(meta.block_size).ok_or(EIO)?;
@@ -2258,7 +2327,7 @@ fn ext2_block_slice_mut<'a>(
     meta: &Ext2Meta,
     block: u32,
 ) -> Result<&'a mut [u8], i64> {
-    if block == 0 {
+    if ext2_block_is_null(meta, block) {
         return Err(EIO);
     }
     let start = (block as usize).checked_mul(meta.block_size).ok_or(EIO)?;
@@ -2270,10 +2339,10 @@ fn ext2_block_slice_mut<'a>(
 }
 
 fn ext2_block_slice_state<'a>(state: &'a mut VfsState, block: u32) -> Result<&'a [u8], i64> {
-    if block == 0 {
+    let meta = state.ext2_meta;
+    if ext2_block_is_null(&meta, block) {
         return Err(EIO);
     }
-    let meta = state.ext2_meta;
     let start = (block as usize).checked_mul(meta.block_size).ok_or(EIO)?;
     let end = start.checked_add(meta.block_size).ok_or(EIO)?;
     if end > state.ext2_image_len {
@@ -2290,10 +2359,10 @@ fn ext2_block_slice_mut_state<'a>(
     state: &'a mut VfsState,
     block: u32,
 ) -> Result<&'a mut [u8], i64> {
-    if block == 0 {
+    let meta = state.ext2_meta;
+    if ext2_block_is_null(&meta, block) {
         return Err(EIO);
     }
-    let meta = state.ext2_meta;
     let start = (block as usize).checked_mul(meta.block_size).ok_or(EIO)?;
     let end = start.checked_add(meta.block_size).ok_or(EIO)?;
     if end > state.ext2_image_len {
@@ -2956,6 +3025,20 @@ fn indirect_recalc_block_count_512_state(
         .saturating_add(ext2_inode_acl_sectors(&meta, inode)))
 }
 
+/// `i_blocks` in 512-byte sectors. With ext4 `huge_file` the count gains 16
+/// high bits, and `EXT4_HUGE_FILE_FL` means it is in filesystem blocks.
+fn ext2_inode_blocks_512(meta: &Ext2Meta, inode: &Ext2Inode) -> u64 {
+    if (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_HUGE_FILE) == 0 {
+        return inode.block_count_512 as u64;
+    }
+    let raw = ((inode.blocks_hi as u64) << 32) | inode.block_count_512 as u64;
+    if (inode.flags & EXT4_HUGE_FILE_FL) != 0 {
+        raw * (meta.block_size as u64 / 512)
+    } else {
+        raw
+    }
+}
+
 /// 512-byte sectors charged to `i_blocks` for the inode's external xattr block.
 fn ext2_inode_acl_sectors(meta: &Ext2Meta, inode: &Ext2Inode) -> u32 {
     if inode.file_acl != 0 {
@@ -3109,6 +3192,9 @@ fn ext2_read_inode_from_state(state: &mut VfsState, ino: u32) -> Result<Ext2Inod
     let flags = ext2_read_u32_state(state, inode_offset + 32)?;
     let file_acl = ext2_read_u32_state(state, inode_offset + 104)?;
     let size_high = ext2_read_u32_state(state, inode_offset + 108)?;
+    let generation = ext2_read_u32_state(state, inode_offset + 0x64)?;
+    let blocks_hi = ext2_read_u16_state(state, inode_offset + 0x74)?;
+    ext2_verify_inode_csum(state, ino, inode_offset)?;
 
     let mut blocks = [0u32; 15];
     let mut i = 0usize;
@@ -3131,6 +3217,9 @@ fn ext2_read_inode_from_state(state: &mut VfsState, ino: u32) -> Result<Ext2Inod
         flags,
         file_acl,
         size_high,
+        ino,
+        generation,
+        blocks_hi,
     })
 }
 
@@ -3876,6 +3965,21 @@ where
             continue;
         }
 
+        let dir_seed = state
+            .ext4_csum
+            .filter(|csum| csum.metadata_csum)
+            .map(|csum| csum.inode_seed_for(inode.ino, inode.generation));
+        if let Some(seed) = dir_seed {
+            let ok = {
+                let block = ext2_block_slice_state(state, block_num)?;
+                ext4_csum::dir_leaf_csum_ok(seed, block)?
+            };
+            // `None`: htree interior/root block (dx_tail, verified in M4).
+            if ok == Some(false) {
+                ext2_report(state, "directory block checksum", block_num as u64);
+                return Err(EIO);
+            }
+        }
         let block = ext2_block_slice_state(state, block_num)?;
         let mut pos = 0usize;
 
@@ -4036,6 +4140,9 @@ fn ext2_create_child_on_disk(
         flags: 0,
         file_acl: 0,
         size_high: 0,
+        ino,
+        generation: 0,
+        blocks_hi: 0,
     };
 
     if is_dir {
@@ -4415,8 +4522,87 @@ fn inode_number(node: &Inode, inode_idx: u16) -> u64 {
     }
 }
 
-fn backend_mutable(backend: NodeBackend) -> bool {
-    matches!(backend, NodeBackend::Tmpfs | NodeBackend::Ext2)
+fn backend_mutable(state: &VfsState, backend: NodeBackend) -> bool {
+    match backend {
+        NodeBackend::Tmpfs => true,
+        NodeBackend::Ext2 => !state.ext2_read_only,
+        _ => false,
+    }
+}
+
+/// Diagnostics callback: `what` names the failing structure, `id` is the
+/// inode or block number.
+pub type Ext2DiagFn = fn(what: &'static str, id: u64);
+
+fn ext2_fs_name_for(state: &VfsState) -> &'static str {
+    let meta = &state.ext2_meta;
+    if (meta.feature_incompat & EXT4_FEATURE_INCOMPAT_READ_ONLY) != 0
+        || (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_READ_ONLY) != 0
+    {
+        "ext4"
+    } else if state.ext2_journal.present {
+        "ext3"
+    } else {
+        "ext2"
+    }
+}
+
+/// Mount-time ext4 checksum checks: superblock (`metadata_csum`) and every
+/// group descriptor (`metadata_csum` crc32c or `gdt_csum` crc16). Enables
+/// per-structure verification on the read path for `metadata_csum`.
+fn ext2_verify_mount_checksums(state: &mut VfsState) -> Result<(), i64> {
+    let meta = state.ext2_meta;
+    let has_metadata_csum = (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0;
+    let has_gdt_csum = (meta.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_GDT_CSUM) != 0;
+    if !has_metadata_csum && !has_gdt_csum {
+        return Ok(());
+    }
+    let mut sb = [0u8; 1024];
+    ext2_read_range_from_state(state, EXT2_SUPERBLOCK_OFFSET, &mut sb)?;
+    let csum = ext4_csum::Ext4Csum::from_superblock(&sb)?;
+    if has_metadata_csum && !ext4_csum::superblock_csum_ok(&sb)? {
+        ext2_report(state, "superblock checksum", 0);
+        return Err(EIO);
+    }
+    let mut desc = [0u8; EXT4_MAX_DESC_SIZE];
+    for group in 0..meta.group_count {
+        let offset = ext2_group_desc_offset(&meta, group)?;
+        ext2_read_range_from_state(state, offset, &mut desc[..meta.desc_size])?;
+        if !csum.group_desc_ok(group, &desc[..meta.desc_size])? {
+            ext2_report(state, "group descriptor checksum", group as u64);
+            return Err(EIO);
+        }
+    }
+    if has_metadata_csum {
+        state.ext4_csum = Some(csum);
+    }
+    Ok(())
+}
+
+fn ext2_report(state: &VfsState, what: &'static str, id: u64) {
+    if let Some(hook) = state.ext2_diag {
+        hook(what, id);
+    }
+}
+
+/// Verifies an ext4 inode checksum (`metadata_csum`); `EIO` on mismatch.
+fn ext2_verify_inode_csum(state: &mut VfsState, ino: u32, inode_offset: usize) -> Result<(), i64> {
+    let csum = match state.ext4_csum {
+        Some(csum) if csum.inode_csums => csum,
+        _ => return Ok(()),
+    };
+    let size = state.ext2_meta.inode_size;
+    let mut raw = [0u8; EXT4_MAX_INODE_SIZE];
+    if size > raw.len() {
+        return Err(EIO);
+    }
+    ext2_read_range_from_state(state, inode_offset, &mut raw[..size])?;
+    if csum.inode_ok(ino, &raw[..size])? {
+        Ok(())
+    } else {
+        ext2_report(state, "inode checksum", ino as u64);
+        Err(EIO)
+    }
 }
 
 const EXT2_JOURNAL_CREDITS_CREATE: usize = 32;
@@ -4724,7 +4910,7 @@ fn open_at_inner(
     }
 
     if (flags & O_TRUNC) != 0 && inode_file_type == FileType::Regular && access != O_RDONLY {
-        if !backend_mutable(inode_backend) {
+        if !backend_mutable(state, inode_backend) {
             match inode_backend {
                 // Character-device style nodes tolerate O_TRUNC as a no-op.
                 NodeBackend::DevNull
@@ -4898,7 +5084,7 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
         stat.nlink = core::cmp::max(1, ext.links_count as u32);
         stat.size = ext2_inode_size64(&ext);
         stat.blksize = state.ext2_meta.block_size as u32;
-        stat.blocks = ext.block_count_512 as u64;
+        stat.blocks = ext2_inode_blocks_512(&state.ext2_meta, &ext);
         stat.atime = ext.atime as u64;
         stat.mtime = ext.mtime as u64;
         stat.ctime = ext.ctime as u64;
@@ -4921,7 +5107,7 @@ fn unlink_at_inner(
     }
 
     let parent_backend = state.inodes[parent as usize].backend;
-    if !backend_mutable(parent_backend) {
+    if !backend_mutable(state, parent_backend) {
         return Err(EROFS);
     }
 
@@ -5033,7 +5219,7 @@ fn rename_at_inner(
     if old_backend != new_backend {
         return Err(EINVAL);
     }
-    if !backend_mutable(old_backend) {
+    if !backend_mutable(state, old_backend) {
         return Err(EROFS);
     }
 
@@ -5148,7 +5334,7 @@ fn link_at_inner(
     if old_backend != new_backend {
         return Err(EINVAL);
     }
-    if !backend_mutable(old_backend) {
+    if !backend_mutable(state, old_backend) {
         return Err(EROFS);
     }
     if state.inodes[new_parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
@@ -5274,7 +5460,7 @@ fn symlink_at_inner(
     }
 
     let parent_backend = state.inodes[parent as usize].backend;
-    if !backend_mutable(parent_backend) {
+    if !backend_mutable(state, parent_backend) {
         return Err(EROFS);
     }
     if state.inodes[parent as usize].child_count as usize >= VFS_MAX_CHILDREN {
@@ -5447,7 +5633,7 @@ fn set_times_inner(state: &mut VfsState, inode: u16, atime: u64, mtime: u64) -> 
     }
 
     let backend = state.inodes[inode as usize].backend;
-    if !backend_mutable(backend) {
+    if !backend_mutable(state, backend) {
         return Err(EROFS);
     }
 
@@ -5486,7 +5672,7 @@ fn chmod_inner(state: &mut VfsState, inode: u16, mode: u16) -> Result<(), i64> {
     }
 
     let backend = state.inodes[inode as usize].backend;
-    if !backend_mutable(backend) {
+    if !backend_mutable(state, backend) {
         return Err(EROFS);
     }
 
@@ -5525,7 +5711,7 @@ fn chown_inner(state: &mut VfsState, inode: u16, uid: u32, gid: u32) -> Result<(
     }
 
     let backend = state.inodes[inode as usize].backend;
-    if !backend_mutable(backend) {
+    if !backend_mutable(state, backend) {
         return Err(EROFS);
     }
 
@@ -5838,6 +6024,9 @@ pub fn write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<WriteR
             return Err(EISDIR);
         }
 
+        if backend == NodeBackend::Ext2 && state.ext2_read_only {
+            return Err(EROFS);
+        }
         let result = match backend {
             NodeBackend::Tmpfs => {
                 let node_ref = &mut state.inodes[inode as usize];
@@ -6084,7 +6273,7 @@ pub fn truncate(inode: u16) -> Result<(), i64> {
         if file_type != FileType::Regular {
             return Err(EINVAL);
         }
-        if !backend_mutable(backend) {
+        if !backend_mutable(state, backend) {
             return Err(EROFS);
         }
 
@@ -6140,7 +6329,7 @@ pub fn truncate_to(inode: u16, length: u64) -> Result<(), i64> {
         if file_type != FileType::Regular {
             return Err(EINVAL);
         }
-        if !backend_mutable(backend) {
+        if !backend_mutable(state, backend) {
             return Err(EROFS);
         }
 
@@ -6414,6 +6603,9 @@ mod tests {
             flags: 0,
             file_acl: 0,
             size_high: 0,
+            ino: 0,
+            generation: 0,
+            blocks_hi: 0,
         };
         for (idx, block) in journal_blocks.iter().enumerate() {
             journal_inode.blocks[idx] = *block;
@@ -6508,6 +6700,9 @@ mod tests {
             flags: 0,
             file_acl: 0,
             size_high: 0,
+            ino: 0,
+            generation: 0,
+            blocks_hi: 0,
         };
         for (idx, block) in journal_blocks.iter().enumerate() {
             journal_inode.blocks[idx] = *block;
@@ -6972,6 +7167,9 @@ mod tests {
             flags: 0,
             file_acl: 0,
             size_high: 0,
+            ino: 0,
+            generation: 0,
+            blocks_hi: 0,
         };
 
         inode.blocks[0] = 2;
@@ -8634,7 +8832,8 @@ mod tests {
         let mut bad = std::vec::Vec::from(SAMPLE_EXT2);
         let incompat_off = EXT2_SUPERBLOCK_OFFSET + 96;
         let incompat = read_u32_le(&bad, incompat_off).expect("read feature incompat");
-        write_u32_le(&mut bad, incompat_off, incompat | 0x40).expect("set unsupported incompat");
+        // 0x8000 = inline_data: still unsupported even read-only.
+        write_u32_le(&mut bad, incompat_off, incompat | 0x8000).expect("set unsupported incompat");
 
         let err = mount_ext2_backend_image_expect_err(&bad, 4096);
         assert_eq!(err, EINVAL);
@@ -10318,13 +10517,315 @@ mod tests {
         assert_eq!(ext4_csum::crc16(0, b"123456789"), 0xBB3D);
     }
 
+    // ---- ext4 M1: read-only mount ----
+
+    static EXT4_DIAG_REPORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn ext4_count_diag(_what: &'static str, _id: u64) {
+        EXT4_DIAG_REPORTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn bigdir_name(i: usize) -> std::string::String {
+        let mut name = std::format!("entry_{i:03}_");
+        while name.len() < 60 {
+            name.push('x');
+        }
+        name
+    }
+
+    fn read_all(path: &str, max: usize) -> std::vec::Vec<u8> {
+        let opened = open(path, O_RDONLY, 0).expect("open for read");
+        let mut buf = std::vec![0u8; max];
+        let mut total = 0usize;
+        loop {
+            let n = read(opened.inode, total as u64, &mut buf[total..]).expect("read");
+            if n == 0 || total + n == max {
+                total += n;
+                break;
+            }
+            total += n;
+        }
+        buf.truncate(total);
+        buf
+    }
+
     #[test]
-    fn ext4_images_are_still_rejected_at_mount() {
+    fn ext4_images_mount_read_only_and_read_every_file() {
         let _guard = TEST_LOCK.lock().expect("lock should work");
         for image in [SAMPLE_EXT4, SAMPLE_EXT4_NOCSUM] {
             init();
-            assert_eq!(mount_ext2_backend_image_expect_err(image, 4096), EINVAL);
+            let ctx = mount_ext2_backend_image(image, 4096);
+            assert_eq!(ext2_fs_name(), "ext4");
+            assert!(ext2_mount_read_only());
+
+            assert_eq!(read_whole("/mnt/ext2/hello.txt"), b"hello ext4\n");
+            assert_eq!(read_whole("/mnt/ext2/sub/nested.txt"), b"nested\n");
+            assert_eq!(read_whole("/mnt/ext2/xattr_block.txt"), b"xattr block file\n");
+            let mut buf = [0u8; 32];
+            let n = readlinkat(root_inode(), "/mnt/ext2/fastlink", &mut buf).unwrap();
+            assert_eq!(&buf[..n], b"hello.txt");
+
+            // htree directory, read linearly.
+            assert_eq!(count_dir_entries("/mnt/ext2/bigdir"), 62);
+            for i in [1usize, 37, 62] {
+                let path = std::format!("/mnt/ext2/bigdir/{}", bigdir_name(i));
+                assert_eq!(read_whole(&path), std::format!("{i}\n").as_bytes());
+            }
+
+            // frag.bin: depth-1 extent tree; data every other 4 KiB block.
+            let frag = read_all("/mnt/ext2/frag.bin", 64 * 4096);
+            assert_eq!(frag.len(), 38 * 4096 + 12);
+            for blk in 0..39usize {
+                let chunk = &frag[blk * 4096..core::cmp::min(frag.len(), (blk + 1) * 4096)];
+                if blk % 2 == 0 {
+                    let expected = std::format!("fragment {:02}\n", blk / 2);
+                    assert_eq!(&chunk[..12], expected.as_bytes(), "block {blk}");
+                    assert!(chunk[12..].iter().all(|&b| b == 0));
+                } else {
+                    assert!(chunk.iter().all(|&b| b == 0), "hole {blk}");
+                }
+            }
+            let frag_stat = stat(open("/mnt/ext2/frag.bin", O_RDONLY, 0).unwrap().inode).unwrap();
+            assert_eq!(frag_stat.blocks, 21 * 8, "20 data blocks + 1 extent leaf");
+
+            let large = open("/mnt/ext2/large.bin", O_RDONLY, 0).unwrap();
+            assert_eq!(stat(large.inode).unwrap().size, 5 * 1024 * 1024 * 1024);
+            assert_eq!(read(large.inode, 0, &mut buf).unwrap_err(), EOVERFLOW);
+
+            assert_eq!(ctx.writes, 0, "a read-only mount must not write");
         }
+    }
+
+    #[test]
+    fn ext4_read_only_mount_refuses_every_mutation() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+        let ctx = mount_sample_ext4();
+        assert_eq!(open("/mnt/ext2/new.txt", O_CREAT | O_RDWR, 0).unwrap_err(), EROFS);
+        assert_eq!(mkdir("/mnt/ext2/newdir").unwrap_err(), EROFS);
+        let hello = open("/mnt/ext2/hello.txt", O_RDONLY, 0).unwrap();
+        assert_eq!(write(hello.inode, 0, b"x", false).unwrap_err(), EROFS);
+        assert_eq!(truncate(hello.inode).unwrap_err(), EROFS);
+        assert_eq!(truncate_to(hello.inode, 1).unwrap_err(), EROFS);
+        assert_eq!(chmod(hello.inode, 0o600).unwrap_err(), EROFS);
+        assert_eq!(chown(hello.inode, 1, 1).unwrap_err(), EROFS);
+        assert_eq!(set_times(hello.inode, 1, 1).unwrap_err(), EROFS);
+        assert_eq!(unlink("/mnt/ext2/hello.txt").unwrap_err(), EROFS);
+        assert_eq!(rmdir("/mnt/ext2/sub").unwrap_err(), EROFS);
+        assert_eq!(
+            renameat(root_inode(), "/mnt/ext2/hello.txt", root_inode(), "/mnt/ext2/h2").unwrap_err(),
+            EROFS
+        );
+        assert_eq!(
+            linkat(root_inode(), "/mnt/ext2/hello.txt", root_inode(), "/mnt/ext2/h3").unwrap_err(),
+            EROFS
+        );
+        assert_eq!(
+            symlinkat(root_inode(), "hello.txt", "/mnt/ext2/l2").unwrap_err(),
+            EROFS
+        );
+        let mut mounts = [0u8; 512];
+        let proc_mounts = open("/proc/mounts", O_RDONLY, 0).unwrap();
+        let n = read(proc_mounts.inode, 0, &mut mounts).unwrap();
+        let text = core::str::from_utf8(&mounts[..n]).unwrap();
+        assert!(text.contains("ext4 /mnt/ext2 ext4 ro"), "{text}");
+        assert_eq!(ctx.writes, 0);
+    }
+
+    fn mount_sample_ext4() -> std::boxed::Box<TestBackendCtx> {
+        mount_ext2_backend_image(SAMPLE_EXT4, 4096)
+    }
+
+    fn ext4_ino_of(path: &str) -> u32 {
+        init();
+        let _ctx = mount_sample_ext4();
+        stat(lookup(path).unwrap()).unwrap().ino as u32
+    }
+
+    /// Each metadata_csum structure, corrupted by one byte, makes the access
+    /// that reads it fail with EIO and reports it through the diag hook.
+    #[test]
+    fn ext4_checksum_mismatches_return_eio() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        let meta = ext4_layout(SAMPLE_EXT4);
+        let hello_ino = ext4_ino_of("/mnt/ext2/hello.txt");
+        let sub_ino = ext4_ino_of("/mnt/ext2/sub");
+
+        let expect_diag = |before: u64| {
+            assert!(EXT4_DIAG_REPORTS.load(std::sync::atomic::Ordering::SeqCst) > before);
+        };
+        let diag_now = || EXT4_DIAG_REPORTS.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Superblock.
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4);
+        image[EXT2_SUPERBLOCK_OFFSET + 0x78] ^= 1;
+        init();
+        set_ext2_diag_hook(Some(ext4_count_diag));
+        let before = diag_now();
+        assert_eq!(mount_ext2_backend_image_expect_err(&image, 4096), EIO);
+        expect_diag(before);
+
+        // Group descriptor (crc32c) and the crc16 variant.
+        for source in [SAMPLE_EXT4, SAMPLE_EXT4_NOCSUM] {
+            let mut image = std::vec::Vec::from(source);
+            let off = ext2_group_desc_offset(&meta, 2).unwrap();
+            image[off + 0x0E] ^= 1; // free inodes count
+            init();
+            set_ext2_diag_hook(Some(ext4_count_diag));
+            assert_eq!(mount_ext2_backend_image_expect_err(&image, 4096), EIO);
+        }
+
+        // Inode: lookup imports the child and verifies it.
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4);
+        let off = ext2_inode_offset_in_image(&image, &meta, hello_ino).unwrap();
+        image[off + 0x08] ^= 1; // atime
+        init();
+        set_ext2_diag_hook(Some(ext4_count_diag));
+        let before = diag_now();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        assert_eq!(open("/mnt/ext2/hello.txt", O_RDONLY, 0).unwrap_err(), EIO);
+        expect_diag(before);
+
+        // Extent leaf block of frag.bin.
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4);
+        let raw = ext4_raw_inode(SAMPLE_EXT4, &meta, EXT4_FRAG_INO);
+        let leaf = read_u32_le(raw, 0x28 + 12 + 4).unwrap() as usize;
+        image[leaf * 4096 + 12] ^= 1;
+        init();
+        set_ext2_diag_hook(Some(ext4_count_diag));
+        let before = diag_now();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        let frag = open("/mnt/ext2/frag.bin", O_RDONLY, 0).unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(read(frag.inode, 0, &mut buf).unwrap_err(), EIO);
+        expect_diag(before);
+
+        // Directory leaf block of /sub.
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4);
+        let raw = ext4_raw_inode(SAMPLE_EXT4, &meta, sub_ino);
+        let dir_block = read_u32_le(raw, 0x28 + 12 + 8).unwrap() as usize;
+        image[dir_block * 4096 + 20] ^= 1;
+        init();
+        set_ext2_diag_hook(Some(ext4_count_diag));
+        let before = diag_now();
+        let _ctx = mount_ext2_backend_image(&image, 4096);
+        assert_eq!(open("/mnt/ext2/sub/nested.txt", O_RDONLY, 0).unwrap_err(), EIO);
+        expect_diag(before);
+        set_ext2_diag_hook(None);
+    }
+
+    // ---- ext4 M1: recovery of Linux-format (64bit + csum v3) journals ----
+    //
+    // user/sample_ext4_journal.img: the stock fixture plus three unrecovered
+    // transactions written by debugfs (journal_64bit, journal_checksum_v3):
+    // tx1 3500=J 3501=K, tx2 revokes 3501, tx3 3502=L. The journal inode maps
+    // journal blocks 0..1023 to filesystem blocks 2048..3071, so tx1 is
+    // jblocks 1 (descriptor) 2-3 (data) 4 (commit), tx2 5-6, tx3 7-9.
+
+    static SAMPLE_EXT4_JOURNAL: &[u8] = include_bytes!("../../../user/sample_ext4_journal.img");
+    const EXT4_JOURNAL_FS_BASE: usize = 2048;
+
+    fn ext4_jblock_off(jblock: usize) -> usize {
+        (EXT4_JOURNAL_FS_BASE + jblock) * 4096
+    }
+
+    fn ext4_block_is(image: &[u8], block: usize, byte: u8) -> bool {
+        image[block * 4096..(block + 1) * 4096].iter().all(|&b| b == byte)
+    }
+
+    #[test]
+    fn ext4_linux_format_journal_replays_on_read_only_mount() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        assert!(ext4_block_is(SAMPLE_EXT4_JOURNAL, 3500, 0), "fixture: not yet replayed");
+        let incompat = read_u32_le(SAMPLE_EXT4_JOURNAL, EXT2_SUPERBLOCK_OFFSET + 96).unwrap();
+        assert_ne!(incompat & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+
+        init();
+        let ctx = mount_ext2_backend_image(SAMPLE_EXT4_JOURNAL, 4096);
+        assert!(ext2_mount_read_only());
+        assert!(ext4_block_is(&ctx.image, 3500, b'J'), "tx1 replayed");
+        assert!(ext4_block_is(&ctx.image, 3501, 0), "tx2 revoked tx1's copy of 3501");
+        assert!(ext4_block_is(&ctx.image, 3502, b'L'), "revoke-only tx2 did not end the log");
+
+        // Recovery finished cleanly: no needs_recovery, empty log, and both
+        // superblock checksums still valid after the kernel's writes.
+        let sb = &ctx.image[EXT2_SUPERBLOCK_OFFSET..EXT2_SUPERBLOCK_OFFSET + 1024];
+        assert_eq!(read_u32_le(sb, 96).unwrap() & EXT2_FEATURE_INCOMPAT_RECOVER, 0);
+        assert!(ext4_csum::superblock_csum_ok(sb).unwrap(), "fs superblock checksum");
+        let jsb = &ctx.image[ext4_jblock_off(0)..ext4_jblock_off(0) + 4096];
+        assert_eq!(read_u32_be(jsb, 28), 0, "journal s_start");
+        assert_eq!(
+            ext2_journal::journal_super_csum_for_test(jsb).unwrap(),
+            read_u32_be(jsb, 0xFC),
+            "journal superblock checksum"
+        );
+        assert_eq!(read_whole("/mnt/ext2/hello.txt"), b"hello ext4\n");
+        if let Ok(path) = std::env::var("PEETOS_EXT4_REPLAYED_IMAGE") {
+            std::fs::write(&path, &ctx.image).expect("write replayed image");
+        }
+
+        // A second mount of the recovered image has nothing to replay.
+        let recovered = ctx.image.clone();
+        init();
+        let ctx2 = mount_ext2_backend_image(&recovered, 4096);
+        assert_eq!(ctx2.writes, 0);
+    }
+
+    #[test]
+    fn ext4_journal_checksum_failures_follow_jbd2_rules() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+
+        // Data block (tx1, jblock 2) or descriptor (jblock 1): recovery fails
+        // and nothing is written; the image still needs recovery.
+        for jblock in [2usize, 1] {
+            let mut image = std::vec::Vec::from(SAMPLE_EXT4_JOURNAL);
+            image[ext4_jblock_off(jblock) + 100] ^= 1;
+            init();
+            assert_eq!(mount_ext2_backend_image_expect_err(&image, 4096), EIO, "jblock {jblock}");
+        }
+
+        // Commit block of tx3 (jblock 9): the log ends after tx2.
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4_JOURNAL);
+        image[ext4_jblock_off(9) + 100] ^= 1;
+        init();
+        let ctx = mount_ext2_backend_image(&image, 4096);
+        assert!(ext4_block_is(&ctx.image, 3500, b'J'));
+        assert!(ext4_block_is(&ctx.image, 3501, 0));
+        assert!(ext4_block_is(&ctx.image, 3502, 0), "tx3 had a bad commit checksum");
+
+        // Journal superblock.
+        let mut image = std::vec::Vec::from(SAMPLE_EXT4_JOURNAL);
+        image[ext4_jblock_off(0) + 0x40] ^= 1; // s_nr_users
+        init();
+        assert_eq!(mount_ext2_backend_image_expect_err(&image, 4096), EIO);
+    }
+
+    /// The runtime writer only produces classic 32-bit, v1-checksum logs, so
+    /// a read-write mount must refuse a journal with 64BIT/CSUM_V2/V3.
+    #[test]
+    fn ext3_read_write_mount_refuses_csum_v3_journal() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        let mut image = std::vec::Vec::from(SAMPLE_EXT3);
+        let jsb = image_journal_super_off(&image);
+        let incompat = read_u32_be(&image, jsb + 0x28);
+        image[jsb + 0x28..jsb + 0x2C].copy_from_slice(&(incompat | 0x10).to_be_bytes());
+        image[jsb + 0x50] = 4; // crc32c
+        let csum = ext2_journal::journal_super_csum_for_test(&image[jsb..jsb + 1024]).unwrap();
+        image[jsb + 0xFC..jsb + 0x100].copy_from_slice(&csum.to_be_bytes());
+        init();
+        assert_eq!(mount_ext2_backend_image_expect_err(&image, 4096), EINVAL);
+    }
+
+    /// 4 KiB-block ext2-family images keep the superblock in block 0
+    /// (s_first_data_block = 0); block 0 must be readable there.
+    #[test]
+    fn ext4_block_zero_is_metadata_with_4k_blocks() {
+        let meta = ext4_layout(SAMPLE_EXT4);
+        assert_eq!(meta.first_data_block, 0);
+        assert!(!ext2_block_is_null(&meta, 0));
+        let ext3 = ext2_parse_meta_with_len(SAMPLE_EXT3, SAMPLE_EXT3.len(), true).unwrap();
+        assert_eq!(ext3.first_data_block, 1);
+        assert!(ext2_block_is_null(&ext3, 0));
     }
 
     #[test]

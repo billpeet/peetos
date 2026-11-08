@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+use super::ext4_csum::crc32c;
 use super::{
     ext2_backend, ext2_backend_read_block, ext2_block_slice_mut_state, ext2_cache_find,
     ext2_cache_flush_block, ext2_data_block_for_logical_index_state, ext2_mark_dirty_block,
@@ -20,10 +21,23 @@ const JBD_REVOKE_BLOCK: u32 = 5;
 /// JBD2 superblock feature bits (v2 superblocks only).
 const JBD2_FEATURE_COMPAT_CHECKSUM: u32 = 0x0000_0001;
 const JBD2_FEATURE_INCOMPAT_REVOKE: u32 = 0x0000_0001;
-/// Incompat/ro-compat bits this implementation understands. Anything else
-/// (64BIT tags, ASYNC_COMMIT, CSUM_V2/V3, FAST_COMMIT, ...) changes the
-/// on-disk log format, so such journals are refused rather than misparsed.
-const JBD2_KNOWN_INCOMPAT: u32 = JBD2_FEATURE_INCOMPAT_REVOKE;
+const JBD2_FEATURE_INCOMPAT_64BIT: u32 = 0x0000_0002;
+const JBD2_FEATURE_INCOMPAT_CSUM_V2: u32 = 0x0000_0008;
+const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
+/// Incompat bits this implementation understands. 64BIT and CSUM_V2/V3 are
+/// what Linux uses on `metadata_csum` ext4; they are understood for recovery
+/// only (the runtime writer emits the classic format, so such journals mount
+/// read-only). ASYNC_COMMIT, FAST_COMMIT, and anything else change the log
+/// semantics and are refused rather than misparsed.
+const JBD2_KNOWN_INCOMPAT: u32 = JBD2_FEATURE_INCOMPAT_REVOKE
+    | JBD2_FEATURE_INCOMPAT_64BIT
+    | JBD2_FEATURE_INCOMPAT_CSUM_V2
+    | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+/// Journal features the runtime writer cannot produce.
+const JBD2_INCOMPAT_RECOVERY_ONLY: u32 =
+    JBD2_FEATURE_INCOMPAT_64BIT | JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+/// `s_checksum_type` for crc32c journal checksums (v2/v3).
+const JBD2_CRC32C_CHKSUM: u8 = 4;
 const JBD2_KNOWN_RO_COMPAT: u32 = 0;
 /// Commit-block checksum type/size for COMPAT_CHECKSUM (crc32_be).
 const JBD2_CRC32_CHKSUM: u8 = 1;
@@ -50,6 +64,98 @@ struct JournalSuper {
     /// v2 superblock (has feature fields).
     v2: bool,
     feature_compat: u32,
+    feature_incompat: u32,
+    /// crc32c(~0, s_uuid): seed for JBD2 v2/v3 block checksums.
+    csum_seed: u32,
+}
+
+/// On-disk log format details derived from the journal superblock.
+#[derive(Clone, Copy)]
+struct JournalFormat {
+    /// Bytes per descriptor tag (Linux `journal_tag_bytes`).
+    tag_bytes: usize,
+    has_64bit: bool,
+    csum_v2: bool,
+    csum_v3: bool,
+    /// Bytes reserved at the end of descriptor/revoke blocks for the
+    /// `jbd2_journal_block_tail` checksum (v2/v3).
+    tail: usize,
+    csum_seed: u32,
+}
+
+impl JournalFormat {
+    fn from_super(superblock: &JournalSuper) -> Self {
+        let incompat = superblock.feature_incompat;
+        let has_64bit = (incompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
+        let csum_v2 = (incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) != 0;
+        let csum_v3 = (incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
+        let tag_bytes = if csum_v3 {
+            16 // journal_block_tag3_t
+        } else {
+            // journal_block_tag_t is 12 bytes; v2 adds a u16; without 64BIT
+            // the trailing t_blocknr_high is absent.
+            let mut size = 12 + if csum_v2 { 2 } else { 0 };
+            if !has_64bit {
+                size -= 4;
+            }
+            size
+        };
+        Self {
+            tag_bytes,
+            has_64bit,
+            csum_v2,
+            csum_v3,
+            tail: if csum_v2 || csum_v3 { 4 } else { 0 },
+            csum_seed: superblock.csum_seed,
+        }
+    }
+
+    fn csum_v2_or_v3(&self) -> bool {
+        self.csum_v2 || self.csum_v3
+    }
+}
+
+/// `jbd2_journal_block_tail`: crc32c(seed, whole block with the tail zeroed).
+fn journal_block_tail_ok(format: &JournalFormat, block: &[u8]) -> Result<bool, i64> {
+    let tail = block.len().checked_sub(4).ok_or(EIO)?;
+    let stored = read_u32_be(block, tail)?;
+    let crc = crc32c(crc32c(format.csum_seed, &block[..tail]), &[0, 0, 0, 0]);
+    Ok(crc == stored)
+}
+
+/// v2/v3 commit block checksum: crc32c(seed, block with h_chksum[0] zeroed).
+fn journal_commit_csum_ok(format: &JournalFormat, block: &[u8]) -> Result<bool, i64> {
+    let stored = read_u32_be(block, 16)?;
+    let mut crc = crc32c(format.csum_seed, &block[..16]);
+    crc = crc32c(crc, &[0, 0, 0, 0]);
+    crc = crc32c(crc, &block[20..]);
+    Ok(crc == stored)
+}
+
+/// v2/v3 data block checksum for a descriptor tag (v2 keeps 16 bits).
+fn journal_data_csum_ok(
+    format: &JournalFormat,
+    sequence: u32,
+    data: &[u8],
+    tag_checksum: u32,
+) -> bool {
+    let crc = crc32c(crc32c(format.csum_seed, &sequence.to_be_bytes()), data);
+    if format.csum_v3 {
+        crc == tag_checksum
+    } else {
+        (crc & 0xFFFF) == (tag_checksum & 0xFFFF)
+    }
+}
+
+/// Journal superblock checksum (v2/v3): crc32c(~0, 1024-byte superblock with
+/// `s_checksum` zeroed), stored big-endian at 0xFC.
+fn journal_super_csum(block: &[u8]) -> Result<u32, i64> {
+    if block.len() < 1024 {
+        return Err(EIO);
+    }
+    let mut crc = crc32c(!0, &block[..0xFC]);
+    crc = crc32c(crc, &[0, 0, 0, 0]);
+    Ok(crc32c(crc, &block[0x100..1024]))
 }
 
 /// CRC-32 as used by JBD2 COMPAT_CHECKSUM (Linux `crc32_be`): polynomial
@@ -81,6 +187,11 @@ pub(super) fn journal_fs_block_for_test(state: &mut VfsState, jblock: u32) -> Re
 }
 
 #[cfg(test)]
+pub(super) fn journal_super_csum_for_test(block: &[u8]) -> Result<u32, i64> {
+    journal_super_csum(block)
+}
+
+#[cfg(test)]
 pub(super) fn checksum_enabled_for_test(state: &VfsState) -> bool {
     state.ext2_journal.checksum
 }
@@ -89,6 +200,8 @@ pub(super) fn checksum_enabled_for_test(state: &VfsState) -> bool {
 struct DescriptorTag {
     home_block: u32,
     flags: u32,
+    /// v2/v3 data block checksum (v2: low 16 bits).
+    checksum: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -173,6 +286,23 @@ fn parse_superblock(block: &[u8], fs_block_size: usize) -> Result<JournalSuper, 
     {
         return Err(EINVAL);
     }
+    let csum_v2 = (feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) != 0;
+    let csum_v3 = (feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
+    // Linux refuses these combinations as well.
+    if (csum_v2 && csum_v3)
+        || ((csum_v2 || csum_v3) && (feature_compat & JBD2_FEATURE_COMPAT_CHECKSUM) != 0)
+    {
+        return Err(EINVAL);
+    }
+    let csum_seed = if v2 { crc32c(!0, &block[0x30..0x40]) } else { 0 };
+    if csum_v2 || csum_v3 {
+        if block[0x50] != JBD2_CRC32C_CHKSUM {
+            return Err(EINVAL);
+        }
+        if journal_super_csum(block)? != read_u32_be(block, 0xFC)? {
+            return Err(EIO);
+        }
+    }
 
     Ok(JournalSuper {
         block_size,
@@ -182,6 +312,8 @@ fn parse_superblock(block: &[u8], fs_block_size: usize) -> Result<JournalSuper, 
         start,
         v2,
         feature_compat,
+        feature_incompat,
+        csum_seed,
     })
 }
 
@@ -240,20 +372,32 @@ fn abort_on_runtime_io_error<T>(state: &mut VfsState, result: Result<T, i64>) ->
     }
 }
 
-fn backend_write_block_raw(state: &mut VfsState, block: u32, data: &[u8]) -> Result<(), i64> {
+/// The single path for raw home writes (journal and plain cache writeback).
+pub(super) fn backend_write_block_raw(state: &mut VfsState, block: u32, data: &[u8]) -> Result<(), i64> {
     let backend = match state.ext2_backend {
         ext2_backend::Ext2Backend::None => return Err(EIO),
         ext2_backend::Ext2Backend::BlockOps(backend) => backend,
     };
     let (sb_block, sb_offset) = fs_superblock_location(state);
-    if state.ext2_journal.present && !state.ext2_journal.replaying && block == sb_block {
-        // Every home write of the fs superblock block (checkpointed journal
-        // snapshots, plain cache writeback) carries the *current* recovery
-        // marker, so an older copy can never silently clear or set it.
+    let patch_recover = state.ext2_journal.present && !state.ext2_journal.replaying;
+    let fix_csum = state.ext4_csum.map_or(false, |csum| csum.metadata_csum);
+    if block == sb_block && (patch_recover || fix_csum) {
         let mut patched = Vec::new();
         patched.try_reserve_exact(data.len()).map_err(|_| ENOSPC)?;
         patched.extend_from_slice(data);
-        patch_recover_bit(&mut patched, sb_offset, state.ext2_journal.recover_marked)?;
+        if patch_recover {
+            // Every home write of the fs superblock block (checkpointed
+            // journal snapshots, plain cache writeback) carries the *current*
+            // recovery marker, so an older copy can never flip it.
+            patch_recover_bit(&mut patched, sb_offset, state.ext2_journal.recover_marked)?;
+        }
+        if fix_csum {
+            // metadata_csum: s_checksum covers the whole superblock, so it is
+            // recomputed for whatever this write carries.
+            let sb = &mut patched[sb_offset..sb_offset + 1024];
+            let csum = super::ext4_csum::superblock_csum(sb)?;
+            sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+        }
         return (backend.write_block)(backend.ctx, block, patched.as_slice());
     }
     (backend.write_block)(backend.ctx, block, data)
@@ -430,9 +574,14 @@ fn journal_cached_inode(state: &VfsState) -> Ext2Inode {
         gid: 0,
         block_count_512: 0,
         blocks: state.ext2_journal.inode_blocks,
-        flags: 0,
+        // ext4 journals are extent-mapped; the flags select the block map and
+        // ino/generation seed extent-block checksums.
+        flags: state.ext2_journal.inode_flags,
         file_acl: 0,
         size_high: 0,
+        ino: state.ext2_journal.inode,
+        generation: state.ext2_journal.inode_generation,
+        blocks_hi: 0,
     }
 }
 
@@ -496,6 +645,8 @@ fn runtime_journal_super(state: &VfsState) -> JournalSuper {
         } else {
             0
         },
+        feature_incompat: 0,
+        csum_seed: 0,
     }
 }
 
@@ -622,6 +773,10 @@ fn write_journal_super_fields(state: &mut VfsState, sequence: u32, start: u32) -
     ext2_backend_read_block(state, state.ext2_journal.superblock_block, &mut super_block)?;
     write_u32_be(&mut super_block, 24, sequence)?;
     write_u32_be(&mut super_block, 28, start)?;
+    if state.ext2_journal.csum_v2_or_v3 {
+        let csum = journal_super_csum(&super_block)?;
+        write_u32_be(&mut super_block, 0xFC, csum)?;
+    }
     write_backend_and_refresh_cache(state, state.ext2_journal.superblock_block, &super_block)
 }
 
@@ -1494,26 +1649,45 @@ fn upsert_pending(
     Ok(())
 }
 
-fn parse_descriptor_tags(block: &[u8]) -> Result<Vec<DescriptorTag>, i64> {
+fn parse_descriptor_tags(block: &[u8], format: &JournalFormat) -> Result<Vec<DescriptorTag>, i64> {
     let mut tags = Vec::new();
     let mut offset = 12usize;
+    let limit = block.len().checked_sub(format.tail).ok_or(EIO)?;
     loop {
-        if offset + 8 > block.len() {
+        if offset + format.tag_bytes > limit {
             return Err(EIO);
         }
-        let home_block = read_u32_be(block, offset)?;
-        let flags = read_u32_be(block, offset + 4)?;
-        offset += 8;
+        let low = read_u32_be(block, offset)?;
+        let (flags, checksum, high) = if format.csum_v3 {
+            // journal_block_tag3_t: blocknr, flags(32), blocknr_high, checksum.
+            (
+                read_u32_be(block, offset + 4)?,
+                read_u32_be(block, offset + 12)?,
+                read_u32_be(block, offset + 8)?,
+            )
+        } else {
+            // journal_block_tag_t: blocknr, checksum(16), flags(16), [high].
+            let checksum = u16::from_be_bytes([block[offset + 4], block[offset + 5]]) as u32;
+            let flags = u16::from_be_bytes([block[offset + 6], block[offset + 7]]) as u32;
+            let high = if format.has_64bit { read_u32_be(block, offset + 8)? } else { 0 };
+            (flags, checksum, high)
+        };
+        offset += format.tag_bytes;
+        // Block numbers stay 32-bit internally (filesystems < 2^32 blocks).
+        if high != 0 {
+            return Err(EIO);
+        }
+        let home_block = low;
 
         if (flags & JBD_FLAG_SAME_UUID) == 0 {
-            if offset + 16 > block.len() {
+            if offset + 16 > limit {
                 return Err(EIO);
             }
             offset += 16;
         }
 
         tags.try_reserve(1).map_err(|_| ENOSPC)?;
-        tags.push(DescriptorTag { home_block, flags });
+        tags.push(DescriptorTag { home_block, flags, checksum });
 
         if (flags & JBD_FLAG_LAST_TAG) != 0 {
             break;
@@ -1522,16 +1696,35 @@ fn parse_descriptor_tags(block: &[u8]) -> Result<Vec<DescriptorTag>, i64> {
     Ok(tags)
 }
 
-fn parse_revoke_block(block: &[u8], revoked: &mut Vec<u32>) -> Result<(), i64> {
+fn parse_revoke_block(
+    block: &[u8],
+    format: &JournalFormat,
+    revoked: &mut Vec<u32>,
+) -> Result<(), i64> {
+    let record = if format.has_64bit { 8 } else { 4 };
     let used_bytes = read_u32_be(block, 12)? as usize;
-    if used_bytes < 16 || used_bytes > block.len() || ((used_bytes - 16) % 4) != 0 {
+    let limit = block.len().checked_sub(format.tail).ok_or(EIO)?;
+    if used_bytes < 16 || used_bytes > limit || ((used_bytes - 16) % record) != 0 {
         return Err(EIO);
     }
 
     let mut offset = 16usize;
     while offset < used_bytes {
-        insert_revoked(revoked, read_u32_be(block, offset)?)?;
-        offset += 4;
+        let block_no = if record == 8 {
+            let high = read_u32_be(block, offset)?;
+            let low = read_u32_be(block, offset + 4)?;
+            // Beyond the 32-bit range this filesystem can address: nothing
+            // to revoke.
+            if high != 0 {
+                offset += record;
+                continue;
+            }
+            low
+        } else {
+            read_u32_be(block, offset)?
+        };
+        insert_revoked(revoked, block_no)?;
+        offset += record;
     }
     Ok(())
 }
@@ -2266,10 +2459,12 @@ fn replay_journal(
     }
     let mut replay_txs = Vec::<ReplayTx>::new();
     let mut revoke_map = Vec::<(u32, u32)>::new();
+    let format = JournalFormat::from_super(superblock);
     let verify_checksums = (superblock.feature_compat & JBD2_FEATURE_COMPAT_CHECKSUM) != 0;
+    let verify_v23 = format.csum_v2_or_v3();
     let mut checksum_seen = false;
     let mut data_block = Vec::new();
-    if verify_checksums {
+    if verify_checksums || verify_v23 {
         data_block.try_reserve_exact(block_size).map_err(|_| ENOSPC)?;
         data_block.resize(block_size, 0);
     }
@@ -2280,7 +2475,15 @@ fn replay_journal(
             Some(h) => h,
             None => break,
         };
-        if header.block_type != JBD_DESCRIPTOR_BLOCK || header.sequence != next_sequence {
+        // A transaction may start with any log block (a revoke-only
+        // transaction starts with its revoke table); only the sequence ties
+        // blocks to the transaction, as in jbd2's do_one_pass.
+        if header.sequence != next_sequence
+            || !matches!(
+                header.block_type,
+                JBD_DESCRIPTOR_BLOCK | JBD_REVOKE_BLOCK | JBD_COMMIT_BLOCK
+            )
+        {
             break;
         }
 
@@ -2302,7 +2505,12 @@ fn replay_journal(
 
             match header.block_type {
                 JBD_DESCRIPTOR_BLOCK => {
-                    let tags = parse_descriptor_tags(&block)?;
+                    // Like jbd2 recovery, a descriptor or revoke block with a
+                    // bad v2/v3 checksum fails recovery outright.
+                    if verify_v23 && !journal_block_tail_ok(&format, &block)? {
+                        return Err(EIO);
+                    }
+                    let tags = parse_descriptor_tags(&block, &format)?;
                     if tags.is_empty() {
                         return Err(EIO);
                     }
@@ -2318,6 +2526,16 @@ fn replay_journal(
                             read_journal_block(state, journal_inode, position, &mut data_block)?;
                             tx_crc = crc32_be(tx_crc, &data_block);
                         }
+                        if verify_v23 {
+                            read_journal_block(state, journal_inode, position, &mut data_block)?;
+                            if !journal_data_csum_ok(&format, next_sequence, &data_block, tag.checksum)
+                            {
+                                // jbd2 skips the block and fails recovery; this
+                                // fails before writing anything, so the image
+                                // stays as it was and still needs recovery.
+                                return Err(EIO);
+                            }
+                        }
                         if (tag.flags & JBD_FLAG_DELETED) == 0 {
                             upsert_pending(
                                 &mut pending,
@@ -2332,8 +2550,11 @@ fn replay_journal(
                     scan_budget = scan_budget.saturating_sub(1);
                 }
                 JBD_REVOKE_BLOCK => {
+                    if verify_v23 && !journal_block_tail_ok(&format, &block)? {
+                        return Err(EIO);
+                    }
                     let mut revoked = Vec::new();
-                    parse_revoke_block(&block, &mut revoked)?;
+                    parse_revoke_block(&block, &format, &mut revoked)?;
                     let mut revoked_idx = 0usize;
                     while revoked_idx < revoked.len() {
                         insert_revoke_sequence(
@@ -2347,6 +2568,10 @@ fn replay_journal(
                     scan_budget = scan_budget.saturating_sub(1);
                 }
                 JBD_COMMIT_BLOCK => {
+                    if verify_v23 && !journal_commit_csum_ok(&format, &block)? {
+                        // As jbd2 without async_commit: the log ends here.
+                        break;
+                    }
                     if verify_checksums {
                         // Same acceptance rule as e2fsck/jbd2 recovery: a
                         // matching CRC32 commits the transaction; an all-zero
@@ -2473,6 +2698,10 @@ pub(super) fn prepare_mount(state: &mut VfsState) -> Result<(), i64> {
     block.resize(block_size, 0);
     ext2_backend_read_block(state, journal_sb_fs_block, &mut block)?;
     let superblock = parse_superblock(&block, block_size)?;
+    if (superblock.feature_incompat & JBD2_INCOMPAT_RECOVERY_ONLY) != 0 && !state.ext2_read_only {
+        // The runtime writer only emits 32-bit tags without v2/v3 checksums.
+        return Err(EINVAL);
+    }
 
     let descriptor_jblock = superblock.first;
     let data_jblock = journal_next_block(&superblock, descriptor_jblock)?;
@@ -2489,6 +2718,8 @@ pub(super) fn prepare_mount(state: &mut VfsState) -> Result<(), i64> {
         mode: Ext2JournalMode::Ordered,
         inode: journal_inode_num,
         inode_blocks: journal_inode.blocks,
+        inode_flags: journal_inode.flags,
+        inode_generation: journal_inode.generation,
         superblock_block: journal_sb_fs_block,
         block_size: superblock.block_size,
         max_len: superblock.max_len,
@@ -2509,6 +2740,7 @@ pub(super) fn prepare_mount(state: &mut VfsState) -> Result<(), i64> {
         recover_marked: (state.ext2_meta.feature_incompat & EXT2_FEATURE_INCOMPAT_RECOVER) != 0,
         // Enabled by enable_journal_checksums once the log is known empty.
         checksum: false,
+        csum_v2_or_v3: JournalFormat::from_super(&superblock).csum_v2_or_v3(),
         commit_barrier_pending: false,
     };
 
@@ -2542,7 +2774,9 @@ pub(super) fn prepare_mount(state: &mut VfsState) -> Result<(), i64> {
 /// a compat feature: readers that do not know it still replay the journal,
 /// and e2fsck/Linux verify the commit CRCs.
 fn enable_journal_checksums(state: &mut VfsState, superblock: &JournalSuper) -> Result<(), i64> {
-    if !superblock.v2 {
+    // Read-only mounts never modify the journal superblock (and never write
+    // transactions, so commit checksums are moot there).
+    if !superblock.v2 || state.ext2_read_only {
         return Ok(());
     }
     if (superblock.feature_compat & JBD2_FEATURE_COMPAT_CHECKSUM) == 0 {
