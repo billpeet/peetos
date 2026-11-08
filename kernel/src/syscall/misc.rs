@@ -103,7 +103,7 @@ pub(super) fn sys_getitimer(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 }
 
 /// `setitimer(which, new, old)`: `ITIMER_REAL` delivers `SIGALRM` to the
-/// process from the timer tick (`signal::itimer_real_tick`).
+/// process from the timer tick (`signal::itimer_real_take_expiry`, then `itimer_real_fire` once `SCHED_LOCK` is released).
 pub(super) fn sys_setitimer(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if call.arg(0) as i32 != ITIMER_REAL {
         return -EINVAL;

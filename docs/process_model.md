@@ -220,3 +220,9 @@ Limitations / Simplifications
   this work); shared read-only frames are not protected from such writes.
 - Frame share counts are 16-bit; a frame that would overflow is copied
   instead of shared.
+
+Note on `ITIMER_REAL` under SMP: the BSP timer tick (`sched::tick`) only
+records which processes' timers expired while it holds `SCHED_LOCK`, and
+sends `SIGALRM` after releasing it. Sending can wake a sleeping target via
+`sched::unblock`, which takes `SCHED_LOCK`; doing it inside the scan
+deadlocked the tick (seen as a hang in upstream libwayland's `sanity-test`).

@@ -515,25 +515,38 @@ pub fn itimer_real_next_deadline(deadline: u64, interval: u64, now: u64) -> Opti
     Some(if next > now { next } else { now.saturating_add(interval) })
 }
 
-/// Timer-tick hook: deliver `SIGALRM` to a process whose `ITIMER_REAL`
-/// expired. Only thread-group leaders carry the timer.
-pub fn itimer_real_tick(task: *mut Task, now: u64) {
+/// Timer-tick bookkeeping for a process's `ITIMER_REAL`: if it expired,
+/// advance (or clear) the deadline and return true. The caller sends
+/// `SIGALRM` afterwards, outside the scheduler lock, because sending may wake
+/// the target (`sched::unblock`), which takes that lock. Only thread-group
+/// leaders carry the timer.
+pub fn itimer_real_take_expiry(task: *mut Task, now: u64) -> bool {
     if task.is_null() {
-        return;
+        return false;
     }
     unsafe {
         if crate::task::leader_of(task) != task {
-            return;
+            return false;
         }
         if matches!((*task).state, TaskState::Zombie | TaskState::Dead) {
-            return;
+            return false;
         }
-        if let Some(next) =
-            itimer_real_next_deadline((*task).itimer_real_deadline, (*task).itimer_real_interval, now)
-        {
-            (*task).itimer_real_deadline = next;
-            let _ = send_to_process(task, SIGALRM);
+        match itimer_real_next_deadline((*task).itimer_real_deadline, (*task).itimer_real_interval, now) {
+            Some(next) => {
+                (*task).itimer_real_deadline = next;
+                true
+            }
+            None => false,
         }
+    }
+}
+
+/// Deliver `SIGALRM` for a process whose `ITIMER_REAL` expired (see
+/// [`itimer_real_take_expiry`]). Must not be called with the scheduler lock
+/// held.
+pub fn itimer_real_fire(task: *mut Task) {
+    if !task.is_null() {
+        let _ = send_to_process(task, SIGALRM);
     }
 }
 
@@ -559,9 +572,10 @@ mod tests {
         let mut t = task::Task::for_test(1);
         let ptr = &mut t as *mut task::Task;
         t.itimer_real_deadline = 10;
-        itimer_real_tick(ptr, 9);
+        assert!(!itimer_real_take_expiry(ptr, 9));
         assert_eq!(t.sig_pending & signal_bit(SIGALRM), 0);
-        itimer_real_tick(ptr, 10);
+        assert!(itimer_real_take_expiry(ptr, 10));
+        itimer_real_fire(ptr);
         assert_ne!(t.sig_pending & signal_bit(SIGALRM), 0);
         assert_eq!(t.itimer_real_deadline, 0);
     }
