@@ -1861,6 +1861,7 @@ fn ucred_layout_matches_linux() {
     assert_eq!(&bytes[0..4], &7i32.to_ne_bytes());
     assert_eq!(&bytes[4..8], &1000u32.to_ne_bytes());
     assert_eq!(&bytes[8..12], &100u32.to_ne_bytes());
+}
 
 #[test]
 fn lock_free_syscalls_are_only_id_and_yield_calls() {

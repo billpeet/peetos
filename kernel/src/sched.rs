@@ -578,13 +578,22 @@ pub fn block_until(reason: &str, deadline: u64) {
     }
     unsafe {
         (*current).sleep_until = deadline;
-        (*current).state = TaskState::Sleeping;
     }
     let _ = reason;
 
+    // Same hand-off as `sleep`: Sleeping is applied by schedule_from under
+    // SCHED_LOCK, so the lock-free PIT tick cannot wake this task (and let
+    // another CPU resume it) while it is still on its own stack.
+    interrupts::disable();
+    this_cpu().block_as = Some(TaskState::Sleeping);
     #[cfg(target_os = "none")]
     unsafe {
         sched_block_asm();
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        this_cpu().block_as = None;
+        interrupts::enable();
     }
 }
 

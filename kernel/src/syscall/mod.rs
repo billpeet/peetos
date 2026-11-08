@@ -1496,7 +1496,7 @@ fn lock_free_syscall(frame: &mut SyscallFrame) -> Option<u64> {
         // A signal arrived meanwhile (e.g. it woke a nanosleep): deliver it
         // exactly as the locked dispatcher would.
         crate::bkl::syscall_enter();
-        if let Some(ret) = apply_pending_signals_syscall(frame) {
+        if let Some(ret) = apply_pending_signals_syscall(frame, Some(nr)) {
             frame.rax = to_sysret(ret);
         }
         let ret = frame.rax;
