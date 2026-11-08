@@ -1,10 +1,29 @@
 //! Round-robin scheduler with one shared run queue and per-CPU state.
 //!
-//! Every CPU has its own current task, idle task and preempt flag. All
-//! scheduler state is protected by the big kernel lock (`crate::bkl`); the
-//! callers of every entry point here hold it. The PIT tick on the BSP drives
-//! sleeper wake-ups and the BSP's time slice; each AP's LAPIC timer drives
-//! its own time slice (`tick_local`).
+//! Every CPU has its own current task, idle task and preempt flag.
+//! `SCHED_LOCK`, an interrupt-safe spinlock, protects:
+//! - the run queue,
+//! - the per-CPU scheduler state,
+//! - the task table,
+//! - the scheduler-owned task state transitions (Ready/Running/Blocked/Sleeping).
+//!
+//! The scheduler does **not** need the big kernel lock. Timer ticks,
+//! reschedule IPIs and context switches all run without it.
+//!
+//! Context switch protocol:
+//! 1. `schedule_from` takes `SCHED_LOCK` (raw form) and records in the
+//!    outgoing task whether it held the big kernel lock (`Task::bkl_resume`).
+//! 2. The CPU switches to the incoming frame's stack.
+//! 3. The frame-exit hook (`bkl::frame_exit_hook`) calls [`finish_switch`]
+//!    to drop `SCHED_LOCK` on the new stack, then takes or drops the big
+//!    kernel lock to match the incoming task's `bkl_resume`.
+//!
+//! Holding `SCHED_LOCK` until the old stack is no longer in use means no
+//! other CPU can resume the outgoing task early. Lock order:
+//! BKL -> SCHED_LOCK. Never acquire the BKL while holding SCHED_LOCK.
+//!
+//! The PIT tick on the BSP drives sleeper wake-ups and the BSP's time slice.
+//! Each AP's LAPIC timer drives its own time slice (`tick_local`).
 
 use core::ptr;
 
@@ -18,6 +37,7 @@ use arch_x86_64::tss;
 
 use crate::memory::vmm;
 use crate::serial_println;
+use crate::sync::{IrqSpinLock, IrqSpinLockGuard};
 use crate::task::{self, Task, TaskState, TASK_FLAG_IDLE};
 
 pub const DEFAULT_TIME_SLICE: u64 = 5;
@@ -26,6 +46,11 @@ struct CpuSched {
     current: *mut Task,
     idle: *mut Task,
     preempt_pending: bool,
+    /// `SCHED_LOCK` is held across an in-progress switch on this CPU.
+    switch_locked: bool,
+    /// State to give the current task when `schedule_from` runs next
+    /// (set by `block`/`sleep` with interrupts disabled).
+    block_as: Option<TaskState>,
 }
 
 impl CpuSched {
@@ -34,8 +59,17 @@ impl CpuSched {
             current: ptr::null_mut(),
             idle: ptr::null_mut(),
             preempt_pending: false,
+            switch_locked: false,
+            block_as: None,
         }
     }
+}
+
+static SCHED_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
+
+/// Take the scheduler lock (interrupts disabled while held).
+pub fn lock() -> IrqSpinLockGuard<'static, ()> {
+    SCHED_LOCK.lock()
 }
 
 static mut CPUS: [CpuSched; MAX_CPUS] = [const { CpuSched::new() }; MAX_CPUS];
@@ -118,15 +152,10 @@ fn run_queue_remove(task: *mut Task) {
 /// that was preempted in user mode. It must not run again; the killing
 /// thread finishes it once it sees it parked.
 fn exiting_in_user_mode(task: *mut Task) -> bool {
-    unsafe {
-        if ((*task).flags & task::TASK_FLAG_EXITING) == 0 || (*task).saved_rsp == 0 {
-            return false;
-        }
-        let frame = (*task).saved_rsp as *const InterruptFrame;
-        (ptr::read_unaligned(ptr::addr_of!((*frame).cs)) & 3) == 3
-    }
+    unsafe { ((*task).flags & task::TASK_FLAG_EXITING) != 0 && parked_in_user_mode(task) }
 }
 
+/// Caller holds `SCHED_LOCK`.
 fn pick_next_task() -> *mut Task {
     let candidates = unsafe { RUN_QUEUE_COUNT };
     for _ in 0..candidates {
@@ -185,8 +214,10 @@ pub fn create_idle(index: usize) -> bool {
     if idle.is_null() {
         return false;
     }
+    let _guard = lock();
     unsafe {
         (*idle).flags |= TASK_FLAG_IDLE;
+        (*idle).bkl_resume = false;
         run_queue_remove(idle);
         (*idle).state = TaskState::Ready;
     }
@@ -221,21 +252,25 @@ pub fn init() {
 }
 
 /// First scheduler entry on an application processor: become CPU `index`'s
-/// idle task and never return. The caller holds the big kernel lock; it is
-/// dropped by the frame-exit hook once the idle frame is live.
+/// idle task and never return. The big kernel lock is not needed.
 pub fn ap_enter(index: usize) -> ! {
     let cpu = cpu_at(index);
-    let idle = cpu.idle;
-    if idle.is_null() {
-        halt_forever("AP has no idle task");
+    let idle;
+    {
+        let _guard = lock();
+        idle = cpu.idle;
+        if idle.is_null() {
+            halt_forever("AP has no idle task");
+        }
+        cpu.current = idle;
+        cpu.preempt_pending = false;
+        unsafe {
+            (*idle).state = TaskState::Running;
+            (*idle).time_slice = DEFAULT_TIME_SLICE;
+            tss::set_rsp0((*idle).kernel_stack_top);
+        }
     }
-    cpu.current = idle;
-    cpu.preempt_pending = false;
-    unsafe {
-        (*idle).state = TaskState::Running;
-        (*idle).time_slice = DEFAULT_TIME_SLICE;
-        tss::set_rsp0((*idle).kernel_stack_top);
-    }
+    interrupts::disable();
     vmm::switch(PhysAddr::new(0));
     task::apply_user_tls_base(idle);
     #[cfg(target_os = "none")]
@@ -250,18 +285,14 @@ pub fn current_task() -> *mut Task {
     this_cpu().current
 }
 
-/// True when this CPU is running its idle task, or is an AP that has not
-/// entered the scheduler yet. Used to decide when to drop the BKL.
+/// True when this CPU is running its idle task.
 pub fn current_is_idle() -> bool {
     let cpu = this_cpu();
-    if cpu.current.is_null() {
-        return percpu::current_index() != 0;
-    }
-    cpu.current == cpu.idle
+    !cpu.current.is_null() && cpu.current == cpu.idle
 }
 
 /// Wake one idle CPU (other than this one) so a newly runnable task does not
-/// wait for that CPU's next timer tick.
+/// wait for that CPU's next timer tick. Caller holds `SCHED_LOCK`.
 fn kick_idle_cpu() {
     let me = percpu::current_index();
     for index in 0..crate::smp::cpu_count() {
@@ -276,32 +307,57 @@ fn kick_idle_cpu() {
     }
 }
 
+/// Caller holds `SCHED_LOCK`.
 fn make_ready(task: *mut Task) {
     run_queue_push(task);
     kick_idle_cpu();
 }
 
-/// True when `t` is executing on some other CPU right now.
-pub fn running_on_other_cpu(t: *mut Task) -> bool {
-    if t.is_null() {
-        return false;
-    }
-    unsafe { (*t).state == TaskState::Running && t != current_task() }
+/// Outcome of [`detach_for_kill`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KillDetach {
+    /// Preempted in user mode: removed from the run queue and made a zombie.
+    /// It will never run again.
+    Detached,
+    /// Executing on another CPU; that CPU has been asked to reschedule.
+    RunningElsewhere,
+    /// Inside the kernel (blocked, sleeping, or runnable with a kernel
+    /// frame). It must unwind and exit on its own.
+    InKernel,
 }
 
-/// Force the CPU running `t` through the scheduler soon (reschedule IPI).
-pub fn kick_task(t: *mut Task) {
-    let me = percpu::current_index();
-    for index in 0..crate::smp::cpu_count() {
-        if index == me {
-            continue;
+/// Atomically classify a sibling thread for exit_group/execve and, when it
+/// is parked in user mode, take it off the run queue as a zombie.
+pub fn detach_for_kill(t: *mut Task) -> KillDetach {
+    let _guard = lock();
+    unsafe {
+        if (*t).state == TaskState::Running && t != this_cpu().current {
+            let me = percpu::current_index();
+            for index in 0..crate::smp::cpu_count() {
+                let cpu = cpu_at(index);
+                if index != me && cpu.current == t {
+                    cpu.preempt_pending = true;
+                    crate::smp::send_resched(index);
+                }
+            }
+            return KillDetach::RunningElsewhere;
         }
-        let cpu = cpu_at(index);
-        if cpu.current == t {
-            cpu.preempt_pending = true;
-            crate::smp::send_resched(index);
-            return;
+        if (*t).state == TaskState::Ready && parked_in_user_mode(t) {
+            run_queue_remove(t);
+            (*t).state = TaskState::Zombie;
+            return KillDetach::Detached;
         }
+    }
+    KillDetach::InKernel
+}
+
+fn parked_in_user_mode(task: *mut Task) -> bool {
+    unsafe {
+        if (*task).saved_rsp == 0 {
+            return false;
+        }
+        let frame = (*task).saved_rsp as *const InterruptFrame;
+        (ptr::read_unaligned(ptr::addr_of!((*frame).cs)) & 3) == 3
     }
 }
 
@@ -309,29 +365,30 @@ pub fn add_task(task: *mut Task) {
     if task.is_null() {
         return;
     }
+    let _guard = lock();
     unsafe {
         if (*task).state != TaskState::Ready {
             return;
         }
     }
-
-    interrupts::without_interrupts(|| make_ready(task));
+    make_ready(task);
 }
 
 pub fn remove_task(task: *mut Task) {
     if task.is_null() {
         return;
     }
-
-    interrupts::without_interrupts(|| run_queue_remove(task));
+    let _guard = lock();
+    run_queue_remove(task);
 }
 
 /// PIT tick on the BSP: sleeper wake-ups plus the BSP's own time slice.
 pub fn tick() {
+    if !is_running() {
+        return;
+    }
+    let guard = lock();
     unsafe {
-        if !SCHED_RUNNING {
-            return;
-        }
 
         STAT_TIMER_TICKS = STAT_TIMER_TICKS.saturating_add(1);
 
@@ -347,15 +404,17 @@ pub fn tick() {
             }
         }
     }
+    drop(guard);
     tick_local();
 }
 
 /// Per-CPU time-slice accounting (PIT on the BSP, LAPIC timer on APs).
 pub fn tick_local() {
+    if !is_running() {
+        return;
+    }
+    let _guard = lock();
     unsafe {
-        if !SCHED_RUNNING {
-            return;
-        }
         let cpu = this_cpu();
         let current = cpu.current;
         if current.is_null() {
@@ -388,6 +447,7 @@ pub fn tick_local() {
 }
 
 pub fn request_preempt() {
+    let _guard = lock();
     this_cpu().preempt_pending = true;
 }
 
@@ -423,10 +483,6 @@ pub fn block(reason: &str) {
         return;
     }
     unsafe {
-        if (*current).state != TaskState::Blocked && (*current).state != TaskState::Sleeping {
-            (*current).state = TaskState::Blocked;
-        }
-
         serial_println!(
             "[SCHED] Blocking task '{}' ({})",
             task_name(&*current),
@@ -434,9 +490,18 @@ pub fn block(reason: &str) {
         );
     }
 
+    // The state change is applied by schedule_from under SCHED_LOCK.
+    // Interrupts stay off until then so a preemption cannot apply it early.
+    interrupts::disable();
+    this_cpu().block_as = Some(TaskState::Blocked);
     #[cfg(target_os = "none")]
     unsafe {
         sched_block_asm();
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        this_cpu().block_as = None;
+        interrupts::enable();
     }
 }
 
@@ -445,6 +510,7 @@ pub fn unblock(task: *mut Task) {
         return;
     }
 
+    let _guard = lock();
     unsafe {
         if (*task).state != TaskState::Blocked && (*task).state != TaskState::Sleeping {
             return;
@@ -455,8 +521,7 @@ pub fn unblock(task: *mut Task) {
         }
         (*task).state = TaskState::Ready;
     }
-
-    interrupts::without_interrupts(|| make_ready(task));
+    make_ready(task);
 }
 
 pub fn sleep(ticks: u64) {
@@ -479,17 +544,21 @@ pub fn sleep(ticks: u64) {
     unsafe {
         let wake_time = pit::ticks().saturating_add(ticks);
         (*current).sleep_until = wake_time;
-        (*current).state = TaskState::Sleeping;
-        serial_println!(
-            "[SCHED] Task '{}' sleeping for {} ticks",
-            task_name(&*current),
-            ticks
-        );
     }
 
+    // Sleeping is applied by schedule_from under SCHED_LOCK, so the
+    // lock-free PIT tick can never wake this task (and let another CPU
+    // resume it) while it is still on its own stack.
+    interrupts::disable();
+    this_cpu().block_as = Some(TaskState::Sleeping);
     #[cfg(target_os = "none")]
     unsafe {
         sched_block_asm();
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        this_cpu().block_as = None;
+        interrupts::enable();
     }
 }
 
@@ -523,44 +592,78 @@ pub fn is_running() -> bool {
     unsafe { SCHED_RUNNING }
 }
 
-pub fn isr_hook(frame: &mut InterruptFrame) -> u64 {
-    if !is_running() || !crate::bkl::held_by_me() {
+/// Post-interrupt hook (interrupts disabled). `irq_acquired_bkl` says the
+/// interrupt entry itself took the big kernel lock, so the interrupted
+/// context did not hold it.
+pub fn isr_hook(frame: &mut InterruptFrame, irq_acquired_bkl: bool) -> u64 {
+    if !is_running() {
         return 0;
     }
     let cpu = this_cpu();
     if cpu.current.is_null() {
         return 0;
     }
-    let idle_with_work = cpu.current == cpu.idle && unsafe { RUN_QUEUE_COUNT } > 0;
-    if !cpu.preempt_pending && !idle_with_work {
-        return 0;
+    {
+        let _guard = lock();
+        let idle_with_work = cpu.current == cpu.idle && unsafe { RUN_QUEUE_COUNT } > 0;
+        if !cpu.preempt_pending && !idle_with_work {
+            return 0;
+        }
+        cpu.preempt_pending = false;
     }
-    cpu.preempt_pending = false;
 
     let current_rsp = frame as *mut InterruptFrame as u64;
-    schedule_from(current_rsp, true)
+    schedule_from(current_rsp, true, irq_acquired_bkl)
 }
 
 #[no_mangle]
 pub extern "C" fn sched_yield_switch(current_rsp: u64) -> u64 {
-    schedule_from(current_rsp, true)
+    schedule_from(current_rsp, true, false)
 }
 
 #[no_mangle]
 pub extern "C" fn sched_block_switch(current_rsp: u64) -> u64 {
-    schedule_from(current_rsp, false)
+    schedule_from(current_rsp, false, false)
 }
 
-fn schedule_from(current_rsp: u64, requeue_current: bool) -> u64 {
+/// Drop `SCHED_LOCK` if this CPU took it for a switch. Called by the
+/// frame-exit hook once the CPU runs on the incoming frame's stack. Returns
+/// true when a switch (or a switch attempt) just finished on this CPU.
+pub fn finish_switch() -> bool {
     let cpu = this_cpu();
-    unsafe {
-        if cpu.current.is_null() {
-            return current_rsp;
-        }
+    if !cpu.switch_locked {
+        return false;
+    }
+    cpu.switch_locked = false;
+    SCHED_LOCK.unlock_raw();
+    true
+}
 
+/// Whether the task now current on this CPU must hold the big kernel lock.
+pub fn current_needs_bkl() -> bool {
+    let cpu = this_cpu();
+    let current = cpu.current;
+    !current.is_null() && current != cpu.idle && unsafe { (*current).bkl_resume }
+}
+
+/// Pick the next task. Interrupts must be disabled. Returns with
+/// `SCHED_LOCK` held (released by [`finish_switch`]) unless this CPU has no
+/// current task yet.
+fn schedule_from(current_rsp: u64, requeue_current: bool, irq_acquired_bkl: bool) -> u64 {
+    let cpu = this_cpu();
+    if cpu.current.is_null() {
+        return current_rsp;
+    }
+    SCHED_LOCK.lock_raw();
+    cpu.switch_locked = true;
+    unsafe {
         let current = cpu.current;
         let idle = cpu.idle;
         (*current).saved_rsp = current_rsp;
+        (*current).bkl_resume = crate::bkl::held_by_me() && !irq_acquired_bkl;
+        if let Some(state) = cpu.block_as.take() {
+            (*current).state = state;
+        }
 
         let is_runnable = (*current).state == TaskState::Running;
         if requeue_current && is_runnable && current != idle {

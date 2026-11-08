@@ -1,28 +1,41 @@
 //! Big kernel lock (BKL).
 //!
-//! SMP phase 2 serialises all kernel execution behind one lock owned by a
-//! CPU, not a task. The kernel was written for one core, where "interrupts
-//! off" meant exclusive access. The BKL keeps that assumption true while
-//! every CPU runs tasks.
+//! The kernel was written for one core, where "interrupts off" meant
+//! exclusive access. The BKL keeps that assumption true for the code still
+//! under it while several CPUs run tasks. The scheduler, PMM and heap have
+//! their own locks and do not need it.
+//!
+//! The lock is a FIFO ticket lock owned by a CPU. Logically it belongs to
+//! the task running there: a task switched out while holding it records
+//! that in `Task::bkl_resume`, gives it up, and the CPU that later resumes
+//! the task takes it again before the task runs.
 //!
 //! Rules:
-//! - **Acquire** on every kernel entry where this CPU does not already own
-//!   it: the SYSCALL path ([`syscall_enter`]), any non-lock-free interrupt or
-//!   exception (the IDT entry hook), and explicit waits ([`relax`],
-//!   [`wait_for_interrupt`]). Re-acquiring on the owning CPU is a no-op, so
-//!   nested interrupts in kernel mode just proceed.
-//! - **Keep** the lock across context switches between kernel contexts.
-//!   The scheduler requires it.
-//! - **Release** only after the CPU has switched to the frame it is about to
-//!   restore ([`frame_exit_hook`], called from assembly on the new stack),
-//!   and only when that frame returns to ring 3 or into an idle task. Doing
-//!   it later than the run-queue update means no other CPU can resume the
-//!   previous task while its kernel stack is still in use here.
-//! - The SYSCALL return path releases in [`syscall_exit`] (same task, same
-//!   stack, so there is no hand-off hazard).
+//! - **Acquire** on every kernel entry that needs it where this CPU does not
+//!   already own it:
+//!   - the SYSCALL path ([`syscall_enter`]),
+//!   - interrupts and exceptions whose vector is not marked lock-free (the
+//!     IDT entry hook, [`interrupt_enter`]),
+//!   - explicit waits ([`relax`], [`wait_for_interrupt`]).
 //!
-//! Lock-free paths (they never take the BKL): the PIT tick counter, the
-//! TLB-shootdown and test IPIs, and the idle loop's `hlt`.
+//!   Re-acquiring on the owning CPU is a no-op.
+//! - **Interrupt balance.** If an interrupt's entry hook took the lock and
+//!   the same frame resumes, the IDT dispatcher gives it back
+//!   ([`interrupt_release`]).
+//! - **Context switches.** [`frame_exit_hook`] runs on the incoming frame's
+//!   stack. It first lets the scheduler drop its own lock, then acquires or
+//!   releases the BKL to match the incoming task's `bkl_resume`. Doing it
+//!   after the stack switch means no other CPU can resume the previous task
+//!   while its kernel stack is still in use here.
+//! - **SYSCALL return.** The return path releases in [`syscall_exit`] (same
+//!   task, same stack, so there is no hand-off hazard).
+//!
+//! Lock-free paths (they never take the BKL):
+//! - the PIT tick counter and scheduler tick,
+//! - the LAPIC timer tick,
+//! - the reschedule, TLB-shootdown and test IPIs,
+//! - context switches,
+//! - the idle loop's `hlt`.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -87,7 +100,8 @@ pub fn release() {
 /// shared kernel state across the call.
 pub fn relax() {
     if !held_by_me() {
-        acquire();
+        // Lock-free callers (scheduler-only kernel threads) have nothing to
+        // give up.
         return;
     }
     release();
@@ -111,8 +125,19 @@ pub fn wait_for_interrupt() {
 }
 
 /// IDT entry hook: every interrupt that is not lock-free.
-pub fn interrupt_enter() {
+/// Returns true when this call acquired the lock (the interrupted context
+/// did not hold it).
+pub fn interrupt_enter() -> bool {
+    if held_by_me() {
+        return false;
+    }
     acquire();
+    true
+}
+
+/// Give back a lock taken by [`interrupt_enter`] when no switch happened.
+pub fn interrupt_release() {
+    release();
 }
 
 /// SYSCALL entry: user mode never holds the lock.
@@ -135,11 +160,16 @@ pub fn syscall_exit() {
 /// Called from `arch_x86_64_frame_exit` with the frame about to be
 /// restored, already running on that frame's stack.
 pub extern "C" fn frame_exit_hook(frame: *const InterruptFrame) {
-    if !held_by_me() {
+    // Only a (possible) context switch changes who should hold the lock; a
+    // plain interrupt return was balanced by the IDT dispatcher already.
+    if !crate::sched::finish_switch() {
         return;
     }
     let cs = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*frame).cs)) };
-    if cs & 3 == 3 || crate::sched::current_is_idle() {
+    let want = cs & 3 == 0 && crate::sched::current_needs_bkl();
+    if want {
+        acquire();
+    } else {
         release();
     }
 }

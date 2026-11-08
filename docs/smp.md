@@ -7,6 +7,7 @@ lock (BKL) that lets every CPU run tasks.
 Status:
 - **Phase 1:** every CPU comes online, and IRQs go through the IOAPIC.
 - **Phase 2:** the scheduler runs on every CPU. The kernel is serialised by one big kernel lock owned by a CPU.
+- **Phase 3 (in progress):** the scheduler, PMM and heap have their own locks. Timer ticks, reschedule IPIs and context switches no longer take the big lock, and big-lock ownership follows tasks across switches.
 
 **Where It Lives**
 - `crates/arch_x86_64/src/acpi.rs`: RSDP/RSDT/XSDT/MADT parsing and ISA IRQ override resolution (pure, host-tested)
@@ -48,28 +49,52 @@ Status:
 - The scheduler keeps `current`, `idle` and `preempt_pending` for each CPU. `sched::current_task()` and `task::current()` therefore return the executing CPU's task.
 - `smp` tracks each CPU's online flag, APIC id, active CR3, and pending TLB-flush flag.
 
-**Big Kernel Lock**
-The lock is owned by a CPU, not a task. It is a FIFO ticket lock: a plain test-and-set lock starved waiters whenever the owner released and immediately re-acquired.
-- **Acquire** whenever this CPU enters the kernel without owning the lock:
+**Locks**
+Three locks matter for SMP. The lock order is BKL, then `SCHED_LOCK`, then heap, then PMM.
+
+- **Big kernel lock** (`kernel/src/bkl.rs`): a FIFO ticket lock that still serialises most kernel code (syscalls, device IRQs, exceptions). It is owned by a CPU, but logically it follows the task:
+  - A task switched out while holding it records that in `Task::bkl_resume` and gives it up.
+  - The CPU that later resumes the task takes it again before the task runs. Kernel threads start with `bkl_resume = true` unless created with `kthread_create_with_lock(.., false)`.
+- **`SCHED_LOCK`** (`kernel/src/sched.rs`): an interrupt-safe spinlock. It protects:
+  - the run queue,
+  - per-CPU current/idle/preempt state,
+  - the task table,
+  - the scheduler-owned task state transitions.
+
+  The scheduler never needs the big lock.
+- **PMM and heap locks**: interrupt-safe spinlocks taken at the public entry points (`alloc_page`, `free_page`, `kmalloc`, `kfree`, ...).
+
+Big-lock rules:
+- **Acquire** whenever this CPU enters the kernel through a path that needs it without owning it:
   - SYSCALL (`bkl::syscall_enter`),
-  - any interrupt or exception that is not lock-free (IDT entry hook),
+  - interrupts and exceptions on vectors not marked lock-free (IDT entry hook, `bkl::interrupt_enter`),
   - explicit waits.
 
   Re-acquiring on the owning CPU is a no-op. The CPU waits for its ticket with interrupts disabled, so a nested interrupt cannot take a second ticket. While it waits it services TLB-shootdown requests.
-- **Keep** the lock across kernel-to-kernel context switches.
-- **Release** only in `arch_x86_64_frame_exit`, after `rsp` has moved to the frame being restored, and only when that frame returns to ring 3 or enters an idle task. Until the CPU has left the old stack, no other CPU can pick the previous task off the run queue. The SYSCALL return path releases in `bkl::syscall_exit`, with interrupts disabled first.
-- **`bkl::relax()`** releases and re-queues. `sched::yield_now()` calls it after every yield, because busy-wait loops (`wait4`, `poll`, futex retries) otherwise spin forever while the task they wait for sits on another CPU, waiting for the lock.
+- **Interrupt balance.** If the entry hook took the lock and the same frame resumes, the IDT dispatcher releases it (`bkl::interrupt_release`).
+- **Context switch hand-off.**
+  - `schedule_from` takes `SCHED_LOCK` (raw form) and records `bkl_resume` for the outgoing task.
+  - On the incoming frame's stack, `arch_x86_64_frame_exit` calls `bkl::frame_exit_hook`. That hook drops `SCHED_LOCK` (`sched::finish_switch`), then acquires or releases the big lock to match the incoming task.
+  - Until the CPU has left the old stack, no other CPU can resume the previous task.
+- **SYSCALL return.** `bkl::syscall_exit` disables interrupts, then releases.
+- **`block`/`sleep`.** These pass the new state to `schedule_from`, which applies it under `SCHED_LOCK`. The lock-free PIT tick can therefore never wake a sleeper, and let another CPU resume it, while the sleeper is still on its own stack.
+- **`bkl::relax()`** releases and re-queues behind waiting CPUs. It is a no-op for lock-free callers. `sched::yield_now()` calls it after every yield, because busy-wait loops (`wait4`, `poll`, futex retries) otherwise starve the task they wait for.
 - **`bkl::wait_for_interrupt()`** halts without the lock. The boot task's main loop uses it.
-- **Lock-free paths:**
-  - The PIT tick counter (a fast handler, so `ticks()` advances even while an AP holds the lock).
-  - The test and TLB IPIs.
-  - The idle loop.
+
+Paths that never take the big lock:
+- The PIT tick: the counter (a fast handler) and `sched::tick`, which runs sleeper wake-ups and the BSP time slice.
+- The LAPIC timer tick and the reschedule IPI (`idt::set_no_entry_lock`).
+- The test and TLB IPIs.
+- Every context switch.
+- The idle loop.
+
+So timer preemption and task switching continue on every CPU even while another CPU sits in a long syscall holding the big lock.
 
 **IPIs and Timers**
 - `0xF0` test (lock-free).
-- `0xF1` per-CPU LAPIC timer tick on APs, which calls `sched::tick_local()`.
+- `0xF1` per-CPU LAPIC timer tick on APs, which calls `sched::tick_local()` (no big lock).
 - `0xF2` TLB shootdown (lock-free).
-- `0xF3` reschedule.
+- `0xF3` reschedule (no big lock).
 - The PIT stays the global clock on the BSP. `sched::tick()` wakes sleepers and runs the BSP's time slice.
 - When a task becomes ready, `sched` sends a reschedule IPI to one idle CPU.
 
@@ -82,10 +107,11 @@ The lock is owned by a CPU, not a task. It is a FIFO ticket lock: a plain test-a
 - Brand-new mappings over non-present entries need no shootdown.
 
 **Threads on Other CPUs**
-- `exit_group`/`execve` (`kill_other_threads`) handle a sibling thread that is running on another CPU:
-  - flag it `EXITING`,
-  - kick its CPU with a reschedule IPI,
-  - `relax()` until the sibling is parked or blocked, then finish it as before.
+- `exit_group`/`execve` (`kill_other_threads`) flag each sibling `EXITING`, then classify it with `sched::detach_for_kill`, atomically under `SCHED_LOCK`:
+  - parked in user mode: taken off the run queue as a zombie;
+  - running on another CPU: that CPU is kicked with a reschedule IPI;
+  - inside the kernel: woken, and it exits on its own.
+- While any sibling is still running elsewhere, the caller `relax()`es and retries.
 - The scheduler never picks an `EXITING` task parked in user mode, so a kicked sibling cannot be resumed while its killer waits.
 
 **Running**
@@ -93,11 +119,15 @@ The lock is owned by a CPU, not a task. It is a FIFO ticket lock: a plain test-a
   - all CPUs come online,
   - the IPI self-test passes,
   - the scheduler is running on 4 CPUs,
-  - kernel worker threads were scheduled on at least two different CPUs.
+  - kernel worker threads were scheduled on at least two different CPUs,
+  - scheduler-only threads kept yielding on other CPUs while a "hog" thread held the big lock with interrupts disabled (`smp_test::run_bkl_free`).
 - `make run QEMU_SMP=4` (or any `run*` target) boots with several CPUs.
 
 Limitations / Simplifications
-- **One big lock.** All kernel execution is serialised, so only user-mode work runs in parallel. Kernel code that busy-waits without yielding holds everyone else out, and a kernel thread that never blocks keeps its CPU's hold on the lock. The next step is per-subsystem locks.
+- **Big kernel lock still covers most kernel code.** Syscalls, device IRQs and exceptions are still serialised by it. Only scheduling, timer ticks and the PMM/heap run outside it, and kernel code that busy-waits without yielding still holds other syscalls out.
+  - Next: VMM, VFS, net, IPC and per-syscall locks, then removing the BKL from syscalls that do not need it (`sched_yield`, `getpid`, time queries).
+- **PMM/heap callers mostly still hold the big lock.** These modules are self-locked, but heap expansion calls `vmm::map_page` while holding the heap lock, and the VMM has no lock of its own yet. Heap callers outside the big lock must not race VMM users on kernel-half page tables.
+- **A task that marks itself a zombie before finishing its exit work** (`exit_current_thread`) can be lost if a timer preemption hits in between. The scheduler never resumes zombies. This is pre-existing and now more likely, because timer preemption no longer waits for the big lock.
 - **One shared run queue.** No per-CPU queues, no load balancing, no CPU affinity. Tasks migrate freely.
 - **Device IRQs and the PIT go to the BSP only.** There is no IRQ balancing, no MSI/MSI-X, and no `_PRT`/AML evaluation. PCI devices use their legacy ISA line plus MADT overrides.
 - **Signals reach running tasks late.** A signal sent to a task running in user mode on another CPU is only noticed at that task's next syscall, which matches the single-core delivery point. Only `exit_group`/`execve` actively kick remote siblings.

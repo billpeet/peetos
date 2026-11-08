@@ -27,7 +27,9 @@ current Rust kernel implementation and forward roadmap.
     - a shared run queue with per-CPU current/idle,
     - a LAPIC timer tick on the APs,
     - reschedule and TLB-shootdown IPIs.
-  - All kernel execution is serialised by a big kernel lock (FIFO ticket lock, owned by a CPU).
+  - Kernel code is serialised by a big kernel lock (a FIFO ticket lock whose ownership follows tasks across switches).
+  - The scheduler, PMM and heap have their own interrupt-safe locks.
+  - Timer ticks, reschedule IPIs and context switches never take the big lock. A smoke test proves that tasks keep switching on other CPUs while one CPU holds it.
   - `tests/smoke.sh` checks that kernel threads run on more than one CPU, and the userspace suites pass at `-smp 4`.
 - Memory management is in place: typed addresses, bitmap PMM, 4-level VMM, and kernel heap.
 
@@ -158,7 +160,8 @@ current Rust kernel implementation and forward roadmap.
 
 ### 1a. SMP Phase 3 (Breaking Up the Big Kernel Lock)
 
-- Add an IRQ-safe `SpinLock` that masks interrupts, then give the PMM, heap, VMM, run queue, VFS, net stack and syscall globals their own locks. Shrink the BKL until it can be removed.
+- Done: the IRQ-safe `IrqSpinLock`, plus self-locked PMM, heap and scheduler (run queue, task table, task-owned BKL hand-off).
+- Next: give the VMM, VFS, net stack, IPC and syscall globals their own locks. Then drop the BKL from syscalls that do not need it (`sched_yield`, `getpid`/`gettid`, time queries), and shrink it until it can be removed.
 - Move to per-CPU run queues with load balancing (and later affinity).
 - Batch TLB shootdowns per operation (`munmap` ranges, fork COW marking) and consider PCID.
 - Deliver signals to tasks running in user mode on another CPU promptly (kick them with a reschedule IPI).

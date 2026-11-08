@@ -85,7 +85,9 @@ Ring-3 transitions: the common stub runs `swapgs` on entry when the saved CS is 
 
 Handlers come in two kinds:
 - **Fast handlers** (`register_fast_handler`) run first and must not need kernel locks: the PIT tick counter, the test IPI and the TLB-shootdown IPI. A vector with only a fast handler skips the entry hook, the normal handler and the post hook.
-- **Normal handlers** run after the entry hook (BKL acquire).
+- **Normal handlers** run after the entry hook (BKL acquire), unless the vector is marked with `idt::set_no_entry_lock`. The PIT, the LAPIC timer and the reschedule IPI are marked that way; they take only the scheduler lock.
+
+The entry hook reports whether it acquired the lock. If the same frame resumes, the dispatcher gives the lock back through the release hook. If the post hook switched tasks, the frame-exit hook settles ownership instead.
 
 The stubs are defined via `global_asm!` and push an interrupt number and error code (dummy for non-error-code exceptions). They save GP registers, call `isr_handler`, restore registers, and `iretq`.
 

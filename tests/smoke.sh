@@ -63,3 +63,6 @@ grep -q "\[SMP\] IPI self-test: 3/3 AP(s) responded" "${LOG_FILE}"
 grep -q "\[SMP\] Scheduler running on 4 CPU(s)" "${LOG_FILE}"
 # Kernel worker threads must actually be scheduled on more than one CPU.
 grep -Eq "\[TEST\] SMP scheduler: 8/8 workers finished on [2-4] CPU\(s\)" "${LOG_FILE}"
+# The scheduler must keep switching tasks on other CPUs while one CPU holds
+# the big kernel lock with interrupts disabled.
+grep -Eq "\[TEST\] BKL-free scheduling: [1-9][0-9]* yield\(s\) on other CPUs while CPU [0-9]+ held the BKL \(hog done=true, yielders stopped=6/6\)" "${LOG_FILE}"

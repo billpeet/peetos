@@ -222,7 +222,9 @@ pub extern "C" fn kmain() -> ! {
     serial_println!("[PTY] Initialized");
 
     pit::set_tick_hook(sched::tick);
-    idt::set_entry_hook(bkl::interrupt_enter);
+    idt::set_entry_hook(bkl::interrupt_enter, bkl::interrupt_release);
+    // The PIT tick only touches the scheduler (its own lock).
+    idt::set_no_entry_lock(arch_x86_64::irq::irq_to_vector(pic::IRQ_TIMER));
     idt::set_exit_hook(bkl::frame_exit_hook);
     idt::set_post_handler_hook(sched::isr_hook);
     smp::release_aps();
@@ -265,6 +267,9 @@ pub extern "C" fn kmain() -> ! {
         }
         let expected = core::cmp::min(smp::online_count() as u32, 2);
         if smp_test::run() < expected {
+            qemu::exit_failure();
+        }
+        if smp::online_count() >= 2 && smp_test::run_bkl_free() == 0 {
             qemu::exit_failure();
         }
         qemu::exit_success();

@@ -1,3 +1,4 @@
+use crate::sync::IrqSpinLock;
 #[cfg(target_os = "none")]
 use core::ptr;
 
@@ -52,6 +53,10 @@ static mut LAST_USABLE_PFN: u64 = 0;
 static mut SEARCH_HINT: u64 = 0;
 static mut DEBUG_TRACKED_PAGE: u64 = 0;
 static mut PMM_INITIALIZED: bool = false;
+/// Serialises all bitmap/refcount/counter updates. The PMM is called from
+/// paths that do not hold the big kernel lock (and from IRQ context), so it
+/// has its own interrupt-safe lock. Lock order: heap -> PMM.
+static PMM_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 /// Extra mappings sharing a page, beyond its first owner. Copy-on-write fork
 /// bumps this; `free_page` drops one reference and only releases the frame
 /// when the count is already zero.
@@ -158,6 +163,12 @@ pub fn debug_track_page(_addr: PhysAddr) {}
 
 #[cfg(target_os = "none")]
 pub fn alloc_page() -> PhysAddr {
+    let _guard = PMM_LOCK.lock();
+    alloc_page_locked()
+}
+
+#[cfg(target_os = "none")]
+fn alloc_page_locked() -> PhysAddr {
     unsafe {
         if !PMM_INITIALIZED {
             serial_println!("[PMM] ERROR: PMM not initialized!");
@@ -216,6 +227,12 @@ pub fn alloc_page() -> PhysAddr {
 
 #[cfg(target_os = "none")]
 pub fn free_page(addr: PhysAddr) {
+    let _guard = PMM_LOCK.lock();
+    free_page_locked(addr)
+}
+
+#[cfg(target_os = "none")]
+fn free_page_locked(addr: PhysAddr) {
     unsafe {
         if !PMM_INITIALIZED {
             serial_println!("[PMM] ERROR: PMM not initialized!");
@@ -268,13 +285,19 @@ pub fn free_page(_addr: PhysAddr) {}
 
 #[cfg(target_os = "none")]
 pub fn alloc_pages(count: usize) -> PhysAddr {
+    let _guard = PMM_LOCK.lock();
+    alloc_pages_locked(count)
+}
+
+#[cfg(target_os = "none")]
+fn alloc_pages_locked(count: usize) -> PhysAddr {
     unsafe {
         if !PMM_INITIALIZED || count == 0 {
             return PhysAddr::new(0);
         }
 
         if count == 1 {
-            return alloc_page();
+            return alloc_page_locked();
         }
 
         if FREE_PAGE_COUNT < count as u64 {
@@ -317,8 +340,9 @@ pub fn alloc_pages(_count: usize) -> PhysAddr {
 
 #[cfg(target_os = "none")]
 pub fn free_pages(addr: PhysAddr, count: usize) {
+    let _guard = PMM_LOCK.lock();
     for i in 0..count {
-        free_page(addr + (i as u64 * PAGE_SIZE));
+        free_page_locked(addr + (i as u64 * PAGE_SIZE));
     }
 }
 
@@ -327,6 +351,7 @@ pub fn free_pages(_addr: PhysAddr, _count: usize) {}
 
 #[cfg(target_os = "none")]
 pub fn mark_used(addr: PhysAddr) {
+    let _guard = PMM_LOCK.lock();
     unsafe {
         if !PMM_INITIALIZED {
             return;
@@ -353,6 +378,7 @@ pub fn mark_used(addr: PhysAddr) {
 pub fn mark_used(_addr: PhysAddr) {}
 
 pub fn get_stats() -> PmmStats {
+    let _guard = PMM_LOCK.lock();
     unsafe {
         let total_pages = TOTAL_PAGE_COUNT;
         let used_pages = USED_PAGE_COUNT;
@@ -391,6 +417,7 @@ fn drop_page_ref(pfn: u64) -> bool {
 /// (and changes nothing) for unmanaged or free frames, or when the share count
 /// would overflow; callers must then copy the page instead of sharing it.
 pub fn page_share(addr: PhysAddr) -> bool {
+    let _guard = PMM_LOCK.lock();
     let pfn = addr.align_down().to_pfn();
     if !is_managed(addr) || pfn >= PMM_MAX_PAGES || !bitmap_test(pfn) {
         return false;
@@ -407,6 +434,7 @@ pub fn page_share(addr: PhysAddr) -> bool {
 
 /// True when more than one mapping currently references this page.
 pub fn page_is_shared(addr: PhysAddr) -> bool {
+    let _guard = PMM_LOCK.lock();
     let pfn = addr.align_down().to_pfn();
     if pfn >= PMM_MAX_PAGES {
         return false;

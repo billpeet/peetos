@@ -36,7 +36,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
   - When an ACPI MADT is present, the kernel switches IRQ delivery from the 8259 PIC to the LAPIC/IOAPIC.
   - It wakes every application processor with INIT/SIPI and checks each one with an IPI self-test.
   - Every CPU runs tasks from a shared run queue. Each CPU has its own GDT/TSS/GS area and LAPIC timer tick, and reschedule and TLB-shootdown IPIs keep them coordinated.
-  - Kernel code is serialised by a big kernel lock, so for now only user-mode work runs in parallel.
+  - Most kernel code is still serialised by a big kernel lock. The scheduler, PMM and heap have their own locks, so timer ticks and task switches keep running on every CPU even while one CPU holds the big lock in a long syscall.
   - See `docs/smp.md`.
 - Tasking/scheduler baseline is in place (kernel threads + PIT-driven preemption).
 - libwayland 1.23.1 (with libffi 3.4.6) is ported as static musl libraries (`make -C wayland`). A dedicated QEMU smoke (`run-wayland-smoke`) runs a libwayland compositor and a separate libwayland client process that connect over `/tmp/wayland-0`, share a sealed memfd `wl_shm` pool, present two frames (growing the pool in between), and exercise `eventfd`, `timerfd`, `signalfd`, `flock`, `fallocate`, `mremap`, and `SO_PEERCRED`. See `docs/wayland.md`.

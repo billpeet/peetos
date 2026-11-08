@@ -1066,7 +1066,11 @@ pub fn clear_user_space(target_pml4: PhysAddr) {
                     }
 
                     let page_phys = pte_addr(pte);
-                    if !syscall::vm_page_cache_release_mapped_phys(page_phys) {
+                    // Device mappings (e.g. /dev/fb0) point at frames the PMM
+                    // does not own; only release managed RAM.
+                    if pmm::is_managed(page_phys)
+                        && !syscall::vm_page_cache_release_mapped_phys(page_phys)
+                    {
                         pmm::free_page(page_phys);
                     }
                     unsafe { ptr::write(pt_table.add(pt_idx), 0) };

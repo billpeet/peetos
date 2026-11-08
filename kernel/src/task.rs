@@ -138,6 +138,9 @@ pub struct Task {
     /// Saved user x87/SSE register state while the task is switched out.
     /// While the task is running, the hardware registers are authoritative.
     pub(crate) fpu: FxSaveArea,
+    /// Whether this task held the big kernel lock when it was last switched
+    /// out; the CPU that resumes it re-acquires the lock first (see `bkl`).
+    pub(crate) bkl_resume: bool,
 }
 
 // Tasks are allocated as a single physical page in `task_alloc`.
@@ -241,6 +244,7 @@ pub fn init() {
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
             fpu: FxSaveArea::new_default(),
+            bkl_resume: false,
         };
         write_name(&mut boot.name, "kernel");
 
@@ -342,8 +346,11 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.next = ptr::null_mut();
         task.prev = ptr::null_mut();
         task.fpu = FxSaveArea::new_default();
+        task.bkl_resume = false;
         write_name(&mut task.name, name);
 
+        // The scheduler scans the table without the big kernel lock.
+        let _sched = crate::sched::lock();
         TASK_TABLE[slot] = task_ptr;
         TASK_COUNT = TASK_COUNT.saturating_add(1);
     }
@@ -366,11 +373,16 @@ pub fn task_destroy(task: *mut Task) {
     }
 
     unsafe {
-        for slot in TASK_TABLE.iter_mut() {
-            if *slot == task {
-                *slot = ptr::null_mut();
-                TASK_COUNT = TASK_COUNT.saturating_sub(1);
-                break;
+        {
+            // Unlink under the scheduler lock so the lock-free sleeper scan
+            // never sees a task being freed.
+            let _sched = crate::sched::lock();
+            for slot in TASK_TABLE.iter_mut() {
+                if *slot == task {
+                    *slot = ptr::null_mut();
+                    TASK_COUNT = TASK_COUNT.saturating_sub(1);
+                    break;
+                }
             }
         }
 
@@ -564,6 +576,18 @@ extern "C" fn kthread_entry_wrapper(entry: KThreadEntry, arg: *mut u8) -> ! {
 }
 
 pub fn kthread_create(name: &str, entry: KThreadEntry, arg: *mut u8) -> Pid {
+    kthread_create_with_lock(name, entry, arg, true)
+}
+
+/// Create a kernel thread. `needs_bkl` = false is for threads that touch
+/// only lock-protected state (scheduler, atomics) and never need the big
+/// kernel lock.
+pub fn kthread_create_with_lock(
+    name: &str,
+    entry: KThreadEntry,
+    arg: *mut u8,
+    needs_bkl: bool,
+) -> Pid {
     let task = task_alloc(name, TASK_FLAG_KERNEL);
     if task.is_null() {
         return INVALID_PID;
@@ -588,6 +612,9 @@ pub fn kthread_create(name: &str, entry: KThreadEntry, arg: *mut u8) -> Pid {
         (*frame).rsi = arg as u64;
 
         (*task).saved_rsp = frame_addr;
+        // Kernel threads run kernel code from their first instruction, so
+        // the CPU that first runs one takes the big kernel lock for it.
+        (*task).bkl_resume = needs_bkl;
         (*task).state = TaskState::Ready;
     }
 
@@ -720,6 +747,7 @@ impl Task {
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
             fpu: FxSaveArea::new_default(),
+            bkl_resume: false,
         }
     }
 

@@ -1110,24 +1110,17 @@ pub(super) fn reap_exited_threads() {
     }
 }
 
-/// True when a task preempted in user mode: it holds no kernel state and can
-/// be terminated without running it again.
-pub(super) fn task_parked_in_user_mode(t: *mut task::Task) -> bool {
-    unsafe {
-        if (*t).state != TaskState::Ready || (*t).saved_rsp == 0 {
-            return false;
-        }
-        let frame = (*t).saved_rsp as *const InterruptFrame;
-        (ptr::read_unaligned(ptr::addr_of!((*frame).cs)) & 3) == 3
-    }
-}
-
-/// Make sibling thread `t` exit (for exit_group or execve). A thread parked
-/// in user mode is terminated immediately; one inside the kernel is flagged
-/// and woken, and exits when its syscall unwinds.
-pub(super) fn kill_sibling_thread(t: *mut task::Task, code: i32) {
+/// Make sibling thread `t` exit (for exit_group or execve). Returns true
+/// while `t` is still executing on another CPU; the caller must retry after
+/// letting that CPU reschedule.
+///
+/// - Parked in user mode: terminated immediately.
+/// - Inside the kernel: flagged and woken, and it exits when its syscall
+///   unwinds.
+/// - Running on another CPU: that CPU is kicked.
+pub(super) fn kill_sibling_thread(t: *mut task::Task, code: i32) -> bool {
     if t.is_null() || !task::is_live(t) {
-        return;
+        return false;
     }
     let is_leader = task::leader_of(t) == t;
     unsafe {
@@ -1136,29 +1129,34 @@ pub(super) fn kill_sibling_thread(t: *mut task::Task, code: i32) {
         if !is_leader {
             // The process (or the exec'd image) may outlive this thread.
             (*t).user_clear_tid = 0;
+        }
+    }
+    match crate::sched::detach_for_kill(t) {
+        crate::sched::KillDetach::RunningElsewhere => return true,
+        crate::sched::KillDetach::Detached => {
+            ipc::remove_task_waiters(t);
+        }
+        crate::sched::KillDetach::InKernel => {
+            let state = unsafe { (*t).state };
+            if state == TaskState::Blocked || state == TaskState::Sleeping {
+                crate::sched::unblock(t);
+            }
+        }
+    }
+    if !is_leader {
+        unsafe {
             (*t).pml4_phys = 0;
         }
     }
-    if task_parked_in_user_mode(t) {
-        crate::sched::remove_task(t);
-        ipc::remove_task_waiters(t);
-        unsafe {
-            (*t).state = TaskState::Zombie;
-        }
-        return;
-    }
-    let state = unsafe { (*t).state };
-    if state == TaskState::Blocked || state == TaskState::Sleeping {
-        crate::sched::unblock(t);
-    }
+    false
 }
 
 /// Make every other thread of `current`'s process exit.
 ///
-/// A sibling executing on another CPU cannot be torn down in place. It is
-/// kicked with a reschedule IPI, and this CPU briefly drops the big kernel
-/// lock so that CPU can preempt it. The sibling is handled by
-/// [`kill_sibling_thread`] once it is parked or blocked.
+/// A sibling executing on another CPU cannot be torn down in place. Its CPU
+/// is kicked with a reschedule IPI, and this CPU briefly drops the big kernel
+/// lock so the sibling can be preempted. The sibling is finished once it is
+/// parked or blocked.
 pub(super) fn kill_other_threads(current: *mut task::Task, code: i32) {
     let tgid = unsafe { (*current).tgid };
     loop {
@@ -1168,15 +1166,7 @@ pub(super) fn kill_other_threads(current: *mut task::Task, code: i32) {
             if t.is_null() || t == current || unsafe { (*t).tgid } != tgid {
                 continue;
             }
-            if crate::sched::running_on_other_cpu(t) {
-                unsafe {
-                    (*t).flags |= task::TASK_FLAG_EXITING;
-                }
-                crate::sched::kick_task(t);
-                running_elsewhere = true;
-                continue;
-            }
-            kill_sibling_thread(t, code);
+            running_elsewhere |= kill_sibling_thread(t, code);
         }
         if !running_elsewhere {
             return;

@@ -41,7 +41,7 @@ Public API:
 Limitations / Simplifications
 - Hard cap of 128 MB managed memory; higher RAM is ignored.
 - E820 is read from fixed bootloader-provided addresses without additional validation.
-- No lock of its own and no per-CPU freelists. It relies on the big kernel lock (`docs/smp.md`) for cross-CPU exclusion.
+- Protected by its own interrupt-safe spinlock (`PMM_LOCK`), taken at every public entry point. It is independent of the big kernel lock. There are no per-CPU freelists.
 - Only reserves low 1MB and the kernel image range by default. SMP bring-up relies on that reservation: it reuses physical `0x8000-0xBFFF` for the AP trampoline and its transitional page tables (see `docs/smp.md`).
 
 **Virtual Memory Manager (VMM)**
@@ -88,7 +88,7 @@ Block layout:
 - Free list is sorted by address and coalesced on free.
 
 Limitations / Simplifications
-- Single global heap with no lock of its own. It relies on the big kernel lock for cross-CPU exclusion.
+- Single global heap protected by its own interrupt-safe spinlock (`HEAP_LOCK`, taken by `kmalloc`/`kfree`/`get_stats`). Lock order is heap, then PMM. Heap expansion maps pages through the VMM, which still relies on the big kernel lock.
 - Fixed 64 MB heap range with no guard pages or shrinking.
 - First-fit allocator only; no slabs, per-size caches, or fragmentation mitigation beyond coalescing.
 

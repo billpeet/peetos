@@ -24,9 +24,16 @@ pub const IPI_VECTOR_FIRST: u8 = 0xF0;
 pub const IPI_VECTOR_COUNT: u8 = 4;
 
 pub type InterruptHandler = extern "C" fn(frame: &mut InterruptFrame);
-pub type PostHandlerHook = fn(frame: &mut InterruptFrame) -> u64;
+/// Runs after the handler and EOI. The flag says whether the entry hook took
+/// the kernel lock for this interrupt. Returns a new frame pointer to switch
+/// to, or 0 to resume the interrupted frame.
+pub type PostHandlerHook = fn(frame: &mut InterruptFrame, entry_locked: bool) -> u64;
 /// Runs before a vector's normal handler; the kernel takes its big lock here.
-pub type EntryHook = fn();
+/// Returns true when it acquired the lock (rather than already holding it).
+pub type EntryHook = fn() -> bool;
+/// Undo the entry hook's acquisition when the interrupt resumes the same
+/// frame (no switch happened).
+pub type EntryReleaseHook = fn();
 /// Called from assembly with the frame that is about to be restored, after
 /// any stack switch. The kernel drops its big lock here when that frame
 /// returns to ring 3 or to an idle context.
@@ -103,6 +110,10 @@ static mut POST_HANDLER_HOOK: Option<PostHandlerHook> = None;
 /// handler table and the post-handler hook entirely.
 static mut FAST_HANDLERS: [Option<InterruptHandler>; IDT_ENTRIES] = [None; IDT_ENTRIES];
 static mut ENTRY_HOOK: Option<EntryHook> = None;
+static mut ENTRY_RELEASE_HOOK: Option<EntryReleaseHook> = None;
+/// Vectors whose normal handler runs without the entry hook (the kernel's
+/// big lock), e.g. timer ticks and reschedule IPIs.
+static mut NO_ENTRY_LOCK: [bool; IDT_ENTRIES] = [false; IDT_ENTRIES];
 #[cfg(target_os = "none")]
 #[no_mangle]
 static mut ARCH_X86_64_EXIT_HOOK: u64 = 0;
@@ -198,9 +209,18 @@ pub fn register_fast_handler(vector: u8, handler: InterruptHandler) {
     }
 }
 
-pub fn set_entry_hook(hook: EntryHook) {
+pub fn set_entry_hook(hook: EntryHook, release: EntryReleaseHook) {
     unsafe {
         ENTRY_HOOK = Some(hook);
+        ENTRY_RELEASE_HOOK = Some(release);
+    }
+}
+
+/// Run `vector`'s normal handler and post hook without the entry hook. The
+/// handler must do its own locking.
+pub fn set_no_entry_lock(vector: u8) {
+    unsafe {
+        NO_ENTRY_LOCK[vector as usize] = true;
     }
 }
 
@@ -344,9 +364,12 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) -> u64 {
         fast(frame);
     }
     let lock_free = is_lock_free(vector as u8);
+    let mut entry_locked = false;
     if !lock_free {
-        if let Some(enter) = unsafe { ENTRY_HOOK } {
-            enter();
+        if !unsafe { NO_ENTRY_LOCK[vector] } {
+            if let Some(enter) = unsafe { ENTRY_HOOK } {
+                entry_locked = enter();
+            }
         }
         match unsafe { HANDLERS[vector] } {
             Some(handler) => handler(frame),
@@ -367,11 +390,18 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) -> u64 {
     if lock_free {
         return 0;
     }
+    let mut next = 0;
     if let Some(hook) = unsafe { POST_HANDLER_HOOK } {
-        return hook(frame);
+        next = hook(frame, entry_locked);
     }
-
-    0
+    if next == 0 && entry_locked {
+        // Same frame resumes: give back what the entry hook took. (After a
+        // switch the frame-exit hook settles lock ownership instead.)
+        if let Some(release) = unsafe { ENTRY_RELEASE_HOOK } {
+            release();
+        }
+    }
+    next
 }
 
 #[inline]

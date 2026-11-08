@@ -6,6 +6,7 @@ use arch_x86_64::addr::{VirtAddr, PAGE_SIZE};
 use crate::memory::pmm;
 use crate::memory::vmm;
 use crate::serial_println;
+use crate::sync::IrqSpinLock;
 
 const HEAP_START: u64 = 0xFFFF_FFFF_9000_0000;
 const HEAP_MAX_SIZE: u64 = 64 * 1024 * 1024;
@@ -50,6 +51,10 @@ static mut STAT_ALLOC_COUNT: u64 = 0;
 static mut STAT_TOTAL_ALLOCS: u64 = 0;
 static mut STAT_TOTAL_FREES: u64 = 0;
 static mut HEAP_INITIALIZED: bool = false;
+/// Serialises the free list, expansion and statistics. Interrupt-safe and
+/// independent of the big kernel lock. Lock order: heap -> PMM. Expansion
+/// maps fresh kernel pages through `vmm::map_page` while holding it.
+static HEAP_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
 #[inline]
 fn align_up(value: usize, align: usize) -> usize {
@@ -242,6 +247,11 @@ pub fn init() {
 }
 
 pub fn kmalloc(size: usize) -> *mut u8 {
+    let _guard = HEAP_LOCK.lock();
+    kmalloc_locked(size)
+}
+
+fn kmalloc_locked(size: usize) -> *mut u8 {
     if size == 0 {
         return ptr::null_mut();
     }
@@ -384,6 +394,11 @@ pub fn krealloc(ptr: *mut u8, size: usize) -> *mut u8 {
 }
 
 pub fn kfree(ptr: *mut u8) {
+    let _guard = HEAP_LOCK.lock();
+    kfree_locked(ptr)
+}
+
+fn kfree_locked(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
@@ -417,6 +432,7 @@ pub fn kfree(ptr: *mut u8) {
 }
 
 pub fn get_stats() -> HeapStats {
+    let _guard = HEAP_LOCK.lock();
     unsafe {
         let total = STAT_TOTAL_SIZE;
         let used = STAT_USED_SIZE;

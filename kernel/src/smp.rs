@@ -60,11 +60,11 @@ const IPI_TEST_TIMEOUT_US: u64 = 100_000;
 
 /// IPI vector used by [`ipi_self_test`] (lock-free).
 pub const IPI_VECTOR_TEST: u8 = idt::IPI_VECTOR_FIRST;
-/// Per-CPU LAPIC timer tick on APs (takes the BKL).
+/// Per-CPU LAPIC timer tick on APs (scheduler lock only, no BKL).
 pub const IPI_VECTOR_TIMER: u8 = idt::IPI_VECTOR_FIRST + 1;
 /// TLB shootdown (lock-free).
 pub const IPI_VECTOR_TLB: u8 = idt::IPI_VECTOR_FIRST + 2;
-/// Reschedule: wakes a CPU so the scheduler hook runs (takes the BKL).
+/// Reschedule: wakes a CPU so the scheduler hook runs (no BKL).
 pub const IPI_VECTOR_RESCHED: u8 = idt::IPI_VECTOR_FIRST + 3;
 
 /// How long to wait for every target to acknowledge a TLB shootdown before
@@ -507,6 +507,9 @@ pub fn start_aps() {
     idt::register_fast_handler(IPI_VECTOR_TLB, tlb_ipi_handler);
     idt::register_handler(IPI_VECTOR_TIMER, timer_ipi_handler);
     idt::register_handler(IPI_VECTOR_RESCHED, resched_ipi_handler);
+    // Both only touch the scheduler, which has its own lock.
+    idt::set_no_entry_lock(IPI_VECTOR_TIMER);
+    idt::set_no_entry_lock(IPI_VECTOR_RESCHED);
 
     // One scheduler tick of LAPIC timer counts, measured against the PIT.
     let tick_us = 1_000_000 / pit::TIMER_FREQUENCY as u64;
@@ -628,7 +631,6 @@ pub extern "C" fn ap_rust_entry(cpu_index: u64) -> ! {
     }
 
     interrupts::disable();
-    crate::bkl::acquire();
     lapic::start_periodic_timer(IPI_VECTOR_TIMER, TIMER_INITIAL_COUNT.load(Ordering::Acquire));
     crate::sched::ap_enter(index)
 }
