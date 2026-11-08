@@ -51,7 +51,7 @@ USER_WAYLAND_SMOKE_BIN := user/wayland_smoke.elf
 USER_PEETWL_BIN := user/peetwl.elf
 USER_WL_DEMO_BIN := user/wl_demo.elf
 WAYLAND_OUT := wayland/out
-WAYLAND_LIBS := $(WAYLAND_OUT)/lib/libwayland-server.a $(WAYLAND_OUT)/lib/libwayland-client.a $(WAYLAND_OUT)/lib/libwlprotocols.a $(WAYLAND_OUT)/lib/libffi.a
+WAYLAND_LIBS := $(WAYLAND_OUT)/lib/libwayland-server.a $(WAYLAND_OUT)/lib/libwayland-client.a $(WAYLAND_OUT)/lib/libwlprotocols.a $(WAYLAND_OUT)/lib/libxkbcommon.a $(WAYLAND_OUT)/lib/libffi.a
 # Upstream libwayland test suite binaries (scripts/build_wayland_tests.sh); TESTS is the stamp.
 WAYLAND_TESTS_STAMP := $(WAYLAND_OUT)/tests/TESTS
 USER_EXT2_MUSL_IMG := user/sample_ext2_musl.img

@@ -2137,3 +2137,86 @@ fn memfd_shmem_object_lives_until_last_fd_and_mapping_are_gone() {
 
     task::Task::install_for_test(0, core::ptr::null_mut());
 }
+
+fn anon_region(start: u64, pages: u64) -> VmMapping {
+    VmMapping {
+        start,
+        len: pages * PAGE_SIZE,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: false,
+        map_shared_can_write: false,
+    }
+}
+
+#[test]
+fn adjacent_compatible_regions_merge_on_insert() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x1_0000_0000u64;
+    mmap_regions_insert(&mut regions, anon_region(base, 2)).unwrap();
+    mmap_regions_insert(&mut regions, anon_region(base + 4 * PAGE_SIZE, 1)).unwrap();
+    // Fills the gap: all three become one region.
+    mmap_regions_insert(&mut regions, anon_region(base + 2 * PAGE_SIZE, 2)).unwrap();
+    let used: Vec<_> = regions.iter().filter(|r| !r.is_empty()).collect();
+    assert_eq!(used.len(), 1);
+    assert_eq!((used[0].start, used[0].len), (base, 5 * PAGE_SIZE));
+
+    // Different protection does not merge.
+    let mut ro = anon_region(base + 5 * PAGE_SIZE, 1);
+    ro.prot = PROT_READ;
+    mmap_regions_insert(&mut regions, ro).unwrap();
+    assert_eq!(regions.iter().filter(|r| !r.is_empty()).count(), 2);
+}
+
+#[test]
+fn full_region_table_rejects_unmergeable_insert_without_changes() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x4_0000_0000u64;
+    // Fill every slot with non-adjacent regions (gaps prevent merging).
+    for i in 0..MMAP_MAX_REGIONS_PER_TASK as u64 {
+        mmap_regions_insert(&mut regions, anon_region(base + i * 4 * PAGE_SIZE, 1)).unwrap();
+    }
+    let before = regions;
+    let far = anon_region(base + 1000 * PAGE_SIZE, 1);
+    assert_eq!(mmap_regions_insert(&mut regions, far), Err(-ENOMEM));
+    assert_eq!(regions, before, "failed insert must not modify the table");
+    // A region adjacent to an existing one still fits by merging.
+    mmap_regions_insert(&mut regions, anon_region(base + PAGE_SIZE, 1)).unwrap();
+}
+
+#[test]
+fn region_table_copies_stay_small() {
+    // Syscall paths copy whole tables onto the 16 KiB kernel stack.
+    assert!(core::mem::size_of::<[VmMapping; MMAP_MAX_REGIONS_PER_TASK]>() <= 1024);
+}
+
+#[test]
+fn file_regions_merge_only_with_contiguous_offsets() {
+    let file = |start: u64, off: u64| VmMapping {
+        start,
+        len: PAGE_SIZE,
+        file_offset: off,
+        file_inode: 9,
+        prot: PROT_READ,
+        map_shared: true,
+        map_shared_can_write: false,
+    };
+    let base = 0x2_0000_0000u64;
+    assert!(mmap_regions_can_merge(&file(base, 0), &file(base + PAGE_SIZE, PAGE_SIZE)));
+    assert!(!mmap_regions_can_merge(&file(base, 0), &file(base + PAGE_SIZE, 0)));
+    let mut other = file(base + PAGE_SIZE, PAGE_SIZE);
+    other.file_inode = 10;
+    assert!(!mmap_regions_can_merge(&file(base, 0), &other));
+}
+
+#[test]
+fn many_adjacent_anonymous_maps_use_one_slot() {
+    // What musl's allocator does while libxkbcommon compiles a keymap.
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    let base = 0x3_0000_0000u64;
+    for i in 0..(2 * MMAP_MAX_REGIONS_PER_TASK as u64) {
+        mmap_regions_insert(&mut regions, anon_region(base + i * PAGE_SIZE, 1)).unwrap();
+    }
+    assert_eq!(regions.iter().filter(|r| !r.is_empty()).count(), 1);
+}

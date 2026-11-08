@@ -89,6 +89,13 @@ if [[ -f "${ROOT_DIR}/user/dropbear_ed25519_host_key" ]]; then
   chmod 0600 "${STAGE_ROOT}/etc/dropbear/dropbear_ed25519_host_key"
 fi
 
+# Stage the verified xkeyboard-config subset (scripts/build_xkbcommon.sh) at
+# libxkbcommon's default root when it has been built.
+if [[ -f "${ROOT_DIR}/wayland/out/share/X11/xkb/rules/evdev" ]]; then
+  mkdir -p "${STAGE_ROOT}/usr/share/X11"
+  cp -a "${ROOT_DIR}/wayland/out/share/X11/xkb" "${STAGE_ROOT}/usr/share/X11/xkb"
+fi
+
 # Stage the peetwl compositor and wl-demo client when available.
 if [[ -x "${ROOT_DIR}/user/peetwl.elf" ]]; then
   cp "${ROOT_DIR}/user/peetwl.elf" "${STAGE_ROOT}/bin/peetwl"
@@ -535,7 +542,7 @@ if [ ! -x bin/peetwl ] || [ ! -x bin/wl-demo ]; then
   echo [musl-ext2-wlcomp-smoke] missing bin/peetwl or bin/wl-demo
   fail=1
 else
-  bin/peetwl --smoke \
+  bin/peetwl --smoke --xkb-layout de \
     --client "/mnt/ext2/bin/wl-demo Alpha 0xd05050" \
     --client "/mnt/ext2/bin/wl-demo Beta 0x4080d0" || fail=1
 fi
@@ -799,7 +806,14 @@ fi
 if [[ "${img_kib}" -lt 3072 ]]; then
   img_kib=3072
 fi
-mke2fs -q -t ext2 -F -b 1024 -I 256 -N 384 \
+# Inodes: one per staged file/dir plus headroom for files created at runtime
+# (sockets, locks, memfd backing files, test temp files).
+staged_entries="$(find "${STAGE_ROOT}" | wc -l)"
+inode_count=$((staged_entries + 256))
+if [[ "${inode_count}" -lt 384 ]]; then
+  inode_count=384
+fi
+mke2fs -q -t ext2 -F -b 1024 -I 256 -N "${inode_count}" \
   -O ^dir_index,^resize_inode,^ext_attr,^large_file \
   -L PEETOS_EXT2 -d "${STAGE_ROOT}" "${TMP_IMG}" "${img_kib}"
 

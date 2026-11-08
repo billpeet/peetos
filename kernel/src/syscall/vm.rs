@@ -773,6 +773,21 @@ pub(super) fn mmap_regions_find_mapping(
     None
 }
 
+/// True when `next` starts exactly where `prev` ends and both describe the
+/// same kind of mapping, so they can be one region (like Linux VMA merging).
+/// File mappings also need contiguous file offsets.
+pub(super) fn mmap_regions_can_merge(prev: &VmMapping, next: &VmMapping) -> bool {
+    !prev.is_empty()
+        && !next.is_empty()
+        && prev.end() == next.start
+        && prev.prot == next.prot
+        && prev.map_shared == next.map_shared
+        && prev.map_shared_can_write == next.map_shared_can_write
+        && prev.file_inode == next.file_inode
+        && (prev.file_inode == task::USER_FD_NONE
+            || prev.file_offset.checked_add(prev.len) == Some(next.file_offset))
+}
+
 pub(super) fn mmap_regions_insert(
     regions: &mut [VmMapping; MMAP_MAX_REGIONS_PER_TASK],
     mapping: VmMapping,
@@ -784,12 +799,36 @@ pub(super) fn mmap_regions_insert(
         return Err(-EINVAL);
     }
 
-    let slot = match mmap_regions_find_free(regions) {
-        Some(slot) => slot,
-        None => return Err(-ENOMEM),
-    };
-    regions[slot] = mapping;
-    Ok(())
+    // Absorb compatible neighbours, in place (no table copy: this runs on the
+    // kernel stack under callers that already hold copies). Allocators such
+    // as musl's mallocng map many small adjacent anonymous areas; without
+    // merging each one would use a region slot. Absorbing a neighbour frees
+    // its slot, so the only failure (table full) leaves `regions` untouched.
+    let mergeable = regions
+        .iter()
+        .any(|r| mmap_regions_can_merge(r, &mapping) || mmap_regions_can_merge(&mapping, r));
+    if !mergeable && mmap_regions_find_free(regions).is_none() {
+        return Err(-ENOMEM);
+    }
+    let mut merged = mapping;
+    for region in regions.iter_mut() {
+        if mmap_regions_can_merge(region, &merged) {
+            merged.start = region.start;
+            merged.len = merged.len.saturating_add(region.len);
+            merged.file_offset = region.file_offset;
+            *region = VmMapping::EMPTY;
+        } else if mmap_regions_can_merge(&merged, region) {
+            merged.len = merged.len.saturating_add(region.len);
+            *region = VmMapping::EMPTY;
+        }
+    }
+    match mmap_regions_find_free(regions) {
+        Some(slot) => {
+            regions[slot] = merged;
+            Ok(())
+        }
+        None => Err(-ENOMEM), // unreachable: checked above
+    }
 }
 
 #[inline]

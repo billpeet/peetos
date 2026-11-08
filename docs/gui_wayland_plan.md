@@ -503,7 +503,8 @@ Progress (2026-11-08):
 - [x] Automated QEMU smoke with real PS/2 input and screendump pixel checks (`make run-wlcomp-smoke`), plus an interactive demo (`make run-wayland-demo`).
 - [x] Kernel work this needed: page-backed memfd objects up to 64 MiB (tmpfs files were capped at 32 KiB), shared mappings covering a file's partial last page, Linux-convention `REL_Y`, and `SIGCHLD` on child exit.
 - [x] Build and run upstream libwayland tests (or a subset) for protocol compliance: 21 of upstream's test binaries (131 cases) pass in QEMU in the `musl-ext2-wayland-tests` profile (`make run-wayland-tests`, part of `make test`). `os-wrappers-test` is skipped because it needs `dlsym(RTLD_NEXT)`. See `docs/wayland.md` ("Upstream Test Suite").
-- [ ] `xkbcommon` keymaps, popups, interactive resize, subsurfaces, clipboard, and replacing the remaining peet-gui demo paths.
+- [x] libxkbcommon 1.7.0 ported with a verified xkeyboard-config subset; `peetwl` sends XKB_V1 keymaps and xkb_state modifiers, and the compositor smoke checks layout-aware text (German layout, Shift, Caps Lock).
+- [ ] Popups, interactive resize, subsurfaces, clipboard, and replacing the remaining peet-gui demo paths.
 
 Scope:
 

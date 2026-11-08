@@ -4,7 +4,8 @@
  * Opens one xdg_toplevel, draws a solid colour with a border (plus an accent
  * bar while the window is activated), and reacts to input:
  *   - left click toggles between the primary and alternate colour
- *   - every key press is logged; 'q' (evdev KEY_Q) exits
+ *   - every key press is logged with its keysym and UTF-8 text (translated
+ *     with libxkbcommon from the compositor's XKB_V1 keymap); 'q' exits
  *   - xdg_toplevel.close (the compositor's close box) exits
  * With --animate it redraws continuously, paced by frame callbacks.
  *
@@ -23,6 +24,7 @@
 #include <unistd.h>
 
 #include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
 #include "xdg-shell-client-protocol.h"
 
 #define KEY_Q 16
@@ -57,6 +59,9 @@ struct app {
     struct xdg_wm_base *wm_base;
     struct wl_pointer *pointer;
     struct wl_keyboard *keyboard;
+    struct xkb_context *xkb_ctx;
+    struct xkb_keymap *keymap;
+    struct xkb_state *xkb_state;
 
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
@@ -352,11 +357,36 @@ static const struct wl_pointer_listener pointer_listener = {
 
 static void keyboard_keymap(void *data, struct wl_keyboard *k, uint32_t format, int32_t fd,
                             uint32_t size) {
-    (void)data;
     (void)k;
-    (void)format;
-    (void)size;
+    struct app *app = data;
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size == 0) {
+        printf("[wl-demo:%s] no xkb keymap (format %u); using raw keycodes\n", app->title,
+               format);
+        close(fd);
+        return;
+    }
+    char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
+    if (map == MAP_FAILED) {
+        printf("[wl-demo:%s] FAIL keymap mmap errno=%d\n", app->title, errno);
+        return;
+    }
+    if (app->xkb_ctx == NULL) {
+        app->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_DEFAULT_INCLUDES);
+    }
+    struct xkb_keymap *keymap = xkb_keymap_new_from_buffer(
+        app->xkb_ctx, map, strnlen(map, size), XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(map, size);
+    if (keymap == NULL) {
+        printf("[wl-demo:%s] FAIL keymap compile\n", app->title);
+        return;
+    }
+    xkb_state_unref(app->xkb_state);
+    xkb_keymap_unref(app->keymap);
+    app->keymap = keymap;
+    app->xkb_state = xkb_state_new(keymap);
+    printf("[wl-demo:%s] xkb keymap loaded (%u bytes, layout %s)\n", app->title, size,
+           xkb_keymap_layout_get_name(keymap, 0));
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *k, uint32_t serial,
@@ -387,8 +417,21 @@ static void keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial, uin
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
         return;
     }
-    printf("[wl-demo:%s] key %u pressed\n", app->title, key);
-    if (key == KEY_Q) {
+    if (app->xkb_state == NULL) {
+        printf("[wl-demo:%s] key %u pressed\n", app->title, key);
+        if (key == KEY_Q) {
+            app->running = 0;
+        }
+        return;
+    }
+    /* evdev keycode + 8 = XKB keycode */
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(app->xkb_state, key + 8);
+    char name[64];
+    char text[16];
+    xkb_keysym_get_name(sym, name, sizeof(name));
+    xkb_state_key_get_utf8(app->xkb_state, key + 8, text, sizeof(text));
+    printf("[wl-demo:%s] key %u pressed sym=%s text='%s'\n", app->title, key, name, text);
+    if (sym == XKB_KEY_q || sym == XKB_KEY_Q) {
         app->running = 0;
     }
 }
@@ -396,13 +439,12 @@ static void keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial, uin
 static void keyboard_modifiers(void *data, struct wl_keyboard *k, uint32_t serial,
                                uint32_t depressed, uint32_t latched, uint32_t locked,
                                uint32_t group) {
-    (void)data;
     (void)k;
     (void)serial;
-    (void)depressed;
-    (void)latched;
-    (void)locked;
-    (void)group;
+    struct app *app = data;
+    if (app->xkb_state != NULL) {
+        xkb_state_update_mask(app->xkb_state, depressed, latched, locked, 0, 0, group);
+    }
 }
 
 static void keyboard_repeat_info(void *data, struct wl_keyboard *k, int32_t rate, int32_t delay) {

@@ -13,13 +13,19 @@
  * per 16 ms; frame callbacks fire after each repaint.
  *
  * Input comes from /dev/input/event0 (keyboard) and /dev/input/event1
- * (pointer; relative PS/2 or absolute tablet). Keys are delivered as raw
- * evdev keycodes with WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP (no xkbcommon yet).
+ * (pointer; relative PS/2 or absolute tablet). The keyboard keymap is
+ * compiled with libxkbcommon (from the xkeyboard-config data under
+ * /usr/share/X11/xkb), sent to clients as an XKB_V1 keymap in a sealed memfd,
+ * and modifier/lock/group state is tracked with xkb_state. If the keymap
+ * cannot be compiled, clients get raw keycodes with NO_KEYMAP instead.
  *
- * Usage: peetwl [--smoke] [--client "<cmd> [args...]"]...
- *   --client  spawn a client once the socket is up (repeatable)
- *   --smoke   log cursor/focus details for tests, exit when every spawned
- *             client has exited, and enforce a watchdog
+ * Usage: peetwl [--smoke] [--xkb-layout L] [--xkb-variant V]
+ *               [--xkb-options O] [--client "<cmd> [args...]"]...
+ *   --client       spawn a client once the socket is up (repeatable)
+ *   --xkb-*        keymap selection (default: XKB_DEFAULT_* environment,
+ *                  then evdev/pc105/us)
+ *   --smoke        log cursor/focus details for tests, exit when every
+ *                  spawned client has exited, and enforce a watchdog
  *
  * Log markers are prefixed "[peetwl]".
  */
@@ -38,6 +44,7 @@
 #include <unistd.h>
 
 #include <wayland-server.h>
+#include <xkbcommon/xkbcommon.h>
 #include "xdg-shell-server-protocol.h"
 
 #include "font8x8.h"
@@ -177,6 +184,13 @@ struct server {
     uint32_t buttons;
     uint32_t mods;
     struct surface *pointer_focus;
+    /* keyboard keymap (xkbcommon) */
+    struct xkb_context *xkb_ctx;
+    struct xkb_keymap *keymap;
+    struct xkb_state *xkb_state;
+    int keymap_fd;
+    uint32_t keymap_size;
+    uint32_t mods_depressed, mods_latched, mods_locked, group;
     struct surface *keyboard_focus;
     struct toplevel *grab;
     int grab_dx, grab_dy;
@@ -465,12 +479,21 @@ static void set_pointer_focus(struct server *srv, struct surface *s, int sx, int
     }
 }
 
+static void send_modifiers(struct server *srv, struct wl_resource *kb, uint32_t serial) {
+    if (srv->xkb_state != NULL) {
+        wl_keyboard_send_modifiers(kb, serial, srv->mods_depressed, srv->mods_latched,
+                                   srv->mods_locked, srv->group);
+    } else {
+        wl_keyboard_send_modifiers(kb, serial, srv->mods, 0, 0, 0);
+    }
+}
+
 static void send_keyboard_enter(struct server *srv, struct wl_resource *kb, struct surface *s) {
     struct wl_array keys;
     wl_array_init(&keys);
     uint32_t serial = wl_display_next_serial(srv->display);
     wl_keyboard_send_enter(kb, serial, s->resource, &keys);
-    wl_keyboard_send_modifiers(kb, serial, srv->mods, 0, 0, 0);
+    send_modifiers(srv, kb, serial);
     wl_array_release(&keys);
 }
 
@@ -689,12 +712,34 @@ static uint32_t modifier_for_key(uint32_t code) {
     }
 }
 
-static void keyboard_key(struct server *srv, uint32_t code, int pressed) {
+/* Feed a key to xkb_state; returns true if the serialized modifier/group
+ * state changed. Without a keymap, a small Shift/Ctrl/Alt tracker is used. */
+static int update_modifiers(struct server *srv, uint32_t code, int pressed) {
+    if (srv->xkb_state != NULL) {
+        /* evdev keycode + 8 = XKB keycode */
+        xkb_state_update_key(srv->xkb_state, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+        uint32_t dep = xkb_state_serialize_mods(srv->xkb_state, XKB_STATE_MODS_DEPRESSED);
+        uint32_t lat = xkb_state_serialize_mods(srv->xkb_state, XKB_STATE_MODS_LATCHED);
+        uint32_t lck = xkb_state_serialize_mods(srv->xkb_state, XKB_STATE_MODS_LOCKED);
+        uint32_t grp = xkb_state_serialize_layout(srv->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+        int changed = dep != srv->mods_depressed || lat != srv->mods_latched ||
+                      lck != srv->mods_locked || grp != srv->group;
+        srv->mods_depressed = dep;
+        srv->mods_latched = lat;
+        srv->mods_locked = lck;
+        srv->group = grp;
+        return changed;
+    }
     uint32_t mod = modifier_for_key(code);
     uint32_t old_mods = srv->mods;
     if (mod != 0) {
         srv->mods = pressed ? (srv->mods | mod) : (srv->mods & ~mod);
     }
+    return srv->mods != old_mods;
+}
+
+static void keyboard_key(struct server *srv, uint32_t code, int pressed) {
+    int mods_changed = update_modifiers(srv, code, pressed);
     if (srv->keyboard_focus == NULL) {
         return;
     }
@@ -709,8 +754,8 @@ static void keyboard_key(struct server *srv, uint32_t code, int pressed) {
         wl_keyboard_send_key(res, serial, t, code,
                              pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
                                      : WL_KEYBOARD_KEY_STATE_RELEASED);
-        if (srv->mods != old_mods) {
-            wl_keyboard_send_modifiers(res, serial, srv->mods, 0, 0, 0);
+        if (mods_changed) {
+            send_modifiers(srv, res, serial);
         }
     }
 }
@@ -1460,11 +1505,18 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32
     wl_resource_set_implementation(res, &keyboard_impl, srv, resource_unlink);
     wl_list_insert(&srv->keyboards, wl_resource_get_link(res));
 
-    /* No xkbcommon yet: clients receive raw evdev keycodes. */
-    int fd = memfd_create("peetwl-keymap", MFD_CLOEXEC);
-    if (fd >= 0) {
-        wl_keyboard_send_keymap(res, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP, fd, 0);
-        close(fd);
+    if (srv->keymap_fd >= 0) {
+        /* libwayland dups the fd when marshalling, so the compositor keeps
+         * its sealed copy for later clients. */
+        wl_keyboard_send_keymap(res, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, srv->keymap_fd,
+                                srv->keymap_size);
+    } else {
+        /* No keymap could be compiled: raw evdev keycodes. */
+        int fd = memfd_create("peetwl-keymap", MFD_CLOEXEC);
+        if (fd >= 0) {
+            wl_keyboard_send_keymap(res, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP, fd, 0);
+            close(fd);
+        }
     }
     if (wl_resource_get_version(res) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION) {
         wl_keyboard_send_repeat_info(res, 25, 600);
@@ -1612,6 +1664,54 @@ static void spawn_client(struct server *srv, const char *cmdline) {
     printf("[peetwl] spawned pid=%d '%s'\n", (int)pid, cmdline);
 }
 
+/* Compile the keyboard keymap and publish it in a sealed, read-only memfd. */
+static void setup_keymap(struct server *srv, const char *layout, const char *variant,
+                         const char *options) {
+    srv->keymap_fd = -1;
+    srv->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (srv->xkb_ctx == NULL) {
+        printf("[peetwl] xkb context failed; using raw keycodes\n");
+        return;
+    }
+    struct xkb_rule_names names = {
+        .rules = NULL, /* NULL fields fall back to XKB_DEFAULT_* / built-ins */
+        .model = NULL,
+        .layout = layout,
+        .variant = variant,
+        .options = options,
+    };
+    srv->keymap = xkb_keymap_new_from_names(srv->xkb_ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (srv->keymap == NULL) {
+        printf("[peetwl] keymap compile failed (layout=%s); using raw keycodes\n",
+               layout ? layout : "default");
+        return;
+    }
+    char *text = xkb_keymap_get_as_string(srv->keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
+    if (text == NULL) {
+        return;
+    }
+    size_t size = strlen(text) + 1;
+    int fd = memfd_create("peetwl-keymap", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0 || write(fd, text, size) != (ssize_t)size) {
+        printf("[peetwl] keymap memfd failed errno=%d; using raw keycodes\n", errno);
+        free(text);
+        if (fd >= 0) {
+            close(fd);
+        }
+        return;
+    }
+    free(text);
+    /* Clients may map it MAP_SHARED: make sure nobody can change it. */
+    fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL);
+    srv->keymap_fd = fd;
+    srv->keymap_size = (uint32_t)size;
+    srv->xkb_state = xkb_state_new(srv->keymap);
+    xkb_layout_index_t n_layouts = xkb_keymap_num_layouts(srv->keymap);
+    printf("[peetwl] keymap layout=%s (%u layout%s, %u bytes)\n",
+           n_layouts > 0 ? xkb_keymap_layout_get_name(srv->keymap, 0) : "?", n_layouts,
+           n_layouts == 1 ? "" : "s", srv->keymap_size);
+}
+
 static int open_framebuffer(struct server *srv) {
     srv->fb_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
     if (srv->fb_fd < 0) {
@@ -1644,14 +1744,22 @@ int main(int argc, char **argv) {
     static struct server srv;
     const char *clients[MAX_CLIENTS];
     int nclients = 0;
+    const char *xkb_layout = NULL, *xkb_variant = NULL, *xkb_options = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--smoke") == 0) {
             srv.smoke = 1;
         } else if (strcmp(argv[i], "--client") == 0 && i + 1 < argc && nclients < MAX_CLIENTS) {
             clients[nclients++] = argv[++i];
+        } else if (strcmp(argv[i], "--xkb-layout") == 0 && i + 1 < argc) {
+            xkb_layout = argv[++i];
+        } else if (strcmp(argv[i], "--xkb-variant") == 0 && i + 1 < argc) {
+            xkb_variant = argv[++i];
+        } else if (strcmp(argv[i], "--xkb-options") == 0 && i + 1 < argc) {
+            xkb_options = argv[++i];
         } else {
-            printf("usage: peetwl [--smoke] [--client \"cmd args\"]...\n");
+            printf("usage: peetwl [--smoke] [--xkb-layout L] [--xkb-variant V] "
+                   "[--xkb-options O] [--client \"cmd args\"]...\n");
             return 2;
         }
     }
@@ -1667,6 +1775,7 @@ int main(int argc, char **argv) {
     }
     srv.cursor_x = srv.width / 2;
     srv.cursor_y = srv.height / 2;
+    setup_keymap(&srv, xkb_layout, xkb_variant, xkb_options);
 
     setenv("XDG_RUNTIME_DIR", RUNTIME_DIR, 0);
     srv.display = wl_display_create();

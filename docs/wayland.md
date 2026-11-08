@@ -16,6 +16,7 @@ kernel interfaces it relies on, and how it is tested. Roadmap context lives in
 - libwayland `1.23.1` (core library and `wayland.xml` protocol)
 - libffi `3.4.6` (used by libwayland to dispatch requests/events to listener functions)
 - wayland-protocols `1.38` (currently only `stable/xdg-shell` is built)
+- libxkbcommon `1.7.0` (keymap compiler and keyboard state machine)
 - Release archives are pinned by SHA-256 in `wayland/fetch-wayland.sh`.
 
 **Build**
@@ -27,6 +28,8 @@ Outputs land in `wayland/out/`:
 - `bin/wayland-scanner`: host tool (runs on the build machine)
 - `include/`: `wayland-{util,version,client,client-core,server,server-core}.h`, generated `wayland-{client,server}-protocol.h`, `ffi.h`
 - `lib/libwayland-server.a`, `lib/libwayland-client.a`, `lib/libffi.a`: static, musl, x86_64
+- `lib/libxkbcommon.a` plus `include/xkbcommon/*.h` (built by `scripts/build_xkbcommon.sh`, which `make -C wayland` runs after `build_wayland.sh`)
+- `share/X11/xkb/`: the verified xkeyboard-config subset staged into the ext2 image at `/usr/share/X11/xkb`
 - `lib/libwlprotocols.a` plus `include/xdg-shell-{client,server}-protocol.h`: generated code for the wayland-protocols listed in `PROTOCOL_XMLS` in `scripts/build_wayland.sh` (add an XML path there to build another protocol)
 - `share/wayland/wayland.xml`, `share/wayland-protocols/*.xml`
 
@@ -68,13 +71,20 @@ make run-wayland-smoke   # or: tests/musl_ext2_wayland_smoke.sh
 - Client (execs the same binary with `--client`, a separate process): connects through `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`, binds the globals, creates a sealed memfd pool (`F_SEAL_SHRINK`, and checks that shrinking fails with `EPERM`), presents frame 1, grows the pool with `posix_fallocate` + `wl_shm_pool_resize` (the server then `mremap`s), presents frame 2 from the new region, signals the server, and disconnects.
 - The runner requires every phase marker plus `[wl-smoke] pass`, and fails on any `[wl-smoke] FAIL`.
 
+**Keyboard Keymaps (libxkbcommon)**
+- `scripts/build_xkbcommon.sh` compiles libxkbcommon's C sources directly (bison generates the keymap parser), using `wayland/peetos/xkbcommon-config.h` in place of meson's `config.h`. The default XKB root is `/usr/share/X11/xkb`, with rules `evdev`, model `pc105`, and layout `us`.
+- Keymap data comes from the build host's installed xkeyboard-config (`XKB_DATA_SRC`, default `/usr/share/X11/xkb`; on Ubuntu the `xkb-data` package). `scripts/xkb_data_subset.py` copies only the include closure of what the `evdev` rules select for `XKB_LAYOUTS` (default `us,gb,de,de:nodeadkeys,fr,us:dvorak`) and `XKB_OPTIONS` (default `ctrl:nocaps,caps:escape,compose:ralt`): about 50 files instead of about 290, which keeps every directory within the ext2 64-entry directory limit.
+- The same sources are also built for the host and `wayland/peetos/xkb-check.c` compiles every staged layout and option set against the subset alone, so a missing data file fails the build rather than a QEMU run.
+- `peetwl` compiles the keymap at startup (`--xkb-layout/--xkb-variant/--xkb-options`, otherwise the `XKB_DEFAULT_*` environment, otherwise `evdev`/`pc105`/`us`), sends it to clients as `WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1` in a memfd sealed against writes and resizing, and tracks depressed/latched/locked modifiers and the effective group with `xkb_state`. If compilation fails it falls back to `NO_KEYMAP` raw keycodes.
+- `wl-demo` maps the keymap `MAP_PRIVATE`, applies `wl_keyboard.modifiers` with `xkb_state_update_mask`, and logs each key's keysym name and UTF-8 text.
+
 **peetwl Compositor**
 `user/peetwl.c` is the PeetOS Wayland compositor, built on libwayland-server:
 - Output: maps `/dev/fb0` (`FBIOGETINFO` + `mmap`), composites into a back buffer, and copies the damaged rectangle to the framebuffer at most every 16 ms. Frame callbacks fire after each repaint.
 - Globals: `wl_compositor` v4, `wl_shm` (XRGB8888/ARGB8888), `wl_seat` v5 (pointer + keyboard), `wl_output` v3, `xdg_wm_base` v6.
 - xdg-shell: toplevels get an initial configure, must `ack_configure` before attaching a buffer, and receive `activated` state changes on focus. `xdg_toplevel.move` starts an interactive move. Popups are created and immediately dismissed (`popup_done`); positioners are accepted and ignored.
 - Window management: new toplevels are cascaded and focused. Server-side decorations (title bar with the toplevel title, focus-coloured border, close box) are drawn by the compositor. Clicking raises and focuses a window, dragging the title bar moves it, and the close box sends `xdg_toplevel.close`.
-- Input: reads `/dev/input/event0` (keyboard) and `/dev/input/event1` (relative PS/2 or absolute tablet pointer), draws a software cursor, does pointer hit-testing for `wl_pointer` enter/leave/motion/button/frame, and delivers raw evdev keycodes with `WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP` plus Shift/Ctrl/Alt modifier masks.
+- Input: reads `/dev/input/event0` (keyboard) and `/dev/input/event1` (relative PS/2 or absolute tablet pointer), draws a software cursor, does pointer hit-testing for `wl_pointer` enter/leave/motion/button/frame, and delivers keys with an XKB keymap and xkb_state-tracked modifiers (see Keyboard Keymaps).
 - Clients: `--client "<cmd> [args]"` spawns clients after the socket is up; `--smoke` adds cursor/focus logging, exits when every spawned client has exited, and enforces a watchdog. The compositor learns about exited children through a `SIGCHLD` signalfd source.
 
 `user/wl_demo.c` (`wl-demo <title> <0xRRGGBB> [--size WxH] [--animate]`) is a small xdg-shell client: double-buffered shm pool, activated-state accent bar, left click toggles its colour, every key press is logged, `q` or the close box exits, and `--animate` redraws continuously paced by frame callbacks.
@@ -87,7 +97,7 @@ make run-wlcomp-smoke   # automated: tests/musl_ext2_wlcomp_smoke.sh
 The automated smoke boots the `compositor-first musl-ext2-wlcomp-smoke` profile with two clients and drives it from `scripts/wlcomp_smoke_driver.py` through the QEMU monitor, injecting real PS/2 input (`mouse_move`, `mouse_button`, `sendkey`) and checking the screen with `screendump`:
 1. both windows show their colours, and the focused/unfocused title bar colours are right
 2. moving onto Alpha and clicking gives it pointer and keyboard focus, delivers the button, and the client's colour change reaches the screen
-3. a key press reaches only the focused client
+3. a key press reaches only the focused client, and with the compositor running the German layout (`--xkb-layout de`) the client's xkbcommon translation gives `a`, Shift+a gives `A`, the `y` key gives `z`, Shift+2 gives `"`, and Caps Lock locks and unlocks uppercase
 4. dragging Alpha's title bar moves the window by exactly the cursor delta
 5. Beta's close box makes the client exit and unmaps it
 6. `q` exits Alpha, and the compositor exits cleanly after both children are reaped
@@ -95,7 +105,7 @@ The automated smoke boots the `compositor-first musl-ext2-wlcomp-smoke` profile 
 Set `WLCOMP_SHOTS=<dir>` to keep PNG copies of the screendumps.
 
 Limitations / Simplifications
-- No `xkbcommon` yet: clients get raw evdev keycodes (`NO_KEYMAP`), so toolkits that require an XKB keymap will not handle keyboard input. Modifiers are tracked for Shift/Ctrl/Alt only; there is no compositor-side key repeat.
+- Keymap data is limited to the staged layouts and options (rebuild with different `XKB_LAYOUTS`/`XKB_OPTIONS` to change them), and it comes from the build host's xkeyboard-config rather than a pinned release. The keymap is chosen at startup only: there is no runtime layout switching, compose table (`XLOCALEDIR` data is not staged), or keyboard LED handling, and repeat is left to clients (`repeat_info` 25/s after 600 ms).
 - The compositor always draws its own cursor and ignores `wl_pointer.set_cursor`. There is no touch support, and scroll/axis events are never sent.
 - Committed buffers are copied into compositor memory on every commit (whole surface, ignoring `wl_surface.damage`), and only XRGB8888/ARGB8888 `wl_shm` buffers are supported. Alpha is ignored: windows are drawn opaque.
 - xdg-shell subset: no popups (dismissed immediately), no interactive resize, maximise, fullscreen or minimise, configures always suggest 0x0 (client-chosen size), and window geometry is ignored. Placement is a fixed cascade.

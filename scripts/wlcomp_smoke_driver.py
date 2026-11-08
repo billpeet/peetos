@@ -19,9 +19,11 @@ import zlib
 
 COLOR_TITLE = 0x505860
 COLOR_TITLE_FOCUSED = 0x3A6EA5
-ALPHA = 0xD05050
-ALPHA_ALT = 0x2FAFAF
-BETA = 0x4080D0
+# Client colour and the colour it toggles to on a left click (bitwise NOT).
+COLORS = {
+    "Alpha": (0xD05050, 0x2FAFAF),
+    "Beta": (0x4080D0, 0xBF7F2F),
+}
 
 
 class Fail(Exception):
@@ -173,9 +175,11 @@ def parse_mapped(d, title):
     x, y, w, h, tx, ty, cx, cy = map(int, m.groups())
     # "center" is where the pointer clicks; pixels are sampled at "probe" so
     # the software cursor never covers the sample.
-    return {"x": x, "y": y, "w": w, "h": h, "center": (x + w // 2, y + h // 2),
+    return {"name": title, "order": m.start(), "x": x, "y": y, "w": w, "h": h,
+            "center": (x + w // 2, y + h // 2),
             "probe": (x + w // 4, y + 3 * h // 4),
-            "bar": (cx - 30, cy), "grab": (cx - 60, cy), "close": (cx, cy)}
+            "bar": (cx - 30, cy), "grab": (cx - 60, cy), "close": (cx, cy),
+            "color": COLORS[title][0], "alt": COLORS[title][1]}
 
 
 def expect_pixel(img, point, color, what):
@@ -186,79 +190,103 @@ def expect_pixel(img, point, color, what):
 
 
 def run(d):
-    d.wait_for(r"\[wl-demo:Alpha\] first frame presented", timeout=90)
-    d.wait_for(r"\[wl-demo:Beta\] first frame presented", timeout=30)
-    alpha = parse_mapped(d, "Alpha")
-    beta = parse_mapped(d, "Beta")
+    d.wait_for(r"\[peetwl\] keymap layout=German", timeout=90)
+    for name in COLORS:
+        d.wait_for(r"\[wl-demo:%s\] xkb keymap loaded \(\d+ bytes, layout German\)" % name,
+                   timeout=90)
+        d.wait_for(r"\[wl-demo:%s\] first frame presented" % name, timeout=90)
+    windows = sorted((parse_mapped(d, name) for name in COLORS), key=lambda w: w["order"])
+    # Clients start in parallel, so map order varies (notably with -smp). The
+    # last-mapped window starts focused; the other one is exercised for
+    # click-to-focus, typing and moving, and the focused one gets closed.
+    first, second = windows
+    a, b = first["name"], second["name"]
+    print("[wlcomp-driver] mapped %s then %s" % (a, b))
 
     img = d.screendump()
-    expect_pixel(img, alpha["probe"], ALPHA, "Alpha content")
-    expect_pixel(img, beta["probe"], BETA, "Beta content")
-    expect_pixel(img, alpha["bar"], COLOR_TITLE, "Alpha title bar (unfocused)")
-    expect_pixel(img, beta["bar"], COLOR_TITLE_FOCUSED, "Beta title bar (focused)")
+    expect_pixel(img, first["probe"], first["color"], "%s content" % a)
+    expect_pixel(img, second["probe"], second["color"], "%s content" % b)
+    expect_pixel(img, first["bar"], COLOR_TITLE, "%s title bar (unfocused)" % a)
+    expect_pixel(img, second["bar"], COLOR_TITLE_FOCUSED, "%s title bar (focused)" % b)
 
     # Pointer focus, click-to-focus and button delivery.
     mark = d.mark()
-    d.move_to(*alpha["center"])
-    d.wait_for(r"\[wl-demo:Alpha\] pointer enter", after=mark)
+    d.move_to(*first["center"])
+    d.wait_for(r"\[wl-demo:%s\] pointer enter" % a, after=mark)
     mark = d.mark()
     d.click()
-    d.wait_for(r"\[wl-demo:Alpha\] button 272 pressed", after=mark)
-    d.wait_for(r"\[peetwl\] focus 'Alpha'", after=mark)
-    d.wait_for(r"\[wl-demo:Alpha\] color now 0x2fafaf", after=mark)
-    print("[wlcomp-driver] click routed to Alpha")
+    d.wait_for(r"\[wl-demo:%s\] button 272 pressed" % a, after=mark)
+    d.wait_for(r"\[peetwl\] focus '%s'" % a, after=mark)
+    d.wait_for(r"\[wl-demo:%s\] color now 0x%06x" % (a, first["alt"]), after=mark)
+    print("[wlcomp-driver] click routed to %s" % a)
 
     # Keyboard goes to the focused client only.
     mark = d.mark()
     d.monitor("sendkey a")
-    d.wait_for(r"\[wl-demo:Alpha\] key 30 pressed", after=mark)
+    d.wait_for(r"\[wl-demo:%s\] key 30 pressed sym=a text='a'" % a, after=mark)
     time.sleep(0.5)
-    if "[wl-demo:Beta] key 30 pressed" in d.log()[mark:]:
-        raise Fail("unfocused client Beta received the key")
-    print("[wlcomp-driver] key routed to focused Alpha only")
+    if "[wl-demo:%s] key 30 pressed" % b in d.log()[mark:]:
+        raise Fail("unfocused client %s received the key" % b)
+    print("[wlcomp-driver] key routed to focused %s only" % a)
+
+    # xkbcommon: the compositor runs the German layout, so these checks prove
+    # the staged keymap data (not just US defaults) drives translation.
+    def typed(keys, pattern, what):
+        mark = d.mark()
+        d.monitor("sendkey %s" % keys)
+        d.wait_for(r"\[wl-demo:%s\] key \d+ pressed %s" % (a, pattern), after=mark)
+        print("[wlcomp-driver] %s" % what)
+
+    typed("shift-a", r"sym=A text='A'", "Shift+a gives 'A'")
+    typed("y", r"sym=z text='z'", "de layout: y key types 'z'")
+    typed("shift-2", r"sym=quotedbl text='\"'", "de layout: Shift+2 types '\"'")
+    typed("caps_lock", r"sym=Caps_Lock", "Caps Lock pressed")
+    typed("b", r"sym=B text='B'", "Caps Lock locks uppercase")
+    typed("caps_lock", r"sym=Caps_Lock", "Caps Lock released")
+    typed("c", r"sym=c text='c'", "Caps Lock unlocked")
 
     img = d.screendump()
-    expect_pixel(img, alpha["probe"], ALPHA_ALT, "Alpha content after click")
-    expect_pixel(img, alpha["bar"], COLOR_TITLE_FOCUSED, "Alpha title bar (focused)")
-    expect_pixel(img, beta["bar"], COLOR_TITLE, "Beta title bar (unfocused)")
+    expect_pixel(img, first["probe"], first["alt"], "%s content after click" % a)
+    expect_pixel(img, first["bar"], COLOR_TITLE_FOCUSED, "%s title bar (focused)" % a)
+    expect_pixel(img, second["bar"], COLOR_TITLE, "%s title bar (unfocused)" % b)
 
-    # Drag Alpha by its title bar.
-    d.move_to(*alpha["grab"])
+    # Drag the clicked window by its title bar.
+    d.move_to(*first["grab"])
     mark = d.mark()
     d.monitor("mouse_button 1")
-    d.wait_for(r"\[peetwl\] move start 'Alpha'", after=mark)
+    d.wait_for(r"\[peetwl\] move start '%s'" % a, after=mark)
     start = d.cursor()
     before_move = d.mark()
     d.monitor("mouse_move 60 200")
     d.wait_for(r"\[peetwl\] cursor \d+,\d+", after=before_move, timeout=5)
     time.sleep(0.5)
     d.monitor("mouse_button 0")
-    m = d.wait_for(r"\[peetwl\] move end 'Alpha' content=(-?\d+),(-?\d+)", after=mark)
+    m = d.wait_for(r"\[peetwl\] move end '%s' content=(-?\d+),(-?\d+)" % a, after=mark)
     nx, ny = int(m.group(1)), int(m.group(2))
     end = d.cursor()
-    if (nx - alpha["x"], ny - alpha["y"]) != (end[0] - start[0], end[1] - start[1]) or ny <= alpha["y"]:
+    if (nx - first["x"], ny - first["y"]) != (end[0] - start[0], end[1] - start[1]) or ny <= first["y"]:
         raise Fail("window moved to %d,%d but cursor moved %s -> %s" % (nx, ny, start, end))
     img = d.screendump()
-    moved_probe = (nx + alpha["w"] // 4, ny + 3 * alpha["h"] // 4)
-    expect_pixel(img, moved_probe, ALPHA_ALT, "Alpha content after move")
+    moved_probe = (nx + first["w"] // 4, ny + 3 * first["h"] // 4)
+    expect_pixel(img, moved_probe, first["alt"], "%s content after move" % a)
 
-    # Close Beta with its close box.
+    # Close the other window with its close box.
     mark = d.mark()
-    d.move_to(*beta["close"])
+    d.move_to(*second["close"])
     d.click()
-    d.wait_for(r"\[peetwl\] close requested 'Beta'", after=mark)
-    d.wait_for(r"\[wl-demo:Beta\] close requested", after=mark)
-    d.wait_for(r"\[peetwl\] unmapped 'Beta'", after=mark)
-    d.wait_for(r"\[peetwl\] focus 'Alpha'", after=mark)
+    d.wait_for(r"\[peetwl\] close requested '%s'" % b, after=mark)
+    d.wait_for(r"\[wl-demo:%s\] close requested" % b, after=mark)
+    d.wait_for(r"\[peetwl\] unmapped '%s'" % b, after=mark)
+    d.wait_for(r"\[peetwl\] focus '%s'" % a, after=mark)
     img = d.screendump()
-    if img.at(*beta["probe"]) == BETA:
-        raise Fail("Beta still visible after close")
-    print("[wlcomp-driver] Beta closed via close box")
+    if img.at(*second["probe"]) == second["color"]:
+        raise Fail("%s still visible after close" % b)
+    print("[wlcomp-driver] %s closed via close box" % b)
 
-    # 'q' quits Alpha; the compositor exits once every client is gone.
+    # 'q' quits the remaining client; the compositor exits once all are gone.
     mark = d.mark()
     d.monitor("sendkey q")
-    d.wait_for(r"\[wl-demo:Alpha\] key 16 pressed", after=mark)
+    d.wait_for(r"\[wl-demo:%s\] key 16 pressed sym=q" % a, after=mark)
     d.wait_for(r"\[peetwl\] all clients exited \(failed=0\)", after=mark, timeout=30)
     d.wait_for(r"\[peetwl\] pass", after=mark, timeout=30)
     print("[wlcomp-driver] pass")

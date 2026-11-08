@@ -5,8 +5,9 @@ usage() {
   cat <<'USAGE'
 Usage: fetch-wayland.sh [options]
 
-Download, verify, and extract pinned libwayland, libffi, and wayland-protocols
-source releases into wayland-src/, libffi-src/, and wayland-protocols-src/.
+Download, verify, and extract pinned libwayland, libffi, wayland-protocols,
+and libxkbcommon source releases into wayland-src/, libffi-src/,
+wayland-protocols-src/, and libxkbcommon-src/.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -30,6 +31,10 @@ LIBFFI_SHA256="b0dea9df23c863a7a50e825440f3ebffabd65df1497108e5d437747843895a4e"
 PROTOCOLS_VERSION="1.38"
 PROTOCOLS_URL="https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/${PROTOCOLS_VERSION}/downloads/wayland-protocols-${PROTOCOLS_VERSION}.tar.xz"
 PROTOCOLS_SHA256="ff17292c05159d2b20ce6cacfe42d7e31a28198fa1429a769b03af7c38581dbe"
+
+XKBCOMMON_VERSION="1.7.0"
+XKBCOMMON_URL="https://xkbcommon.org/download/libxkbcommon-${XKBCOMMON_VERSION}.tar.xz"
+XKBCOMMON_SHA256="65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863b247"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -96,3 +101,5 @@ fetch_one "libffi ${LIBFFI_VERSION}" "${LIBFFI_URL}" "${LIBFFI_SHA256}" \
   "${OUTPUT_DIR}/libffi-src" "libffi-${LIBFFI_VERSION}.tar.gz"
 fetch_one "wayland-protocols ${PROTOCOLS_VERSION}" "${PROTOCOLS_URL}" "${PROTOCOLS_SHA256}" \
   "${OUTPUT_DIR}/wayland-protocols-src" "wayland-protocols-${PROTOCOLS_VERSION}.tar.xz"
+fetch_one "libxkbcommon ${XKBCOMMON_VERSION}" "${XKBCOMMON_URL}" "${XKBCOMMON_SHA256}" \
+  "${OUTPUT_DIR}/libxkbcommon-src" "libxkbcommon-${XKBCOMMON_VERSION}.tar.xz"

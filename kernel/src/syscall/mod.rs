@@ -383,6 +383,11 @@ const EXEC_MAX_STR_LEN: usize = 256;
 const EXEC_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 const GETCWD_MAX_DEPTH: usize = 32;
 const UTS_FIELD_LEN: usize = 65;
+/// Region slots per task. Adjacent compatible regions are merged on insert
+/// (see `mmap_regions_insert`), so this bounds distinct mappings, not mmap
+/// calls. Keep it small: several syscall paths copy a whole table onto the
+/// 16 KiB kernel stack (32 slots x 32 bytes = 1 KiB per copy); 128 slots
+/// overflowed the stack in `mmap`.
 const MMAP_MAX_REGIONS_PER_TASK: usize = 32;
 const MMAP_MAX_PAGES_PER_TASK: u64 = 8192;
 const VM_PAGE_CACHE_MAX_PAGES: usize = 1024;
