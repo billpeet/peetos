@@ -15,6 +15,9 @@ const HEAP_END: u64 = HEAP_START + HEAP_MAX_SIZE;
 const KMALLOC_MIN_SIZE: usize = 32;
 const KMALLOC_ALIGN: usize = 16;
 const KMALLOC_MAGIC: u32 = 0xDEAD_C0DE;
+/// Tags the 16 bytes in front of a kmalloc_aligned() pointer, which hold the
+/// pointer to the underlying kmalloc() block instead of a real BlockHeader.
+const KMALLOC_ALIGNED_MAGIC: u32 = 0xA11C_0DE5;
 
 const BLOCK_FREE: u32 = 0;
 const BLOCK_USED: u32 = 1;
@@ -305,21 +308,29 @@ pub fn kmalloc_aligned(size: usize, align: usize) -> *mut u8 {
 
     let total = size
         .saturating_add(align)
-        .saturating_add(mem::size_of::<*mut u8>());
+        .saturating_add(mem::size_of::<BlockHeader>());
     let ptr = kmalloc(total);
     if ptr.is_null() {
         return ptr::null_mut();
     }
 
-    let mut addr = ptr as usize + mem::size_of::<*mut u8>();
-    addr = align_up(addr, align);
-
-    unsafe {
-        let orig_ptr = (addr - mem::size_of::<*mut u8>()) as *mut *mut u8;
-        *orig_ptr = ptr;
-    }
-
+    let addr = align_up(ptr as usize + mem::size_of::<BlockHeader>(), align);
+    unsafe { write_aligned_header(addr as *mut u8, ptr) };
     addr as *mut u8
+}
+
+/// Write the tag kfree()/resolve_header() use to find the real block behind
+/// an aligned pointer. Without it, whatever stale bytes precede the aligned
+/// pointer (often an old free-block header with KMALLOC_MAGIC) are mistaken
+/// for its header: a bogus "double free" plus a leak, or heap corruption.
+///
+/// Safety: the BlockHeader-sized area before `aligned` must be writable and
+/// inside the block that starts at `orig`.
+unsafe fn write_aligned_header(aligned: *mut u8, orig: *mut u8) {
+    let tag = data_to_block(aligned);
+    (*tag).magic = KMALLOC_ALIGNED_MAGIC;
+    (*tag).flags = BLOCK_USED;
+    (*tag).size = orig as u64;
 }
 
 fn resolve_header(ptr: *mut u8) -> Option<(*mut BlockHeader, usize)> {
@@ -329,25 +340,22 @@ fn resolve_header(ptr: *mut u8) -> Option<(*mut BlockHeader, usize)> {
 
     let header = data_to_block(ptr);
     unsafe {
-        if (*header).magic == KMALLOC_MAGIC {
-            return Some((header, 0));
+        match (*header).magic {
+            KMALLOC_MAGIC => Some((header, 0)),
+            KMALLOC_ALIGNED_MAGIC => {
+                let orig_ptr = (*header).size as usize as *mut u8;
+                if orig_ptr.is_null() || orig_ptr >= ptr {
+                    return None;
+                }
+                let orig_header = data_to_block(orig_ptr);
+                if (*orig_header).magic != KMALLOC_MAGIC {
+                    return None;
+                }
+                Some((orig_header, ptr as usize - orig_ptr as usize))
+            }
+            _ => None,
         }
     }
-
-    unsafe {
-        let orig_slot = (ptr as *mut *mut u8).offset(-1);
-        let orig_ptr = *orig_slot;
-        if orig_ptr.is_null() {
-            return None;
-        }
-        let header = data_to_block(orig_ptr);
-        if (*header).magic == KMALLOC_MAGIC {
-            let offset = ptr as usize - orig_ptr as usize;
-            return Some((header, offset));
-        }
-    }
-
-    None
 }
 
 pub fn krealloc(ptr: *mut u8, size: usize) -> *mut u8 {
@@ -475,5 +483,39 @@ mod tests {
         let data_ptr = unsafe { (header_ptr as *mut u8).add(mem::size_of::<BlockHeader>()) };
         let resolved = resolve_header(data_ptr);
         assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn resolve_header_ignores_stale_header_before_aligned_ptr() {
+        // An aligned allocation carved out of a block whose payload still holds
+        // an old free-block header right where data_to_block(aligned) points.
+        #[repr(C, align(64))]
+        struct Buf([u8; 256]);
+        let mut buf = Buf([0u8; 256]);
+        let base = buf.0.as_mut_ptr();
+        let hdr = mem::size_of::<BlockHeader>();
+        unsafe {
+            *(base as *mut BlockHeader) = BlockHeader { magic: KMALLOC_MAGIC, flags: BLOCK_USED, size: 192 };
+            let orig = base.add(hdr);
+            let aligned = base.add(64);
+            *(data_to_block(aligned)) = BlockHeader { magic: KMALLOC_MAGIC, flags: BLOCK_FREE, size: 32 };
+
+            // Untagged, the stale header wins (the old bug).
+            let (stale, _) = resolve_header(aligned).expect("stale header resolves");
+            assert_eq!((*stale).flags, BLOCK_FREE);
+
+            write_aligned_header(aligned, orig);
+            let (real, offset) = resolve_header(aligned).expect("aligned ptr resolves");
+            assert_eq!(real, base as *mut BlockHeader);
+            assert_eq!((*real).flags, BLOCK_USED);
+            assert_eq!(offset, 64 - hdr);
+        }
+    }
+
+    #[test]
+    fn resolve_header_rejects_unknown_magic() {
+        let mut buffer = [0u8; 64];
+        let data_ptr = unsafe { buffer.as_mut_ptr().add(32) };
+        assert!(resolve_header(data_ptr).is_none());
     }
 }

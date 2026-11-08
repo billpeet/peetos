@@ -1607,21 +1607,13 @@ pub(super) fn sys_mprotect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if length == 0 {
         return 0;
     }
-    if (addr & (PAGE_SIZE - 1)) != 0 || addr < MMAP_BASE_ADDR {
-        return -EINVAL;
-    }
-
-    let len = match page_align_up(length) {
-        Some(v) if v > 0 => v,
-        _ => return -EINVAL,
+    let target = match mprotect_target(addr, length) {
+        Ok(target) => target,
+        Err(err) => return err,
     };
-    let end = match addr.checked_add(len) {
-        Some(v) => v,
-        None => return -EINVAL,
+    let end = match target {
+        MprotectTarget::Regions { end } | MprotectTarget::ExecImage { end } => end,
     };
-    if end >= KERNEL_VIRT_BASE {
-        return -EINVAL;
-    }
 
     let pte_flags = match mmap_prot_to_pte_flags(prot) {
         Ok(v) => v,
@@ -1635,10 +1627,28 @@ pub(super) fn sys_mprotect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Some(slot) => slot,
         None => return -ESRCH,
     };
-    let protect_result =
-        unsafe { mmap_regions_protect_range(&mut TASK_VM_MAPPINGS[slot], addr, end, prot) };
-    if let Err(err) = protect_result {
-        return err;
+    match target {
+        MprotectTarget::Regions { .. } => {
+            let protect_result = unsafe {
+                mmap_regions_protect_range(&mut TASK_VM_MAPPINGS[slot], addr, end, prot)
+            };
+            if let Err(err) = protect_result {
+                return err;
+            }
+        }
+        MprotectTarget::ExecImage { .. } => {
+            // Segments execve loaded (the program and its PT_INTERP loader,
+            // e.g. musl applying RELRO) are mapped eagerly and are not in the
+            // region table, so only their page-table entries change. Every
+            // page must be present, as with an untracked range on Linux.
+            let mut page = addr;
+            while page < end {
+                if vmm::get_physical_in(pml4, VirtAddr::new(page)).is_none() {
+                    return -ENOMEM;
+                }
+                page += PAGE_SIZE;
+            }
+        }
     }
 
     let mut page = addr;
@@ -1670,6 +1680,38 @@ pub(super) fn sys_mprotect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MprotectTarget {
+    /// mmap()ed memory tracked in the task's region table.
+    Regions { end: u64 },
+    /// The low, execve-loaded image area (program, interpreter, brk) below
+    /// MMAP_BASE_ADDR, which the region table does not track.
+    ExecImage { end: u64 },
+}
+
+/// Validate an mprotect() range and decide which bookkeeping it touches.
+/// A range may not straddle MMAP_BASE_ADDR, and page zero is never valid.
+pub(super) fn mprotect_target(addr: u64, length: u64) -> Result<MprotectTarget, i64> {
+    if (addr & (PAGE_SIZE - 1)) != 0 || addr < PAGE_SIZE {
+        return Err(-EINVAL);
+    }
+    let len = match page_align_up(length) {
+        Some(v) if v > 0 => v,
+        _ => return Err(-EINVAL),
+    };
+    let end = addr.checked_add(len).ok_or(-EINVAL)?;
+    if end >= KERNEL_VIRT_BASE {
+        return Err(-EINVAL);
+    }
+    if addr >= MMAP_BASE_ADDR {
+        Ok(MprotectTarget::Regions { end })
+    } else if end <= MMAP_BASE_ADDR {
+        Ok(MprotectTarget::ExecImage { end })
+    } else {
+        Err(-EINVAL)
+    }
 }
 
 pub(super) fn mmap_prot_allows_fault_access(prot: u32, error_code: u64) -> bool {

@@ -1,0 +1,112 @@
+# Desktop Environment Roadmap (Living Document)
+
+Last updated: 2026-11-08
+
+This is the plan from today's Wayland stack (libwayland, wayland-protocols,
+xkbcommon, the `peetwl` compositor) to a modern stacking desktop in the style of
+Windows, GNOME or Plasma. It complements `docs/gui_wayland_plan.md` (the
+phase-by-phase Wayland bring-up) and `docs/PORTING_PLAN.md` (overall kernel
+status).
+
+## Target
+
+GNOME's Mutter and Plasma's KWin depend on systemd/logind, D-Bus, GLib or Qt,
+PipeWire, polkit and GL-accelerated rendering, none of which PeetOS has yet. The
+practical target is a **stacking desktop built from wlroots-family
+components**: a real compositor (for example labwc), a panel/taskbar, a
+launcher, a terminal and a file manager, all running Wayland-native apps. Every
+layer of that stack is also a prerequisite for GNOME- or Plasma-class software
+later.
+
+## Where We Are
+
+- Kernel: x86_64, SMP, CoW fork + threads, Linux-compatible syscall surface
+  including epoll/eventfd/timerfd/signalfd, memfd + sealing, `SCM_RIGHTS`,
+  `SO_PEERCRED`.
+- Display: one fixed VESA framebuffer (`/dev/fb0`), no mode setting, no GPU.
+- Input: PS/2 keyboard and mouse, optional USB tablet, evdev-style
+  `/dev/input/event{0,1}` (no `EVIOCG*` ioctls).
+- Userspace: static musl binaries; libwayland 1.23.1, wayland-protocols 1.38
+  (xdg-shell), libxkbcommon 1.7.0; the `peetwl` compositor with server-side
+  decorations, focus, move/close, and XKB keymaps.
+
+## Phases (in dependency order)
+
+### 1. Platform limits real applications hit first
+
+- [x] **Shared libraries.** musl's dynamic loader (`/lib/ld-musl-x86_64.so.1`)
+  running dynamically linked PIE programs with `.so` dependencies, `dlopen`, and
+  TLS in shared objects. Toolkits are far too large to link statically into
+  every program, and static linking multiplies memory use. *(Done:
+  `make run-dynlink-smoke`, see "Dynamic Linking" in `docs/elf.md`. Next, build
+  the ported libraries as `.so` files.)*
+- [ ] **Process and memory limits.** Remove whole-table stack copies in the VM
+  syscalls so the region table can grow past 32 slots; raise the per-task
+  mapping budget (32 MiB), memfd size cap (64 MiB), task limit (64), socket
+  limit (96); lift the ext2 64-entries-per-directory limit.
+- [ ] **System information.** A usable `/proc` (and parts of `/sys`), a real-time
+  clock, and the input ioctls libinput needs (`EVIOCGNAME`, `EVIOCGBIT`,
+  `EVIOCGABS`, ...).
+
+### 2. A real display interface
+
+- [ ] **Minimal DRM/KMS** for QEMU's `bochs-display` or `virtio-gpu`: mode
+  setting (any resolution), dumb buffers, page flips, vblank events.
+- [ ] Later: `virtio-gpu` with virgl for host-accelerated GL.
+
+### 3. Software rendering stack
+
+- [ ] pixman, freetype, harfbuzz, fontconfig + fonts, libpng, cairo, pango.
+- [ ] A C++ runtime for musl (libc++ or libstdc++), needed by Mesa, Qt and many
+  applications.
+- [ ] Mesa with `softpipe` (or `llvmpipe`, which needs LLVM) for EGL/GLES; GTK4
+  and Qt prefer GL even though they have software fallbacks.
+
+### 4. A real compositor stack
+
+- [ ] Port wlroots (pixman renderer, DRM backend, libinput backend) plus
+  libinput, libevdev and a minimal seat/udev substitute.
+- [ ] Run **labwc** (Openbox-like stacking, closest to Windows behaviour) or a
+  custom shell on wlroots. This brings layer-shell (panels, docks), popups,
+  xdg-decoration, data-device (clipboard, drag and drop), viewporter,
+  fractional scaling, cursor-shape, presentation-time and linux-dmabuf.
+- [ ] Keep `peetwl` as the minimal test and fallback compositor.
+
+### 5. Desktop shell and core applications
+
+- [ ] **foot** terminal: the best first real application (pixman, fcft/freetype,
+  fontconfig, xkbcommon).
+- [ ] Panel/taskbar and launcher (for example waybar or sfwbar, fuzzel or wofi).
+- [ ] GTK3/4 (GLib, GObject, gdk-pixbuf, libepoxy), unlocking a file manager
+  (Thunar, PCManFM), a text editor and settings applications.
+
+### 6. Session services
+
+- [ ] D-Bus (kernel side still needs `SCM_CREDENTIALS` and abstract Unix
+  sockets).
+- [ ] A session/login manager instead of `init` launching a compositor directly.
+- [ ] Notifications; audio (Intel HDA or virtio-snd driver plus PipeWire).
+- [ ] Networking basics: DHCP and DNS.
+
+## Near-Term Order
+
+1. ~~Dynamic linking end to end (musl loader, a shared library, `dlopen`, TLS).~~ Done.
+2. Lift the platform limits, starting with the VM region-table stack copies.
+3. DRM/KMS minimum: mode setting, dumb buffers, page flips.
+
+First big milestone: **foot running under `peetwl`** with fonts and a usable
+shell, before the much larger wlroots and GTK ports.
+
+## Risks and Dependencies
+
+- Each toolkit port drags in a large dependency tree; shared-library support
+  and the platform limits above decide whether that is tractable.
+- Software rendering at desktop resolutions is CPU-heavy under QEMU TCG;
+  `virtio-gpu`/virgl is the escape hatch.
+- Build-host assumptions (xkeyboard-config data, bison, expat) should move to
+  pinned, fetched inputs as the stack grows.
+
+## Update Rules
+
+- Tick items as they land and link the doc that describes them.
+- Keep detailed status in the subsystem docs; this file tracks direction.

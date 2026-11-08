@@ -2,6 +2,9 @@
 /target
 /musl/musl-src
 /musl/sysroot
+/musl/shared
+/musl/build-shared
+/user/*.so
 /musl/musl-*.tar.gz
 /toybox/toybox-src
 /toybox/out

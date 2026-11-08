@@ -12,6 +12,8 @@ This document describes the ELF loader used for user-mode bring-up. The loader a
 - `user/hello_dyn.elf`
 - `user/ld-peetos.so`
 - `scripts/build_user.sh`
+- `scripts/build_musl_shared.sh`, `scripts/build_dynlink_smoke.sh`
+- `user/dynlink_smoke.c`, `user/dynlink/`
 
 **Supported Format**
 The loader supports ELF64 for `x86_64` little-endian. `elf::load()` accepts `ET_EXEC` binaries, while `elf::load_at()` accepts both `ET_EXEC` and `ET_DYN` (PIE/shared objects) and applies a load bias.
@@ -30,9 +32,8 @@ The loader supports ELF64 for `x86_64` little-endian. `elf::load()` accepts `ET_
 8. `execve` now reuses the same loader/stack path to replace the current task image from a VFS file and apply caller-provided `argv`/`envp`.
 
 Limitations / Simplifications
-- `elf::load_at()` accepts PIE/`ET_DYN`, but relocations and `PT_DYNAMIC` entry parsing are not implemented.
-- `PT_INTERP` mapping is still minimal bootstrap logic: embedded interpreter image support is first-class, VFS fallback exists for `execve`, and there is still no shebang-style script resolution.
-- Dynamic symbol resolution/relocations are still not implemented (`PT_DYNAMIC` is metadata-only at this stage).
+- The kernel never processes relocations or `PT_DYNAMIC` itself; that is the interpreter's job (see "Dynamic Linking" below).
+- `PT_INTERP` is loaded from the embedded bootstrap image or, for `execve`, from the VFS (up to 2 MiB, read whole into a kernel buffer). There is still no shebang-style script resolution.
 - Segment permissions set `PTE_NO_EXECUTE`, and `EFER.NXE` is enabled during syscall/MSR setup.
 - Segment-level W^X is enforced by rejecting `PF_W | PF_X` `PT_LOAD` segments, but there is no SMEP/SMAP integration.
 - User address checks are stricter than the initial baseline (checked arithmetic + entrypoint-in-exec-range checks), but there is still no ASLR.
@@ -40,3 +41,60 @@ Limitations / Simplifications
 - Initial `argv`/`envp` for bootstrap remain fixed, but `execve` now accepts caller-provided vectors (with bounded argument/environment counts and string lengths).
 - Load failure rollback is still minimal; pages mapped before a late failure are not fully unwound.
 - The embedded ELF is rebuilt automatically via the Makefile; `scripts/build_user.sh` remains a manual helper.
+
+## Dynamic Linking
+
+Dynamically linked programs run through musl's own dynamic loader. musl's
+shared `libc.so` is also its loader; it is installed in the ext2 image as
+`/lib/ld-musl-x86_64.so.1`, the interpreter path `musl-gcc` already writes
+into `PT_INTERP`.
+
+**How it works**
+1. `execve` loads the program (PIE `ET_DYN` at `0x400000`) and its
+   `PT_INTERP` loader (at `0x7000_0000`) eagerly, and passes `AT_PHDR`,
+   `AT_ENTRY`, `AT_BASE` and the other auxv entries on the initial stack.
+2. The loader relocates itself and the program, then opens `NEEDED` libraries
+   from its default path (`/lib:/usr/local/lib:/usr/lib`) and maps them with
+   ordinary file-backed `mmap` calls.
+3. It applies RELRO with `mprotect(PROT_READ)` to each module, including the
+   program and itself. Those two live below `MMAP_BASE_ADDR` and are not in the
+   VM region table, so `mprotect` handles that low, execve-loaded range by
+   updating the page-table entries directly (`mprotect_target()` in
+   `kernel/src/syscall/vm.rs`).
+4. Static TLS for startup modules and dynamically allocated TLS for `dlopen`ed
+   modules are set up in user space (`arch_prctl(ARCH_SET_FS)` and
+   `__tls_get_addr`); no other kernel support is needed.
+
+**Building**
+- `make -C musl shared` (or `scripts/build_musl_shared.sh`) builds musl's
+  `libc.so` out of tree into `musl/shared/lib/` without touching the static
+  sysroot.
+- Link a dynamic program with `musl-gcc -L musl/shared/lib ... -fPIE -pie`;
+  the extra `-L` makes the linker pick `libc.so` over the sysroot's `libc.a`.
+- The ext2 builder stages `/lib/ld-musl-x86_64.so.1` whenever
+  `musl/shared/lib/libc.so` exists.
+
+**Testing**
+`make run-dynlink-smoke` (`tests/musl_ext2_dynlink_smoke.sh`, part of
+`make test`) runs `dynlink_smoke`, a dynamically linked PIE. It checks
+`libc.so` stdio and malloc, then a `NEEDED` library (`libpeetdyn.so`: its
+constructor, functions, exported data and a TLS variable). It then checks a
+`dlopen`ed plugin (`libpeetplugin.so`), which depends on `libpeetdyn.so` and has
+its own dynamic TLS, plus the `dlerror` path for a missing library. Finally it
+checks fresh TLS copies in a new pthread and a dynamic program that forks and
+`execve`s itself. The libraries live in `/usr/lib`.
+
+Limitations / Simplifications
+- The ported libraries (libwayland, libffi, libxkbcommon) and the staged
+  programs are still linked statically; only the smoke test links dynamically
+  so far.
+- `mprotect` on the execve-loaded range changes page-table entries only. It
+  needs every page to be present (the range is mapped eagerly, but untouched
+  `brk` pages are not) and keeps no per-range protection record.
+- Each shared library takes several VM region slots (one per segment, merged
+  where adjacent and compatible) out of the 32 per task, which limits how many
+  libraries a process can load.
+- There is no ASLR: the program, the loader and `mmap` placement are all
+  deterministic.
+- Libraries are read through file-backed private mappings. Pages are not
+  shared between processes that load the same library.

@@ -95,6 +95,12 @@ Limitations / Simplifications
 
 Block layout:
 - `BlockHeader` (magic, flags, size) followed by payload.
+- `kmalloc_aligned` over-allocates a normal block and returns an aligned
+  pointer inside it. The 16 bytes in front of that pointer hold a tag header
+  (`KMALLOC_ALIGNED_MAGIC`, with the original block pointer in `size`) so
+  `kfree`/`krealloc` can tell it from a real header. Stale bytes from earlier
+  allocations must never be read as a header: they used to cause bogus
+  "double free" reports and leaks when AHCI DMA buffers were freed.
 - Free list is sorted by address and coalesced on free.
 
 Limitations / Simplifications

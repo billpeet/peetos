@@ -32,7 +32,7 @@ ifneq ($(strip $(MUSL_RANLIB)),)
 CONFIGURE_ARGS += --ranlib "$(MUSL_RANLIB)"
 endif
 
-.PHONY: all fetch configure build install clean distclean info
+.PHONY: all fetch configure build install shared clean distclean info
 
 all: install
 
@@ -53,6 +53,13 @@ $(MUSL_SRC)/lib/libc.a: $(MUSL_SRC)/config.mak
 	$(MAKE) -C $(MUSL_SRC)
 
 install: $(SYSROOT)/lib/libc.a
+
+# Shared libc / dynamic loader (ld-musl-x86_64.so.1), built out of tree into
+# shared/ so the static sysroot is untouched. See scripts/build_musl_shared.sh.
+shared: shared/lib/libc.so
+
+shared/lib/libc.so: $(MUSL_SRC)
+	../scripts/build_musl_shared.sh
 
 $(SYSROOT)/lib/libc.a: $(MUSL_SRC)/lib/libc.a
 	$(MAKE) -C $(MUSL_SRC) install

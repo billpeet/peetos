@@ -2220,3 +2220,26 @@ fn many_adjacent_anonymous_maps_use_one_slot() {
     }
     assert_eq!(regions.iter().filter(|r| !r.is_empty()).count(), 1);
 }
+
+#[test]
+fn mprotect_target_classifies_exec_image_and_mmap_ranges() {
+    // musl's loader applies RELRO to the program and itself, which execve
+    // loaded below MMAP_BASE_ADDR (0x400000 and 0x7000_0000).
+    assert_eq!(
+        mprotect_target(0x7000_3000, 0x1800),
+        Ok(MprotectTarget::ExecImage { end: 0x7000_5000 })
+    );
+    assert_eq!(
+        mprotect_target(0x40_1000, PAGE_SIZE),
+        Ok(MprotectTarget::ExecImage { end: 0x40_2000 })
+    );
+    assert_eq!(
+        mprotect_target(MMAP_BASE_ADDR, PAGE_SIZE),
+        Ok(MprotectTarget::Regions { end: MMAP_BASE_ADDR + PAGE_SIZE })
+    );
+    // Straddling the boundary, page zero, misalignment, and kernel space fail.
+    assert_eq!(mprotect_target(MMAP_BASE_ADDR - PAGE_SIZE, 2 * PAGE_SIZE), Err(-EINVAL));
+    assert_eq!(mprotect_target(0, PAGE_SIZE), Err(-EINVAL));
+    assert_eq!(mprotect_target(0x40_1001, PAGE_SIZE), Err(-EINVAL));
+    assert_eq!(mprotect_target(KERNEL_VIRT_BASE - PAGE_SIZE, PAGE_SIZE), Err(-EINVAL));
+}

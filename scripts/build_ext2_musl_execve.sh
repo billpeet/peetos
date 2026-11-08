@@ -89,6 +89,20 @@ if [[ -f "${ROOT_DIR}/user/dropbear_ed25519_host_key" ]]; then
   chmod 0600 "${STAGE_ROOT}/etc/dropbear/dropbear_ed25519_host_key"
 fi
 
+# Stage musl's dynamic loader (its shared libc) so dynamically linked programs
+# can run, plus the dynamic-linking smoke binaries when built.
+if [[ -f "${ROOT_DIR}/musl/shared/lib/libc.so" ]]; then
+  mkdir -p "${STAGE_ROOT}/lib"
+  cp "${ROOT_DIR}/musl/shared/lib/libc.so" "${STAGE_ROOT}/lib/ld-musl-x86_64.so.1"
+  chmod 0755 "${STAGE_ROOT}/lib/ld-musl-x86_64.so.1"
+fi
+if [[ -x "${ROOT_DIR}/user/dynlink_smoke.elf" ]]; then
+  mkdir -p "${STAGE_ROOT}/usr/lib"
+  cp "${ROOT_DIR}/user/dynlink_smoke.elf" "${STAGE_ROOT}/bin/dynlink_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/dynlink_smoke"
+  cp "${ROOT_DIR}/user/libpeetdyn.so" "${ROOT_DIR}/user/libpeetplugin.so" "${STAGE_ROOT}/usr/lib/"
+fi
+
 # Stage the verified xkeyboard-config subset (scripts/build_xkbcommon.sh) at
 # libxkbcommon's default root when it has been built.
 if [[ -f "${ROOT_DIR}/wayland/out/share/X11/xkb/rules/evdev" ]]; then
@@ -540,6 +554,23 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/unix_rights_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/dynlink_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/dynlink_smoke ] || [ ! -f /lib/ld-musl-x86_64.so.1 ]; then
+  echo [musl-ext2-dynlink-smoke] missing bin/dynlink_smoke or /lib/ld-musl-x86_64.so.1
+  fail=1
+else
+  bin/dynlink_smoke || fail=1
+fi
+
+echo [musl-ext2-dynlink-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-dynlink-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/dynlink_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/wlcomp_smoke.sh" <<'EOS'
 fail=0

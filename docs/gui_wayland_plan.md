@@ -3,6 +3,9 @@
 Last updated: 2026-03-14
 Status: Draft roadmap, Phase 1 implementation complete; Phase 2 required tests now cover host shared-buffer/epoll units plus QEMU epoll/shared-buffer smokes; Phase 3 is complete with `/dev/fb0` metadata + mmap, pollable `/dev/input/event{0,1}` queues, explicit console-first vs compositor-first display ownership, console fallback after tracked compositor termination, and QEMU smoke coverage for console-first, compositor-first, and compositor-failure flows; Phase 4 is complete with a dedicated userspace compositor smoke session that owns framebuffer/input, accepts multiple client shared buffers over inherited `AF_UNIX` streams, runs explicit surface lifecycle plus clipped `DAMAGE` notifications under QEMU regression, redraws through coalesced dirty regions, routes hover pointer focus plus click-to-focus keyboard input to an input-aware client, rejects invalid attach fds and stale post-destroy traffic without wedging, and now stays green in the full `make test` harness
 
+> The roadmap past Wayland compatibility, toward a full desktop
+> environment, is in `docs/desktop_roadmap.md`.
+
 ## Purpose
 
 This document tracks the current GUI/display/input implementation and a staged
