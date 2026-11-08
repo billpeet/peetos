@@ -17,6 +17,10 @@ pub const PTE_ACCESSED: u64 = 1 << 5;
 pub const PTE_DIRTY: u64 = 1 << 6;
 pub const PTE_LARGE: u64 = 1 << 7;
 pub const PTE_GLOBAL: u64 = 1 << 8;
+/// Software-defined (AVL) bit: page is shared copy-on-write and the hardware
+/// write bit has been cleared. A write fault on such a page copies it, or
+/// re-enables write when the faulting mapping is the last owner.
+pub const PTE_COW: u64 = 1 << 9;
 pub const PTE_NO_EXECUTE: u64 = 1 << 63;
 
 pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -727,45 +731,166 @@ fn copy_bytes(dest: *mut u8, src: *const u8, size: usize) {
     }
 }
 
-pub fn clone_user_space(src_pml4: PhysAddr, dst_pml4: PhysAddr) -> i32 {
+/// PTE value both parent and child use after a copy-on-write fork: writable
+/// pages lose their hardware write bit and gain `PTE_COW`; read-only pages are
+/// shared unchanged.
+pub const fn cow_share_pte(pte: u64) -> u64 {
+    if (pte & PTE_WRITE) != 0 {
+        (pte & !PTE_WRITE) | PTE_COW
+    } else {
+        pte
+    }
+}
+
+/// Adjust the PTE flags `mprotect` wants for one page. A page still shared
+/// with another address space must not become hardware-writable, so it
+/// becomes COW instead. Read-only protections drop the COW marker so that
+/// writes fault as protection violations.
+pub const fn cow_adjust_flags(flags: u64, page_shared: bool) -> u64 {
+    if (flags & PTE_WRITE) == 0 {
+        return flags & !PTE_COW;
+    }
+    if page_shared {
+        (flags & !PTE_WRITE) | PTE_COW
+    } else {
+        flags & !PTE_COW
+    }
+}
+
+/// Result of a COW write-fault resolution attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CowResolve {
+    /// The page is not mapped or not marked COW; nothing to do.
+    NotCow,
+    /// The page is now privately writable.
+    Resolved,
+    /// A private copy was needed but no physical page was available.
+    NoMemory,
+}
+
+/// What resolving one PTE requires, given whether its frame is still shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CowAction {
+    None,
+    /// Last owner: make the existing frame writable again, with these flags.
+    Reclaim(u64),
+    /// Still shared: copy into a fresh frame mapped with these flags.
+    Copy(u64),
+}
+
+pub const fn cow_action(pte: u64, page_shared: bool) -> CowAction {
+    if (pte & PTE_PRESENT) == 0 || (pte & PTE_COW) == 0 {
+        return CowAction::None;
+    }
+    let flags = ((pte & PTE_FLAGS_MASK) | PTE_WRITE) & !PTE_COW;
+    if page_shared {
+        CowAction::Copy(flags)
+    } else {
+        CowAction::Reclaim(flags)
+    }
+}
+
+/// Locate the leaf page-table slot of a 4 KiB mapping.
+fn leaf_pte_slot(pml4: PhysAddr, virt: u64) -> Option<(PhysAddr, usize)> {
+    let pml4e = read_pte(pml4, pml4_index(virt));
+    if !pte_present(pml4e) {
+        return None;
+    }
+    let pdpte = read_pte(pte_addr(pml4e), pdpt_index(virt));
+    if !pte_present(pdpte) || (pdpte & PTE_LARGE) != 0 {
+        return None;
+    }
+    let pde = read_pte(pte_addr(pdpte), pd_index(virt));
+    if !pte_present(pde) || (pde & PTE_LARGE) != 0 {
+        return None;
+    }
+    Some((pte_addr(pde), pt_index(virt)))
+}
+
+/// Break copy-on-write sharing for the page containing `virt`.
+pub fn resolve_cow_in(target_pml4: PhysAddr, virt: VirtAddr) -> CowResolve {
+    let mut pml4 = target_pml4;
+    if pml4.as_u64() == 0 {
+        pml4 = unsafe { PML4_PHYS };
+    }
+    let virt = virt.align_down();
+    let (pt, idx) = match leaf_pte_slot(pml4, virt.as_u64()) {
+        Some(slot) => slot,
+        None => return CowResolve::NotCow,
+    };
+    let pte = read_pte(pt, idx);
+    let old_phys = pte_addr(pte);
+    let new_pte = match cow_action(pte, pmm::page_is_shared(old_phys)) {
+        CowAction::None => return CowResolve::NotCow,
+        CowAction::Reclaim(flags) => old_phys.as_u64() | flags,
+        CowAction::Copy(flags) => {
+            let new_phys = pmm::alloc_page();
+            if new_phys.as_u64() == 0 {
+                return CowResolve::NoMemory;
+            }
+            copy_bytes(
+                new_phys.to_virt().as_u64() as *mut u8,
+                old_phys.to_virt().as_u64() as *const u8,
+                PAGE_SIZE as usize,
+            );
+            // Drops this mapping's share of the old frame.
+            pmm::free_page(old_phys);
+            new_phys.as_u64() | flags
+        }
+    };
+    write_pte(pt, idx, new_pte);
+    if (read_cr3() & PTE_ADDR_MASK) == pml4.as_u64() {
+        invalidate_page(virt);
+    }
+    CowResolve::Resolved
+}
+
+/// Duplicate the user half of `src_pml4` into `dst_pml4` for `fork`.
+///
+/// Private pages are shared copy-on-write: both sides map the same frame with
+/// the write bit cleared and `PTE_COW` set, and the frame's PMM share count is
+/// bumped. Pages for which `skip(virt)` returns true are left unmapped in the
+/// child; the caller uses this for shared file mappings, device mappings and
+/// SysV shm, which are refaulted or re-attached instead. Frames the PMM cannot
+/// share (unmanaged memory, share-count overflow) are copied eagerly.
+pub fn clone_user_space(
+    src_pml4: PhysAddr,
+    dst_pml4: PhysAddr,
+    skip: &dyn Fn(u64) -> bool,
+) -> i32 {
     if src_pml4.as_u64() == 0 || dst_pml4.as_u64() == 0 {
         serial_println!("[VMM] ERROR: Invalid PML4 addresses");
         return -1;
     }
 
     let src_table = table_ptr(src_pml4);
+    let mut pages_shared = 0u64;
     let mut pages_copied = 0u64;
+    let mut result = 0;
 
-    for pml4_idx in 0..256usize {
+    'outer: for pml4_idx in 0..256usize {
         let pml4e = unsafe { ptr::read(src_table.add(pml4_idx)) };
         if !pte_present(pml4e) {
             continue;
         }
 
-        let src_pdpt = pte_addr(pml4e);
-        let pdpt_table = table_ptr(src_pdpt);
+        let pdpt_table = table_ptr(pte_addr(pml4e));
 
         for pdpt_idx in 0..VMM_ENTRIES_PER_TABLE {
             let pdpte = unsafe { ptr::read(pdpt_table.add(pdpt_idx)) };
-            if !pte_present(pdpte) {
+            if !pte_present(pdpte) || (pdpte & PTE_LARGE) != 0 {
                 continue;
             }
 
-            let src_pd = pte_addr(pdpte);
-            let pd_table = table_ptr(src_pd);
+            let pd_table = table_ptr(pte_addr(pdpte));
 
             for pd_idx in 0..VMM_ENTRIES_PER_TABLE {
                 let pde = unsafe { ptr::read(pd_table.add(pd_idx)) };
-                if !pte_present(pde) {
+                if !pte_present(pde) || (pde & PTE_LARGE) != 0 {
                     continue;
                 }
 
-                if (pde & PTE_LARGE) != 0 {
-                    continue;
-                }
-
-                let src_pt = pte_addr(pde);
-                let pt_table = table_ptr(src_pt);
+                let pt_table = table_ptr(pte_addr(pde));
 
                 for pt_idx in 0..VMM_ENTRIES_PER_TABLE {
                     let pte = unsafe { ptr::read(pt_table.add(pt_idx)) };
@@ -773,40 +898,72 @@ pub fn clone_user_space(src_pml4: PhysAddr, dst_pml4: PhysAddr) -> i32 {
                         continue;
                     }
 
+                    let virt = ((pml4_idx as u64) << 39)
+                        | ((pdpt_idx as u64) << 30)
+                        | ((pd_idx as u64) << 21)
+                        | ((pt_idx as u64) << 12);
+                    if skip(virt) {
+                        continue;
+                    }
+
                     let src_phys = pte_addr(pte);
-                    let flags = pte & PTE_FLAGS_MASK;
+                    if pmm::page_share(src_phys) {
+                        let shared = cow_share_pte(pte);
+                        if shared != pte {
+                            unsafe { ptr::write(pt_table.add(pt_idx), shared) };
+                        }
+                        if map_page_in(
+                            dst_pml4,
+                            VirtAddr::new(virt),
+                            src_phys,
+                            shared & PTE_FLAGS_MASK,
+                        ) != 0
+                        {
+                            serial_println!("[VMM] ERROR: Failed to map COW page");
+                            pmm::free_page(src_phys);
+                            result = -1;
+                            break 'outer;
+                        }
+                        pages_shared += 1;
+                        continue;
+                    }
 
                     let dst_phys = pmm::alloc_page();
                     if dst_phys.as_u64() == 0 {
                         serial_println!("[VMM] ERROR: Failed to allocate page for clone");
-                        return -1;
+                        result = -1;
+                        break 'outer;
                     }
-
                     copy_bytes(
                         dst_phys.to_virt().as_u64() as *mut u8,
                         src_phys.to_virt().as_u64() as *const u8,
                         PAGE_SIZE as usize,
                     );
-
-                    let virt = ((pml4_idx as u64) << 39)
-                        | ((pdpt_idx as u64) << 30)
-                        | ((pd_idx as u64) << 21)
-                        | ((pt_idx as u64) << 12);
-
-                    if map_page_in(dst_pml4, VirtAddr::new(virt), dst_phys, flags) != 0 {
+                    if map_page_in(dst_pml4, VirtAddr::new(virt), dst_phys, pte & PTE_FLAGS_MASK)
+                        != 0
+                    {
                         serial_println!("[VMM] ERROR: Failed to map cloned page");
                         pmm::free_page(dst_phys);
-                        return -1;
+                        result = -1;
+                        break 'outer;
                     }
-
                     pages_copied += 1;
                 }
             }
         }
     }
 
-    serial_println!("[VMM] Cloned {} user pages", pages_copied);
-    0
+    // Parent PTEs may have lost their write bit; drop stale TLB entries.
+    if (read_cr3() & PTE_ADDR_MASK) == src_pml4.as_u64() {
+        flush_tlb();
+    }
+
+    serial_println!(
+        "[VMM] Fork: {} pages shared copy-on-write, {} copied",
+        pages_shared,
+        pages_copied
+    );
+    result
 }
 
 pub fn clear_user_space(target_pml4: PhysAddr) {
@@ -922,5 +1079,57 @@ mod tests {
         assert_eq!(pd_index(addr), ((addr >> 21) & 0x1FF) as usize);
         assert_eq!(pt_index(addr), ((addr >> 12) & 0x1FF) as usize);
         assert_eq!(page_offset(addr), addr & 0xFFF);
+    }
+
+    const PHYS: u64 = 0x0012_3000;
+
+    #[test]
+    fn cow_share_strips_write_and_marks_cow() {
+        let rw = PHYS | PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NO_EXECUTE;
+        let shared = cow_share_pte(rw);
+        assert_eq!(shared & PTE_WRITE, 0);
+        assert_ne!(shared & PTE_COW, 0);
+        assert_eq!(pte_addr(shared).as_u64(), PHYS);
+        assert_ne!(shared & PTE_NO_EXECUTE, 0);
+
+        let ro = PHYS | PTE_PRESENT | PTE_USER;
+        assert_eq!(cow_share_pte(ro), ro);
+    }
+
+    #[test]
+    fn cow_action_reclaims_last_owner_and_copies_shared() {
+        let cow = cow_share_pte(PHYS | PTE_PRESENT | PTE_WRITE | PTE_USER);
+        match cow_action(cow, false) {
+            CowAction::Reclaim(flags) => {
+                assert_ne!(flags & PTE_WRITE, 0);
+                assert_eq!(flags & PTE_COW, 0);
+                assert_eq!(flags & PTE_ADDR_MASK, 0);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        match cow_action(cow, true) {
+            CowAction::Copy(flags) => {
+                assert_ne!(flags & PTE_WRITE, 0);
+                assert_ne!(flags & PTE_USER, 0);
+                assert_eq!(flags & PTE_COW, 0);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        // Plain read-only and non-present entries are not COW.
+        assert_eq!(
+            cow_action(PHYS | PTE_PRESENT | PTE_USER, true),
+            CowAction::None
+        );
+        assert_eq!(cow_action(PHYS | PTE_COW, true), CowAction::None);
+    }
+
+    #[test]
+    fn cow_adjust_flags_keeps_shared_pages_read_only() {
+        let rw = PTE_PRESENT | PTE_WRITE | PTE_USER;
+        let ro = PTE_PRESENT | PTE_USER;
+        assert_eq!(cow_adjust_flags(rw, true), ro | PTE_COW);
+        assert_eq!(cow_adjust_flags(rw, false), rw);
+        assert_eq!(cow_adjust_flags(ro | PTE_COW, true), ro);
+        assert_eq!(cow_adjust_flags(ro, false), ro);
     }
 }

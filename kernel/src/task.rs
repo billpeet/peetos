@@ -24,6 +24,15 @@ pub const SIG_MAX_TASK_SIGNALS: usize = 32;
 pub const TASK_FLAG_KERNEL: u32 = 0x01;
 pub const TASK_FLAG_USER: u32 = 0x02;
 pub const TASK_FLAG_IDLE: u32 = 0x04;
+/// Non-leader member of a thread group (created by `clone(CLONE_THREAD)`).
+/// Such tasks are never waited for; they are reaped automatically.
+pub const TASK_FLAG_THREAD: u32 = 0x08;
+/// Set on a thread told to exit because a sibling called exit_group or
+/// execve. It leaves at its next return towards user mode.
+pub const TASK_FLAG_EXITING: u32 = 0x10;
+/// Set on a thread group leader once the process is exiting as a whole; its
+/// `exit_code` then holds the process exit status.
+pub const TASK_FLAG_GROUP_EXIT: u32 = 0x20;
 
 pub const USER_FD_KIND_EMPTY: u8 = 0;
 pub const USER_FD_KIND_CONSOLE: u8 = 1;
@@ -57,7 +66,15 @@ pub enum TaskState {
 
 #[repr(C)]
 pub struct Task {
+    /// Kernel task id. For a thread group leader this is also the process id.
     pub(crate) pid: Pid,
+    /// Thread group (process) id: the leader's `pid`.
+    pub(crate) tgid: Pid,
+    /// Leader of this task's thread group, or null when this task is the
+    /// leader. Process-wide state (fd table, cwd, brk, mmap regions, shm,
+    /// signal actions, ids, exec metadata) lives on the leader; see
+    /// `leader_of`.
+    pub(crate) group_leader: *mut Task,
     pub(crate) ppid: Pid,
     pub(crate) pgid: Pid,
     pub(crate) sid: Pid,
@@ -160,6 +177,8 @@ pub fn init() {
 
         let mut boot = Task {
             pid: 0,
+            tgid: 0,
+            group_leader: ptr::null_mut(),
             ppid: 0,
             pgid: 0,
             sid: 0,
@@ -259,7 +278,10 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         let task = &mut *task_ptr;
         task.pid = NEXT_PID;
         NEXT_PID = NEXT_PID.saturating_add(1);
-        task.ppid = current().as_ref().map(|t| t.pid).unwrap_or(0);
+        task.tgid = task.pid;
+        task.group_leader = ptr::null_mut();
+        // A process's parent is the creating *process*, not a specific thread.
+        task.ppid = current().as_ref().map(|t| t.tgid).unwrap_or(0);
         task.pgid = task.pid;
         task.sid = task.pid;
         task.ctty_type = CTTY_NONE;
@@ -351,6 +373,53 @@ pub fn task_destroy(task: *mut Task) {
 
         let task_phys = VirtAddr::new(task as u64).to_phys();
         pmm::free_page(task_phys);
+    }
+}
+
+/// The task that holds process-wide state for `task`: its thread group leader,
+/// or `task` itself when it is a leader (or null).
+#[inline]
+pub fn leader_of(task: *mut Task) -> *mut Task {
+    if task.is_null() {
+        return task;
+    }
+    let leader = unsafe { (*task).group_leader };
+    if leader.is_null() {
+        task
+    } else {
+        leader
+    }
+}
+
+#[inline]
+pub fn is_live(task: *const Task) -> bool {
+    unsafe { (*task).state != TaskState::Zombie && (*task).state != TaskState::Dead }
+}
+
+/// Number of live (not zombie/dead) tasks in thread group `tgid`.
+pub fn live_threads_in_group(tgid: Pid) -> usize {
+    let mut count = 0;
+    unsafe {
+        for t in TASK_TABLE.iter() {
+            if !t.is_null() && (**t).tgid == tgid && is_live(*t) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Make `thread` a member of `leader`'s thread group.
+pub fn join_thread_group(thread: *mut Task, leader: *mut Task) {
+    if thread.is_null() || leader.is_null() {
+        return;
+    }
+    let leader = leader_of(leader);
+    unsafe {
+        (*thread).tgid = (*leader).tgid;
+        (*thread).group_leader = leader;
+        (*thread).ppid = (*leader).ppid;
+        (*thread).flags |= TASK_FLAG_THREAD;
     }
 }
 
@@ -502,6 +571,8 @@ impl Task {
     pub(crate) fn for_test(pid: Pid) -> Self {
         Task {
             pid,
+            tgid: pid,
+            group_leader: ptr::null_mut(),
             ppid: 0,
             pgid: pid,
             sid: pid,

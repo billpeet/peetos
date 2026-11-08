@@ -177,6 +177,9 @@ pub(super) fn do_select(
                 return 0;
             }
         }
+        if signal::must_abort_wait(ctx.current) {
+            return -EINTR;
+        }
 
         #[cfg(not(test))]
         {
@@ -198,9 +201,9 @@ pub(super) fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16
 
     let (kind, inode, flags) = unsafe {
         (
-            (*task_ptr).user_fd_kind[idx],
-            (*task_ptr).user_fd_inode[idx],
-            (*task_ptr).user_fd_flags[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_flags[idx],
         )
     };
 
@@ -534,8 +537,8 @@ pub(super) fn epoll_validate_fd_target(
     }
     let (kind, inode) = unsafe {
         (
-            (*task_ptr).user_fd_kind[idx],
-            (*task_ptr).user_fd_inode[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[idx],
         )
     };
     if kind == task::USER_FD_KIND_EPOLL {
@@ -557,8 +560,8 @@ pub(super) fn epoll_fd_to_id(task_ptr: *mut task::Task, epfd: i32) -> Result<u16
     }
     let (kind, inode) = unsafe {
         (
-            (*task_ptr).user_fd_kind[idx],
-            (*task_ptr).user_fd_inode[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[idx],
         )
     };
     if kind != task::USER_FD_KIND_EPOLL {
@@ -673,8 +676,8 @@ pub(super) fn epoll_watch_stale(watch: &EpollWatch) -> bool {
     }
     let (kind, inode) = unsafe {
         (
-            (*owner).user_fd_kind[fd_idx],
-            (*owner).user_fd_inode[fd_idx],
+            (*crate::task::leader_of(owner)).user_fd_kind[fd_idx],
+            (*crate::task::leader_of(owner)).user_fd_inode[fd_idx],
         )
     };
     kind != watch.kind || inode != watch.inode
@@ -790,6 +793,9 @@ pub(super) fn do_poll(
             }
         }
 
+        if signal::must_abort_wait(ctx.current) {
+            return -EINTR;
+        }
         // Drive NIC + TCP tick, then yield
         #[cfg(not(test))]
         {
@@ -912,7 +918,7 @@ pub(super) fn sys_epoll_ctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => return err,
     };
 
-    let owner_pid = unsafe { (*ctx.current).pid };
+    let owner_pid = unsafe { (*ctx.current).tgid };
 
     match op {
         EPOLL_CTL_ADD | EPOLL_CTL_MOD => {

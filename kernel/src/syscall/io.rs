@@ -49,18 +49,18 @@ pub(super) fn sys_copy_file_range(ctx: &SyscallContext, call: &SyscallArgs) -> i
 
     let (in_kind, in_ino, in_fd_off, in_flags) = unsafe {
         (
-            (*ctx.current).user_fd_kind[in_idx],
-            (*ctx.current).user_fd_inode[in_idx],
-            (*ctx.current).user_fd_offset[in_idx],
-            (*ctx.current).user_fd_flags[in_idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[in_idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[in_idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_offset[in_idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_flags[in_idx],
         )
     };
     let (out_kind, out_ino, out_fd_off, out_flags) = unsafe {
         (
-            (*ctx.current).user_fd_kind[out_idx],
-            (*ctx.current).user_fd_inode[out_idx],
-            (*ctx.current).user_fd_offset[out_idx],
-            (*ctx.current).user_fd_flags[out_idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[out_idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[out_idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_offset[out_idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_flags[out_idx],
         )
     };
     if in_kind != task::USER_FD_KIND_VFS || out_kind != task::USER_FD_KIND_VFS {
@@ -138,7 +138,7 @@ pub(super) fn sys_copy_file_range(ctx: &SyscallContext, call: &SyscallArgs) -> i
 
     if in_off_ptr == 0 {
         unsafe {
-            (*ctx.current).user_fd_offset[in_idx] = in_off;
+            (*crate::task::leader_of(ctx.current)).user_fd_offset[in_idx] = in_off;
         }
     } else if in_off <= i64::MAX as u64 {
         if let Err(err) = write_struct_to_user(ctx.current, in_off_ptr, &(in_off as i64)) {
@@ -147,7 +147,7 @@ pub(super) fn sys_copy_file_range(ctx: &SyscallContext, call: &SyscallArgs) -> i
     }
     if out_off_ptr == 0 {
         unsafe {
-            (*ctx.current).user_fd_offset[out_idx] = out_off;
+            (*crate::task::leader_of(ctx.current)).user_fd_offset[out_idx] = out_off;
         }
     } else if out_off <= i64::MAX as u64 {
         if let Err(err) = write_struct_to_user(ctx.current, out_off_ptr, &(out_off as i64)) {
@@ -191,10 +191,10 @@ pub(super) fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
         let (kind, inode, offset, flags) = unsafe {
             (
-                (*ctx.current).user_fd_kind[idx],
-                (*ctx.current).user_fd_inode[idx],
-                (*ctx.current).user_fd_offset[idx],
-                (*ctx.current).user_fd_flags[idx],
+                (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+                (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+                (*crate::task::leader_of(ctx.current)).user_fd_offset[idx],
+                (*crate::task::leader_of(ctx.current)).user_fd_flags[idx],
             )
         };
 
@@ -295,7 +295,7 @@ pub(super) fn sys_read(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
 
         unsafe {
-            (*ctx.current).user_fd_offset[idx] = offset.saturating_add(read_n as u64);
+            (*crate::task::leader_of(ctx.current)).user_fd_offset[idx] = offset.saturating_add(read_n as u64);
         }
         read_total += read_n;
 
@@ -333,10 +333,10 @@ pub(super) fn write_from_user_fd(
 
         let (kind, inode, offset, flags) = unsafe {
             (
-                (*ctx.current).user_fd_kind[idx],
-                (*ctx.current).user_fd_inode[idx],
-                (*ctx.current).user_fd_offset[idx],
-                (*ctx.current).user_fd_flags[idx],
+                (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+                (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+                (*crate::task::leader_of(ctx.current)).user_fd_offset[idx],
+                (*crate::task::leader_of(ctx.current)).user_fd_flags[idx],
             )
         };
 
@@ -350,7 +350,7 @@ pub(super) fn write_from_user_fd(
         if kind == task::USER_FD_KIND_CONSOLE {
             crate::serial::write_bytes(&chunk[..take]);
             unsafe {
-                (*ctx.current).user_fd_offset[idx] = offset.saturating_add(take as u64);
+                (*crate::task::leader_of(ctx.current)).user_fd_offset[idx] = offset.saturating_add(take as u64);
             }
             written += take;
             continue;
@@ -380,7 +380,7 @@ pub(super) fn write_from_user_fd(
 
             vm_page_cache_invalidate_inode_range(inode, offset, write_res.written as u64);
             unsafe {
-                (*ctx.current).user_fd_offset[idx] = write_res.new_offset;
+                (*crate::task::leader_of(ctx.current)).user_fd_offset[idx] = write_res.new_offset;
             }
             if write_res.written > 0 {
                 *wrote_vfs = true;
@@ -407,7 +407,7 @@ pub(super) fn write_from_user_fd(
                 break;
             }
             unsafe {
-                (*ctx.current).user_fd_offset[idx] = offset.saturating_add(wrote as u64);
+                (*crate::task::leader_of(ctx.current)).user_fd_offset[idx] = offset.saturating_add(wrote as u64);
             }
             written += wrote;
             continue;
@@ -583,9 +583,9 @@ pub(super) fn sys_lseek(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode, current) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
-            (*ctx.current).user_fd_offset[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_offset[idx],
         )
     };
     if kind == task::USER_FD_KIND_CONSOLE
@@ -605,7 +605,7 @@ pub(super) fn sys_lseek(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
 
     unsafe {
-        (*ctx.current).user_fd_offset[idx] = new_offset;
+        (*crate::task::leader_of(ctx.current)).user_fd_offset[idx] = new_offset;
     }
     new_offset as i64
 }
@@ -637,9 +637,9 @@ pub(super) fn sys_pread64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode, flags) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
-            (*ctx.current).user_fd_flags[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_flags[idx],
         )
     };
 
@@ -728,9 +728,9 @@ pub(super) fn sys_pwrite64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode, flags) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
-            (*ctx.current).user_fd_flags[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_flags[idx],
         )
     };
 

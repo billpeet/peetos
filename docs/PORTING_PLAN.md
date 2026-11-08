@@ -22,6 +22,10 @@ current Rust kernel implementation and forward roadmap.
 
 - Preemptive scheduler, kernel threads, and user-mode bootstrap are active.
 - Per-task x87/SSE state is switched eagerly with `FXSAVE`/`FXRSTOR`, copied on fork, reset on exec, and saved/restored around signal handlers. The `musl-ext2-fpu-smoke` QEMU profile (`make run-fpu-smoke`) covers all three; before this, user XMM/MXCSR state leaked between preempted processes.
+- `fork` is copy-on-write (PMM share counts + `PTE_COW` write faults), and
+  `clone(CLONE_THREAD)` thread groups run musl pthreads (mutexes, condvars,
+  TLS, join, `tgkill`, process-wide exit). Covered by `make run-proc-smoke`;
+  see `docs/process_model.md`.
 - ELF loading supports `ET_EXEC` + `ET_DYN` bootstrap paths with `PT_INTERP`
   handoff and hardened segment validation.
 - Table-driven syscall dispatch is active across SYSCALL/int80 paths.
@@ -123,7 +127,7 @@ current Rust kernel implementation and forward roadmap.
 
 ### 1. Process and Runtime Semantics
 
-- Complete Linux-like `clone`/thread semantics (`CLONE_THREAD`, robust TLS/TID behavior, thread groups).
+- Finish thread semantics on top of the new thread groups: futex timeouts/requeue/robust lists, a shared process-wide pending-signal set, real-time and cancellation signals, `execve` from non-leader threads, and socket waits that notice `exit_group`.
 - Harden job-control and controlling-tty behavior beyond current baseline.
 - Expand signal semantics (`sigaltstack`, richer `siginfo_t`/ucontext behavior including a Linux-compatible `_fpstate`, queued RT payloads).
 - Add `XSAVE`/AVX state support if userspace workloads need AVX (today only the legacy `FXSAVE` image is managed and `CR4.OSXSAVE` stays off).

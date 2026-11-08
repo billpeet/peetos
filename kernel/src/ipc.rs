@@ -367,6 +367,9 @@ pub fn pipe_read(
             let mut state = IPC_STATE.lock();
             remove_waiter_locked(&mut state, read_key, task);
         }
+        if crate::signal::must_abort_wait(task) {
+            return Err(EAGAIN);
+        }
     }
 }
 
@@ -425,6 +428,9 @@ pub fn pipe_write(
             block_current("pipe-write");
             let mut state = IPC_STATE.lock();
             remove_waiter_locked(&mut state, write_key, task);
+        }
+        if crate::signal::must_abort_wait(task) {
+            return Err(EAGAIN);
         }
     }
 

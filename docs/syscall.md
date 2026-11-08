@@ -102,16 +102,17 @@ Current implemented handlers:
 - `utimensat` baseline atime/mtime updates with `UTIME_NOW`/`UTIME_OMIT`
 - `copy_file_range` baseline buffered VFS-to-VFS copy path
 - `execve(path, argv, envp)` with in-kernel argument/environment copy, VFS-backed ELF load, and direct frame handoff to the new image entry
-- `fork()` with baseline address-space clone + task metadata/fd table copy (no COW yet)
-- `clone(flags, child_stack, ...)` with a narrow fork-compatible subset (`SIGCHLD`-exit signal, optional child stack, and optional `CLONE_VM|CLONE_VFORK` compatibility flags without full Linux shared-VM semantics)
-- `vfork()` as a fork-compatible compatibility path (no parent suspension or shared-VM semantics yet)
+- `fork()` with a copy-on-write address-space clone plus task metadata/fd table copy and shm inheritance (see `docs/process_model.md`)
+- `clone(flags, child_stack, ptid, ctid, tls)`: fork-compatible process creation (`SIGCHLD` exit signal, optional child stack, `CLONE_VM|CLONE_VFORK` compatibility) and `CLONE_THREAD` threads that share VM/files/fs/signal handlers (musl `pthread_create` flag set), with `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
+- `vfork()` as a copy-on-write fork (no parent suspension)
+- `tkill(tid, sig)` and `tgkill(tgid, tid, sig)` thread-directed signals
 - `wait4(pid, status, options, rusage)` with baseline zombie-child reaping (`pid=-1` and specific positive `pid`, `WNOHANG`; `rusage` currently unimplemented)
 - `ioctl(fd, request, argp)` with baseline tty subset (`TIOCGWINSZ`, `TCGETS`, `TCSETS*`, `TIOCGPGRP`, `TIOCSPGRP`) plus framebuffer metadata query (`FBIOGETINFO`) on `/dev/fb0`
 - `setpgid(pid, pgid)`, `setsid()`, `getsid(pid)` with baseline process-group/session tracking
 - `arch_prctl(ARCH_SET_FS/ARCH_GET_FS)` with per-task FS-base tracking and scheduler restore on context switch
-- `exit(status)` and `exit_group(status)` with task-teardown cleanup of open fds/epoll watches/shared mappings before zombie state
+- `exit(status)` ends the calling thread (the process when it is the last thread); `exit_group(status)` ends every thread; the last thread releases fds/epoll watches/shared mappings/address space before the process becomes a zombie
 - `sched_yield()`
-- `getpid()`, `getppid()`, `gettid()`
+- `getpid()` (thread group id), `getppid()`, `gettid()` (per-thread id)
 - `getuid()`, `geteuid()`, `getgid()`, `getegid()`
 - `uname(buf)` baseline utsname fields (`sysname`, `nodename`, `release`, `version`, `machine`, `domainname`)
 - `chdir()`, `fchdir()`, `getcwd()` (baseline cwd-inode path reconstruction)
@@ -170,13 +171,13 @@ Limitations / Simplifications
 - AF_UNIX pathname binds currently reserve a VFS path entry and reject conflicts at bind time; abstract namespace socket addresses are still deferred.
 - Message-based socket compatibility is still partial: `sendmsg`/`recvmsg` support payload iovec handling and baseline `SCM_RIGHTS`, but `SCM_CREDENTIALS` and full Linux ancillary edge semantics are not yet complete.
 - Process-group/session semantics are currently minimal: no full job-control signal semantics yet, and no controlling-tty foreground group state beyond basic group-id validation for `TIOCSPGRP`.
-- `clone`/`vfork` support is intentionally narrow: no `CLONE_THREAD`/TLS/tid-pointer semantics, no thread-group model, and no true Linux `vfork` parent-blocking/shared-address-space behavior.
-- VM syscalls are still simplified: `mmap` now supports `MAP_PRIVATE` (anonymous + file-backed), baseline file-backed `MAP_SHARED` mappings including writable shared mappings with software dirty tracking and `msync`/`sync`/`fsync` writeback hooks, and direct shared `/dev/fb0` framebuffer mappings for GUI bring-up. User-page allocation now does best-effort reclaim by unmapping reclaim-safe file-backed pages and evicting unmapped VM page-cache pages before retrying allocation. There is still no swap-backed reclaim for anonymous/private-writable pages, no copy-on-write fork optimization, and no advanced display-buffer ownership/fencing model; per-task mapped VMA pages are capped (`8192`, currently 32 MiB virtual coverage).
+- `clone` supports full-sharing threads and plain forks only: partial sharing (e.g. `CLONE_FILES` without `CLONE_THREAD`), namespaces and `CLONE_PIDFD` return `-EINVAL`, and `vfork` does not suspend the parent. See `docs/process_model.md` for thread-group limits.
+- VM syscalls are still simplified: `mmap` now supports `MAP_PRIVATE` (anonymous + file-backed), baseline file-backed `MAP_SHARED` mappings including writable shared mappings with software dirty tracking and `msync`/`sync`/`fsync` writeback hooks, and direct shared `/dev/fb0` framebuffer mappings for GUI bring-up. User-page allocation now does best-effort reclaim by unmapping reclaim-safe file-backed pages and evicting unmapped VM page-cache pages before retrying allocation. There is still no swap-backed reclaim for anonymous/private-writable pages and no advanced display-buffer ownership/fencing model; per-task mapped VMA pages are capped (`8192`, currently 32 MiB virtual coverage).
 - User-mode page faults now resolve non-present `mmap` pages on demand; invalid faults are handled as fatal user faults (SIGSEGV-style exit path), with no `siginfo_t` fault payload/ucontext delivery yet.
 - VM mappings are currently constrained to a dedicated high user range managed by the kernel mmap allocator (used to avoid touching legacy low-memory bootstrap mappings).
 - `brk` still uses simple contiguous growth/shrink and does not yet integrate with full userspace allocator policies (no overcommit accounting, no guard-page policy).
 - `futex` support is intentionally narrow: no timeout handling, no `*_PRIVATE`/bitset/requeue/PI variants, and no robust-list support yet.
-- Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, no permission enforcement, and no inheritance semantics across `fork`/`exec` yet.
+- Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, and no permission enforcement. Attachments are inherited across `fork` and dropped on exit; `execve` does not detach them yet.
 - `execve` is intentionally narrow: `FD_CLOEXEC` teardown is now wired, but there is still no shebang/script loading, bounded `argv`/`envp` vector sizes, and no full Linux signal-reset semantics.
 - `arch_prctl` is intentionally narrow: only `ARCH_SET_FS` and `ARCH_GET_FS` are implemented; GS-base operations return `-EINVAL`.
 - `access`/`faccessat` semantics are baseline-only (no ACLs/capabilities, simplified effective-vs-real ID behavior).

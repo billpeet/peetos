@@ -12,7 +12,7 @@ This document describes the tasking and scheduler implementation. It supports ke
 
 **Task Structure**
 `kernel/src/task.rs` defines the `Task` struct and task table. Each task stores:
-- IDs (PID/PPID)
+- IDs (PID/PPID, plus `tgid` and `group_leader` for thread groups; see `docs/process_model.md`)
 - Name
 - State and flags
 - Saved interrupt-frame stack pointer (`saved_rsp`)
@@ -79,16 +79,15 @@ In the default build the initial user program is a small dynamic ELF that writes
 5. `user::spawn_init()`
 
 Limitations / Simplifications
-- `fork` copies every user page up front; there is no copy-on-write.
-- No threads: `CLONE_THREAD`, thread groups and shared signal handling are not implemented, so musl pthreads do not work.
+- `execve` replaces the process image with caller-provided `argv`/`envp`; copy-on-write `fork` and `clone(CLONE_THREAD)` thread groups are described in `docs/process_model.md`.
 - Dynamic-linking support is bootstrap-only (embedded `PT_INTERP` image, no reloc/symbol resolution).
 - Per-task FD state includes baseline descriptor semantics (`dup*`, `fcntl`, and `FD_CLOEXEC` close-on-exec), but open-file-description sharing semantics are still simplified.
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
 - Per-task FS-base TLS state is tracked/restored (`arch_prctl` `ARCH_SET_FS`/`ARCH_GET_FS`), but GS-base handling and full TLS model compatibility are still incomplete.
-- `user_clear_tid` zeroing performs a best-effort futex wake for one waiter at exit, but robust-list semantics are not implemented.
+- `user_clear_tid` zeroing performs a best-effort futex wake for one waiter at thread exit (`pthread_join`); robust-list semantics are not implemented.
 - FPU/SSE switching is eager: every context switch pays one `FXSAVE` plus one `FXRSTOR`, even for kernel threads that never use the FPU. Lazy switching (`CR0.TS` + `#NM`) is not implemented.
 - Only the legacy 512-byte `FXSAVE` image is managed. `CR4.OSXSAVE`/`XSAVE` is not enabled, so AVX/AVX-512 state cannot be used by userspace at all (CPUID reports OSXSAVE=0, so well-behaved code falls back to SSE).
 - The signal-frame FPU image uses the PeetOS-private frame layout, not Linux's `ucontext_t`/`_fpstate`, so handlers cannot inspect or edit the interrupted FPU state through `ucontext`.
 - `#XM`/`#MF` floating-point exceptions that userspace unmasks are not translated into `SIGFPE` with `FPE_*` codes.
-- Orphaned children are not reparented to init, so their zombies are only reaped if the original parent waits for them.
+- Zombie processes are reaped by `wait4`; exited non-leader threads are reaped automatically. Orphaned children are not reparented to init, so their zombies are only reaped if the original parent waits for them.
 - Run queue operations are protected only by interrupt masking (single-core assumption).

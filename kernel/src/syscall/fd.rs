@@ -11,7 +11,7 @@ pub(super) fn fd_index(fd: i32) -> Result<usize, i64> {
 }
 
 pub(super) fn fd_slot_is_open(task_ptr: *mut task::Task, idx: usize) -> bool {
-    unsafe { (*task_ptr).user_fd_kind[idx] != task::USER_FD_KIND_EMPTY }
+    unsafe { (*crate::task::leader_of(task_ptr)).user_fd_kind[idx] != task::USER_FD_KIND_EMPTY }
 }
 
 #[inline]
@@ -57,7 +57,7 @@ pub(super) fn fd_find_free_from(task_ptr: *mut task::Task, start: usize) -> Opti
         return None;
     }
     for idx in start..task::MAX_TASK_FDS {
-        if unsafe { (*task_ptr).user_fd_kind[idx] == task::USER_FD_KIND_EMPTY } {
+        if unsafe { (*crate::task::leader_of(task_ptr)).user_fd_kind[idx] == task::USER_FD_KIND_EMPTY } {
             return Some(idx);
         }
     }
@@ -73,8 +73,8 @@ pub(super) fn task_memfd_contains_inode(task_ptr: *mut task::Task, inode: u16) -
     while idx < task::MAX_TASK_FDS {
         let is_match = unsafe {
             fd_slot_is_open(task_ptr, idx)
-                && fd_is_memfd((*task_ptr).user_fd_flags[idx])
-                && (*task_ptr).user_fd_inode[idx] == inode
+                && fd_is_memfd((*crate::task::leader_of(task_ptr)).user_fd_flags[idx])
+                && (*crate::task::leader_of(task_ptr)).user_fd_inode[idx] == inode
         };
         if is_match {
             return true;
@@ -96,8 +96,8 @@ pub(super) fn task_memfd_object_count(task_ptr: *mut task::Task) -> usize {
         let (open, flags, inode) = unsafe {
             (
                 fd_slot_is_open(task_ptr, idx),
-                (*task_ptr).user_fd_flags[idx],
-                (*task_ptr).user_fd_inode[idx],
+                (*crate::task::leader_of(task_ptr)).user_fd_flags[idx],
+                (*crate::task::leader_of(task_ptr)).user_fd_inode[idx],
             )
         };
         if open && fd_is_memfd(flags) && inode != task::USER_FD_NONE {
@@ -158,8 +158,8 @@ pub(super) fn fd_write_slot(
     flags: u32,
 ) {
     unsafe {
-        (*task_ptr).user_fd_kind[idx] = kind;
-        (*task_ptr).user_fd_inode[idx] = if kind == task::USER_FD_KIND_VFS
+        (*crate::task::leader_of(task_ptr)).user_fd_kind[idx] = kind;
+        (*crate::task::leader_of(task_ptr)).user_fd_inode[idx] = if kind == task::USER_FD_KIND_VFS
             || kind == task::USER_FD_KIND_PIPE
             || kind == task::USER_FD_KIND_SOCKET
             || kind == task::USER_FD_KIND_PTY_MASTER
@@ -170,8 +170,8 @@ pub(super) fn fd_write_slot(
         } else {
             task::USER_FD_NONE
         };
-        (*task_ptr).user_fd_offset[idx] = offset;
-        (*task_ptr).user_fd_flags[idx] = flags;
+        (*crate::task::leader_of(task_ptr)).user_fd_offset[idx] = offset;
+        (*crate::task::leader_of(task_ptr)).user_fd_flags[idx] = flags;
     }
 }
 
@@ -214,10 +214,10 @@ pub(super) fn fd_dup_from(
 
     let (kind, inode, offset, src_flags) = unsafe {
         (
-            (*task_ptr).user_fd_kind[src_idx],
-            (*task_ptr).user_fd_inode[src_idx],
-            (*task_ptr).user_fd_offset[src_idx],
-            (*task_ptr).user_fd_flags[src_idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[src_idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[src_idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_offset[src_idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_flags[src_idx],
         )
     };
     if fd_is_memfd(src_flags) {
@@ -269,10 +269,10 @@ pub(super) fn fd_dup_to(
 
     let (kind, inode, offset, src_flags) = unsafe {
         (
-            (*task_ptr).user_fd_kind[src_idx],
-            (*task_ptr).user_fd_inode[src_idx],
-            (*task_ptr).user_fd_offset[src_idx],
-            (*task_ptr).user_fd_flags[src_idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[src_idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[src_idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_offset[src_idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_flags[src_idx],
         )
     };
     if fd_is_memfd(src_flags) {
@@ -306,12 +306,12 @@ pub(super) fn fd_close(task_ptr: *mut task::Task, fd: i32) -> Result<(), i64> {
 
     let (kind, inode, flags) = unsafe {
         (
-            (*task_ptr).user_fd_kind[idx],
-            (*task_ptr).user_fd_inode[idx],
-            (*task_ptr).user_fd_flags[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_flags[idx],
         )
     };
-    let owner_pid = unsafe { (*task_ptr).pid };
+    let owner_pid = unsafe { (*task_ptr).tgid };
 
     epoll_drop_watches_for_fd(owner_pid, fd, kind, inode);
 
@@ -340,10 +340,10 @@ pub(super) fn fd_close(task_ptr: *mut task::Task, fd: i32) -> Result<(), i64> {
     }
 
     unsafe {
-        (*task_ptr).user_fd_kind[idx] = task::USER_FD_KIND_EMPTY;
-        (*task_ptr).user_fd_inode[idx] = task::USER_FD_NONE;
-        (*task_ptr).user_fd_offset[idx] = 0;
-        (*task_ptr).user_fd_flags[idx] = 0;
+        (*crate::task::leader_of(task_ptr)).user_fd_kind[idx] = task::USER_FD_KIND_EMPTY;
+        (*crate::task::leader_of(task_ptr)).user_fd_inode[idx] = task::USER_FD_NONE;
+        (*crate::task::leader_of(task_ptr)).user_fd_offset[idx] = 0;
+        (*crate::task::leader_of(task_ptr)).user_fd_flags[idx] = 0;
     }
     Ok(())
 }
@@ -368,7 +368,7 @@ pub(super) fn close_cloexec_fds(task_ptr: *mut task::Task) {
     let mut fd = 0usize;
     while fd < task::MAX_TASK_FDS {
         let should_close = unsafe {
-            fd_slot_is_open(task_ptr, fd) && fd_has_cloexec((*task_ptr).user_fd_flags[fd])
+            fd_slot_is_open(task_ptr, fd) && fd_has_cloexec((*crate::task::leader_of(task_ptr)).user_fd_flags[fd])
         };
         if should_close {
             let _ = fd_close(task_ptr, fd as i32);
@@ -712,7 +712,7 @@ pub(super) fn sys_fcntl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     match cmd {
         F_GETFD => {
-            let flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+            let flags = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] };
             if fd_has_cloexec(flags) {
                 FD_CLOEXEC as i64
             } else {
@@ -722,21 +722,21 @@ pub(super) fn sys_fcntl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         F_SETFD => {
             let cloexec = (arg as u32 & FD_CLOEXEC) != 0;
             unsafe {
-                let flags = (*ctx.current).user_fd_flags[idx];
-                (*ctx.current).user_fd_flags[idx] = fd_set_cloexec(flags, cloexec);
+                let flags = (*crate::task::leader_of(ctx.current)).user_fd_flags[idx];
+                (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] = fd_set_cloexec(flags, cloexec);
             }
             0
         }
         F_GETFL => {
-            let flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+            let flags = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] };
             fd_open_flags(flags) as i64
         }
         F_SETFL => {
             unsafe {
-                let current_flags = (*ctx.current).user_fd_flags[idx];
-                let kind = (*ctx.current).user_fd_kind[idx];
+                let current_flags = (*crate::task::leader_of(ctx.current)).user_fd_flags[idx];
+                let kind = (*crate::task::leader_of(ctx.current)).user_fd_kind[idx];
                 let next_flags = fd_apply_fcntl_setfl(current_flags, kind, arg as u32);
-                (*ctx.current).user_fd_flags[idx] = next_flags;
+                (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] = next_flags;
             }
             0
         }

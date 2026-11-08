@@ -611,6 +611,8 @@ pub(super) fn mmap_prot_to_pte_flags(prot: u32) -> Result<u64, i64> {
 }
 
 pub(super) fn mmap_task_slot(task_ptr: *mut task::Task) -> Option<usize> {
+    // Threads share their leader's mapping table.
+    let task_ptr = task::leader_of(task_ptr);
     if task_ptr.is_null() {
         return None;
     }
@@ -623,6 +625,7 @@ pub(super) fn mmap_task_slot(task_ptr: *mut task::Task) -> Option<usize> {
 }
 
 pub(super) fn mmap_prepare_task_slot(task_ptr: *mut task::Task) -> Option<usize> {
+    let task_ptr = task::leader_of(task_ptr);
     let slot = mmap_task_slot(task_ptr)?;
     unsafe {
         let pid = (*task_ptr).pid;
@@ -908,7 +911,7 @@ pub(super) fn mmap_find_range(
     len: u64,
 ) -> Result<u64, i64> {
     let (brk, stack_bottom) =
-        unsafe { ((*ctx.current).user_brk, (*ctx.current).user_stack_bottom) };
+        unsafe { ((*crate::task::leader_of(ctx.current)).user_brk, (*crate::task::leader_of(ctx.current)).user_stack_bottom) };
     if stack_bottom == 0 {
         return Err(-ENOMEM);
     }
@@ -959,9 +962,9 @@ pub(super) fn mmap_file_inode(
 
     let (kind, inode, fd_flags) = unsafe {
         (
-            (*task_ptr).user_fd_kind[idx],
-            (*task_ptr).user_fd_inode[idx],
-            (*task_ptr).user_fd_flags[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_flags[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
@@ -1027,9 +1030,9 @@ pub(super) fn set_program_break(ctx: &SyscallContext, requested: u64) -> i64 {
 
     let (current, start, stack_bottom) = unsafe {
         (
-            (*ctx.current).user_brk,
-            (*ctx.current).user_brk_start,
-            (*ctx.current).user_stack_bottom,
+            (*crate::task::leader_of(ctx.current)).user_brk,
+            (*crate::task::leader_of(ctx.current)).user_brk_start,
+            (*crate::task::leader_of(ctx.current)).user_stack_bottom,
         )
     };
 
@@ -1068,7 +1071,7 @@ pub(super) fn set_program_break(ctx: &SyscallContext, requested: u64) -> i64 {
     }
 
     unsafe {
-        (*ctx.current).user_brk = requested;
+        (*crate::task::leader_of(ctx.current)).user_brk = requested;
     }
     requested as i64
 }
@@ -1324,7 +1327,10 @@ pub(super) fn sys_mprotect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             }
         };
 
-        if vmm::map_page_in(pml4, VirtAddr::new(page), phys, pte_flags) != 0 {
+        // Pages still shared copy-on-write with another process must stay
+        // write-protected; they become COW rather than writable.
+        let page_flags = vmm::cow_adjust_flags(pte_flags, pmm::page_is_shared(phys));
+        if vmm::map_page_in(pml4, VirtAddr::new(page), phys, page_flags) != 0 {
             return -ENOMEM;
         }
         let mapping = unsafe { mmap_regions_find_mapping(&TASK_VM_MAPPINGS[slot], page) };
@@ -1450,47 +1456,43 @@ pub(super) fn mmap_clone_task_regions(
     Ok(())
 }
 
-pub(super) fn mmap_fork_reconcile_shared_file_mappings(
-    task_ptr: *mut task::Task,
-) -> Result<(), i64> {
-    if task_ptr.is_null() {
-        return Err(-ESRCH);
+/// Resolve a write fault on a present copy-on-write page of the current task.
+/// Kernel code reaches user memory through the physical map, so it must call
+/// `vmm::resolve_cow_in` itself before writing (see `copy_user_bytes`); CR0.WP
+/// is not set, so kernel-mode writes would not fault here.
+fn try_handle_cow_fault(fault_addr: u64, error_code: u64) -> bool {
+    let write_to_present = PAGE_FAULT_ERROR_PRESENT | PAGE_FAULT_ERROR_WRITE;
+    if (error_code & write_to_present) != write_to_present {
+        return false;
     }
-    let pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
+    if fault_addr >= KERNEL_VIRT_BASE || fault_addr > USER_CANON_MAX {
+        return false;
+    }
+    let current = task::current();
+    if current.is_null() {
+        return false;
+    }
+    let pml4 = unsafe { PhysAddr::new((*current).pml4_phys) };
     if pml4.as_u64() == 0 {
-        return Err(-EINVAL);
+        return false;
     }
-    let slot = mmap_prepare_task_slot(task_ptr).ok_or(-ESRCH)?;
-    let regions = unsafe { TASK_VM_MAPPINGS[slot] };
-
-    for region in regions {
-        if region.is_empty() || !region.map_shared || region.file_inode == task::USER_FD_NONE {
-            continue;
-        }
-
-        let mut page = region.start;
-        while page < region.end() {
-            let virt = VirtAddr::new(page);
-            let phys = match vmm::get_physical_in(pml4, virt) {
-                Some(phys) => PhysAddr::new(phys.as_u64() & !(PAGE_SIZE - 1)),
-                None => {
-                    page = page.saturating_add(PAGE_SIZE);
-                    continue;
-                }
-            };
-
-            if vmm::unmap_page_in(pml4, virt) != 0 {
-                return Err(-ENOMEM);
-            }
-            pmm::free_page(phys);
-            page = page.saturating_add(PAGE_SIZE);
+    match vmm::resolve_cow_in(pml4, VirtAddr::new(fault_addr)) {
+        vmm::CowResolve::Resolved => true,
+        vmm::CowResolve::NotCow => false,
+        vmm::CowResolve::NoMemory => {
+            sys_log!(
+                "[SYSCALL] out of memory breaking copy-on-write at 0x{:x}",
+                fault_addr
+            );
+            false
         }
     }
-
-    Ok(())
 }
 
 pub fn try_handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
+    if try_handle_cow_fault(fault_addr, error_code) {
+        return true;
+    }
     if (error_code & PAGE_FAULT_ERROR_USER) == 0 {
         return false;
     }

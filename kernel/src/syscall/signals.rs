@@ -41,14 +41,58 @@ pub(super) fn sys_kill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if target.is_null() {
         return -ESRCH;
     }
-    if sig == 0 {
+    // Like Linux, signalling an exited but unreaped process succeeds and
+    // has no effect.
+    if sig == 0 || !group_has_live_thread(target) {
         return 0;
     }
 
+    match signal::send_to_process(target, sig as u32) {
+        Ok(()) => 0,
+        Err(err) => -signal_to_errno(err),
+    }
+}
+
+pub(super) fn group_has_live_thread(t: *mut task::Task) -> bool {
+    task::live_threads_in_group(unsafe { (*t).tgid }) > 0
+}
+
+/// Send `sig` to one specific thread.
+pub(super) fn signal_thread(target: *mut task::Task, sig: i64) -> i64 {
+    if target.is_null() || !task::is_live(target) {
+        return -ESRCH;
+    }
+    if sig < 0 {
+        return -EINVAL;
+    }
+    if sig == 0 {
+        return 0;
+    }
     match signal::send(target, sig as u32) {
         Ok(()) => 0,
         Err(err) => -signal_to_errno(err),
     }
+}
+
+pub(super) fn sys_tkill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let tid = call.arg(0) as i64;
+    if tid <= 0 || tid > i32::MAX as i64 {
+        return -EINVAL;
+    }
+    signal_thread(task::get_by_pid(tid as i32), call.arg(1) as i64)
+}
+
+pub(super) fn sys_tgkill(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let tgid = call.arg(0) as i64;
+    let tid = call.arg(1) as i64;
+    if tgid <= 0 || tid <= 0 || tgid > i32::MAX as i64 || tid > i32::MAX as i64 {
+        return -EINVAL;
+    }
+    let target = task::get_by_pid(tid as i32);
+    if target.is_null() || unsafe { (*target).tgid } != tgid as i32 {
+        return -ESRCH;
+    }
+    signal_thread(target, call.arg(2) as i64)
 }
 
 pub(super) fn sys_rt_sigaction(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -329,10 +373,24 @@ pub(super) fn can_process_pending_signals(current: *mut task::Task) -> bool {
     unsafe { (*current).state != TaskState::Zombie && (*current).state != TaskState::Dead }
 }
 
+/// A thread told to exit (exit_group/execve from a sibling) leaves here, on
+/// its way back to user mode.
+pub(super) fn exit_if_thread_killed(current: *mut task::Task) -> Option<i64> {
+    if current.is_null() || unsafe { ((*current).flags & task::TASK_FLAG_EXITING) == 0 } {
+        return None;
+    }
+    let code = unsafe { (*current).exit_code };
+    let ctx = SyscallContext::new(current);
+    Some(exit_current_thread(&ctx, code))
+}
+
 pub(super) fn apply_pending_signals_syscall(frame: &mut SyscallFrame) -> Option<i64> {
     let current = task::current();
     if !can_process_pending_signals(current) {
         return None;
+    }
+    if let Some(ret) = exit_if_thread_killed(current) {
+        return Some(ret);
     }
 
     loop {
@@ -358,6 +416,9 @@ pub(super) fn apply_pending_signals_int80(frame: &mut InterruptFrame) -> Option<
     let current = task::current();
     if !can_process_pending_signals(current) {
         return None;
+    }
+    if let Some(ret) = exit_if_thread_killed(current) {
+        return Some(ret);
     }
 
     loop {

@@ -847,17 +847,17 @@ fn fd_dup_helpers_apply_requested_cloexec() {
     let plain_idx = plain as usize;
     assert_eq!(plain_idx, 0);
     assert!(!fd_has_cloexec(unsafe {
-        (*task_ptr).user_fd_flags[plain_idx]
+        (*crate::task::leader_of(task_ptr)).user_fd_flags[plain_idx]
     }));
-    assert_eq!(unsafe { (*task_ptr).user_fd_offset[plain_idx] }, 11);
+    assert_eq!(unsafe { (*crate::task::leader_of(task_ptr)).user_fd_offset[plain_idx] }, 11);
 
     let clo = fd_dup_from(task_ptr, 5, 1, true).expect("dup with cloexec");
     let clo_idx = clo as usize;
     assert_eq!(clo_idx, 1);
     assert!(fd_has_cloexec(unsafe {
-        (*task_ptr).user_fd_flags[clo_idx]
+        (*crate::task::leader_of(task_ptr)).user_fd_flags[clo_idx]
     }));
-    assert_eq!(unsafe { (*task_ptr).user_fd_inode[clo_idx] }, 42);
+    assert_eq!(unsafe { (*crate::task::leader_of(task_ptr)).user_fd_inode[clo_idx] }, 42);
 }
 
 #[test]
@@ -1269,9 +1269,9 @@ fn install_received_right_sets_cloexec_when_requested() {
     };
     let fd = install_received_right(task_ptr, right, true).expect("install right");
     let idx = fd as usize;
-    assert!(fd_has_cloexec(unsafe { (*task_ptr).user_fd_flags[idx] }));
-    assert_eq!(unsafe { (*task_ptr).user_fd_inode[idx] }, 77);
-    assert_eq!(unsafe { (*task_ptr).user_fd_offset[idx] }, 123);
+    assert!(fd_has_cloexec(unsafe { (*crate::task::leader_of(task_ptr)).user_fd_flags[idx] }));
+    assert_eq!(unsafe { (*crate::task::leader_of(task_ptr)).user_fd_inode[idx] }, 77);
+    assert_eq!(unsafe { (*crate::task::leader_of(task_ptr)).user_fd_offset[idx] }, 123);
 }
 
 #[test]
@@ -1292,7 +1292,7 @@ fn close_cloexec_fds_keeps_non_cloexec_entries() {
 
     assert!(!fd_slot_is_open(task_ptr, 3));
     assert!(fd_slot_is_open(task_ptr, 4));
-    assert_eq!(unsafe { (*task_ptr).user_fd_inode[4] }, 11);
+    assert_eq!(unsafe { (*crate::task::leader_of(task_ptr)).user_fd_inode[4] }, 11);
 }
 
 #[test]
@@ -1508,7 +1508,7 @@ fn clone_args_accept_fork_compatible_flags() {
         num: SYS_CLONE,
         args: [SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
     };
-    assert_eq!(validate_clone_args(&call), Ok(0));
+    assert_eq!(validate_clone_args(&call), Ok(CloneRequest::FORK));
 }
 
 #[test]
@@ -1517,7 +1517,8 @@ fn clone_args_accept_vfork_compat_flags() {
         num: SYS_CLONE,
         args: [CLONE_VM | CLONE_VFORK | SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
     };
-    assert_eq!(validate_clone_args(&call), Ok(0));
+    let req = validate_clone_args(&call).expect("vfork flags");
+    assert!(!req.is_thread());
 }
 
 #[test]
@@ -1529,11 +1530,92 @@ fn clone_args_reject_partial_vm_vfork_combo() {
     assert_eq!(validate_clone_args(&call), Err(-EINVAL));
 }
 
+/// Flags musl's pthread_create passes to clone.
+const MUSL_PTHREAD_FLAGS: u64 = CLONE_VM
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_THREAD
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_DETACHED;
+
 #[test]
-fn clone_args_reject_nonzero_tid_tls_pointers() {
+fn clone_args_ignore_tid_pointers_without_flags() {
     let call = SyscallArgs {
         num: SYS_CLONE,
         args: [SIGCHLD_EXIT_SIGNAL, 0, 1, 0, 0, 0],
     };
+    let req = validate_clone_args(&call).expect("pointer without flag is ignored");
+    assert_eq!(req.parent_tid, 1);
+    assert!(!req.is_thread());
+}
+
+#[test]
+fn clone_args_accept_musl_pthread_flags() {
+    let call = SyscallArgs {
+        num: SYS_CLONE,
+        args: [MUSL_PTHREAD_FLAGS, 0x7000_0000, 0x6000_0010, 0x6000_0020, 0x6000_1000, 0],
+    };
+    let req = validate_clone_args(&call).expect("musl pthread flags");
+    assert!(req.is_thread());
+    assert_eq!(req.child_stack, 0x7000_0000);
+    assert_eq!(req.parent_tid, 0x6000_0010);
+    assert_eq!(req.child_tid, 0x6000_0020);
+    assert_eq!(req.tls, 0x6000_1000);
+}
+
+#[test]
+fn clone_args_reject_thread_without_full_sharing_or_stack() {
+    let no_files = SyscallArgs {
+        num: SYS_CLONE,
+        args: [MUSL_PTHREAD_FLAGS & !CLONE_FILES, 0x7000_0000, 0, 0, 0, 0],
+    };
+    assert_eq!(validate_clone_args(&no_files), Err(-EINVAL));
+
+    let no_stack = SyscallArgs {
+        num: SYS_CLONE,
+        args: [MUSL_PTHREAD_FLAGS, 0, 0x6000_0010, 0x6000_0020, 0x6000_1000, 0],
+    };
+    assert_eq!(validate_clone_args(&no_stack), Err(-EINVAL));
+
+    let with_signal = SyscallArgs {
+        num: SYS_CLONE,
+        args: [
+            MUSL_PTHREAD_FLAGS | SIGCHLD_EXIT_SIGNAL,
+            0x7000_0000,
+            0x6000_0010,
+            0x6000_0020,
+            0x6000_1000,
+            0,
+        ],
+    };
+    assert_eq!(validate_clone_args(&with_signal), Err(-EINVAL));
+}
+
+#[test]
+fn clone_args_reject_partial_sharing_for_processes() {
+    let call = SyscallArgs {
+        num: SYS_CLONE,
+        args: [CLONE_FILES | SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
+    };
     assert_eq!(validate_clone_args(&call), Err(-EINVAL));
+}
+
+#[test]
+fn clone_args_reject_kernel_tid_pointers() {
+    let call = SyscallArgs {
+        num: SYS_CLONE,
+        args: [
+            MUSL_PTHREAD_FLAGS,
+            0x7000_0000,
+            KERNEL_VIRT_BASE,
+            0x6000_0020,
+            0x6000_1000,
+            0,
+        ],
+    };
+    assert_eq!(validate_clone_args(&call), Err(-EFAULT));
 }

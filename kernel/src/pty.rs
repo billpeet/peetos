@@ -221,9 +221,14 @@ pub fn master_read(
         }
 
         block_current("pty-mread");
-        let mut state = PTY_STATE.lock();
-        if valid_pty(&state, pty_id) {
-            state.entries[pty_id as usize].remove_master_waiter(task);
+        {
+            let mut state = PTY_STATE.lock();
+            if valid_pty(&state, pty_id) {
+                state.entries[pty_id as usize].remove_master_waiter(task);
+            }
+        }
+        if crate::signal::must_abort_wait(task) {
+            return Err(EAGAIN);
         }
     }
 }
@@ -386,9 +391,14 @@ pub fn slave_read(
         }
 
         block_current("pty-sread");
-        let mut state = PTY_STATE.lock();
-        if valid_pty(&state, pty_id) {
-            state.entries[pty_id as usize].tty.remove_waiter(task);
+        {
+            let mut state = PTY_STATE.lock();
+            if valid_pty(&state, pty_id) {
+                state.entries[pty_id as usize].tty.remove_waiter(task);
+            }
+        }
+        if crate::signal::must_abort_wait(task) {
+            return Err(EAGAIN);
         }
     }
 }

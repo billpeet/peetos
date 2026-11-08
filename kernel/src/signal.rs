@@ -186,10 +186,10 @@ pub fn read_action(task: *mut Task, signum: u32) -> Result<SigAction, i64> {
     let idx = signum as usize;
     unsafe {
         Ok(SigAction {
-            handler: (*task).signal_handlers[idx],
-            flags: (*task).signal_flags[idx],
-            restorer: (*task).signal_restorer,
-            mask: (*task).signal_mask_saved[idx],
+            handler: (*crate::task::leader_of(task)).signal_handlers[idx],
+            flags: (*crate::task::leader_of(task)).signal_flags[idx],
+            restorer: (*crate::task::leader_of(task)).signal_restorer,
+            mask: (*crate::task::leader_of(task)).signal_mask_saved[idx],
         })
     }
 }
@@ -208,11 +208,11 @@ pub fn write_action(task: *mut Task, signum: u32, action: SigAction) -> Result<S
     let idx = signum as usize;
     let old = read_action(task, signum)?;
     unsafe {
-        (*task).signal_handlers[idx] = action.handler;
-        (*task).signal_flags[idx] = action.flags;
-        (*task).signal_mask_saved[idx] = action.mask;
+        (*crate::task::leader_of(task)).signal_handlers[idx] = action.handler;
+        (*crate::task::leader_of(task)).signal_flags[idx] = action.flags;
+        (*crate::task::leader_of(task)).signal_mask_saved[idx] = action.mask;
         if (action.flags & SA_RESTORER) != 0 {
-            (*task).signal_restorer = action.restorer;
+            (*crate::task::leader_of(task)).signal_restorer = action.restorer;
         }
     }
     Ok(old)
@@ -244,14 +244,14 @@ pub fn consume_next(task: *mut Task) -> DeliveryAction {
     let idx = signum as usize;
     unsafe {
         (*task).sig_pending &= !signal_bit(signum);
-        let handler = (*task).signal_handlers[idx];
+        let handler = (*crate::task::leader_of(task)).signal_handlers[idx];
         if handler == SIG_IGN && can_catch(signum) {
             return DeliveryAction::Ignore;
         }
         if handler != SIG_DFL {
-            let flags = (*task).signal_flags[idx];
+            let flags = (*crate::task::leader_of(task)).signal_flags[idx];
             let restorer = if (flags & SA_RESTORER) != 0 {
-                (*task).signal_restorer
+                (*crate::task::leader_of(task)).signal_restorer
             } else {
                 0
             };
@@ -260,7 +260,7 @@ pub fn consume_next(task: *mut Task) -> DeliveryAction {
             }
 
             let saved_mask = (*task).signal_blocked;
-            let mut next_mask = saved_mask | (*task).signal_mask_saved[idx];
+            let mut next_mask = saved_mask | (*crate::task::leader_of(task)).signal_mask_saved[idx];
             next_mask |= signal_bit(signum);
             next_mask &= !signal_bit(SIGKILL);
             next_mask &= !signal_bit(SIGSTOP);
@@ -281,6 +281,69 @@ pub fn consume_next(task: *mut Task) -> DeliveryAction {
     }
 }
 
+/// Choose which thread of `task`'s process receives a process-directed
+/// signal: the leader if it is alive and not blocking the signal, otherwise
+/// the first live thread that is not blocking it, otherwise any live thread.
+fn process_signal_target(task: *mut Task, signum: u32) -> *mut Task {
+    let leader = crate::task::leader_of(task);
+    let bit = signal_bit(signum);
+    let leader_live = crate::task::is_live(leader);
+    unsafe {
+        if leader_live && ((*leader).signal_blocked & bit) == 0 {
+            return leader;
+        }
+    }
+
+    let tgid = unsafe { (*leader).tgid };
+    let mut fallback = if leader_live { leader } else { core::ptr::null_mut() };
+    for idx in 0..crate::task::MAX_TASKS {
+        let t = crate::task::get_by_index(idx);
+        if t.is_null() || t == leader {
+            continue;
+        }
+        unsafe {
+            if (*t).tgid != tgid || !crate::task::is_live(t) {
+                continue;
+            }
+            if ((*t).signal_blocked & bit) == 0 {
+                return t;
+            }
+        }
+        if fallback.is_null() {
+            fallback = t;
+        }
+    }
+    if fallback.is_null() {
+        leader
+    } else {
+        fallback
+    }
+}
+
+/// Send a signal to a whole process (kill(2) semantics): it is queued on one
+/// thread chosen by `process_signal_target`.
+pub fn send_to_process(task: *mut Task, signum: u32) -> Result<(), i64> {
+    if task.is_null() {
+        return Err(ESRCH);
+    }
+    if !valid_signal(signum) {
+        return Err(EINVAL);
+    }
+    send(process_signal_target(task, signum), signum)
+}
+
+/// True when a blocked task must give up waiting: it is being killed
+/// (SIGKILL pending) or told to exit by a sibling thread.
+pub fn must_abort_wait(task: *mut Task) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    unsafe {
+        ((*task).flags & crate::task::TASK_FLAG_EXITING) != 0
+            || ((*task).sig_pending & signal_bit(SIGKILL)) != 0
+    }
+}
+
 pub fn send_to_foreground_group(pgid: i32, signum: u32) {
     if !valid_signal(signum) {
         return;
@@ -291,19 +354,21 @@ pub fn send_to_foreground_group(pgid: i32, signum: u32) {
             continue;
         }
         unsafe {
-            let task_state = (*task_ptr).state;
-            let task_pgid = (*task_ptr).pgid;
             let task_flags = (*task_ptr).flags;
-            if task_state == TaskState::Dead || task_state == TaskState::Zombie {
+            // One delivery per process: visit thread group leaders only.
+            if (task_flags & crate::task::TASK_FLAG_THREAD) != 0 {
                 continue;
             }
             if (task_flags & crate::task::TASK_FLAG_USER) == 0 {
                 continue;
             }
-            if pgid != 0 && task_pgid != pgid {
+            if crate::task::live_threads_in_group((*task_ptr).tgid) == 0 {
                 continue;
             }
-            let _ = send(task_ptr, signum);
+            if pgid != 0 && (*task_ptr).pgid != pgid {
+                continue;
+            }
+            let _ = send_to_process(task_ptr, signum);
         }
     }
 }
@@ -328,6 +393,33 @@ mod tests {
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn must_abort_wait_tracks_sigkill_and_exiting_flag() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        let mut t = task::Task::for_test(1);
+        let ptr = &mut t as *mut task::Task;
+        assert!(!must_abort_wait(ptr));
+
+        send(ptr, SIGTERM).expect("send");
+        assert!(!must_abort_wait(ptr));
+
+        send(ptr, SIGKILL).expect("send");
+        assert!(must_abort_wait(ptr));
+
+        t.sig_pending = 0;
+        t.flags |= task::TASK_FLAG_EXITING;
+        assert!(must_abort_wait(&mut t as *mut task::Task));
+    }
+
+    #[test]
+    fn process_signal_prefers_unblocked_leader() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        let mut leader = task::Task::for_test(40);
+        let ptr = &mut leader as *mut task::Task;
+        send_to_process(ptr, SIGUSR1).expect("send");
+        assert_ne!(leader.sig_pending & signal_bit(SIGUSR1), 0);
+    }
 
     #[test]
     fn invalid_signal_is_rejected() {

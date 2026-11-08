@@ -173,8 +173,8 @@ pub(super) fn fd_to_socket_id(task_ptr: *mut task::Task, fd: i32) -> Result<(usi
     }
     let (kind, inode) = unsafe {
         (
-            (*task_ptr).user_fd_kind[idx],
-            (*task_ptr).user_fd_inode[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[idx],
         )
     };
     if kind != task::USER_FD_KIND_SOCKET {
@@ -296,7 +296,7 @@ pub(super) fn sys_connect(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(e) => return e,
     };
 
-    let flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let flags = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] };
     let nb = (fd_open_flags(flags) & O_NONBLOCK) != 0;
     let domain = match socket::socket_domain(sock_id) {
         Ok(v) => v,
@@ -351,7 +351,7 @@ pub(super) fn sys_accept4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(e) => return e,
     };
 
-    let listen_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let listen_flags = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] };
     let nb = (fd_open_flags(listen_flags) & O_NONBLOCK) != 0;
 
     let domain = match socket::socket_domain(sock_id) {
@@ -420,7 +420,7 @@ pub(super) fn sys_sendto(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let fd_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let fd_flags = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] };
     let nb = (fd_open_flags(fd_flags) & O_NONBLOCK) != 0;
 
     // Copy data from user
@@ -463,7 +463,7 @@ pub(super) fn sys_recvfrom(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(e) => return e,
     };
 
-    let fd_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let fd_flags = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] };
     let nb = (fd_open_flags(fd_flags) & O_NONBLOCK) != 0;
 
     const RECV_MAX: usize = 4096;
@@ -509,10 +509,10 @@ pub(super) fn unix_fd_transfer_from_task(
     }
     let (kind, inode, offset, flags) = unsafe {
         (
-            (*task_ptr).user_fd_kind[idx],
-            (*task_ptr).user_fd_inode[idx],
-            (*task_ptr).user_fd_offset[idx],
-            (*task_ptr).user_fd_flags[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_kind[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_inode[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_offset[idx],
+            (*crate::task::leader_of(task_ptr)).user_fd_flags[idx],
         )
     };
     match kind {
@@ -642,7 +642,7 @@ pub(super) fn sys_sendmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let fd_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let fd_flags = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] };
     let nb = (fd_open_flags(fd_flags) & O_NONBLOCK) != 0 || (msg_flags_arg & MSG_DONTWAIT) != 0;
 
     let hdr = match read_struct_from_user::<LinuxMsgHdr>(ctx.current, msghdr_ptr) {
@@ -748,7 +748,7 @@ pub(super) fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(e) => return e,
     };
 
-    let fd_flags = unsafe { (*ctx.current).user_fd_flags[idx] };
+    let fd_flags = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_flags[idx] };
     let nb = (fd_open_flags(fd_flags) & O_NONBLOCK) != 0 || (msg_flags_arg & MSG_DONTWAIT) != 0;
 
     let hdr = match read_struct_from_user::<LinuxMsgHdr>(ctx.current, msghdr_ptr) {

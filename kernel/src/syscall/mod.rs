@@ -132,6 +132,8 @@ const SYS_SETSID: u64 = 112;
 const SYS_GETSID: u64 = 124;
 const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_GETTID: u64 = 186;
+const SYS_TKILL: u64 = 200;
+const SYS_TGKILL: u64 = 234;
 const SYS_FUTEX: u64 = 202;
 const SYS_SET_TID_ADDRESS: u64 = 218;
 const SYS_GETDENTS64: u64 = 217;
@@ -238,7 +240,23 @@ const UTIME_OMIT: i64 = 0x3fff_fffe;
 
 const CLONE_CSIGNAL: u64 = 0x0000_00FF;
 const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_FS: u64 = 0x0000_0200;
+const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_SIGHAND: u64 = 0x0000_0800;
 const CLONE_VFORK: u64 = 0x0000_4000;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_DETACHED: u64 = 0x0040_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+/// Everything a POSIX thread shares with its creator. PeetOS supports these
+/// only as a set: partial sharing (e.g. CLONE_VM without CLONE_FILES) is
+/// rejected.
+const CLONE_THREAD_SHARE: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+const CLONE_TID_FLAGS: u64 =
+    CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
 
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
@@ -537,8 +555,18 @@ impl SyscallContext {
         self.has_task() && unsafe { ((*self.current).flags & TASK_FLAG_USER) != 0 }
     }
 
+    /// Process id: the thread group id, shared by every thread.
     #[inline]
     fn pid(&self) -> Result<i64, i64> {
+        if !self.has_task() {
+            return Err(-ESRCH);
+        }
+        Ok(unsafe { (*self.current).tgid as i64 })
+    }
+
+    /// Thread id: unique per task.
+    #[inline]
+    fn tid(&self) -> Result<i64, i64> {
         if !self.has_task() {
             return Err(-ESRCH);
         }
@@ -550,7 +578,7 @@ impl SyscallContext {
         if !self.has_task() {
             return Err(-ESRCH);
         }
-        Ok(unsafe { (*self.current).ppid as i64 })
+        Ok(unsafe { (*crate::task::leader_of(self.current)).ppid as i64 })
     }
 
     fn user_pml4(&self) -> Result<PhysAddr, i64> {
@@ -677,6 +705,8 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_arch_prctl,
     ),
     syscall_def(SYS_GETTID, "gettid", SyscallMode::AnyTask, sys_gettid),
+    syscall_def(SYS_TKILL, "tkill", SyscallMode::UserTask, sys_tkill),
+    syscall_def(SYS_TGKILL, "tgkill", SyscallMode::UserTask, sys_tgkill),
     syscall_def(
         SYS_SET_TID_ADDRESS,
         "set_tid_address",
@@ -1337,8 +1367,8 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
         }
         let result = if frame.rax == SYS_CLONE {
             let call = call_from_syscall_frame(frame);
-            let child_stack = match validate_clone_args(&call) {
-                Ok(stack) => stack,
+            let req = match validate_clone_args(&call) {
+                Ok(req) => req,
                 Err(err) => {
                     frame.rax = to_sysret(err);
                     if let Some(ret) = apply_pending_signals_syscall(frame) {
@@ -1347,7 +1377,7 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
                     return frame.rax;
                 }
             };
-            let child_frame = match build_clone_child_frame_from_syscall(frame, child_stack) {
+            let child_frame = match build_clone_child_frame_from_syscall(frame, req.child_stack) {
                 Ok(child_frame) => child_frame,
                 Err(err) => {
                     frame.rax = to_sysret(err);
@@ -1357,10 +1387,10 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
                     return frame.rax;
                 }
             };
-            create_fork_child(&ctx, &child_frame)
+            create_fork_child(&ctx, &child_frame, &req)
         } else {
             let child_frame = build_child_frame_from_syscall_frame(frame);
-            create_fork_child(&ctx, &child_frame)
+            create_fork_child(&ctx, &child_frame, &CloneRequest::FORK)
         };
         frame.rax = to_sysret(match result {
             Ok(pid) => pid,
@@ -1423,8 +1453,8 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
             to_sysret(-EPERM)
         } else if frame.rax == SYS_CLONE {
             let call = call_from_int80_frame(frame);
-            let child_stack = match validate_clone_args(&call) {
-                Ok(stack) => stack,
+            let req = match validate_clone_args(&call) {
+                Ok(req) => req,
                 Err(err) => {
                     frame.rax = to_sysret(err);
                     if let Some(ret) = apply_pending_signals_int80(frame) {
@@ -1433,7 +1463,7 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
                     return;
                 }
             };
-            let child_frame = match build_clone_child_frame_from_int80(frame, child_stack) {
+            let child_frame = match build_clone_child_frame_from_int80(frame, req.child_stack) {
                 Ok(child_frame) => child_frame,
                 Err(err) => {
                     frame.rax = to_sysret(err);
@@ -1443,14 +1473,14 @@ pub extern "C" fn syscall_int80_handler(frame: &mut InterruptFrame) {
                     return;
                 }
             };
-            let result = create_fork_child(&ctx, &child_frame);
+            let result = create_fork_child(&ctx, &child_frame, &req);
             to_sysret(match result {
                 Ok(pid) => pid,
                 Err(err) => err,
             })
         } else {
             let child_frame = build_child_frame_from_int80_frame(frame);
-            let result = create_fork_child(&ctx, &child_frame);
+            let result = create_fork_child(&ctx, &child_frame, &CloneRequest::FORK);
             to_sysret(match result {
                 Ok(pid) => pid,
                 Err(err) => err,

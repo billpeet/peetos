@@ -13,7 +13,7 @@ pub(super) fn process_group_exists_in_session(sid: i32, pgid: i32) -> bool {
             continue;
         }
         let (task_sid, task_pgid, state) =
-            unsafe { ((*task_ptr).sid, (*task_ptr).pgid, (*task_ptr).state) };
+            unsafe { ((*crate::task::leader_of(task_ptr)).sid, (*crate::task::leader_of(task_ptr)).pgid, (*task_ptr).state) };
         if state == TaskState::Dead {
             continue;
         }
@@ -30,7 +30,7 @@ pub(super) fn process_group_exists(pgid: i32) -> bool {
         if task_ptr.is_null() {
             continue;
         }
-        let (task_pgid, state) = unsafe { ((*task_ptr).pgid, (*task_ptr).state) };
+        let (task_pgid, state) = unsafe { ((*crate::task::leader_of(task_ptr)).pgid, (*task_ptr).state) };
         if state == TaskState::Dead {
             continue;
         }
@@ -84,7 +84,7 @@ pub(super) fn ioctl_console(ctx: &SyscallContext, request: u64, argp: u64) -> i6
             if argp == 0 {
                 return -EFAULT;
             }
-            let pgrp = unsafe { (*ctx.current).pgid };
+            let pgrp = unsafe { (*crate::task::leader_of(ctx.current)).pgid };
             match write_i32_to_user(ctx.current, argp, pgrp) {
                 Ok(()) => 0,
                 Err(err) => -err,
@@ -101,7 +101,7 @@ pub(super) fn ioctl_console(ctx: &SyscallContext, request: u64, argp: u64) -> i6
             if requested <= 0 {
                 return -EINVAL;
             }
-            let sid = unsafe { (*ctx.current).sid };
+            let sid = unsafe { (*crate::task::leader_of(ctx.current)).sid };
             if !process_group_exists_in_session(sid, requested) {
                 return -EPERM;
             }
@@ -165,15 +165,15 @@ pub(super) fn ioctl_pty(ctx: &SyscallContext, pty_id: u16, request: u64, argp: u
         }
         TIOCSCTTY => {
             unsafe {
-                (*ctx.current).ctty_type = task::CTTY_PTY;
-                (*ctx.current).ctty_id = pty_id;
+                (*crate::task::leader_of(ctx.current)).ctty_type = task::CTTY_PTY;
+                (*crate::task::leader_of(ctx.current)).ctty_id = pty_id;
             }
             0
         }
         TIOCNOTTY => {
             unsafe {
-                (*ctx.current).ctty_type = task::CTTY_NONE;
-                (*ctx.current).ctty_id = 0;
+                (*crate::task::leader_of(ctx.current)).ctty_type = task::CTTY_NONE;
+                (*crate::task::leader_of(ctx.current)).ctty_id = 0;
             }
             0
         }
@@ -181,7 +181,7 @@ pub(super) fn ioctl_pty(ctx: &SyscallContext, pty_id: u16, request: u64, argp: u
             if argp == 0 {
                 return -EFAULT;
             }
-            let pgrp = unsafe { (*ctx.current).pgid };
+            let pgrp = unsafe { (*crate::task::leader_of(ctx.current)).pgid };
             match write_i32_to_user(ctx.current, argp, pgrp) {
                 Ok(()) => 0,
                 Err(err) => -err,
@@ -198,7 +198,7 @@ pub(super) fn ioctl_pty(ctx: &SyscallContext, pty_id: u16, request: u64, argp: u
             if requested <= 0 {
                 return -EINVAL;
             }
-            let sid = unsafe { (*ctx.current).sid };
+            let sid = unsafe { (*crate::task::leader_of(ctx.current)).sid };
             if !process_group_exists_in_session(sid, requested) {
                 return -EPERM;
             }
@@ -261,8 +261,8 @@ pub(super) fn sys_ioctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EBADF;
     }
 
-    let kind = unsafe { (*ctx.current).user_fd_kind[idx] };
-    let inode = unsafe { (*ctx.current).user_fd_inode[idx] };
+    let kind = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_kind[idx] };
+    let inode = unsafe { (*crate::task::leader_of(ctx.current)).user_fd_inode[idx] };
     let request = call.arg(1);
     let argp = call.arg(2);
     if kind == task::USER_FD_KIND_CONSOLE {

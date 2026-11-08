@@ -602,7 +602,7 @@ fn query_current_cwd_path(path_buf: &mut [u8; fs::VFS_MAX_PATH]) -> usize {
         return 1;
     }
 
-    let cwd = unsafe { (*task_ptr).user_cwd_inode };
+    let cwd = unsafe { (*crate::task::leader_of(task_ptr)).user_cwd_inode };
     if cwd == fs::root_inode() {
         path_buf[0] = b'/';
         return 1;

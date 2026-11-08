@@ -95,6 +95,12 @@ if [[ -x "${ROOT_DIR}/user/fpu_context_smoke.elf" ]]; then
   chmod 0755 "${STAGE_ROOT}/bin/fpu_context_smoke"
 fi
 
+# Stage process-model (COW fork / pthreads) smoke helper when available.
+if [[ -x "${ROOT_DIR}/user/proc_model_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/proc_model_smoke.elf" "${STAGE_ROOT}/bin/proc_model_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/proc_model_smoke"
+fi
+
 # Stage AF_UNIX SCM_RIGHTS smoke helper when available.
 if [[ -x "${ROOT_DIR}/user/unix_rights_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/unix_rights_smoke.elf" "${STAGE_ROOT}/bin/unix_rights_smoke"
@@ -508,6 +514,22 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/fpu_smoke.sh"
+cat > "${STAGE_ROOT}/bin/proc_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/proc_model_smoke ]; then
+  echo [musl-ext2-proc-smoke] missing bin/proc_model_smoke
+  fail=1
+else
+  bin/proc_model_smoke || fail=1
+fi
+
+echo [musl-ext2-proc-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-proc-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/proc_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/epoll_smoke.sh" <<'EOS'
 fail=0

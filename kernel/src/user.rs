@@ -40,7 +40,8 @@ const EXEC_MAX_INTERP_IMAGE: usize = 2 * 1024 * 1024;
     feature = "musl-ext2-quickjs-smoke",
     feature = "musl-ext2-micropython-smoke",
     feature = "musl-ext2-dropbear-smoke",
-    feature = "musl-ext2-fpu-smoke"
+    feature = "musl-ext2-fpu-smoke",
+    feature = "musl-ext2-proc-smoke"
 ))]
 const INIT_ARGV0: &[u8] = b"/init-ext2\0";
 #[cfg(all(
@@ -59,6 +60,7 @@ const INIT_ARGV0: &[u8] = b"/init-ext2\0";
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     feature = "musl-smoke"
 ))]
 const INIT_ARGV0: &[u8] = b"/bin/echo\0";
@@ -78,6 +80,7 @@ const INIT_ARGV0: &[u8] = b"/bin/echo\0";
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-smoke")
 ))]
 const INIT_ARGV0: &[u8] = b"/init\0";
@@ -109,22 +112,30 @@ const EACCES: i64 = 13;
 
 static INIT_PID: AtomicI32 = AtomicI32::new(task::INVALID_PID);
 
-#[cfg(feature = "musl-ext2-fpu-smoke")]
+#[cfg(feature = "musl-ext2-proc-smoke")]
+static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_proc_smoke.elf");
+#[cfg(all(
+    not(feature = "musl-ext2-proc-smoke"),
+    feature = "musl-ext2-fpu-smoke"
+))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_fpu_smoke.elf");
 #[cfg(all(
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     feature = "musl-ext2-dropbear-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_dropbear_smoke.elf");
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     feature = "musl-ext2-micropython-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_micropython_smoke.elf");
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     feature = "musl-ext2-quickjs-smoke"
 ))]
@@ -132,6 +143,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_quickjs_smo
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     feature = "musl-ext2-ping-smoke"
@@ -140,6 +152,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_ping_smoke.
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -149,6 +162,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_shared_buff
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -159,6 +173,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_epoll_smoke
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -170,6 +185,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_console_fir
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -183,6 +199,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_gui_demo.el
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -196,6 +213,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_gui_smoke.e
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -210,6 +228,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_peet_gui_sm
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -225,6 +244,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_peet_shell_
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -241,6 +261,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_unix_rights
 #[cfg(all(
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
@@ -259,6 +280,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2_smoke.elf")
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-ext2-quickjs-smoke"),
     not(feature = "musl-ext2-ping-smoke"),
     not(feature = "musl-ext2-shared-buffer-smoke"),
@@ -289,6 +311,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_execve_ext2.elf");
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     feature = "musl-smoke"
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
@@ -308,6 +331,7 @@ static INIT_ELF: &[u8] = include_bytes!("../../user/musl_echo.elf");
     not(feature = "musl-ext2-micropython-smoke"),
     not(feature = "musl-ext2-dropbear-smoke"),
     not(feature = "musl-ext2-fpu-smoke"),
+    not(feature = "musl-ext2-proc-smoke"),
     not(feature = "musl-smoke")
 ))]
 static INIT_ELF: &[u8] = include_bytes!("../../user/hello_dyn.elf");
@@ -937,7 +961,9 @@ fn populate_user_stack<const ARGC: usize, const ENVC: usize, const AUXC: usize>(
 
 pub fn spawn_init() -> bool {
     serial_println!("[USER] Setting up initial user task...");
-    if cfg!(feature = "musl-ext2-dropbear-smoke") {
+    if cfg!(feature = "musl-ext2-proc-smoke") {
+        serial_println!("[USER] musl-ext2-proc-smoke init image selected");
+    } else if cfg!(feature = "musl-ext2-dropbear-smoke") {
         serial_println!("[USER] musl-ext2-dropbear-smoke init image selected");
     } else if cfg!(feature = "musl-ext2-micropython-smoke") {
         serial_println!("[USER] musl-ext2-micropython-smoke init image selected");
@@ -1112,25 +1138,25 @@ pub fn spawn_init() -> bool {
 
     unsafe {
         (*task_ptr).pml4_phys = pml4.as_u64();
-        (*task_ptr).user_entry = elf_result.entry_point;
-        (*task_ptr).user_stack_bottom = stack_bottom;
-        (*task_ptr).user_stack_top = stack_top;
-        (*task_ptr).user_stack_ptr = stack_plan.initial_rsp;
-        (*task_ptr).user_argc = stack_plan.argc;
-        (*task_ptr).user_argv = stack_plan.argv_ptr;
-        (*task_ptr).user_envp = stack_plan.envp_ptr;
-        (*task_ptr).user_auxv = stack_plan.auxv_ptr;
+        (*crate::task::leader_of(task_ptr)).user_entry = elf_result.entry_point;
+        (*crate::task::leader_of(task_ptr)).user_stack_bottom = stack_bottom;
+        (*crate::task::leader_of(task_ptr)).user_stack_top = stack_top;
+        (*crate::task::leader_of(task_ptr)).user_stack_ptr = stack_plan.initial_rsp;
+        (*crate::task::leader_of(task_ptr)).user_argc = stack_plan.argc;
+        (*crate::task::leader_of(task_ptr)).user_argv = stack_plan.argv_ptr;
+        (*crate::task::leader_of(task_ptr)).user_envp = stack_plan.envp_ptr;
+        (*crate::task::leader_of(task_ptr)).user_auxv = stack_plan.auxv_ptr;
         (*task_ptr).user_clear_tid = 0;
-        (*task_ptr).user_brk_start = elf_result.program_break;
-        (*task_ptr).user_brk = elf_result.program_break;
-        (*task_ptr).user_phdr_addr = elf_result.phdr_addr;
-        (*task_ptr).user_phdr_count = elf_result.phdr_count;
-        (*task_ptr).user_phdr_size = elf_result.phdr_size;
-        (*task_ptr).user_base_addr = elf_result.base_addr;
-        (*task_ptr).user_interp_base = interp_base;
-        (*task_ptr).user_is_dynamic = elf_result.is_dynamic;
-        (*task_ptr).ctty_type = crate::task::CTTY_CONSOLE;
-        (*task_ptr).ctty_id = 0;
+        (*crate::task::leader_of(task_ptr)).user_brk_start = elf_result.program_break;
+        (*crate::task::leader_of(task_ptr)).user_brk = elf_result.program_break;
+        (*crate::task::leader_of(task_ptr)).user_phdr_addr = elf_result.phdr_addr;
+        (*crate::task::leader_of(task_ptr)).user_phdr_count = elf_result.phdr_count;
+        (*crate::task::leader_of(task_ptr)).user_phdr_size = elf_result.phdr_size;
+        (*crate::task::leader_of(task_ptr)).user_base_addr = elf_result.base_addr;
+        (*crate::task::leader_of(task_ptr)).user_interp_base = interp_base;
+        (*crate::task::leader_of(task_ptr)).user_is_dynamic = elf_result.is_dynamic;
+        (*crate::task::leader_of(task_ptr)).ctty_type = crate::task::CTTY_CONSOLE;
+        (*crate::task::leader_of(task_ptr)).ctty_id = 0;
 
         let stack_top = (*task_ptr).kernel_stack_top;
         let mut frame_addr = stack_top - size_of::<InterruptFrame>() as u64;
@@ -1261,7 +1287,7 @@ pub fn exec_current_image(
         }
     };
 
-    let (uid, gid) = unsafe { ((*current).user_uid as u64, (*current).user_gid as u64) };
+    let (uid, gid) = unsafe { ((*crate::task::leader_of(current)).user_uid as u64, (*crate::task::leader_of(current)).user_gid as u64) };
     const AUX_IDX_RANDOM: usize = 11;
     const AUX_IDX_EXECFN: usize = 12;
     let auxv = [
@@ -1317,29 +1343,29 @@ pub fn exec_current_image(
 
     unsafe {
         (*current).pml4_phys = new_pml4.as_u64();
-        (*current).user_entry = elf_result.entry_point;
-        (*current).user_stack_bottom = stack_bottom;
-        (*current).user_stack_top = stack_top;
-        (*current).user_stack_ptr = stack_plan.initial_rsp;
-        (*current).user_argc = stack_plan.argc;
-        (*current).user_argv = stack_plan.argv_ptr;
-        (*current).user_envp = stack_plan.envp_ptr;
-        (*current).user_auxv = stack_plan.auxv_ptr;
+        (*crate::task::leader_of(current)).user_entry = elf_result.entry_point;
+        (*crate::task::leader_of(current)).user_stack_bottom = stack_bottom;
+        (*crate::task::leader_of(current)).user_stack_top = stack_top;
+        (*crate::task::leader_of(current)).user_stack_ptr = stack_plan.initial_rsp;
+        (*crate::task::leader_of(current)).user_argc = stack_plan.argc;
+        (*crate::task::leader_of(current)).user_argv = stack_plan.argv_ptr;
+        (*crate::task::leader_of(current)).user_envp = stack_plan.envp_ptr;
+        (*crate::task::leader_of(current)).user_auxv = stack_plan.auxv_ptr;
         (*current).user_fs_base = 0;
         (*current).user_clear_tid = 0;
-        (*current).user_brk_start = elf_result.program_break;
-        (*current).user_brk = elf_result.program_break;
-        (*current).user_phdr_addr = elf_result.phdr_addr;
-        (*current).user_phdr_count = elf_result.phdr_count;
-        (*current).user_phdr_size = elf_result.phdr_size;
-        (*current).user_base_addr = elf_result.base_addr;
-        (*current).user_interp_base = interp_base;
-        (*current).user_is_dynamic = elf_result.is_dynamic;
+        (*crate::task::leader_of(current)).user_brk_start = elf_result.program_break;
+        (*crate::task::leader_of(current)).user_brk = elf_result.program_break;
+        (*crate::task::leader_of(current)).user_phdr_addr = elf_result.phdr_addr;
+        (*crate::task::leader_of(current)).user_phdr_count = elf_result.phdr_count;
+        (*crate::task::leader_of(current)).user_phdr_size = elf_result.phdr_size;
+        (*crate::task::leader_of(current)).user_base_addr = elf_result.base_addr;
+        (*crate::task::leader_of(current)).user_interp_base = interp_base;
+        (*crate::task::leader_of(current)).user_is_dynamic = elf_result.is_dynamic;
         (*current).sig_pending = 0;
-        (*current).signal_handlers = [0; task::SIG_MAX_TASK_SIGNALS];
-        (*current).signal_flags = [0; task::SIG_MAX_TASK_SIGNALS];
-        (*current).signal_mask_saved = [0; task::SIG_MAX_TASK_SIGNALS];
-        (*current).signal_restorer = 0;
+        (*crate::task::leader_of(current)).signal_handlers = [0; task::SIG_MAX_TASK_SIGNALS];
+        (*crate::task::leader_of(current)).signal_flags = [0; task::SIG_MAX_TASK_SIGNALS];
+        (*crate::task::leader_of(current)).signal_mask_saved = [0; task::SIG_MAX_TASK_SIGNALS];
+        (*crate::task::leader_of(current)).signal_restorer = 0;
     }
 
     vmm::switch(new_pml4);

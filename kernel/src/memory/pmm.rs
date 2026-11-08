@@ -52,6 +52,10 @@ static mut LAST_USABLE_PFN: u64 = 0;
 static mut SEARCH_HINT: u64 = 0;
 static mut DEBUG_TRACKED_PAGE: u64 = 0;
 static mut PMM_INITIALIZED: bool = false;
+/// Extra mappings sharing a page, beyond its first owner. Copy-on-write fork
+/// bumps this; `free_page` drops one reference and only releases the frame
+/// when the count is already zero.
+static mut PAGE_EXTRA_REFS: [u16; PMM_MAX_PAGES as usize] = [0; PMM_MAX_PAGES as usize];
 
 extern "C" {
     static __kernel_start: u8;
@@ -171,6 +175,7 @@ pub fn alloc_page() -> PhysAddr {
         loop {
             if !bitmap_test(pfn) {
                 bitmap_set(pfn);
+                PAGE_EXTRA_REFS[pfn as usize] = 0;
                 FREE_PAGE_COUNT = FREE_PAGE_COUNT.saturating_sub(1);
                 USED_PAGE_COUNT = USED_PAGE_COUNT.saturating_add(1);
 
@@ -237,6 +242,10 @@ pub fn free_page(addr: PhysAddr) {
             return;
         }
 
+        if !drop_page_ref(pfn) {
+            return;
+        }
+
         if cfg!(feature = "musl-ext2-cmd-smoke")
             && DEBUG_TRACKED_PAGE != 0
             && addr.as_u64() == DEBUG_TRACKED_PAGE
@@ -288,6 +297,7 @@ pub fn alloc_pages(count: usize) -> PhysAddr {
             if found {
                 for offset in 0..count {
                     bitmap_set(start + offset);
+                    PAGE_EXTRA_REFS[(start + offset) as usize] = 0;
                 }
                 FREE_PAGE_COUNT = FREE_PAGE_COUNT.saturating_sub(count);
                 USED_PAGE_COUNT = USED_PAGE_COUNT.saturating_add(count);
@@ -359,6 +369,49 @@ pub fn get_stats() -> PmmStats {
             free_bytes: free_pages * PAGE_SIZE,
         }
     }
+}
+
+/// Drop one reference to `pfn`. Returns true when the caller held the last
+/// reference and the frame should be released to the bitmap.
+fn drop_page_ref(pfn: u64) -> bool {
+    if pfn >= PMM_MAX_PAGES {
+        return true;
+    }
+    unsafe {
+        let refs = &mut PAGE_EXTRA_REFS[pfn as usize];
+        if *refs > 0 {
+            *refs -= 1;
+            return false;
+        }
+    }
+    true
+}
+
+/// Record one more mapping of an allocated, PMM-managed page. Returns false
+/// (and changes nothing) for unmanaged or free frames, or when the share count
+/// would overflow; callers must then copy the page instead of sharing it.
+pub fn page_share(addr: PhysAddr) -> bool {
+    let pfn = addr.align_down().to_pfn();
+    if !is_managed(addr) || pfn >= PMM_MAX_PAGES || !bitmap_test(pfn) {
+        return false;
+    }
+    unsafe {
+        let refs = &mut PAGE_EXTRA_REFS[pfn as usize];
+        if *refs == u16::MAX {
+            return false;
+        }
+        *refs += 1;
+    }
+    true
+}
+
+/// True when more than one mapping currently references this page.
+pub fn page_is_shared(addr: PhysAddr) -> bool {
+    let pfn = addr.align_down().to_pfn();
+    if pfn >= PMM_MAX_PAGES {
+        return false;
+    }
+    unsafe { PAGE_EXTRA_REFS[pfn as usize] > 0 }
 }
 
 pub fn is_managed(addr: PhysAddr) -> bool {
@@ -549,6 +602,53 @@ mod tests {
         assert_eq!(stats.total_bytes, 10 * PAGE_SIZE);
         assert_eq!(stats.used_bytes, 4 * PAGE_SIZE);
         assert_eq!(stats.free_bytes, 6 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn page_refs_share_and_drop() {
+        let _guard = lock_tests();
+        unsafe {
+            PMM_BITMAP = [0u8; PMM_BITMAP_SIZE];
+            FIRST_USABLE_PFN = 16;
+            LAST_USABLE_PFN = 64;
+        }
+        let pfn = 20u64;
+        let addr = PhysAddr::new(pfn_to_addr(pfn));
+        unsafe {
+            PAGE_EXTRA_REFS[pfn as usize] = 0;
+        }
+
+        // Free frames and unmanaged frames cannot be shared.
+        assert!(!page_share(addr));
+        assert!(!page_share(PhysAddr::new(pfn_to_addr(2))));
+
+        bitmap_set(pfn);
+        assert!(!page_is_shared(addr));
+        assert!(page_share(addr));
+        assert!(page_share(addr));
+        assert!(page_is_shared(addr));
+
+        // Two extra refs: first two drops keep the frame, third releases it.
+        assert!(!drop_page_ref(pfn));
+        assert!(!drop_page_ref(pfn));
+        assert!(!page_is_shared(addr));
+        assert!(drop_page_ref(pfn));
+    }
+
+    #[test]
+    fn page_share_refuses_overflow() {
+        let _guard = lock_tests();
+        unsafe {
+            PMM_BITMAP = [0u8; PMM_BITMAP_SIZE];
+            FIRST_USABLE_PFN = 16;
+            LAST_USABLE_PFN = 64;
+            PAGE_EXTRA_REFS[30] = u16::MAX;
+        }
+        bitmap_set(30);
+        assert!(!page_share(PhysAddr::new(pfn_to_addr(30))));
+        unsafe {
+            PAGE_EXTRA_REFS[30] = 0;
+        }
     }
 
     #[test]

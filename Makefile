@@ -32,6 +32,7 @@ USER_MUSL_EXT2_QUICKJS_SMOKE_ELF := user/musl_execve_ext2_quickjs_smoke.elf
 USER_MUSL_EXT2_MICROPYTHON_SMOKE_ELF := user/musl_execve_ext2_micropython_smoke.elf
 USER_MUSL_EXT2_DROPBEAR_SMOKE_ELF := user/musl_execve_ext2_dropbear_smoke.elf
 USER_MUSL_EXT2_FPU_SMOKE_ELF := user/musl_execve_ext2_fpu_smoke.elf
+USER_MUSL_EXT2_PROC_SMOKE_ELF := user/musl_execve_ext2_proc_smoke.elf
 USER_UNIX_RIGHTS_SMOKE_BIN := user/unix_rights_smoke.elf
 USER_EPOLL_COMPOSITOR_SMOKE_BIN := user/epoll_compositor_smoke.elf
 USER_SHARED_BUFFER_RIGHTS_SMOKE_BIN := user/shared_buffer_rights_smoke.elf
@@ -39,6 +40,7 @@ USER_GUI_COMPOSITOR_SMOKE_BIN := user/gui_compositor_smoke.elf
 USER_PEET_GUI_COMPOSITOR_SMOKE_BIN := user/peet_gui_compositor_smoke.elf
 USER_PEET_SHELL_DEMO_BIN := user/peet_shell_demo.elf
 USER_FPU_CONTEXT_SMOKE_BIN := user/fpu_context_smoke.elf
+USER_PROC_MODEL_SMOKE_BIN := user/proc_model_smoke.elf
 USER_EXT2_MUSL_IMG := user/sample_ext2_musl.img
 USER_QUICKJS_BIN := user/qjs
 USER_MICROPYTHON_BIN := user/micropython
@@ -145,7 +147,11 @@ ifneq ($(findstring musl-ext2-fpu-smoke,$(KERNEL_FEATURES)),)
 USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_FPU_CONTEXT_SMOKE_BIN)
 endif
 
-.PHONY: all image bootloader kernel user user-elf user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke user-musl-ext2-unix-rights-smoke user-musl-ext2-epoll-smoke user-musl-ext2-gui-smoke user-musl-ext2-gui-demo user-musl-ext2-shared-buffer-smoke user-musl-ext2-console-first-smoke user-musl-ext2-peet-gui-smoke user-musl-ext2-peet-shell-demo user-musl-ext2-quickjs-smoke user-musl-ext2-micropython-smoke user-musl-ext2-dropbear-smoke user-musl-ext2-fpu-smoke clean run run-current run-image run-tablet run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke run-unix-rights-smoke run-epoll-smoke run-gui-smoke run-gui-demo run-shared-buffer-smoke run-console-first-smoke run-gui-fallback-smoke run-peet-gui-smoke run-peet-shell-demo run-peet-shell-demo-smoke run-quickjs-smoke run-micropython-smoke run-dropbear-smoke run-fpu-smoke test ext2-image \
+ifneq ($(findstring musl-ext2-proc-smoke,$(KERNEL_FEATURES)),)
+USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_PROC_MODEL_SMOKE_BIN)
+endif
+
+.PHONY: all image bootloader kernel user user-elf user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke user-musl-ext2-unix-rights-smoke user-musl-ext2-epoll-smoke user-musl-ext2-gui-smoke user-musl-ext2-gui-demo user-musl-ext2-shared-buffer-smoke user-musl-ext2-console-first-smoke user-musl-ext2-peet-gui-smoke user-musl-ext2-peet-shell-demo user-musl-ext2-quickjs-smoke user-musl-ext2-micropython-smoke user-musl-ext2-dropbear-smoke user-musl-ext2-fpu-smoke user-musl-ext2-proc-smoke clean run run-current run-image run-tablet run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke run-unix-rights-smoke run-epoll-smoke run-gui-smoke run-gui-demo run-shared-buffer-smoke run-console-first-smoke run-gui-fallback-smoke run-peet-gui-smoke run-peet-shell-demo run-peet-shell-demo-smoke run-quickjs-smoke run-micropython-smoke run-dropbear-smoke run-fpu-smoke run-proc-smoke test ext2-image \
 	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
 	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info \
 	quickjs-fetch quickjs quickjs-clean quickjs-distclean quickjs-info \
@@ -244,6 +250,12 @@ $(USER_MUSL_EXT2_FPU_SMOKE_ELF): user/musl_execve_ext2_fpu_smoke.c $(USER_MUSL_S
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
 
 $(USER_FPU_CONTEXT_SMOKE_BIN): user/fpu_context_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
+	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
+
+$(USER_MUSL_EXT2_PROC_SMOKE_ELF): user/musl_execve_ext2_proc_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
+	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
+
+$(USER_PROC_MODEL_SMOKE_BIN): user/proc_model_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
 
 $(USER_UNIX_RIGHTS_SMOKE_BIN): user/unix_rights_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
@@ -375,6 +387,12 @@ else
 KERNEL_MUSL_EXT2_FPU_SMOKE_DEP :=
 endif
 
+ifneq ($(findstring musl-ext2-proc-smoke,$(KERNEL_FEATURES)),)
+KERNEL_MUSL_EXT2_PROC_SMOKE_DEP := $(USER_MUSL_EXT2_PROC_SMOKE_ELF) $(USER_PROC_MODEL_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
+else
+KERNEL_MUSL_EXT2_PROC_SMOKE_DEP :=
+endif
+
 user: user-elf $(USER_EXT2_IMG)
 
 # Default-build embedded user binaries (needed by `cargo test -p kernel`).
@@ -396,10 +414,12 @@ user-musl-ext2-quickjs-smoke: $(USER_MUSL_EXT2_QUICKJS_SMOKE_ELF) $(USER_QUICKJS
 user-musl-ext2-micropython-smoke: $(USER_MUSL_EXT2_MICROPYTHON_SMOKE_ELF) $(USER_MICROPYTHON_BIN) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-dropbear-smoke: $(USER_MUSL_EXT2_DROPBEAR_SMOKE_ELF) $(USER_DROPBEAR_BIN) $(USER_DROPBEARKEY_BIN) $(USER_DROPBEAR_HOSTKEY) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-fpu-smoke: $(USER_MUSL_EXT2_FPU_SMOKE_ELF) $(USER_FPU_CONTEXT_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
+user-musl-ext2-proc-smoke: $(USER_MUSL_EXT2_PROC_SMOKE_ELF) $(USER_PROC_MODEL_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
 
-kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PING_SMOKE_DEP) $(KERNEL_MUSL_EXT2_UNIX_RIGHTS_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EPOLL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_SHARED_BUFFER_SMOKE_DEP) $(KERNEL_MUSL_EXT2_CONSOLE_FIRST_SMOKE_DEP) $(KERNEL_MUSL_EXT2_GUI_SMOKE_DEP) $(KERNEL_MUSL_EXT2_GUI_DEMO_DEP) $(KERNEL_MUSL_EXT2_PEET_GUI_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PEET_SHELL_DEMO_DEP) $(KERNEL_MUSL_EXT2_QUICKJS_SMOKE_DEP) $(KERNEL_MUSL_EXT2_MICROPYTHON_SMOKE_DEP) $(KERNEL_MUSL_EXT2_DROPBEAR_SMOKE_DEP) $(KERNEL_MUSL_EXT2_FPU_SMOKE_DEP)
+kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PING_SMOKE_DEP) $(KERNEL_MUSL_EXT2_UNIX_RIGHTS_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EPOLL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_SHARED_BUFFER_SMOKE_DEP) $(KERNEL_MUSL_EXT2_CONSOLE_FIRST_SMOKE_DEP) $(KERNEL_MUSL_EXT2_GUI_SMOKE_DEP) $(KERNEL_MUSL_EXT2_GUI_DEMO_DEP) $(KERNEL_MUSL_EXT2_PEET_GUI_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PEET_SHELL_DEMO_DEP) $(KERNEL_MUSL_EXT2_QUICKJS_SMOKE_DEP) $(KERNEL_MUSL_EXT2_MICROPYTHON_SMOKE_DEP) $(KERNEL_MUSL_EXT2_DROPBEAR_SMOKE_DEP) $(KERNEL_MUSL_EXT2_FPU_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PROC_SMOKE_DEP)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@case " $(KERNEL_FEATURES) " in \
+		*" musl-ext2-proc-smoke "*) init_dep="musl_execve_ext2_proc_smoke.elf" ;; \
 		*" musl-ext2-fpu-smoke "*) init_dep="musl_execve_ext2_fpu_smoke.elf" ;; \
 		*" musl-ext2-dropbear-smoke "*) init_dep="musl_execve_ext2_dropbear_smoke.elf" ;; \
 		*" musl-ext2-micropython-smoke "*) init_dep="musl_execve_ext2_micropython_smoke.elf" ;; \
@@ -629,6 +649,9 @@ run-dropbear-smoke:
 
 run-fpu-smoke:
 	scripts/run_toybox_fpu_smoke.sh
+
+run-proc-smoke:
+	scripts/run_toybox_proc_smoke.sh
 
 test:
 	@tests/run.sh

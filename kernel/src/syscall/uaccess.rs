@@ -42,6 +42,14 @@ pub(super) fn copy_user_bytes(
         let page_off = (vaddr & (PAGE_SIZE - 1)) as usize;
         let bytes_in_page = cmp::min(remaining, PAGE_SIZE as usize - page_off);
 
+        // Writes go through the physical map, which bypasses the hardware
+        // write-protection COW relies on: break sharing first.
+        if to_user
+            && vmm::resolve_cow_in(pml4, VirtAddr::new(page_vaddr)) == vmm::CowResolve::NoMemory
+        {
+            return Err(ENOMEM);
+        }
+
         let page_phys = match vmm::get_physical_in(pml4, VirtAddr::new(page_vaddr)) {
             Some(phys) => phys,
             None => return Err(EFAULT),

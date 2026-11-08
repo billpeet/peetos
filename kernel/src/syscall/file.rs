@@ -28,7 +28,7 @@ pub(super) fn resolve_dir_inode(ctx: &SyscallContext, dirfd: i32) -> Result<u16,
         if ctx.current.is_null() {
             return Err(-ESRCH);
         }
-        return Ok(unsafe { (*ctx.current).user_cwd_inode });
+        return Ok(unsafe { (*crate::task::leader_of(ctx.current)).user_cwd_inode });
     }
 
     let idx = fd_index(dirfd)?;
@@ -38,8 +38,8 @@ pub(super) fn resolve_dir_inode(ctx: &SyscallContext, dirfd: i32) -> Result<u16,
 
     let (kind, inode) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
@@ -71,8 +71,8 @@ pub(super) fn resolve_vfs_fd_inode(ctx: &SyscallContext, fd: i32) -> Result<u16,
     }
     let (kind, inode) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
@@ -219,7 +219,7 @@ pub(super) fn build_cwd_path(
     if task_ptr.is_null() {
         return Err(-ESRCH);
     }
-    let cwd = unsafe { (*task_ptr).user_cwd_inode };
+    let cwd = unsafe { (*crate::task::leader_of(task_ptr)).user_cwd_inode };
     if cwd == fs::root_inode() {
         path_buf[0] = b'/';
         return Ok(1);
@@ -279,7 +279,7 @@ pub(super) fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     // /dev/tty → route to controlling terminal
     if opened.is_tty {
-        let ctty_type = unsafe { (*ctx.current).ctty_type };
+        let ctty_type = unsafe { (*crate::task::leader_of(ctx.current)).ctty_type };
         return match ctty_type {
             task::CTTY_CONSOLE => {
                 match fd_alloc(ctx.current, task::USER_FD_KIND_CONSOLE, 0, fd_flags) {
@@ -288,7 +288,7 @@ pub(super) fn sys_openat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 }
             }
             task::CTTY_PTY => {
-                let pty_id = unsafe { (*ctx.current).ctty_id };
+                let pty_id = unsafe { (*crate::task::leader_of(ctx.current)).ctty_id };
                 if crate::pty::is_in_use(pty_id) {
                     if let Err(e) = crate::pty::slave_open(pty_id) {
                         return e as i64;
@@ -400,7 +400,7 @@ pub(super) fn sys_access_common(ctx: &SyscallContext, dirfd: i32, pathname: u64,
         Err(err) => return -fs_to_errno(err),
     };
 
-    let (uid, gid) = unsafe { ((*ctx.current).user_uid, (*ctx.current).user_gid) };
+    let (uid, gid) = unsafe { ((*crate::task::leader_of(ctx.current)).user_uid, (*crate::task::leader_of(ctx.current)).user_gid) };
     if access_allowed(&stat, mode, uid, gid) {
         0
     } else {
@@ -441,7 +441,7 @@ pub(super) fn sys_chdir(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     match fs::inode_is_dir(inode) {
         Ok(true) => {
             unsafe {
-                (*ctx.current).user_cwd_inode = inode;
+                (*crate::task::leader_of(ctx.current)).user_cwd_inode = inode;
             }
             0
         }
@@ -456,7 +456,7 @@ pub(super) fn sys_fchdir(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => return err,
     };
     unsafe {
-        (*ctx.current).user_cwd_inode = inode;
+        (*crate::task::leader_of(ctx.current)).user_cwd_inode = inode;
     }
     0
 }
@@ -957,8 +957,8 @@ pub(super) fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
     if kind == task::USER_FD_KIND_PIPE {
@@ -1067,9 +1067,9 @@ pub(super) fn sys_getdents64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode, mut offset) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
-            (*ctx.current).user_fd_offset[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_offset[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
@@ -1129,7 +1129,7 @@ pub(super) fn sys_getdents64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     unsafe {
-        (*ctx.current).user_fd_offset[idx] = offset;
+        (*crate::task::leader_of(ctx.current)).user_fd_offset[idx] = offset;
     }
     total as i64
 }
@@ -1228,8 +1228,8 @@ pub(super) fn sys_ftruncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
@@ -1347,8 +1347,8 @@ pub(super) fn sys_fstatfs(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
@@ -1384,8 +1384,8 @@ pub(super) fn sys_fchmod(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
@@ -1419,8 +1419,8 @@ pub(super) fn sys_fchown(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
     if kind != task::USER_FD_KIND_VFS {
@@ -1501,8 +1501,8 @@ pub(super) fn sys_fsync(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     let (kind, inode) = unsafe {
         (
-            (*ctx.current).user_fd_kind[idx],
-            (*ctx.current).user_fd_inode[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_kind[idx],
+            (*crate::task::leader_of(ctx.current)).user_fd_inode[idx],
         )
     };
     if kind == task::USER_FD_KIND_VFS {

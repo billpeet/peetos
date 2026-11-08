@@ -317,7 +317,7 @@ pub fn shm_attach(task: *mut Task, shmid: i32, addr: u64, flags: i32) -> Result<
     let mut attach_slot = None;
     let mut idx = 0usize;
     while idx < MAX_TASK_SHM_ATTACH {
-        if unsafe { (*task).user_shm_id[idx] == 0 } {
+        if unsafe { (*crate::task::leader_of(task)).user_shm_id[idx] == 0 } {
             attach_slot = Some(idx);
             break;
         }
@@ -359,10 +359,10 @@ pub fn shm_attach(task: *mut Task, shmid: i32, addr: u64, flags: i32) -> Result<
     map_segment_pages(pml4, chosen_addr, &seg, (flags & SHM_RDONLY) != 0)?;
 
     unsafe {
-        (*task).user_shm_id[attach_slot] = shmid;
-        (*task).user_shm_addr[attach_slot] = chosen_addr;
-        (*task).user_shm_size[attach_slot] = seg.num_pages as u64 * PAGE_SIZE;
-        (*task).user_shm_flags[attach_slot] = flags as u32;
+        (*crate::task::leader_of(task)).user_shm_id[attach_slot] = shmid;
+        (*crate::task::leader_of(task)).user_shm_addr[attach_slot] = chosen_addr;
+        (*crate::task::leader_of(task)).user_shm_size[attach_slot] = seg.num_pages as u64 * PAGE_SIZE;
+        (*crate::task::leader_of(task)).user_shm_flags[attach_slot] = flags as u32;
     }
 
     if state.segments[seg_idx].ref_count < u16::MAX {
@@ -381,7 +381,7 @@ pub fn shm_detach(task: *mut Task, addr: u64) -> Result<(), i64> {
     let mut idx = 0usize;
     while idx < MAX_TASK_SHM_ATTACH {
         let is_match =
-            unsafe { (*task).user_shm_id[idx] != 0 && (*task).user_shm_addr[idx] == addr };
+            unsafe { (*crate::task::leader_of(task)).user_shm_id[idx] != 0 && (*crate::task::leader_of(task)).user_shm_addr[idx] == addr };
         if is_match {
             found_slot = Some(idx);
             break;
@@ -396,18 +396,18 @@ pub fn shm_detach(task: *mut Task, addr: u64) -> Result<(), i64> {
 
     let (shmid, vaddr, size, pml4) = unsafe {
         (
-            (*task).user_shm_id[slot],
-            (*task).user_shm_addr[slot],
-            (*task).user_shm_size[slot],
+            (*crate::task::leader_of(task)).user_shm_id[slot],
+            (*crate::task::leader_of(task)).user_shm_addr[slot],
+            (*crate::task::leader_of(task)).user_shm_size[slot],
             PhysAddr::new((*task).pml4_phys),
         )
     };
 
     unsafe {
-        (*task).user_shm_id[slot] = 0;
-        (*task).user_shm_addr[slot] = 0;
-        (*task).user_shm_size[slot] = 0;
-        (*task).user_shm_flags[slot] = 0;
+        (*crate::task::leader_of(task)).user_shm_id[slot] = 0;
+        (*crate::task::leader_of(task)).user_shm_addr[slot] = 0;
+        (*crate::task::leader_of(task)).user_shm_size[slot] = 0;
+        (*crate::task::leader_of(task)).user_shm_flags[slot] = 0;
     }
 
     if pml4.as_u64() != 0 {
@@ -440,6 +440,80 @@ pub fn shm_ctl(shmid: i32, cmd: i32) -> Result<(), i64> {
     Ok(())
 }
 
+/// True if `addr` lies inside one of `task`'s attachments.
+pub fn task_attachment_contains(task: *mut Task, addr: u64) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    let mut idx = 0usize;
+    while idx < MAX_TASK_SHM_ATTACH {
+        let (id, start, size) = unsafe {
+            (
+                (*crate::task::leader_of(task)).user_shm_id[idx],
+                (*crate::task::leader_of(task)).user_shm_addr[idx],
+                (*crate::task::leader_of(task)).user_shm_size[idx],
+            )
+        };
+        if id != 0 && addr >= start && addr < start.saturating_add(size) {
+            return true;
+        }
+        idx += 1;
+    }
+    false
+}
+
+/// Give a freshly forked `child` the same attachments as `parent`, mapping
+/// the shared segment pages into the child's address space (fork must not
+/// turn shm into private copy-on-write memory).
+pub fn fork_attachments(parent: *mut Task, child: *mut Task) -> Result<(), i64> {
+    if parent.is_null() || child.is_null() {
+        return Err(EINVAL);
+    }
+    let child_pml4 = unsafe { PhysAddr::new((*child).pml4_phys) };
+    if child_pml4.as_u64() == 0 {
+        return Err(EINVAL);
+    }
+
+    let mut idx = 0usize;
+    while idx < MAX_TASK_SHM_ATTACH {
+        let (shmid, addr, size, flags) = unsafe {
+            (
+                (*crate::task::leader_of(parent)).user_shm_id[idx],
+                (*crate::task::leader_of(parent)).user_shm_addr[idx],
+                (*crate::task::leader_of(parent)).user_shm_size[idx],
+                (*crate::task::leader_of(parent)).user_shm_flags[idx],
+            )
+        };
+        idx += 1;
+        if shmid == 0 {
+            continue;
+        }
+
+        let mut state = SHM_STATE.lock();
+        let seg_idx = match find_by_id_locked(&state, shmid) {
+            Some(seg_idx) => seg_idx,
+            None => continue,
+        };
+        let seg = state.segments[seg_idx];
+        map_segment_pages(
+            child_pml4,
+            addr,
+            &seg,
+            (flags as i32 & SHM_RDONLY) != 0,
+        )?;
+        unsafe {
+            (*crate::task::leader_of(child)).user_shm_id[idx - 1] = shmid;
+            (*crate::task::leader_of(child)).user_shm_addr[idx - 1] = addr;
+            (*crate::task::leader_of(child)).user_shm_size[idx - 1] = size;
+            (*crate::task::leader_of(child)).user_shm_flags[idx - 1] = flags;
+        }
+        if state.segments[seg_idx].ref_count < u16::MAX {
+            state.segments[seg_idx].ref_count += 1;
+        }
+    }
+    Ok(())
+}
+
 pub fn cleanup_task(task: *mut Task) {
     if task.is_null() {
         return;
@@ -447,7 +521,7 @@ pub fn cleanup_task(task: *mut Task) {
 
     let mut idx = 0usize;
     while idx < MAX_TASK_SHM_ATTACH {
-        let addr = unsafe { (*task).user_shm_addr[idx] };
+        let addr = unsafe { (*crate::task::leader_of(task)).user_shm_addr[idx] };
         if addr != 0 {
             let _ = shm_detach(task, addr);
         }
@@ -502,11 +576,48 @@ mod tests {
 
         let addr = shm_attach(task_ptr, shmid, 0, 0).expect("attach");
         assert_eq!(addr, SHM_AUTO_BASE);
-        assert_eq!(unsafe { (*task_ptr).user_shm_id[0] }, shmid);
+        assert_eq!(unsafe { (*crate::task::leader_of(task_ptr)).user_shm_id[0] }, shmid);
 
         shm_ctl(shmid, IPC_RMID).expect("mark remove");
         assert!(shm_detach(task_ptr, addr).is_ok());
-        assert_eq!(unsafe { (*task_ptr).user_shm_id[0] }, 0);
+        assert_eq!(unsafe { (*crate::task::leader_of(task_ptr)).user_shm_id[0] }, 0);
         assert_eq!(shm_attach(task_ptr, shmid, 0, 0).unwrap_err(), ENOENT);
+    }
+
+    #[test]
+    fn fork_attachments_shares_segment_with_child() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let shmid = shm_get(123, PAGE_SIZE, IPC_CREAT).expect("create segment");
+
+        let mut parent = task::Task::for_test(1);
+        parent.flags = task::TASK_FLAG_USER;
+        parent.pml4_phys = 0x1000;
+        let parent_ptr = &mut parent as *mut task::Task;
+        let mut child = task::Task::for_test(2);
+        child.flags = task::TASK_FLAG_USER;
+        child.pml4_phys = 0x2000;
+        let child_ptr = &mut child as *mut task::Task;
+
+        let addr = shm_attach(parent_ptr, shmid, 0, SHM_RDONLY).expect("attach");
+        assert!(task_attachment_contains(parent_ptr, addr));
+        assert!(task_attachment_contains(parent_ptr, addr + PAGE_SIZE - 1));
+        assert!(!task_attachment_contains(parent_ptr, addr + PAGE_SIZE));
+
+        fork_attachments(parent_ptr, child_ptr).expect("fork attachments");
+        assert_eq!(child.user_shm_id[0], shmid);
+        assert_eq!(child.user_shm_addr[0], addr);
+        assert_eq!(child.user_shm_flags[0], SHM_RDONLY as u32);
+
+        // The segment survives until both processes detach.
+        shm_ctl(shmid, IPC_RMID).expect("mark remove");
+        shm_detach(parent_ptr, addr).expect("parent detach");
+        {
+            let state = SHM_STATE.lock();
+            assert!(find_by_id_locked(&state, shmid).is_some());
+        }
+        shm_detach(child_ptr, addr).expect("child detach");
+        let state = SHM_STATE.lock();
+        assert!(find_by_id_locked(&state, shmid).is_none());
     }
 }

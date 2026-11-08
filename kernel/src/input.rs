@@ -553,9 +553,14 @@ pub fn read_device(
         }
 
         block_current("input-read");
-        let mut state = INPUT_STATE.lock();
-        if let Some(queue) = state.queue_mut(device_id) {
-            queue.remove_waiter(task);
+        {
+            let mut state = INPUT_STATE.lock();
+            if let Some(queue) = state.queue_mut(device_id) {
+                queue.remove_waiter(task);
+            }
+        }
+        if crate::signal::must_abort_wait(task) {
+            return Err(EAGAIN);
         }
     }
 }

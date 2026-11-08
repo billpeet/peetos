@@ -58,7 +58,8 @@ Key functions:
 - `get_physical()`, `get_physical_in()` and `is_mapped()`
 - `set_flags()`
 - `create_address_space()`, `destroy_address_space()`
-- `clone_user_space()` and `clear_user_space()`
+- `clone_user_space()` (copy-on-write fork clone with a skip predicate) and `clear_user_space()`
+- `resolve_cow_in()` breaks copy-on-write sharing for one page; `cow_share_pte()` / `cow_adjust_flags()` are the pure PTE rules (see `docs/process_model.md`)
 - `switch()` and `invalidate_page()`
 
 RAII support:
@@ -66,7 +67,7 @@ RAII support:
 
 Limitations / Simplifications
 - Only 4 KB mappings are created; large pages are detected but not allocated.
-- Page table allocation is simple and not reference-counted; `destroy_address_space` only frees the PML4.
+- Page table allocation is simple and not reference-counted; `destroy_address_space` only frees the PML4. Data frames carry a 16-bit PMM share count for copy-on-write; page-table frames are never shared.
 - No TLB shootdown across CPUs, PCID, or advanced address-space isolation features.
 
 **Kernel Heap (kmalloc)**

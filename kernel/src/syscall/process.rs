@@ -94,6 +94,22 @@ pub(super) fn read_exec_image_from_inode(inode: u16) -> Result<ExecImage, i64> {
     Ok(image)
 }
 
+/// execve replaces the whole process, so the other threads must go first.
+/// Only the thread group leader may exec while other threads are alive (the
+/// kernel does not move the process id to another thread).
+pub(super) fn exec_prepare_thread_group(ctx: &SyscallContext) -> Result<(), i64> {
+    let current = ctx.current;
+    let tgid = unsafe { (*current).tgid };
+    if task::live_threads_in_group(tgid) <= 1 {
+        return Ok(());
+    }
+    if task::leader_of(current) != current {
+        return Err(-EINVAL);
+    }
+    kill_other_threads(current, 0);
+    Ok(())
+}
+
 pub(super) fn execve_common(
     ctx: &SyscallContext,
     filename_ptr: u64,
@@ -108,6 +124,7 @@ pub(super) fn execve_common(
     if path.len() + 1 > fs::VFS_MAX_PATH {
         return Err(-EINVAL);
     }
+    exec_prepare_thread_group(ctx)?;
 
     let argv_buf_size = size_of::<ExecCString>() * EXEC_MAX_ARGV;
     let argv_buf_ptr = heap::kmalloc(argv_buf_size) as *mut ExecCString;
@@ -205,6 +222,7 @@ pub(super) fn fork_cleanup_child(task_ptr: *mut task::Task) {
     mmap_clear_task_regions(task_ptr);
     close_all_fds(task_ptr);
     epoll_drop_watches_for_owner(owner_pid);
+    shm::cleanup_task(task_ptr);
     teardown_user_address_space(task_ptr);
     task::task_destroy(task_ptr);
 }
@@ -214,18 +232,18 @@ pub(super) fn clone_parent_fds_for_child(
     child: *mut task::Task,
 ) -> Result<(), i64> {
     unsafe {
-        (*child).user_fd_kind = (*parent).user_fd_kind;
-        (*child).user_fd_inode = (*parent).user_fd_inode;
-        (*child).user_fd_offset = (*parent).user_fd_offset;
-        (*child).user_fd_flags = (*parent).user_fd_flags;
+        (*crate::task::leader_of(child)).user_fd_kind = (*crate::task::leader_of(parent)).user_fd_kind;
+        (*crate::task::leader_of(child)).user_fd_inode = (*crate::task::leader_of(parent)).user_fd_inode;
+        (*crate::task::leader_of(child)).user_fd_offset = (*crate::task::leader_of(parent)).user_fd_offset;
+        (*crate::task::leader_of(child)).user_fd_flags = (*crate::task::leader_of(parent)).user_fd_flags;
     }
 
     for idx in 0..task::MAX_TASK_FDS {
         let (kind, inode, flags) = unsafe {
             (
-                (*child).user_fd_kind[idx],
-                (*child).user_fd_inode[idx],
-                (*child).user_fd_flags[idx],
+                (*crate::task::leader_of(child)).user_fd_kind[idx],
+                (*crate::task::leader_of(child)).user_fd_inode[idx],
+                (*crate::task::leader_of(child)).user_fd_flags[idx],
             )
         };
         if kind == task::USER_FD_KIND_PIPE && inode != task::USER_FD_NONE {
@@ -253,11 +271,16 @@ pub(super) fn clone_parent_fds_for_child(
 pub(super) fn create_fork_child(
     ctx: &SyscallContext,
     child_frame: &InterruptFrame,
+    req: &CloneRequest,
 ) -> Result<i64, i64> {
+    if req.is_thread() {
+        return create_thread_child(ctx, child_frame, req);
+    }
     let parent = ctx.current;
     if parent.is_null() {
         return Err(-ESRCH);
     }
+    reap_exited_threads();
     let parent_pml4 = unsafe { PhysAddr::new((*parent).pml4_phys) };
     if parent_pml4.as_u64() == 0 {
         return Err(-EINVAL);
@@ -273,7 +296,23 @@ pub(super) fn create_fork_child(
         task::task_destroy(child);
         return Err(-ENOMEM);
     }
-    if vmm::clone_user_space(parent_pml4, child_pml4) != 0 {
+    // Shared file mappings, device mappings and shm stay shared after fork:
+    // keep them out of the COW clone. The child refaults file/device pages
+    // from the inherited mapping metadata and re-attaches shm below.
+    let parent_regions = mmap_prepare_task_slot(parent)
+        .map(|slot| unsafe { TASK_VM_MAPPINGS[slot] })
+        .unwrap_or([VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK]);
+    let skip_shared = |virt: u64| -> bool {
+        if let Some(region) = mmap_regions_find_mapping(&parent_regions, virt) {
+            if mmap_mapping_is_framebuffer(&region)
+                || (region.map_shared && region.file_inode != task::USER_FD_NONE)
+            {
+                return true;
+            }
+        }
+        shm::task_attachment_contains(parent, virt)
+    };
+    if vmm::clone_user_space(parent_pml4, child_pml4, &skip_shared) != 0 {
         vmm::clear_user_space(child_pml4);
         vmm::destroy_address_space(child_pml4);
         task::task_destroy(child);
@@ -283,54 +322,69 @@ pub(super) fn create_fork_child(
     unsafe {
         (*child).pml4_phys = child_pml4.as_u64();
 
-        (*child).user_entry = (*parent).user_entry;
-        (*child).user_stack_bottom = (*parent).user_stack_bottom;
-        (*child).user_stack_top = (*parent).user_stack_top;
-        (*child).user_stack_ptr = (*parent).user_stack_ptr;
-        (*child).user_argc = (*parent).user_argc;
-        (*child).user_argv = (*parent).user_argv;
-        (*child).user_envp = (*parent).user_envp;
-        (*child).user_auxv = (*parent).user_auxv;
+        (*crate::task::leader_of(child)).user_entry = (*crate::task::leader_of(parent)).user_entry;
+        (*crate::task::leader_of(child)).user_stack_bottom = (*crate::task::leader_of(parent)).user_stack_bottom;
+        (*crate::task::leader_of(child)).user_stack_top = (*crate::task::leader_of(parent)).user_stack_top;
+        (*crate::task::leader_of(child)).user_stack_ptr = (*crate::task::leader_of(parent)).user_stack_ptr;
+        (*crate::task::leader_of(child)).user_argc = (*crate::task::leader_of(parent)).user_argc;
+        (*crate::task::leader_of(child)).user_argv = (*crate::task::leader_of(parent)).user_argv;
+        (*crate::task::leader_of(child)).user_envp = (*crate::task::leader_of(parent)).user_envp;
+        (*crate::task::leader_of(child)).user_auxv = (*crate::task::leader_of(parent)).user_auxv;
         (*child).user_fs_base = (*parent).user_fs_base;
         // The parent is the running task, so the live registers are its
         // user FPU/SSE state; the child resumes with an identical copy.
         (*child).fpu.save();
         (*child).user_clear_tid = 0;
-        (*child).user_brk_start = (*parent).user_brk_start;
-        (*child).user_brk = (*parent).user_brk;
-        (*child).user_phdr_addr = (*parent).user_phdr_addr;
-        (*child).user_phdr_count = (*parent).user_phdr_count;
-        (*child).user_phdr_size = (*parent).user_phdr_size;
-        (*child).user_base_addr = (*parent).user_base_addr;
-        (*child).user_interp_base = (*parent).user_interp_base;
-        (*child).user_is_dynamic = (*parent).user_is_dynamic;
-        (*child).user_uid = (*parent).user_uid;
-        (*child).user_gid = (*parent).user_gid;
-        (*child).user_cwd_inode = (*parent).user_cwd_inode;
-        (*child).pgid = (*parent).pgid;
-        (*child).sid = (*parent).sid;
-        (*child).ctty_type = (*parent).ctty_type;
-        (*child).ctty_id = (*parent).ctty_id;
-        (*child).signal_handlers = (*parent).signal_handlers;
-        (*child).signal_flags = (*parent).signal_flags;
-        (*child).signal_mask_saved = (*parent).signal_mask_saved;
-        (*child).signal_restorer = (*parent).signal_restorer;
+        (*crate::task::leader_of(child)).user_brk_start = (*crate::task::leader_of(parent)).user_brk_start;
+        (*crate::task::leader_of(child)).user_brk = (*crate::task::leader_of(parent)).user_brk;
+        (*crate::task::leader_of(child)).user_phdr_addr = (*crate::task::leader_of(parent)).user_phdr_addr;
+        (*crate::task::leader_of(child)).user_phdr_count = (*crate::task::leader_of(parent)).user_phdr_count;
+        (*crate::task::leader_of(child)).user_phdr_size = (*crate::task::leader_of(parent)).user_phdr_size;
+        (*crate::task::leader_of(child)).user_base_addr = (*crate::task::leader_of(parent)).user_base_addr;
+        (*crate::task::leader_of(child)).user_interp_base = (*crate::task::leader_of(parent)).user_interp_base;
+        (*crate::task::leader_of(child)).user_is_dynamic = (*crate::task::leader_of(parent)).user_is_dynamic;
+        (*crate::task::leader_of(child)).user_uid = (*crate::task::leader_of(parent)).user_uid;
+        (*crate::task::leader_of(child)).user_gid = (*crate::task::leader_of(parent)).user_gid;
+        (*crate::task::leader_of(child)).user_cwd_inode = (*crate::task::leader_of(parent)).user_cwd_inode;
+        (*crate::task::leader_of(child)).pgid = (*crate::task::leader_of(parent)).pgid;
+        (*crate::task::leader_of(child)).sid = (*crate::task::leader_of(parent)).sid;
+        (*crate::task::leader_of(child)).ctty_type = (*crate::task::leader_of(parent)).ctty_type;
+        (*crate::task::leader_of(child)).ctty_id = (*crate::task::leader_of(parent)).ctty_id;
+        (*crate::task::leader_of(child)).signal_handlers = (*crate::task::leader_of(parent)).signal_handlers;
+        (*crate::task::leader_of(child)).signal_flags = (*crate::task::leader_of(parent)).signal_flags;
+        (*crate::task::leader_of(child)).signal_mask_saved = (*crate::task::leader_of(parent)).signal_mask_saved;
+        (*crate::task::leader_of(child)).signal_restorer = (*crate::task::leader_of(parent)).signal_restorer;
         (*child).signal_blocked = (*parent).signal_blocked;
         (*child).sig_pending = 0;
-        (*child).user_shm_id = [0; task::MAX_TASK_SHM_ATTACH];
-        (*child).user_shm_addr = [0; task::MAX_TASK_SHM_ATTACH];
-        (*child).user_shm_size = [0; task::MAX_TASK_SHM_ATTACH];
-        (*child).user_shm_flags = [0; task::MAX_TASK_SHM_ATTACH];
+        (*crate::task::leader_of(child)).user_shm_id = [0; task::MAX_TASK_SHM_ATTACH];
+        (*crate::task::leader_of(child)).user_shm_addr = [0; task::MAX_TASK_SHM_ATTACH];
+        (*crate::task::leader_of(child)).user_shm_size = [0; task::MAX_TASK_SHM_ATTACH];
+        (*crate::task::leader_of(child)).user_shm_flags = [0; task::MAX_TASK_SHM_ATTACH];
     }
 
-    mmap_clone_task_regions(parent, child)?;
-    mmap_fork_reconcile_shared_file_mappings(child)?;
+    if let Err(err) = mmap_clone_task_regions(parent, child) {
+        fork_cleanup_child(child);
+        return Err(err);
+    }
+    if let Err(err) = shm::fork_attachments(parent, child) {
+        fork_cleanup_child(child);
+        return Err(-shm_to_errno(err));
+    }
 
     if let Err(err) = clone_parent_fds_for_child(parent, child) {
         fork_cleanup_child(child);
         return Err(err);
     }
+    if let Err(err) = apply_clone_tid_flags(parent, child, req) {
+        fork_cleanup_child(child);
+        return Err(err);
+    }
 
+    start_cloned_task(child, child_frame);
+    Ok(unsafe { (*child).pid as i64 })
+}
+
+pub(super) fn start_cloned_task(child: *mut task::Task, child_frame: &InterruptFrame) {
     unsafe {
         let mut frame_addr = (*child).kernel_stack_top - size_of::<InterruptFrame>() as u64;
         frame_addr &= !0xF;
@@ -339,8 +393,73 @@ pub(super) fn create_fork_child(
         (*child).saved_rsp = frame_addr;
         (*child).state = TaskState::Ready;
     }
-
     crate::sched::add_task(child);
+}
+
+/// Handle CLONE_SETTLS / CLONE_*_SETTID / CLONE_CHILD_CLEARTID for a new task.
+pub(super) fn apply_clone_tid_flags(
+    parent: *mut task::Task,
+    child: *mut task::Task,
+    req: &CloneRequest,
+) -> Result<(), i64> {
+    let tid = unsafe { (*child).pid };
+    unsafe {
+        if (req.flags & CLONE_SETTLS) != 0 {
+            (*child).user_fs_base = req.tls;
+        }
+        if (req.flags & CLONE_CHILD_CLEARTID) != 0 {
+            (*child).user_clear_tid = req.child_tid;
+        }
+    }
+    if (req.flags & CLONE_PARENT_SETTID) != 0 {
+        write_i32_to_user(parent, req.parent_tid, tid).map_err(|err| -err)?;
+    }
+    if (req.flags & CLONE_CHILD_SETTID) != 0 {
+        // Written through the child's page tables: after a COW fork this
+        // gives the child its own copy of the page.
+        write_i32_to_user(child, req.child_tid, tid).map_err(|err| -err)?;
+    }
+    Ok(())
+}
+
+/// `clone(CLONE_THREAD | ...)`: a new task in the caller's thread group,
+/// sharing its address space and all process-wide state.
+pub(super) fn create_thread_child(
+    ctx: &SyscallContext,
+    child_frame: &InterruptFrame,
+    req: &CloneRequest,
+) -> Result<i64, i64> {
+    let parent = ctx.current;
+    if parent.is_null() {
+        return Err(-ESRCH);
+    }
+    let leader = task::leader_of(parent);
+    if unsafe { ((*leader).flags & task::TASK_FLAG_GROUP_EXIT) != 0 } {
+        return Err(-EAGAIN);
+    }
+    reap_exited_threads();
+
+    let child = task::task_alloc("thread", TASK_FLAG_USER);
+    if child.is_null() {
+        return Err(-ENOMEM);
+    }
+    task::join_thread_group(child, parent);
+    unsafe {
+        (*child).name = (*parent).name;
+        (*child).pml4_phys = (*parent).pml4_phys;
+        (*child).user_fs_base = (*parent).user_fs_base;
+        (*child).signal_blocked = (*parent).signal_blocked;
+        (*child).sig_pending = 0;
+        // The creating thread is running, so the live registers are its user
+        // FPU/SSE state; the new thread starts with a copy, as on Linux.
+        (*child).fpu.save();
+    }
+    if let Err(err) = apply_clone_tid_flags(parent, child, req) {
+        task::task_destroy(child);
+        return Err(err);
+    }
+
+    start_cloned_task(child, child_frame);
     Ok(unsafe { (*child).pid as i64 })
 }
 
@@ -379,31 +498,94 @@ pub(super) fn build_child_frame_from_int80_frame(frame: &InterruptFrame) -> Inte
     child
 }
 
-pub(super) fn validate_clone_args(call: &SyscallArgs) -> Result<u64, i64> {
-    let flags = call.arg(0);
-    let child_stack = call.arg(1);
-    let parent_tid = call.arg(2);
-    let child_tid = call.arg(3);
-    let tls = call.arg(4);
+/// Decoded `clone` arguments (x86-64 order: flags, stack, ptid, ctid, tls).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CloneRequest {
+    pub(super) flags: u64,
+    pub(super) child_stack: u64,
+    pub(super) parent_tid: u64,
+    pub(super) child_tid: u64,
+    pub(super) tls: u64,
+}
 
-    if (flags & !(CLONE_CSIGNAL | CLONE_VM | CLONE_VFORK)) != 0 {
+impl CloneRequest {
+    /// Plain `fork()`/`vfork()`.
+    pub(super) const FORK: Self = Self {
+        flags: SIGCHLD_EXIT_SIGNAL,
+        child_stack: 0,
+        parent_tid: 0,
+        child_tid: 0,
+        tls: 0,
+    };
+
+    #[inline]
+    pub(super) fn is_thread(&self) -> bool {
+        (self.flags & CLONE_THREAD) != 0
+    }
+}
+
+pub(super) fn validate_clone_args(call: &SyscallArgs) -> Result<CloneRequest, i64> {
+    let req = CloneRequest {
+        flags: call.arg(0),
+        child_stack: call.arg(1),
+        parent_tid: call.arg(2),
+        child_tid: call.arg(3),
+        tls: call.arg(4),
+    };
+    let flags = req.flags;
+
+    let supported = CLONE_CSIGNAL
+        | CLONE_THREAD_SHARE
+        | CLONE_VFORK
+        | CLONE_SYSVSEM
+        | CLONE_DETACHED
+        | CLONE_TID_FLAGS;
+    if (flags & !supported) != 0 {
         return Err(-EINVAL);
     }
-    if (flags & CLONE_CSIGNAL) != SIGCHLD_EXIT_SIGNAL {
-        return Err(-EINVAL);
+
+    if req.is_thread() {
+        // Threads must share everything and get their own stack.
+        if (flags & CLONE_THREAD_SHARE) != CLONE_THREAD_SHARE {
+            return Err(-EINVAL);
+        }
+        if (flags & (CLONE_VFORK | CLONE_CSIGNAL)) != 0 {
+            return Err(-EINVAL);
+        }
+        if req.child_stack == 0 {
+            return Err(-EINVAL);
+        }
+    } else {
+        if (flags & (CLONE_FS | CLONE_FILES | CLONE_SIGHAND)) != 0 {
+            return Err(-EINVAL);
+        }
+        if (flags & CLONE_CSIGNAL) != SIGCHLD_EXIT_SIGNAL {
+            return Err(-EINVAL);
+        }
+        // CLONE_VM is only accepted together with CLONE_VFORK, and both are
+        // handled as a (copy-on-write) fork.
+        let clone_vm = (flags & CLONE_VM) != 0;
+        let clone_vfork = (flags & CLONE_VFORK) != 0;
+        if clone_vm != clone_vfork {
+            return Err(-EINVAL);
+        }
     }
-    let clone_vm = (flags & CLONE_VM) != 0;
-    let clone_vfork = (flags & CLONE_VFORK) != 0;
-    if clone_vm != clone_vfork {
-        return Err(-EINVAL);
-    }
-    if parent_tid != 0 || child_tid != 0 || tls != 0 {
-        return Err(-EINVAL);
-    }
-    if child_stack != 0 && !user_range_ok(child_stack, 1) {
+
+    if (flags & CLONE_PARENT_SETTID) != 0 && !user_range_ok(req.parent_tid, 4) {
         return Err(-EFAULT);
     }
-    Ok(child_stack)
+    if (flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) != 0
+        && !user_range_ok(req.child_tid, 4)
+    {
+        return Err(-EFAULT);
+    }
+    if (flags & CLONE_SETTLS) != 0 && !arch_prctl_set_fs_addr_ok(req.tls) {
+        return Err(-EINVAL);
+    }
+    if req.child_stack != 0 && !user_range_ok(req.child_stack, 1) {
+        return Err(-EFAULT);
+    }
+    Ok(req)
 }
 
 pub(super) fn build_clone_child_frame_from_syscall(
@@ -485,8 +667,18 @@ pub(super) fn find_waitable_child(
         if child.is_null() {
             continue;
         }
-        let (child_ppid, child_pid, child_state) =
-            unsafe { ((*child).ppid, (*child).pid, (*child).state) };
+        let (child_ppid, child_pid, child_state, child_flags) = unsafe {
+            (
+                (*crate::task::leader_of(child)).ppid,
+                (*child).pid,
+                (*child).state,
+                (*child).flags,
+            )
+        };
+        // Only processes (thread group leaders) are waitable.
+        if (child_flags & task::TASK_FLAG_THREAD) != 0 {
+            continue;
+        }
         if child_ppid != parent_pid {
             continue;
         }
@@ -494,7 +686,9 @@ pub(super) fn find_waitable_child(
             continue;
         }
         *found_match = true;
-        if child_state == TaskState::Zombie {
+        // A leader that exited before its threads is not reaped until the
+        // whole group is gone.
+        if child_state == TaskState::Zombie && task::live_threads_in_group(child_pid) == 0 {
             return Some(child);
         }
     }
@@ -520,8 +714,9 @@ pub(super) fn sys_wait4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -ESRCH;
     }
 
-    let parent_pid = unsafe { (*ctx.current).pid };
+    let parent_pid = unsafe { (*ctx.current).tgid };
     loop {
+        reap_exited_threads();
         let mut found_match = false;
         let child = find_waitable_child(parent_pid, wait_pid, &mut found_match);
         if let Some(child_task) = child {
@@ -559,6 +754,9 @@ pub(super) fn sys_wait4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
         if !crate::sched::is_running() {
             return -EAGAIN;
+        }
+        if signal::must_abort_wait(ctx.current) {
+            return -EINTR;
         }
         crate::sched::yield_now();
     }
@@ -625,8 +823,8 @@ pub(super) fn sys_setpgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -ESRCH;
     }
 
-    let caller_pid = unsafe { (*ctx.current).pid };
-    let caller_sid = unsafe { (*ctx.current).sid };
+    let caller_pid = unsafe { (*ctx.current).tgid };
+    let caller_sid = unsafe { (*crate::task::leader_of(ctx.current)).sid };
 
     let target_pid = match pid_from_syscall_arg_or_current(call.arg(0), caller_pid) {
         Ok(pid) => pid,
@@ -648,8 +846,8 @@ pub(super) fn sys_setpgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let (target_pid_value, target_ppid, target_sid, target_state) = unsafe {
         (
             (*target).pid,
-            (*target).ppid,
-            (*target).sid,
+            (*crate::task::leader_of(target)).ppid,
+            (*crate::task::leader_of(target)).sid,
             (*target).state,
         )
     };
@@ -671,7 +869,7 @@ pub(super) fn sys_setpgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
 
     unsafe {
-        (*target).pgid = new_pgid;
+        (*crate::task::leader_of(target)).pgid = new_pgid;
     }
     0
 }
@@ -681,17 +879,17 @@ pub(super) fn sys_setsid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
         return -ESRCH;
     }
 
-    let pid = unsafe { (*ctx.current).pid };
-    let pgid = unsafe { (*ctx.current).pgid };
+    let pid = unsafe { (*ctx.current).tgid };
+    let pgid = unsafe { (*crate::task::leader_of(ctx.current)).pgid };
     if pgid == pid || process_group_exists(pid) {
         return -EPERM;
     }
 
     unsafe {
-        (*ctx.current).sid = pid;
-        (*ctx.current).pgid = pid;
-        (*ctx.current).ctty_type = task::CTTY_NONE;
-        (*ctx.current).ctty_id = 0;
+        (*crate::task::leader_of(ctx.current)).sid = pid;
+        (*crate::task::leader_of(ctx.current)).pgid = pid;
+        (*crate::task::leader_of(ctx.current)).ctty_type = task::CTTY_NONE;
+        (*crate::task::leader_of(ctx.current)).ctty_id = 0;
     }
     pid as i64
 }
@@ -701,7 +899,7 @@ pub(super) fn sys_getsid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -ESRCH;
     }
 
-    let caller_pid = unsafe { (*ctx.current).pid };
+    let caller_pid = unsafe { (*ctx.current).tgid };
     let target_pid = match pid_from_syscall_arg_or_current(call.arg(0), caller_pid) {
         Ok(pid) => pid,
         Err(err) => return err,
@@ -710,14 +908,14 @@ pub(super) fn sys_getsid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if target.is_null() {
         return -ESRCH;
     }
-    unsafe { (*target).sid as i64 }
+    unsafe { (*crate::task::leader_of(target)).sid as i64 }
 }
 
 pub(super) fn sys_getuid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     if !ctx.has_task() {
         return -ESRCH;
     }
-    unsafe { (*ctx.current).user_uid as i64 }
+    unsafe { (*crate::task::leader_of(ctx.current)).user_uid as i64 }
 }
 
 pub(super) fn sys_geteuid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
@@ -728,7 +926,7 @@ pub(super) fn sys_getgid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     if !ctx.has_task() {
         return -ESRCH;
     }
-    unsafe { (*ctx.current).user_gid as i64 }
+    unsafe { (*crate::task::leader_of(ctx.current)).user_gid as i64 }
 }
 
 pub(super) fn sys_getegid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
@@ -750,7 +948,7 @@ pub(super) fn sys_getppid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
 }
 
 pub(super) fn sys_gettid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
-    match ctx.pid() {
+    match ctx.tid() {
         Ok(tid) => tid,
         Err(err) => err,
     }
@@ -830,31 +1028,166 @@ pub(super) fn teardown_user_address_space(task_ptr: *mut task::Task) {
     }
 }
 
+/// Free a process's shared state once its last thread has exited.
+pub(super) fn release_process_resources(leader: *mut task::Task) {
+    let tgid = unsafe { (*leader).tgid };
+    mmap_clear_task_regions(leader);
+    close_all_fds(leader);
+    epoll_drop_watches_for_owner(tgid);
+    shm::cleanup_task(leader);
+    // Dying non-leader threads have already dropped their reference to the
+    // address space; the leader's copy is the canonical one.
+    teardown_user_address_space(leader);
+    for idx in 0..task::MAX_TASKS {
+        let t = task::get_by_index(idx);
+        if !t.is_null() && unsafe { (*t).tgid } == tgid {
+            unsafe {
+                (*t).pml4_phys = 0;
+            }
+        }
+    }
+}
+
+/// Free the task structs of exited non-leader threads. Exited threads never
+/// run again, so this is safe from any other task's context.
+pub(super) fn reap_exited_threads() {
+    let current = task::current();
+    for idx in 0..task::MAX_TASKS {
+        let t = task::get_by_index(idx);
+        if t.is_null() || t == current {
+            continue;
+        }
+        let reapable = unsafe {
+            ((*t).flags & task::TASK_FLAG_THREAD) != 0 && (*t).state == TaskState::Zombie
+        };
+        if reapable {
+            ipc::remove_task_waiters(t);
+            task::task_destroy(t);
+        }
+    }
+}
+
+/// True when a task preempted in user mode: it holds no kernel state and can
+/// be terminated without running it again.
+pub(super) fn task_parked_in_user_mode(t: *mut task::Task) -> bool {
+    unsafe {
+        if (*t).state != TaskState::Ready || (*t).saved_rsp == 0 {
+            return false;
+        }
+        let frame = (*t).saved_rsp as *const InterruptFrame;
+        (ptr::read_unaligned(ptr::addr_of!((*frame).cs)) & 3) == 3
+    }
+}
+
+/// Make sibling thread `t` exit (for exit_group or execve). A thread parked
+/// in user mode is terminated immediately; one inside the kernel is flagged
+/// and woken, and exits when its syscall unwinds.
+pub(super) fn kill_sibling_thread(t: *mut task::Task, code: i32) {
+    if t.is_null() || !task::is_live(t) {
+        return;
+    }
+    let is_leader = task::leader_of(t) == t;
+    unsafe {
+        (*t).flags |= task::TASK_FLAG_EXITING;
+        (*t).exit_code = code;
+        if !is_leader {
+            // The process (or the exec'd image) may outlive this thread.
+            (*t).user_clear_tid = 0;
+            (*t).pml4_phys = 0;
+        }
+    }
+    if task_parked_in_user_mode(t) {
+        crate::sched::remove_task(t);
+        ipc::remove_task_waiters(t);
+        unsafe {
+            (*t).state = TaskState::Zombie;
+        }
+        return;
+    }
+    let state = unsafe { (*t).state };
+    if state == TaskState::Blocked || state == TaskState::Sleeping {
+        crate::sched::unblock(t);
+    }
+}
+
+pub(super) fn kill_other_threads(current: *mut task::Task, code: i32) {
+    let tgid = unsafe { (*current).tgid };
+    for idx in 0..task::MAX_TASKS {
+        let t = task::get_by_index(idx);
+        if !t.is_null() && t != current && unsafe { (*t).tgid } == tgid {
+            kill_sibling_thread(t, code);
+        }
+    }
+}
+
+/// Stop running the current task after it became a zombie. The scheduler
+/// never picks a zombie again, so this does not return on the real kernel.
+pub(super) fn leave_exited_task(ctx: &SyscallContext) {
+    if ctx.current == task::current() {
+        crate::sched::yield_now();
+    }
+}
+
+/// Exit the calling thread. When it is the last live thread of its process,
+/// the process's resources are released and the leader becomes waitable.
+pub(super) fn exit_current_thread(ctx: &SyscallContext, code: i32) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+    let current = ctx.current;
+    if !task::is_live(current) {
+        return 0;
+    }
+    let leader = task::leader_of(current);
+    let tgid = unsafe { (*current).tgid };
+
+    clear_child_tid(ctx);
+    ipc::remove_task_waiters(current);
+    unsafe {
+        (*current).exit_code = code;
+        (*current).state = TaskState::Zombie;
+    }
+
+    if task::live_threads_in_group(tgid) == 0 {
+        let status = unsafe {
+            if ((*leader).flags & task::TASK_FLAG_GROUP_EXIT) != 0 {
+                (*leader).exit_code
+            } else {
+                code
+            }
+        };
+        unsafe {
+            (*leader).exit_code = status;
+        }
+        release_process_resources(leader);
+        crate::user::maybe_restore_console_after_init_exit(leader, status);
+    }
+
+    reap_exited_threads();
+    crate::sched::request_preempt();
+    leave_exited_task(ctx);
+    0
+}
+
+/// Terminate the whole process (exit_group, fatal signals, fatal faults).
 pub(super) fn sys_exit_common(ctx: &SyscallContext, code: i32) -> i64 {
     if !ctx.has_task() {
         return -ESRCH;
     }
-
-    let owner_pid = unsafe { (*ctx.current).pid };
-    clear_child_tid(ctx);
-    mmap_clear_task_regions(ctx.current);
-    close_all_fds(ctx.current);
-    epoll_drop_watches_for_owner(owner_pid);
-    shm::cleanup_task(ctx.current);
-    teardown_user_address_space(ctx.current);
-    ipc::remove_task_waiters(ctx.current);
-
+    let leader = task::leader_of(ctx.current);
     unsafe {
-        (*ctx.current).exit_code = code;
-        (*ctx.current).state = TaskState::Zombie;
+        if ((*leader).flags & task::TASK_FLAG_GROUP_EXIT) == 0 {
+            (*leader).flags |= task::TASK_FLAG_GROUP_EXIT;
+            (*leader).exit_code = code;
+        }
     }
-    crate::user::maybe_restore_console_after_init_exit(ctx.current, code);
-    crate::sched::request_preempt();
-    0
+    let status = unsafe { (*leader).exit_code };
+    kill_other_threads(ctx.current, status);
+    exit_current_thread(ctx, status)
 }
 
 pub(super) fn sys_exit(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
-    sys_exit_common(ctx, call.arg(0) as i32)
+    exit_current_thread(ctx, call.arg(0) as i32)
 }
 
 pub(super) fn sys_exit_group(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
@@ -933,7 +1266,7 @@ pub(super) fn sys_getpgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 
     if pid == 0 {
         // Return current task's pgid.
-        let pgid = unsafe { (*ctx.current).pgid };
+        let pgid = unsafe { (*crate::task::leader_of(ctx.current)).pgid };
         return pgid as i64;
     }
 
@@ -942,6 +1275,6 @@ pub(super) fn sys_getpgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if target.is_null() {
         return -ESRCH;
     }
-    let pgid = unsafe { (*target).pgid };
+    let pgid = unsafe { (*crate::task::leader_of(target)).pgid };
     pgid as i64
 }

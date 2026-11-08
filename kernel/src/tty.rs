@@ -424,8 +424,13 @@ pub fn read_console(task: *mut Task, out: &mut [u8]) -> Result<usize, i64> {
         }
 
         block_current("tty-read");
-        let mut tty = CONSOLE_TTY.lock();
-        tty.remove_waiter(task);
+        {
+            let mut tty = CONSOLE_TTY.lock();
+            tty.remove_waiter(task);
+        }
+        if crate::signal::must_abort_wait(task) {
+            return Err(EAGAIN);
+        }
     }
 }
 
