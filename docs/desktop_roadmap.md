@@ -38,8 +38,9 @@ later.
   running dynamically linked PIE programs with `.so` dependencies, `dlopen`, and
   TLS in shared objects. Toolkits are far too large to link statically into
   every program, and static linking multiplies memory use. *(Done:
-  `make run-dynlink-smoke`, see "Dynamic Linking" in `docs/elf.md`. Next, build
-  the ported libraries as `.so` files.)*
+  `make run-dynlink-smoke`, see "Dynamic Linking" in `docs/elf.md`. libwayland,
+  libffi and libxkbcommon also build as `.so` files, and `peetwl`/`wl_demo`
+  link against them.)*
 - [ ] **Process and memory limits.** Remove whole-table stack copies in the VM
   syscalls so the region table can grow past 32 slots; raise the per-task
   mapping budget (32 MiB), memfd size cap (64 MiB), task limit (64), socket

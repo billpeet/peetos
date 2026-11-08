@@ -12,6 +12,9 @@
 #                              (xdg-shell), headers in include/
 #   lib/libxkbcommon.a         keymap compiler/state machine, headers in
 #                              include/xkbcommon/
+#   lib/lib*.so.N, lib/lib*.so shared builds of libffi, libwayland-server,
+#                              libwayland-client and libxkbcommon (need
+#                              ../musl/shared from `make -C musl shared`)
 #   share/X11/xkb/             verified xkeyboard-config subset (staged into
 #                              the ext2 image at /usr/share/X11/xkb)
 #   share/wayland/wayland.xml
@@ -29,7 +32,10 @@ fetch:
 wayland-src libffi-src wayland-protocols-src libxkbcommon-src:
 	$(MAKE) fetch
 
-build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src
+../musl/shared/lib/libc.so:
+	$(MAKE) -C ../musl shared
+
+build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src ../musl/shared/lib/libc.so
 	../scripts/build_wayland.sh \
 		--wayland-src "$(CURDIR)/wayland-src" \
 		--libffi-src "$(CURDIR)/libffi-src" \

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build static libwayland-server/libwayland-client (+ libffi) for PeetOS
-# userspace with the musl toolchain, plus a host wayland-scanner.
+# Build libwayland-server/libwayland-client (+ libffi) for PeetOS userspace
+# with the musl toolchain, both as static archives and as shared libraries,
+# plus a host wayland-scanner. The shared libraries link against musl's
+# libc.so (scripts/build_musl_shared.sh) and are installed under their sonames
+# (libwayland-server.so.0, ...) with a plain .so symlink for the linker.
 #
 # No meson/ninja/autotools needed: libwayland's core is a handful of C files
 # compiled directly here, and libffi's release tarball ships a generated
@@ -55,6 +58,11 @@ for dir in "${WAYLAND_SRC}" "${LIBFFI_SRC}" "${PROTOCOLS_SRC}"; do
 done
 if [[ ! -x "${MUSL_CC}" ]]; then
   echo "musl compiler wrapper not found: ${MUSL_CC} (run 'make musl')" >&2
+  exit 1
+fi
+MUSL_SHARED_LIB="${ROOT_DIR}/musl/shared/lib"
+if [[ ! -f "${MUSL_SHARED_LIB}/libc.so" ]]; then
+  echo "shared musl libc not found: ${MUSL_SHARED_LIB}/libc.so (run 'make -C musl shared')" >&2
   exit 1
 fi
 if ! echo '#include <expat.h>' | "${HOST_CC}" -E -x c - >/dev/null 2>&1; then
@@ -115,9 +123,26 @@ FFI_PREFIX="${BUILD}/libffi-install"
 cp "${FFI_PREFIX}/include/ffi.h" "${FFI_PREFIX}/include/ffitarget.h" "${OUT}/include/"
 cp "${FFI_PREFIX}/lib/libffi.a" "${OUT}/lib/"
 
+# Shared libraries: link PIC objects against musl's libc.so. Installed under
+# the soname, plus an unversioned symlink so -lfoo finds them at link time.
+SHLIB_LDFLAGS=(-shared -L"${MUSL_SHARED_LIB}" -L"${OUT}/lib" -Wl,-z,max-page-size=0x1000 -Wl,--no-undefined)
+link_shared() {
+  local soname="$1"; shift
+  local base="${soname%%.so*}.so"
+  rm -f "${OUT}/lib/${soname}" "${OUT}/lib/${base}"
+  "${MUSL_CC}" "${SHLIB_LDFLAGS[@]}" -Wl,-soname,"${soname}" -o "${OUT}/lib/${soname}" "$@"
+  ln -s "${soname}" "${OUT}/lib/${base}"
+}
+
+# libffi's objects are already PIC (CFLAGS above); its libtool shared build is
+# skipped in favour of linking the archive whole.
+link_shared libffi.so.8 -Wl,--whole-archive "${OUT}/lib/libffi.a" -Wl,--no-whole-archive
+
 # --- libwayland (static, musl) -----------------------------------------------
 echo "[wayland] building libwayland-server / libwayland-client"
-CFLAGS=(-O2 -std=gnu99 -fno-strict-aliasing
+# -fvisibility=hidden as upstream's meson build: only WL_EXPORT symbols are
+# exported from the shared libraries. -fPIC so the same objects serve both.
+CFLAGS=(-O2 -std=gnu99 -fno-strict-aliasing -fPIC -fvisibility=hidden
   -I"${WAYLAND_SRC}" -I"${BUILD}/gen" -I"${WSRC}" -I"${OUT}/include")
 
 compile() {
@@ -140,6 +165,9 @@ rm -f "${OUT}/lib/libwayland-server.a" "${OUT}/lib/libwayland-client.a"
 ar rcs "${OUT}/lib/libwayland-server.a" "${COMMON[@]}" \
   "${O}/wayland-server.o" "${O}/wayland-shm.o" "${O}/event-loop.o"
 ar rcs "${OUT}/lib/libwayland-client.a" "${COMMON[@]}" "${O}/wayland-client.o"
+link_shared libwayland-server.so.0 "${COMMON[@]}" \
+  "${O}/wayland-server.o" "${O}/wayland-shm.o" "${O}/event-loop.o" -lffi
+link_shared libwayland-client.so.0 "${COMMON[@]}" "${O}/wayland-client.o" -lffi
 
 # --- wayland-protocols ---------------------------------------------------------
 echo "[wayland] generating wayland-protocols code"
@@ -155,6 +183,8 @@ for rel in "${PROTOCOL_XMLS[@]}"; do
   PROTO_OBJS+=("${O}/${name}-protocol.o")
   cp "${xml}" "${OUT}/share/wayland-protocols/"
 done
+# Protocol glue stays static-only: like upstream wayland-protocols, each
+# program compiles in the interfaces it uses (private-code, hidden symbols).
 rm -f "${OUT}/lib/libwlprotocols.a"
 ar rcs "${OUT}/lib/libwlprotocols.a" "${PROTO_OBJS[@]}"
 

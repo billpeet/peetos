@@ -56,6 +56,9 @@ USER_WL_DEMO_BIN := user/wl_demo.elf
 USER_DYNLINK_SMOKE_BIN := user/dynlink_smoke.elf
 MUSL_SHARED_LIBC := musl/shared/lib/libc.so
 WAYLAND_OUT := wayland/out
+# Shared builds (soname files), linked by the dynamic peetwl/wl_demo and
+# staged into the ext2 image's /usr/lib.
+WAYLAND_SHLIBS := $(WAYLAND_OUT)/lib/libwayland-server.so.0 $(WAYLAND_OUT)/lib/libwayland-client.so.0 $(WAYLAND_OUT)/lib/libxkbcommon.so.0 $(WAYLAND_OUT)/lib/libffi.so.8
 WAYLAND_LIBS := $(WAYLAND_OUT)/lib/libwayland-server.a $(WAYLAND_OUT)/lib/libwayland-client.a $(WAYLAND_OUT)/lib/libwlprotocols.a $(WAYLAND_OUT)/lib/libxkbcommon.a $(WAYLAND_OUT)/lib/libffi.a
 # Upstream libwayland test suite binaries (scripts/build_wayland_tests.sh); TESTS is the stamp.
 WAYLAND_TESTS_STAMP := $(WAYLAND_OUT)/tests/TESTS
@@ -77,6 +80,7 @@ USER_DYN_ASM := user/hello_dyn.asm
 USER_INTERP_ASM := user/ld_peetos.asm
 USER_EXT2_SCRIPT := scripts/build_ext2_sample.sh
 USER_MUSL_SMOKE_SCRIPT := scripts/build_musl_echo.sh
+USER_MUSL_DYN_SCRIPT := scripts/build_musl_dyn.sh
 USER_EXT2_MUSL_SCRIPT := scripts/build_ext2_musl_execve.sh
 USER_TOYBOX_SH_SCRIPT := scripts/build_toybox_sh.sh
 USER_TOYBOX_CORE_SCRIPT := scripts/build_toybox_core.sh
@@ -309,17 +313,19 @@ $(USER_MUSL_EXT3_JOURNAL_SMOKE_ELF): user/musl_execve_ext3_journal_smoke.c $(USE
 $(USER_JOURNAL_SMOKE_HELPER_BIN): user/journal_smoke_helper.c $(USER_MUSL_SMOKE_SCRIPT)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
 
-$(WAYLAND_LIBS):
+$(WAYLAND_LIBS) $(WAYLAND_SHLIBS): $(MUSL_SHARED_LIBC)
 	$(MAKE) -C wayland
 
 $(USER_WAYLAND_SMOKE_BIN): user/wayland_smoke.c $(USER_MUSL_SMOKE_SCRIPT) $(WAYLAND_LIBS)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@ -- -I$(WAYLAND_OUT)/include $(WAYLAND_LIBS) -lm
 
-$(USER_PEETWL_BIN): user/peetwl.c user/font8x8.h $(USER_MUSL_SMOKE_SCRIPT) $(WAYLAND_LIBS)
-	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@ -- -I$(WAYLAND_OUT)/include $(WAYLAND_LIBS) -lm
+# peetwl and wl_demo link dynamically against the shared libwayland,
+# libxkbcommon and libffi (protocol glue stays static).
+$(USER_PEETWL_BIN): user/peetwl.c user/font8x8.h $(USER_MUSL_DYN_SCRIPT) $(WAYLAND_LIBS) $(WAYLAND_SHLIBS)
+	$(USER_MUSL_DYN_SCRIPT) --src $< --out $@ -- -I$(WAYLAND_OUT)/include -L$(WAYLAND_OUT)/lib $(WAYLAND_OUT)/lib/libwlprotocols.a -lwayland-server -lxkbcommon -lm
 
-$(USER_WL_DEMO_BIN): user/wl_demo.c $(USER_MUSL_SMOKE_SCRIPT) $(WAYLAND_LIBS)
-	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@ -- -I$(WAYLAND_OUT)/include $(WAYLAND_LIBS) -lm
+$(USER_WL_DEMO_BIN): user/wl_demo.c $(USER_MUSL_DYN_SCRIPT) $(WAYLAND_LIBS) $(WAYLAND_SHLIBS)
+	$(USER_MUSL_DYN_SCRIPT) --src $< --out $@ -- -I$(WAYLAND_OUT)/include -L$(WAYLAND_OUT)/lib $(WAYLAND_OUT)/lib/libwlprotocols.a -lwayland-client -lxkbcommon -lm
 
 $(USER_MUSL_EXT2_WLCOMP_SMOKE_ELF): user/musl_execve_ext2_wlcomp_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@

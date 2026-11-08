@@ -28,6 +28,7 @@ Outputs land in `wayland/out/`:
 - `bin/wayland-scanner`: host tool (runs on the build machine)
 - `include/`: `wayland-{util,version,client,client-core,server,server-core}.h`, generated `wayland-{client,server}-protocol.h`, `ffi.h`
 - `lib/libwayland-server.a`, `lib/libwayland-client.a`, `lib/libffi.a`: static, musl, x86_64
+- `lib/libwayland-server.so.0`, `lib/libwayland-client.so.0`, `lib/libffi.so.8`, `lib/libxkbcommon.so.0` (plus unversioned `.so` symlinks for the linker): shared builds of the same PIC objects, linked against musl's `libc.so`. They need `make -C musl shared` first, which `make -C wayland` runs if needed. Like upstream, the objects are compiled with `-fvisibility=hidden`, so only `WL_EXPORT`/`XKB_EXPORT` symbols are exported. The ext2 builder stages the soname files in `/usr/lib`.
 - `lib/libxkbcommon.a` plus `include/xkbcommon/*.h` (built by `scripts/build_xkbcommon.sh`, which `make -C wayland` runs after `build_wayland.sh`)
 - `share/X11/xkb/`: the verified xkeyboard-config subset staged into the ext2 image at `/usr/share/X11/xkb`
 - `lib/libwlprotocols.a` plus `include/xdg-shell-{client,server}-protocol.h`: generated code for the wayland-protocols listed in `PROTOCOL_XMLS` in `scripts/build_wayland.sh` (add an XML path there to build another protocol)
@@ -38,12 +39,19 @@ The build needs no meson, ninja, or autotools:
 - libffi's release tarball ships a generated `configure`, run as a cross build (`--host=x86_64-linux-musl`) because musl binaries cannot run on the build host.
 - `wayland-scanner` is compiled from the same libwayland source with the host compiler and host expat (`libexpat1-dev`), so generated code always matches the library version.
 
-Linking a client or compositor:
+Linking a client or compositor statically:
 ```bash
 musl-gcc -static app.c -Iwayland/out/include \
   wayland/out/lib/libwayland-client.a wayland/out/lib/libffi.a -lm
 ```
-`scripts/build_musl_echo.sh` accepts the extra arguments after `--`, which is how the Makefile builds `user/wayland_smoke.elf`.
+`scripts/build_musl_echo.sh` accepts the extra arguments after `--`, which is how the Makefile builds `user/wayland_smoke.elf` and the upstream tests.
+
+Or dynamically, which is how `peetwl` and `wl_demo` are built (see "Dynamic Linking" in `docs/elf.md`):
+```bash
+scripts/build_musl_dyn.sh --src app.c --out app.elf -- -Iwayland/out/include \
+  -Lwayland/out/lib wayland/out/lib/libwlprotocols.a -lwayland-client -lxkbcommon -lm
+```
+`libwlprotocols.a` stays static, like upstream wayland-protocols: each program compiles in the protocol interfaces it uses.
 
 **Kernel Interfaces Used**
 libwayland 1.23 needs these kernel features, all implemented:
@@ -112,7 +120,8 @@ Limitations / Simplifications
 - No subsurfaces (`wl_subcompositor`), no `wl_data_device_manager` (clipboard/drag and drop), no multi-output or output scaling.
 - Repaint is timer-driven at up to ~60 Hz with a single damage rectangle; there is no vblank synchronisation.
 - Only the core library is ported: no `libwayland-cursor` or `libwayland-egl`, and from wayland-protocols only `xdg-shell` is built.
-- Libraries are static only; PeetOS's dynamic loader is bootstrap-grade, so shared libraries are out of scope for now.
+- Both static and shared builds exist. `peetwl` and `wl_demo` are dynamic. `wayland_smoke` and the upstream test binaries stay static, so both link modes stay covered.
+- The shared libffi is linked from the static archive (`--whole-archive`) instead of through libffi's libtool shared build, so it has no symbol version script.
 - libffi is built with `--disable-exec-static-tramp` because the musl sysroot has no Linux UAPI headers. libwayland only uses `ffi_call`, not closures, so this does not matter for it.
 - The smoke uses `/tmp` on the ext2 root as `XDG_RUNTIME_DIR`; there is no per-user runtime directory or permission model.
 - `wayland-scanner` is built without libxml2, so it does not DTD-validate protocol XML (meson's `dtd_validation` option).

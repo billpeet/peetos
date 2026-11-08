@@ -103,6 +103,13 @@ if [[ -x "${ROOT_DIR}/user/dynlink_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/libpeetdyn.so" "${ROOT_DIR}/user/libpeetplugin.so" "${STAGE_ROOT}/usr/lib/"
 fi
 
+# Shared builds of the ported libraries (scripts/build_wayland.sh and
+# build_xkbcommon.sh), staged under their sonames for dynamic programs.
+if compgen -G "${ROOT_DIR}/wayland/out/lib/*.so.[0-9]*" >/dev/null; then
+  mkdir -p "${STAGE_ROOT}/usr/lib"
+  cp -L "${ROOT_DIR}"/wayland/out/lib/*.so.[0-9]* "${STAGE_ROOT}/usr/lib/"
+fi
+
 # Stage the verified xkeyboard-config subset (scripts/build_xkbcommon.sh) at
 # libxkbcommon's default root when it has been built.
 if [[ -f "${ROOT_DIR}/wayland/out/share/X11/xkb/rules/evdev" ]]; then

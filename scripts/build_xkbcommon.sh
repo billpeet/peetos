@@ -77,7 +77,7 @@ SOURCES=(
 )
 # The generated parser.h must come from -I gen (compose/ has its own parser.h,
 # found first via its directory).
-CFLAGS=(-O2 -std=gnu11 -fno-strict-aliasing -fvisibility=hidden
+CFLAGS=(-O2 -std=gnu11 -fno-strict-aliasing -fvisibility=hidden -fPIC
   -I"${BUILD}/gen" -I"${XKB_SRC}/src" -I"${XKB_SRC}/include" -I"${XKB_SRC}")
 
 build_lib() {
@@ -101,6 +101,17 @@ build_lib() {
 
 echo "[xkbcommon] building libxkbcommon (musl)"
 build_lib "${MUSL_CC}" "${BUILD}/obj-musl" "${OUT}/lib/libxkbcommon.a"
+# Shared library (XKB_EXPORT symbols only) against musl's libc.so.
+MUSL_SHARED_LIB="${ROOT_DIR}/musl/shared/lib"
+if [[ ! -f "${MUSL_SHARED_LIB}/libc.so" ]]; then
+  echo "shared musl libc not found: ${MUSL_SHARED_LIB}/libc.so (run 'make -C musl shared')" >&2
+  exit 1
+fi
+rm -f "${OUT}/lib/libxkbcommon.so.0" "${OUT}/lib/libxkbcommon.so"
+"${MUSL_CC}" -shared -L"${MUSL_SHARED_LIB}" -Wl,-z,max-page-size=0x1000 -Wl,--no-undefined \
+  -Wl,-soname,libxkbcommon.so.0 -o "${OUT}/lib/libxkbcommon.so.0" \
+  -Wl,--whole-archive "${OUT}/lib/libxkbcommon.a" -Wl,--no-whole-archive
+ln -s libxkbcommon.so.0 "${OUT}/lib/libxkbcommon.so"
 cp "${XKB_SRC}"/include/xkbcommon/xkbcommon.h \
    "${XKB_SRC}"/include/xkbcommon/xkbcommon-keysyms.h \
    "${XKB_SRC}"/include/xkbcommon/xkbcommon-names.h \

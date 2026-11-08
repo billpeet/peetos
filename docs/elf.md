@@ -66,6 +66,9 @@ into `PT_INTERP`.
    `__tls_get_addr`); no other kernel support is needed.
 
 **Building**
+- `scripts/build_musl_dyn.sh --src x.c --out x.elf -- <libs>` is the
+  dynamic counterpart of `scripts/build_musl_echo.sh`. It builds a PIE against
+  `libc.so` and checks the interpreter path.
 - `make -C musl shared` (or `scripts/build_musl_shared.sh`) builds musl's
   `libc.so` out of tree into `musl/shared/lib/` without touching the static
   sysroot.
@@ -85,9 +88,9 @@ checks fresh TLS copies in a new pthread and a dynamic program that forks and
 `execve`s itself. The libraries live in `/usr/lib`.
 
 Limitations / Simplifications
-- The ported libraries (libwayland, libffi, libxkbcommon) and the staged
-  programs are still linked statically; only the smoke test links dynamically
-  so far.
+- Only `dynlink_smoke`, `peetwl` and `wl_demo` link dynamically (against
+  the shared libwayland, libxkbcommon and libffi in `/usr/lib`, see
+  `docs/wayland.md`). toybox and the other staged programs are still static.
 - `mprotect` on the execve-loaded range changes page-table entries only. It
   needs every page to be present (the range is mapped eagerly, but untouched
   `brk` pages are not) and keeps no per-range protection record.
