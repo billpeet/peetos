@@ -11,4 +11,6 @@ cargo test -p arch_x86_64 --target "${HOST}"
 cargo test -p drivers --target "${HOST}"
 cargo test -p fs --target "${HOST}"
 # The kernel host tests share global singleton state and are not thread-safe yet.
+# The kernel crate embeds generated user ELFs via include_bytes!, so build them first.
+make -C "${ROOT_DIR}" --no-print-directory user-elf
 cargo test -p kernel --target "${HOST}" -- --test-threads=1

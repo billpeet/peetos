@@ -10,7 +10,7 @@ current Rust kernel implementation and forward roadmap.
 - Stage 1-9 parity goals are largely complete; remaining work focuses on
   hardening, completeness, and new capability.
 
-## Status Snapshot (Last reviewed: 2026-03-14)
+## Status Snapshot (Last reviewed: 2026-11-08)
 
 ### Kernel Foundation
 

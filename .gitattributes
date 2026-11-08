@@ -1,0 +1,16 @@
+# The build and test harness runs under Linux/WSL bash, so keep LF line
+# endings in the working tree on every platform (including Windows checkouts
+# with core.autocrlf=true). CRLF breaks bash scripts, Makefile recipes and
+# NASM sources.
+* text=auto eol=lf
+
+# Binary artifacts.
+*.elf binary
+*.so binary
+*.img binary
+*.bin binary
+*.o binary
+*.png binary
+*.gz binary
+*.xz binary
+*.bz2 binary

@@ -200,6 +200,10 @@ make test
 
 `make test` runs host unit tests plus the shell/setup/QEMU regression scripts under [`tests/`](/home/bill/source/peetos/tests/), including the console-first shell smoke, the compositor-first GUI smoke (`tests/musl_ext2_gui_smoke.sh`), and setup coverage for the separate GUI demo entrypoint.
 
+The host unit tests (`tests/unit.sh`) build the embedded default-build user binaries first (`make user-elf`), so `nasm` and `ld` are needed even for unit tests. Generated user ELFs under `user/` are build outputs and are not tracked in git.
+
+The harness expects to run under Linux or WSL bash. `.gitattributes` forces LF line endings in the working tree, so a Windows checkout's scripts also run under WSL.
+
 ## Historical Reference
 
 If you need behavior comparisons with the earlier implementation, use:
