@@ -35,6 +35,7 @@ mod qemu;
 mod sched;
 mod serial;
 mod shm;
+mod shmem;
 mod signal;
 #[cfg(target_os = "none")]
 mod smp;

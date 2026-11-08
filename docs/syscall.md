@@ -88,7 +88,7 @@ Limitations / Simplifications
 Current implemented handlers:
 - `open/openat/close/read/write/writev/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
 - `dup/dup2/dup3/fcntl` baseline descriptor operations (`F_GETFD`, `F_SETFD`, `F_GETFL`, `F_SETFL`, `F_DUPFD`, `F_DUPFD_CLOEXEC`) with `FD_CLOEXEC` and runtime `O_NONBLOCK` updates on sockets/pipes/PTYs
-- `memfd_create(name, flags)` baseline tmpfs-backed anonymous-buffer fd creation (`MFD_CLOEXEC` supported; sealing flags currently rejected) with per-task shared-buffer object caps
+- `memfd_create(name, flags)` anonymous shared-buffer fds backed by page-based shmem objects up to 64 MiB (`MFD_CLOEXEC`, `MFD_ALLOW_SEALING` with `F_ADD_SEALS`/`F_GET_SEALS`) with per-task shared-buffer object caps
 - `mmap/mprotect/munmap` for baseline userspace mapping management (anonymous/private plus file-backed private/shared mappings from VFS fds, fixed/fixed-noreplace handling, per-task VMA metadata, lazy page-fault mapping, transactional VMA split/update handling, page-level protection updates, and per-task mapped-page caps)
 - `msync` baseline shared-file mapping writeback path (range walk + page-cache dirty writeback + backing ext2 sync/flush)
 - `kill`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` for baseline signal control and user-handler return

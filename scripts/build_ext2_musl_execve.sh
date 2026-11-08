@@ -89,6 +89,16 @@ if [[ -f "${ROOT_DIR}/user/dropbear_ed25519_host_key" ]]; then
   chmod 0600 "${STAGE_ROOT}/etc/dropbear/dropbear_ed25519_host_key"
 fi
 
+# Stage the peetwl compositor and wl-demo client when available.
+if [[ -x "${ROOT_DIR}/user/peetwl.elf" ]]; then
+  cp "${ROOT_DIR}/user/peetwl.elf" "${STAGE_ROOT}/bin/peetwl"
+  chmod 0755 "${STAGE_ROOT}/bin/peetwl"
+fi
+if [[ -x "${ROOT_DIR}/user/wl_demo.elf" ]]; then
+  cp "${ROOT_DIR}/user/wl_demo.elf" "${STAGE_ROOT}/bin/wl-demo"
+  chmod 0755 "${STAGE_ROOT}/bin/wl-demo"
+fi
+
 # Stage libwayland server/client smoke helper when available.
 if [[ -x "${ROOT_DIR}/user/wayland_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/wayland_smoke.elf" "${STAGE_ROOT}/bin/wayland_smoke"
@@ -517,6 +527,38 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/unix_rights_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/wlcomp_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/peetwl ] || [ ! -x bin/wl-demo ]; then
+  echo [musl-ext2-wlcomp-smoke] missing bin/peetwl or bin/wl-demo
+  fail=1
+else
+  bin/peetwl --smoke \
+    --client "/mnt/ext2/bin/wl-demo Alpha 0xd05050" \
+    --client "/mnt/ext2/bin/wl-demo Beta 0x4080d0" || fail=1
+fi
+
+echo [musl-ext2-wlcomp-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-wlcomp-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/wlcomp_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/wayland_demo.sh" <<'EOS'
+if [ ! -x bin/peetwl ] || [ ! -x bin/wl-demo ]; then
+  echo [musl-ext2-wayland-demo] missing bin/peetwl or bin/wl-demo
+  exit 1
+fi
+echo [musl-ext2-wayland-demo] starting peetwl with three wl-demo windows
+exec bin/peetwl \
+  --client "/mnt/ext2/bin/wl-demo One 0x3070c0 --animate" \
+  --client "/mnt/ext2/bin/wl-demo Two 0xc07030" \
+  --client "/mnt/ext2/bin/wl-demo Three 0x40a060 --size 240x160"
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/wayland_demo.sh"
 
 cat > "${STAGE_ROOT}/bin/wayland_smoke.sh" <<'EOS'
 fail=0

@@ -5,8 +5,8 @@ usage() {
   cat <<'USAGE'
 Usage: fetch-wayland.sh [options]
 
-Download, verify, and extract pinned libwayland and libffi source releases
-into wayland-src/ and libffi-src/.
+Download, verify, and extract pinned libwayland, libffi, and wayland-protocols
+source releases into wayland-src/, libffi-src/, and wayland-protocols-src/.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -26,6 +26,10 @@ WAYLAND_SHA256="864fb2a8399e2d0ec39d56e9d9b753c093775beadc6022ce81f441929a81e5ed
 LIBFFI_VERSION="3.4.6"
 LIBFFI_URL="https://github.com/libffi/libffi/releases/download/v${LIBFFI_VERSION}/libffi-${LIBFFI_VERSION}.tar.gz"
 LIBFFI_SHA256="b0dea9df23c863a7a50e825440f3ebffabd65df1497108e5d437747843895a4e"
+
+PROTOCOLS_VERSION="1.38"
+PROTOCOLS_URL="https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/${PROTOCOLS_VERSION}/downloads/wayland-protocols-${PROTOCOLS_VERSION}.tar.xz"
+PROTOCOLS_SHA256="ff17292c05159d2b20ce6cacfe42d7e31a28198fa1429a769b03af7c38581dbe"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -90,3 +94,5 @@ fetch_one "libwayland ${WAYLAND_VERSION}" "${WAYLAND_URL}" "${WAYLAND_SHA256}" \
   "${OUTPUT_DIR}/wayland-src" "wayland-${WAYLAND_VERSION}.tar.xz"
 fetch_one "libffi ${LIBFFI_VERSION}" "${LIBFFI_URL}" "${LIBFFI_SHA256}" \
   "${OUTPUT_DIR}/libffi-src" "libffi-${LIBFFI_VERSION}.tar.gz"
+fetch_one "wayland-protocols ${PROTOCOLS_VERSION}" "${PROTOCOLS_URL}" "${PROTOCOLS_SHA256}" \
+  "${OUTPUT_DIR}/wayland-protocols-src" "wayland-protocols-${PROTOCOLS_VERSION}.tar.xz"

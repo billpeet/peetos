@@ -616,6 +616,15 @@ pub(super) fn sys_memfd_create(ctx: &SyscallContext, call: &SyscallArgs) -> i64 
         let fd_flags = fd_flags_from_open_flags(open_flags) | FD_INTERNAL_MEMFD;
         return match fd_alloc(ctx.current, task::USER_FD_KIND_VFS, opened.inode, fd_flags) {
             Ok(fd) => {
+                if let Err(err) = crate::shmem::create(opened.inode) {
+                    let _ = fd_close(ctx.current, fd as i32);
+                    let _ = fs::unlink(path);
+                    return err;
+                }
+                // Like Linux memfds, the object has no name in the namespace:
+                // the fd's open reference keeps the inode (and its shmem
+                // pages) alive, and the last close or unmap frees both.
+                let _ = fs::unlink(path);
                 memfd_seals_register(opened.inode, memfd_flags.allow_sealing);
                 fd
             }

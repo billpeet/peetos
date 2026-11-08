@@ -79,7 +79,7 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
   - signed relative motion (`dx`/`dy`)
   - overflow rejection and first-byte sync-bit resynchronization
 - Decoded pointer activity now also feeds `/dev/input/event1`:
-  - PS/2 packets emit `EV_REL` (`REL_X`, `REL_Y`) plus `EV_KEY` button changes
+  - PS/2 packets emit `EV_REL` (`REL_X`, `REL_Y`) plus `EV_KEY` button changes, using the Linux evdev convention (`REL_Y` positive = down; PS/2 reports positive = up, so the driver flips it)
   - USB tablet absolute updates emit `EV_ABS` (`ABS_X`, `ABS_Y`) plus button changes
   - each packet/report ends with `SYN_REPORT`
   - queue overflow is reported with `SYN_DROPPED` on the next successfully queued packet

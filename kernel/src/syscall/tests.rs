@@ -2046,3 +2046,94 @@ fn lock_free_return_falls_back_for_signals_and_exit() {
     // Told to exit by a sibling thread.
     assert!(needs_locked_return(0, 0, task::TASK_FLAG_EXITING));
 }
+
+#[test]
+fn process_exit_sends_sigchld_to_parent() {
+    let _guard = evfd_test_setup();
+    task::Task::reset_registry_for_test();
+    let mut parent = task::Task::for_test(410);
+    let mut child = task::Task::for_test(411);
+    child.ppid = 410;
+    let parent_ptr = &mut parent as *mut task::Task;
+    let child_ptr = &mut child as *mut task::Task;
+    task::Task::install_for_test(0, parent_ptr);
+    task::Task::install_for_test(1, child_ptr);
+
+    // Default disposition ignores SIGCHLD: nothing is queued.
+    notify_parent_of_exit(child_ptr);
+    assert_eq!(parent.sig_pending & signal::signal_bit(signal::SIGCHLD), 0);
+
+    // A parent that blocks SIGCHLD (e.g. to read it from a signalfd) sees it.
+    parent.signal_blocked |= signal::signal_bit(signal::SIGCHLD);
+    notify_parent_of_exit(child_ptr);
+    assert_ne!(parent.sig_pending & signal::signal_bit(signal::SIGCHLD), 0);
+
+    // No parent: nothing to do (and no crash).
+    child.ppid = 999;
+    notify_parent_of_exit(child_ptr);
+
+    task::Task::install_for_test(0, core::ptr::null_mut());
+    task::Task::install_for_test(1, core::ptr::null_mut());
+}
+
+#[test]
+fn shared_write_window_allows_partial_last_page() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+    let opened = fs::open("/temp/window-test", fs::O_CREAT | fs::O_RDWR, 0o600).expect("create");
+    let inode = opened.inode;
+    fs::write(inode, 0, &[7u8; 100], false).expect("write");
+    // A 100-byte file can be mapped with one (page-rounded) page...
+    assert_eq!(mmap_validate_shared_write_window(inode, 0, PAGE_SIZE), Ok(()));
+    // ...but not with two.
+    assert_eq!(mmap_validate_shared_write_window(inode, 0, 2 * PAGE_SIZE), Err(-EINVAL));
+}
+
+#[test]
+fn memfd_shmem_object_lives_until_last_fd_and_mapping_are_gone() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+    crate::shmem::reset_for_test();
+    let mut task = task::Task::for_test(420);
+    let task_ptr = &mut task as *mut task::Task;
+    task::Task::install_for_test(0, task_ptr);
+
+    // What memfd_create does: tmpfs inode + fd (open reference) + shmem
+    // object, then unlink so only references keep it alive.
+    let opened = fs::open("/temp/memfd-life", fs::O_CREAT | fs::O_RDWR, 0o600).expect("create");
+    let inode = opened.inode;
+    let fd = fd_alloc(task_ptr, task::USER_FD_KIND_VFS, inode, fs::O_RDWR | FD_INTERNAL_MEMFD)
+        .expect("fd") as i32;
+    crate::shmem::create(inode).expect("shmem");
+    fs::unlink("/temp/memfd-life").expect("unlink");
+    assert_eq!(vfs_truncate_to(inode, 3 * 1024 * 1024), Ok(()));
+    assert_eq!(vfs_file_size(inode), Ok(3 * 1024 * 1024));
+
+    // dup + close the original: the object survives through the dup.
+    let dup = fd_dup_from(task_ptr, fd, 8, false).expect("dup") as i32;
+    fd_close(task_ptr, fd).expect("close original");
+    assert!(crate::shmem::exists(inode));
+
+    // A mapping keeps the object alive after the last fd closes.
+    let slot = mmap_prepare_task_slot(task_ptr).expect("vm slot");
+    unsafe {
+        TASK_VM_MAPPINGS[slot][0] = VmMapping {
+            start: 0x1_0000_0000,
+            len: PAGE_SIZE,
+            file_offset: 0,
+            file_inode: inode,
+            prot: PROT_READ | PROT_WRITE,
+            map_shared: true,
+            map_shared_can_write: true,
+        };
+    }
+    vm_sync_inode_pins();
+    fd_close(task_ptr, dup).expect("close dup");
+    assert!(crate::shmem::exists(inode), "still mapped");
+
+    // Dropping the mapping frees the inode and with it the shmem object.
+    mmap_clear_task_regions(task_ptr);
+    assert!(!crate::shmem::exists(inode));
+
+    task::Task::install_for_test(0, core::ptr::null_mut());
+}

@@ -65,7 +65,7 @@ Key functions:
 
 User `mremap`:
 - `mremap(old, old_size, new_size, flags)` (`kernel/src/syscall/vm.rs`) shrinks in place, grows in place when the following range is free, or with `MREMAP_MAYMOVE` relocates the mapping.
-- Relocation moves the present page-table entries instead of copying, so anonymous memory, page-cache pins (tracked by physical address), and dirty state follow the mapping; if a page-table allocation fails midway, already-moved pages are put back.
+- Relocation moves the present page-table entries instead of copying (`vmm::move_page_in`, one `VMM_LOCK` hold per page so other CPUs never see a page mapped twice or missing), so anonymous memory, page-cache pins (tracked by physical address), and dirty state follow the mapping; if a page-table allocation fails midway, already-moved pages are put back.
 - Growing a shared writable file mapping re-validates the file window, and growth is counted against the per-task mapping budget.
 
 User shared anonymous mappings:
@@ -80,8 +80,9 @@ Limitations / Simplifications
 - Page table allocation is simple and not reference-counted; `destroy_address_space` only frees the PML4. Data frames carry a 16-bit PMM share count for copy-on-write; page-table frames are never shared.
 - Page-table updates are serialised by `VMM_LOCK`, an interrupt-safe spinlock taken at the public entry points. Internal calls use `*_locked` variants. `switch` and the getters take no lock. Lock order is heap, then VMM, then PMM.
 - TLB shootdown is coarse. Removing or downgrading a present mapping sends an IPI that makes every CPU using that address space (or every CPU, for kernel addresses) flush its whole TLB. Shootdowns are not batched across pages, and there is no PCID or other advanced address-space isolation.
+- Shared writable file mappings may cover the partial page at the end of the file (the window is checked against the file size rounded up to a page), matching Linux.
 - `mremap` requires the old range to lie inside one existing mapping, does not support `MREMAP_FIXED` or `MREMAP_DONTUNMAP`, and refuses to resize framebuffer mappings.
-- `MAP_SHARED | MAP_ANONYMOUS` regions inherit tmpfs limits: the backing file is capped at 32 KiB, so contents beyond that can be lost if memory-pressure reclaim evicts those pages. Each region uses one VFS node until it is unmapped everywhere.
+- `MAP_SHARED | MAP_ANONYMOUS` regions are backed by a hidden, unlinked tmpfs inode whose contents live in a shmem object (up to 64 MiB, the same storage as memfd). Each region uses one VFS node and one of the 64 shmem objects until it is unmapped everywhere.
 - Inode pins are recomputed by scanning every task's region table (64 tasks x 32 regions) after each `mmap`/`munmap`/teardown, which is fine at current sizes but linear.
 
 **Kernel Heap (kmalloc)**
@@ -109,7 +110,8 @@ This order is enforced in `kernel/src/main.rs`.
 **Status Notes**
 - PMM and VMM are functional but still conservative about large pages.
 - Heap is suitable for early kernel allocations; there is no slab/buddy layer yet.
-- Shared-buffer bring-up now includes `memfd_create` tmpfs-backed fd objects for
+- memfd contents live in page-backed shmem objects (`kernel/src/shmem.rs`): up to 64 MiB per object in lazily allocated pages tracked through index pages. Each user mapping of a shmem page takes a PMM share reference (`pmm::page_share`) that the normal unmap/exit paths drop with `pmm::free_page`, so mapped pages outlive the object.
+- Shared-buffer bring-up now includes `memfd_create` fd objects for
   userspace sharing workflows, plus baseline writable shared `mmap`
   reliability for compositor/client buffer exchange; per-task VMA mapping
   coverage now has an explicit hardening cap (currently 8192 pages / 32 MiB

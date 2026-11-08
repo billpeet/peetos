@@ -116,6 +116,16 @@ process (not the thread) as its parent.
   reloads periodic timers. Timers survive `execve` (including a non-leader
   `execve` taking over the leader) and are cleared in `fork` children.
 
+## Child Exit Notification
+
+When the last thread of a process exits, its parent process is sent
+`SIGCHLD` (`notify_parent_of_exit` in `kernel/src/syscall/process.rs`).
+`clone` only accepts `SIGCHLD` as the exit signal for new processes, so no
+other exit signal exists. With the default disposition the signal is
+discarded at send; a parent that installs a handler, or blocks `SIGCHLD` and
+reads it through a signalfd (as the `peetwl` compositor does), sees it. Before
+this, `SIGCHLD` was never raised and parents could only poll with `wait4`.
+
 ## Interrupted Syscalls
 
 A signal that will run a handler or terminate the process interrupts blocking

@@ -3,7 +3,65 @@
 use super::*;
 
 pub(super) fn read_vfs_bytes(inode: u16, offset: u64, dst: &mut [u8]) -> Result<usize, i64> {
+    if let Some(result) = crate::shmem::read(inode, offset, dst) {
+        return result;
+    }
     vm_page_cache_read(inode, offset, dst)
+}
+
+// The vfs_* wrappers route memfd inodes (backed by `crate::shmem`) away from
+// tmpfs and otherwise defer to the fs crate. They keep the fs crate's error
+// convention (fs error codes, mapped with `fs_to_errno` by callers).
+
+/// Map a shmem errno to the closest fs error code.
+fn shmem_err_to_fs(err: i64) -> i64 {
+    if err == -EFBIG || err == -ENOMEM {
+        fs::ENOSPC
+    } else {
+        fs::EIO
+    }
+}
+
+pub(super) fn vfs_write(inode: u16, offset: u64, src: &[u8], append: bool) -> Result<fs::WriteResult, i64> {
+    if let Some(size) = crate::shmem::size(inode) {
+        let start = if append { size } else { offset };
+        return match crate::shmem::write(inode, start, src) {
+            Some(Ok(written)) => Ok(fs::WriteResult {
+                written,
+                new_offset: start + written as u64,
+            }),
+            Some(Err(err)) => Err(shmem_err_to_fs(err)),
+            None => Err(fs::EIO),
+        };
+    }
+    fs::write(inode, offset, src, append)
+}
+
+pub(super) fn vfs_stat(inode: u16) -> Result<fs::FileStat, i64> {
+    let mut stat = fs::stat(inode)?;
+    if let Some(size) = crate::shmem::size(inode) {
+        stat.size = size;
+        stat.blocks = size.div_ceil(512);
+    }
+    Ok(stat)
+}
+
+pub(super) fn vfs_file_size(inode: u16) -> Result<u64, i64> {
+    if let Some(size) = crate::shmem::size(inode) {
+        return Ok(size);
+    }
+    fs::file_size(inode)
+}
+
+pub(super) fn vfs_truncate_to(inode: u16, length: u64) -> Result<(), i64> {
+    if let Some(result) = crate::shmem::truncate(inode, length) {
+        return result.map_err(shmem_err_to_fs);
+    }
+    if length == 0 {
+        fs::truncate(inode)
+    } else {
+        fs::truncate_to(inode, length)
+    }
 }
 
 pub(super) fn input_device_read(
@@ -112,7 +170,7 @@ pub(super) fn sys_copy_file_range(ctx: &SyscallContext, call: &SyscallArgs) -> i
             break;
         }
 
-        let write_res = match fs::write(out_ino, out_off, &buf[..read_n], false) {
+        let write_res = match vfs_write(out_ino, out_off, &buf[..read_n], false) {
             Ok(w) => w,
             Err(err) => {
                 if copied > 0 {
@@ -378,7 +436,7 @@ pub(super) fn write_from_user_fd(
             let append = (fd_open_flags(flags) & fs::O_APPEND) != 0;
             let seals = fd_seals(flags, inode);
             if seals != 0 {
-                let size = fs::file_size(inode).unwrap_or(0);
+                let size = vfs_file_size(inode).unwrap_or(0);
                 let start = if append { size } else { offset };
                 let end = start.saturating_add(take as u64);
                 let sealed = seals_allow_write(seals)
@@ -390,7 +448,7 @@ pub(super) fn write_from_user_fd(
                     return Err(err);
                 }
             }
-            let write_res = match fs::write(inode, offset, &chunk[..take], append) {
+            let write_res = match vfs_write(inode, offset, &chunk[..take], append) {
                 Ok(result) => result,
                 Err(err) => {
                     if written > 0 {
@@ -636,6 +694,23 @@ pub(super) fn sys_lseek(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -EBADF;
     }
 
+    if let Some(size) = crate::shmem::size(inode) {
+        let base = match call.arg(2) as u32 {
+            0 => 0i128,
+            1 => current as i128,
+            2 => size as i128,
+            _ => return -EINVAL,
+        };
+        let next = base + (call.arg(1) as i64) as i128;
+        if next < 0 || next > i64::MAX as i128 {
+            return -EINVAL;
+        }
+        unsafe {
+            (*crate::task::leader_of(ctx.current)).user_fd_offset[idx] = next as u64;
+        }
+        return next as i64;
+    }
+
     let new_offset = match fs::seek(inode, current, call.arg(1) as i64, call.arg(2) as u32) {
         Ok(offset) => offset,
         Err(err) => return -fs_to_errno(err),
@@ -800,7 +875,7 @@ pub(super) fn sys_pwrite64(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             return -err;
         }
 
-        let write_res = match fs::write(inode, pos, &chunk[..take], false) {
+        let write_res = match vfs_write(inode, pos, &chunk[..take], false) {
             Ok(result) => result,
             Err(err) => {
                 if written > 0 {

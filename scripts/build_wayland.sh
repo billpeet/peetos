@@ -11,6 +11,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WAYLAND_SRC="${ROOT_DIR}/wayland/wayland-src"
 LIBFFI_SRC="${ROOT_DIR}/wayland/libffi-src"
+PROTOCOLS_SRC="${ROOT_DIR}/wayland/wayland-protocols-src"
+# wayland-protocols XML files (relative to PROTOCOLS_SRC) whose interface code
+# is compiled into libwlprotocols.a, with client/server headers installed.
+PROTOCOL_XMLS=(
+  stable/xdg-shell/xdg-shell.xml
+)
 OUT="${ROOT_DIR}/wayland/out"
 MUSL_CC="${MUSL_CC:-${ROOT_DIR}/musl/sysroot/bin/musl-gcc}"
 HOST_CC="${HOST_CC:-cc}"
@@ -23,6 +29,7 @@ Usage: build_wayland.sh [options]
 Options:
   --wayland-src <dir>  libwayland source tree (default: wayland/wayland-src)
   --libffi-src <dir>   libffi source tree (default: wayland/libffi-src)
+  --protocols-src <dir> wayland-protocols tree (default: wayland/wayland-protocols-src)
   --out <dir>          install prefix (default: wayland/out)
   --musl-cc <path>     musl compiler wrapper (default: musl/sysroot/bin/musl-gcc)
 USAGE
@@ -32,6 +39,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --wayland-src) WAYLAND_SRC="$2"; shift 2 ;;
     --libffi-src) LIBFFI_SRC="$2"; shift 2 ;;
+    --protocols-src) PROTOCOLS_SRC="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --musl-cc) MUSL_CC="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
@@ -39,7 +47,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for dir in "${WAYLAND_SRC}" "${LIBFFI_SRC}"; do
+for dir in "${WAYLAND_SRC}" "${LIBFFI_SRC}" "${PROTOCOLS_SRC}"; do
   if [[ ! -d "${dir}" ]]; then
     echo "source tree not found: ${dir} (run 'make -C wayland fetch')" >&2
     exit 1
@@ -132,6 +140,23 @@ rm -f "${OUT}/lib/libwayland-server.a" "${OUT}/lib/libwayland-client.a"
 ar rcs "${OUT}/lib/libwayland-server.a" "${COMMON[@]}" \
   "${O}/wayland-server.o" "${O}/wayland-shm.o" "${O}/event-loop.o"
 ar rcs "${OUT}/lib/libwayland-client.a" "${COMMON[@]}" "${O}/wayland-client.o"
+
+# --- wayland-protocols ---------------------------------------------------------
+echo "[wayland] generating wayland-protocols code"
+PROTO_OBJS=()
+mkdir -p "${OUT}/share/wayland-protocols"
+for rel in "${PROTOCOL_XMLS[@]}"; do
+  xml="${PROTOCOLS_SRC}/${rel}"
+  name="$(basename "${rel}" .xml)"
+  "${SCANNER}" -s client-header "${xml}" "${OUT}/include/${name}-client-protocol.h"
+  "${SCANNER}" -s server-header "${xml}" "${OUT}/include/${name}-server-protocol.h"
+  "${SCANNER}" -s private-code "${xml}" "${BUILD}/gen/${name}-protocol.c"
+  compile "${BUILD}/gen/${name}-protocol.c" "${O}/${name}-protocol.o"
+  PROTO_OBJS+=("${O}/${name}-protocol.o")
+  cp "${xml}" "${OUT}/share/wayland-protocols/"
+done
+rm -f "${OUT}/lib/libwlprotocols.a"
+ar rcs "${OUT}/lib/libwlprotocols.a" "${PROTO_OBJS[@]}"
 
 # --- headers -----------------------------------------------------------------
 cp "${WSRC}/wayland-util.h" \

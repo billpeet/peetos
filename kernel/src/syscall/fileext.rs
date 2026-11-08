@@ -326,7 +326,7 @@ pub(super) fn sys_fallocate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         return -ENODEV;
     }
 
-    let size = match fs::file_size(inode) {
+    let size = match vfs_file_size(inode) {
         Ok(size) => size,
         Err(err) => return -fs_to_errno(err),
     };
@@ -337,7 +337,7 @@ pub(super) fn sys_fallocate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if let Err(err) = seals_allow_resize(fd_seals(flags, inode), size, end) {
         return err;
     }
-    match fs::truncate_to(inode, end) {
+    match vfs_truncate_to(inode, end) {
         Ok(()) => {
             vm_page_cache_invalidate_inode(inode);
             sync_ext2_backing();

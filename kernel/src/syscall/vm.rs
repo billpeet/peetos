@@ -721,9 +721,10 @@ fn mmap_shared_anon_backing(task_ptr: *mut task::Task, len: u64) -> Result<Hidde
         };
         fs::inode_open_retain(opened.inode);
         let guard = HiddenFileRef(opened.inode);
-        // Best effort: tmpfs files are size-capped; pages past EOF read as
-        // zeroes and stay coherent through the page cache while mapped.
-        let _ = fs::truncate_to(opened.inode, len);
+        // Page-backed storage (crate::shmem), freed with the inode, so the
+        // region is not limited by tmpfs's inline file size.
+        crate::shmem::create(opened.inode)?;
+        vfs_truncate_to(opened.inode, len).map_err(|err| -fs_to_errno(err))?;
         let _ = fs::unlink(path);
         return Ok(guard);
     }
@@ -1068,8 +1069,11 @@ pub(super) fn mmap_validate_shared_write_window(
     len: u64,
 ) -> Result<(), i64> {
     let end = offset.checked_add(len).ok_or(-EINVAL)?;
-    let stat = fs::stat(inode).map_err(|err| -fs_to_errno(err))?;
-    if end > stat.size {
+    let stat = vfs_stat(inode).map_err(|err| -fs_to_errno(err))?;
+    // `len` is page-rounded; like Linux, the mapping may cover the partial
+    // page holding the end of the file.
+    let limit = stat.size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    if end > limit {
         return Err(-EINVAL);
     }
     Ok(())
@@ -1340,29 +1344,20 @@ pub(super) const MREMAP_MAYMOVE: u32 = 1;
 pub(super) fn mremap_move_ptes(pml4: PhysAddr, old_start: u64, new_start: u64, len: u64) -> Result<(), i64> {
     let mut off = 0u64;
     while off < len {
-        let old_va = VirtAddr::new(old_start + off);
-        if let Some(pte) = vmm::get_pte_in(pml4, old_va) {
-            let phys = PhysAddr::new(pte & vmm::PTE_ADDR_MASK);
-            let flags = pte & vmm::PTE_FLAGS_MASK;
-            if vmm::map_page_in(pml4, VirtAddr::new(new_start + off), phys, flags) != 0 {
-                // Roll back the pages moved so far.
-                let mut back = 0u64;
-                while back < off {
-                    let new_va = VirtAddr::new(new_start + back);
-                    if let Some(moved) = vmm::get_pte_in(pml4, new_va) {
-                        let _ = vmm::map_page_in(
-                            pml4,
-                            VirtAddr::new(old_start + back),
-                            PhysAddr::new(moved & vmm::PTE_ADDR_MASK),
-                            moved & vmm::PTE_FLAGS_MASK,
-                        );
-                        let _ = vmm::unmap_page_in(pml4, new_va);
-                    }
-                    back += PAGE_SIZE;
-                }
-                return Err(-ENOMEM);
+        let from = VirtAddr::new(old_start + off);
+        let to = VirtAddr::new(new_start + off);
+        if vmm::move_page_in(pml4, from, to).is_err() {
+            // Roll back the pages moved so far.
+            let mut back = 0u64;
+            while back < off {
+                let _ = vmm::move_page_in(
+                    pml4,
+                    VirtAddr::new(new_start + back),
+                    VirtAddr::new(old_start + back),
+                );
+                back += PAGE_SIZE;
             }
-            let _ = vmm::unmap_page_in(pml4, old_va);
+            return Err(-ENOMEM);
         }
         off += PAGE_SIZE;
     }
@@ -1500,6 +1495,7 @@ pub(super) fn sys_mremap(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     unsafe {
         TASK_VM_MAPPINGS[slot] = next;
     }
+    vm_sync_inode_pins();
     new_start as i64
 }
 
@@ -1654,6 +1650,31 @@ pub(super) fn mmap_fault_map_page(
             pte_flags,
         ) != 0
         {
+            return Err(-ENOMEM);
+        }
+        return Ok(());
+    }
+
+    if mapping.map_shared
+        && mapping.file_inode != task::USER_FD_NONE
+        && crate::shmem::exists(mapping.file_inode)
+    {
+        // memfd pages are owned by the shmem object; each mapping takes its
+        // own PMM share reference, dropped by the normal unmap/exit paths.
+        let map_delta = page_addr.checked_sub(mapping.start).ok_or(-EINVAL)?;
+        let file_off = mapping.file_offset.checked_add(map_delta).ok_or(-EINVAL)?;
+        let page_off = align_down(file_off, PAGE_SIZE);
+        let phys = match crate::shmem::fault_page(mapping.file_inode, page_off) {
+            Some(Ok(phys)) => PhysAddr::new(phys),
+            Some(Err(err)) => return Err(err),
+            None => return Err(-EINVAL),
+        };
+        if !pmm::page_share(phys) {
+            return Err(-ENOMEM);
+        }
+        let pte_flags = mmap_prot_to_pte_flags(mapping.prot)?;
+        if vmm::map_page_in(pml4, VirtAddr::new(page_addr), phys, pte_flags) != 0 {
+            pmm::free_page(phys);
             return Err(-ENOMEM);
         }
         return Ok(());

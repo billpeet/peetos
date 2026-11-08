@@ -8,6 +8,8 @@
 #   lib/libwayland-server.a   static, musl, x86_64
 #   lib/libwayland-client.a
 #   lib/libffi.a
+#   lib/libwlprotocols.a       generated interface code for wayland-protocols
+#                              (xdg-shell), headers in include/
 #   share/wayland/wayland.xml
 
 OUT_DIR ?= $(CURDIR)/out
@@ -20,13 +22,14 @@ all: build
 fetch:
 	./fetch-wayland.sh
 
-wayland-src libffi-src:
+wayland-src libffi-src wayland-protocols-src:
 	$(MAKE) fetch
 
-build: wayland-src libffi-src
+build: wayland-src libffi-src wayland-protocols-src
 	../scripts/build_wayland.sh \
 		--wayland-src "$(CURDIR)/wayland-src" \
 		--libffi-src "$(CURDIR)/libffi-src" \
+		--protocols-src "$(CURDIR)/wayland-protocols-src" \
 		--out "$(OUT_DIR)" \
 		--musl-cc "$(MUSL_CC)"
 
@@ -34,7 +37,7 @@ clean:
 	rm -rf "$(OUT_DIR)" build
 
 distclean: clean
-	rm -rf wayland-src libffi-src wayland-*.tar.xz libffi-*.tar.gz
+	rm -rf wayland-src libffi-src wayland-protocols-src wayland-*.tar.xz libffi-*.tar.gz
 
 info:
 	@echo "OUT_DIR=$(OUT_DIR)"

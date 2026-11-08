@@ -404,7 +404,7 @@ pub(super) fn sys_access_common(ctx: &SyscallContext, dirfd: i32, pathname: u64,
         Ok(inode) => inode,
         Err(err) => return err,
     };
-    let stat = match fs::stat(inode) {
+    let stat = match vfs_stat(inode) {
         Ok(stat) => stat,
         Err(err) => return -fs_to_errno(err),
     };
@@ -799,7 +799,7 @@ pub(super) fn sys_utimensat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
     };
 
-    let current = match fs::stat(inode) {
+    let current = match vfs_stat(inode) {
         Ok(stat) => stat,
         Err(err) => return -fs_to_errno(err),
     };
@@ -922,7 +922,7 @@ pub(super) fn stat_path(
         // through lookupat with the same behavior as stat.
         fs::lookupat(dir_inode, path).map_err(|err| -fs_to_errno(err))?
     };
-    fs::stat(inode).map_err(|err| -fs_to_errno(err))
+    vfs_stat(inode).map_err(|err| -fs_to_errno(err))
 }
 
 pub(super) fn write_stat_to_user(task_ptr: *mut task::Task, dst: u64, stat: fs::FileStat) -> i64 {
@@ -1005,7 +1005,7 @@ pub(super) fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if kind != task::USER_FD_KIND_VFS {
         return -EBADF;
     }
-    let stat = match fs::stat(inode) {
+    let stat = match vfs_stat(inode) {
         Ok(stat) => stat,
         Err(err) => return -fs_to_errno(err),
     };
@@ -1072,7 +1072,7 @@ pub(super) fn sys_newfstatat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             Err(err) => return -fs_to_errno(err),
         }
     };
-    let stat = match fs::stat(inode) {
+    let stat = match vfs_stat(inode) {
         Ok(stat) => stat,
         Err(err) => return -fs_to_errno(err),
     };
@@ -1223,6 +1223,7 @@ pub(super) fn dev_fd_dir_entry(offset: u64, is_open: impl Fn(usize) -> bool) -> 
 /// cached pages so a later file reusing the inode slot never sees them, and
 /// flush ext2 metadata.
 pub(super) fn vfs_inode_freed(inode: u16) {
+    crate::shmem::destroy(inode);
     vm_page_cache_invalidate_inode(inode);
     sync_ext2_backing();
 }
@@ -1345,7 +1346,7 @@ pub(super) fn sys_ftruncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     }
     let seals = fd_seals(fd_flags, inode);
     if seals != 0 {
-        let size = match fs::file_size(inode) {
+        let size = match vfs_file_size(inode) {
             Ok(size) => size,
             Err(err) => return -fs_to_errno(err),
         };
@@ -1354,11 +1355,7 @@ pub(super) fn sys_ftruncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         }
     }
 
-    let result = if length == 0 {
-        fs::truncate(inode)
-    } else {
-        fs::truncate_to(inode, length)
-    };
+    let result = vfs_truncate_to(inode, length);
 
     match result {
         Ok(()) => {
@@ -1579,11 +1576,7 @@ pub(super) fn sys_truncate(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => return -fs_to_errno(err),
     };
 
-    let result = if length == 0 {
-        fs::truncate(inode)
-    } else {
-        fs::truncate_to(inode, length)
-    };
+    let result = vfs_truncate_to(inode, length);
 
     match result {
         Ok(()) => {

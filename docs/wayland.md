@@ -15,6 +15,7 @@ kernel interfaces it relies on, and how it is tested. Roadmap context lives in
 **Versions**
 - libwayland `1.23.1` (core library and `wayland.xml` protocol)
 - libffi `3.4.6` (used by libwayland to dispatch requests/events to listener functions)
+- wayland-protocols `1.38` (currently only `stable/xdg-shell` is built)
 - Release archives are pinned by SHA-256 in `wayland/fetch-wayland.sh`.
 
 **Build**
@@ -26,7 +27,8 @@ Outputs land in `wayland/out/`:
 - `bin/wayland-scanner`: host tool (runs on the build machine)
 - `include/`: `wayland-{util,version,client,client-core,server,server-core}.h`, generated `wayland-{client,server}-protocol.h`, `ffi.h`
 - `lib/libwayland-server.a`, `lib/libwayland-client.a`, `lib/libffi.a`: static, musl, x86_64
-- `share/wayland/wayland.xml`
+- `lib/libwlprotocols.a` plus `include/xdg-shell-{client,server}-protocol.h`: generated code for the wayland-protocols listed in `PROTOCOL_XMLS` in `scripts/build_wayland.sh` (add an XML path there to build another protocol)
+- `share/wayland/wayland.xml`, `share/wayland-protocols/*.xml`
 
 The build needs no meson, ninja, or autotools:
 - libwayland's core is eight C files compiled directly by `scripts/build_wayland.sh` with `musl-gcc`.
@@ -66,13 +68,44 @@ make run-wayland-smoke   # or: tests/musl_ext2_wayland_smoke.sh
 - Client (execs the same binary with `--client`, a separate process): connects through `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`, binds the globals, creates a sealed memfd pool (`F_SEAL_SHRINK`, and checks that shrinking fails with `EPERM`), presents frame 1, grows the pool with `posix_fallocate` + `wl_shm_pool_resize` (the server then `mremap`s), presents frame 2 from the new region, signals the server, and disconnects.
 - The runner requires every phase marker plus `[wl-smoke] pass`, and fails on any `[wl-smoke] FAIL`.
 
+**peetwl Compositor**
+`user/peetwl.c` is the PeetOS Wayland compositor, built on libwayland-server:
+- Output: maps `/dev/fb0` (`FBIOGETINFO` + `mmap`), composites into a back buffer, and copies the damaged rectangle to the framebuffer at most every 16 ms. Frame callbacks fire after each repaint.
+- Globals: `wl_compositor` v4, `wl_shm` (XRGB8888/ARGB8888), `wl_seat` v5 (pointer + keyboard), `wl_output` v3, `xdg_wm_base` v6.
+- xdg-shell: toplevels get an initial configure, must `ack_configure` before attaching a buffer, and receive `activated` state changes on focus. `xdg_toplevel.move` starts an interactive move. Popups are created and immediately dismissed (`popup_done`); positioners are accepted and ignored.
+- Window management: new toplevels are cascaded and focused. Server-side decorations (title bar with the toplevel title, focus-coloured border, close box) are drawn by the compositor. Clicking raises and focuses a window, dragging the title bar moves it, and the close box sends `xdg_toplevel.close`.
+- Input: reads `/dev/input/event0` (keyboard) and `/dev/input/event1` (relative PS/2 or absolute tablet pointer), draws a software cursor, does pointer hit-testing for `wl_pointer` enter/leave/motion/button/frame, and delivers raw evdev keycodes with `WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP` plus Shift/Ctrl/Alt modifier masks.
+- Clients: `--client "<cmd> [args]"` spawns clients after the socket is up; `--smoke` adds cursor/focus logging, exits when every spawned client has exited, and enforces a watchdog. The compositor learns about exited children through a `SIGCHLD` signalfd source.
+
+`user/wl_demo.c` (`wl-demo <title> <0xRRGGBB> [--size WxH] [--animate]`) is a small xdg-shell client: double-buffered shm pool, activated-state accent bar, left click toggles its colour, every key press is logged, `q` or the close box exits, and `--animate` redraws continuously paced by frame callbacks.
+
+Running it:
+```bash
+make run-wayland-demo   # interactive: three wl-demo windows in a QEMU window (usb-tablet pointer)
+make run-wlcomp-smoke   # automated: tests/musl_ext2_wlcomp_smoke.sh
+```
+The automated smoke boots the `compositor-first musl-ext2-wlcomp-smoke` profile with two clients and drives it from `scripts/wlcomp_smoke_driver.py` through the QEMU monitor, injecting real PS/2 input (`mouse_move`, `mouse_button`, `sendkey`) and checking the screen with `screendump`:
+1. both windows show their colours, and the focused/unfocused title bar colours are right
+2. moving onto Alpha and clicking gives it pointer and keyboard focus, delivers the button, and the client's colour change reaches the screen
+3. a key press reaches only the focused client
+4. dragging Alpha's title bar moves the window by exactly the cursor delta
+5. Beta's close box makes the client exit and unmaps it
+6. `q` exits Alpha, and the compositor exits cleanly after both children are reaped
+
+Set `WLCOMP_SHOTS=<dir>` to keep PNG copies of the screendumps.
+
 Limitations / Simplifications
-- Only the core library is ported: no `libwayland-cursor`, `libwayland-egl`, or `wayland-protocols` (so no `xdg-shell` yet). The smoke compositor implements `wl_compositor`/`wl_surface`/`wl_region` minimally and does not present to `/dev/fb0`.
+- No `xkbcommon` yet: clients get raw evdev keycodes (`NO_KEYMAP`), so toolkits that require an XKB keymap will not handle keyboard input. Modifiers are tracked for Shift/Ctrl/Alt only; there is no compositor-side key repeat.
+- The compositor always draws its own cursor and ignores `wl_pointer.set_cursor`. There is no touch support, and scroll/axis events are never sent.
+- Committed buffers are copied into compositor memory on every commit (whole surface, ignoring `wl_surface.damage`), and only XRGB8888/ARGB8888 `wl_shm` buffers are supported. Alpha is ignored: windows are drawn opaque.
+- xdg-shell subset: no popups (dismissed immediately), no interactive resize, maximise, fullscreen or minimise, configures always suggest 0x0 (client-chosen size), and window geometry is ignored. Placement is a fixed cascade.
+- No subsurfaces (`wl_subcompositor`), no `wl_data_device_manager` (clipboard/drag and drop), no multi-output or output scaling.
+- Repaint is timer-driven at up to ~60 Hz with a single damage rectangle; there is no vblank synchronisation.
+- Only the core library is ported: no `libwayland-cursor` or `libwayland-egl`, and from wayland-protocols only `xdg-shell` is built.
 - Libraries are static only; PeetOS's dynamic loader is bootstrap-grade, so shared libraries are out of scope for now.
 - libffi is built with `--disable-exec-static-tramp` because the musl sysroot has no Linux UAPI headers. libwayland only uses `ffi_call`, not closures, so this does not matter for it.
 - The smoke uses `/tmp` on the ext2 root as `XDG_RUNTIME_DIR`; there is no per-user runtime directory or permission model.
 - `wayland-scanner` is built without libxml2, so it does not DTD-validate protocol XML (meson's `dtd_validation` option).
-- Upstream libwayland's own test suite is not built or run yet.
 
 **Upstream Test Suite**
 A subset of libwayland 1.23.1's own test suite (`wayland-src/tests`) runs inside PeetOS:

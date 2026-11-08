@@ -61,7 +61,7 @@ impl ExecImage {
 }
 
 pub(super) fn read_exec_image_from_inode(inode: u16) -> Result<ExecImage, i64> {
-    let stat = fs::stat(inode).map_err(|err| -fs_to_errno(err))?;
+    let stat = vfs_stat(inode).map_err(|err| -fs_to_errno(err))?;
     if stat.file_type != fs::FileType::Regular {
         return Err(-EACCES);
     }
@@ -1199,6 +1199,25 @@ pub(super) fn leave_exited_task(ctx: &SyscallContext) {
     }
 }
 
+/// Send the exit signal (always `SIGCHLD`: `clone` only accepts that exit
+/// signal for new processes) to the parent of a process that just exited.
+/// Like any signal, it is discarded when the parent ignores `SIGCHLD`
+/// (the default) and stays pending when the parent blocks it.
+pub(super) fn notify_parent_of_exit(leader: *mut task::Task) {
+    if leader.is_null() {
+        return;
+    }
+    let ppid = unsafe { (*leader).ppid };
+    if ppid <= 0 {
+        return;
+    }
+    let parent = task::get_by_pid(ppid);
+    if parent.is_null() || !task::is_live(parent) {
+        return;
+    }
+    let _ = signal::send_to_process(parent, signal::SIGCHLD);
+}
+
 /// Exit the calling thread. When it is the last live thread of its process,
 /// the process's resources are released and the leader becomes waitable.
 pub(super) fn exit_current_thread(ctx: &SyscallContext, code: i32) -> i64 {
@@ -1231,6 +1250,7 @@ pub(super) fn exit_current_thread(ctx: &SyscallContext, code: i32) -> i64 {
             (*leader).exit_code = status;
         }
         release_process_resources(leader);
+        notify_parent_of_exit(leader);
         crate::user::maybe_restore_console_after_init_exit(leader, status);
     }
 
