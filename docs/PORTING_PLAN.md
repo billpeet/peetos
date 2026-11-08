@@ -224,6 +224,8 @@ current Rust kernel implementation and forward roadmap.
 
 - Add partition parsing (MBR/GPT) for block-device mounts.
 - Continue ext2/ext3 hardening and fs/page-cache integration.
+- ext4 compatibility, staged as M0-M5 in `docs/ext4_compat_plan.md` (read-only
+  mount first, then extent writes, then `metadata_csum` writes).
 - Add additional filesystem support (for example FAT-family support) as needed.
 - Improve durability guarantees around writeback scheduling and crash handling.
 
