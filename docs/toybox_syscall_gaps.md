@@ -13,11 +13,11 @@ For shell-specific bring-up priorities, see `docs/toybox_shell_syscalls.md`.
 - QuickJS runtime smoke is staged through the same ext2 launcher path (`musl-ext2-quickjs-smoke`) to validate JavaScript userspace execution on top of the current toybox/musl baseline.
 - MicroPython runtime smoke is staged through the same ext2 launcher path (`musl-ext2-micropython-smoke`) to validate Python userspace execution on top of the current toybox/musl baseline.
 - Dropbear runtime smoke is staged through the same ext2 launcher path (`musl-ext2-dropbear-smoke`) to validate SSH daemon/key tool userspace execution on top of the current toybox/musl baseline.
-- Use `kernel/src/syscall.rs` as current implemented surface.
+- Use `kernel/src/syscall/` as current implemented surface.
 
 ## Current Kernel Syscalls
 
-Currently implemented in `kernel/src/syscall.rs`:
+Currently implemented in `kernel/src/syscall/`:
 
 - `read`, `write`, `writev`, `readv`, `pread64`, `pwrite64`, `open`, `openat`, `close`, `lseek`
 - `stat`, `lstat`, `fstat`, `newfstatat`, `getdents64`

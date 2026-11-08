@@ -5,7 +5,7 @@ This document describes the current syscall entry implementation and dispatcher 
 **Where It Lives**
 - `crates/arch_x86_64/src/syscall.rs`
 - `crates/arch_x86_64/src/msr.rs`
-- `kernel/src/syscall.rs`
+- `kernel/src/syscall/` (see "Module Layout" below)
 - `kernel/src/main.rs`
 
 **MSR Setup**
@@ -71,7 +71,7 @@ Limitations / Simplifications
 - `int 0x80` is retained as a compatibility path for current userspace bring-up and tooling.
 
 **Syscall Handler**
-`kernel/src/syscall.rs` now implements a table-driven dispatcher shared by both the SYSCALL and int 0x80 paths. Arguments are normalized into a small `SyscallArgs` struct, syscall entries carry mode metadata (any task vs user task), unknown syscall logs are rate-limited, and return values use Linux-style negative errno.
+`kernel/src/syscall/mod.rs` implements a table-driven dispatcher shared by both the SYSCALL and int 0x80 paths. Arguments are normalized into a small `SyscallArgs` struct, syscall entries carry mode metadata (any task vs user task), unknown syscall logs are rate-limited, and return values use Linux-style negative errno.
 
 Current implemented handlers:
 - `open/openat/close/read/write/writev/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
@@ -184,6 +184,27 @@ Limitations / Simplifications
 - `getcwd` uses bounded in-kernel directory traversal and does not yet have dedicated VFS reverse-path metadata.
 - Signal support remains simplified: delivery is syscall-boundary based and user handlers currently require `SA_RESTORER`; `sigaltstack`, queued RT signal payloads/`siginfo_t`, and full Linux ucontext semantics are not implemented yet.
 - Several Toybox-relevant syscalls are still stubbed and return `-ENOSYS` pending VFS/metadata support (`fchmodat`, `fchownat`, `mknodat`, plus compatibility wrappers `utimes`/`futimesat`).
+
+**Module Layout**
+`kernel/src/syscall/` is split by area. `mod.rs` holds the syscall numbers and constants, the shared Linux ABI structs, per-task state tables, the `SYSCALL_TABLE`, errno conversion, dispatch, and the SYSCALL/int 0x80 entry handlers. Handlers and their helpers live in submodules:
+- `uaccess.rs`: copying data to and from user memory
+- `vm.rs`: `mmap`/`munmap`/`mprotect`/`msync`/`brk`, user page faults, and the file-backed page cache
+- `fd.rs`: fd table helpers, `close`/`dup*`/`fcntl`, pipes, `memfd_create`
+- `file.rs`: path resolution, `open*`, metadata (`stat*`, `statfs`, `chmod`/`chown`, times), directory operations, `getdents64`, `truncate`/`sync`
+- `io.rs`: `read`/`write`/`readv`/`writev`/`pread64`/`pwrite64`/`lseek`/`copy_file_range`
+- `process.rs`: `fork`/`vfork`/`clone`, `execve`, `wait4`, `exit*`, ids and process groups, `arch_prctl`, `futex`
+- `signals.rs`: `kill`, `rt_sig*`, signal-frame install/restore (including FPU state), pending-signal delivery
+- `ioctl.rs`: console, pty and framebuffer `ioctl`
+- `poll.rs`: `select`/`poll`/`ppoll` and epoll
+- `sockets.rs`: BSD sockets, `sendmsg`/`recvmsg`, `SCM_RIGHTS`
+- `misc.rs`: time, `uname`, `getrandom`, `sysinfo`, System V shm
+- `tests.rs`: host unit tests
+
+Submodules import everything from `mod.rs` with `use super::*`, and `mod.rs` glob-imports each submodule, so items are `pub(super)` and visible across the whole `syscall` module.
+
+Limitations / Simplifications
+- The split is by file only; the submodules still share the global state in `mod.rs` and call each other freely, so there is no enforced layering between areas.
+- `mod.rs` is still large because the syscall table and constants for every area live there.
 
 **Integration**
 `kernel/src/main.rs` calls `arch_syscall::init()` (MSR setup) and `syscall::init()` (dispatcher state init) during early boot.

@@ -1,0 +1,1539 @@
+use super::*;
+use std::sync::Mutex;
+
+static EPOLL_TEST_LOCK: Mutex<()> = Mutex::new(());
+static INPUT_TEST_LOCK: Mutex<()> = Mutex::new(());
+static MMAP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn reset_epoll_for_test() {
+    unsafe {
+        for idx in 0..EPOLL_MAX_INSTANCES {
+            EPOLL_INSTANCES[idx] = EpollInstance::EMPTY;
+        }
+    }
+}
+
+fn reset_vm_for_test() {
+    fs::init();
+    crate::input::init();
+    let _ = fs::mkdir("/temp");
+    task::Task::reset_registry_for_test();
+    init();
+}
+
+#[test]
+fn user_range_validation() {
+    assert!(user_range_ok(0x1000, 4));
+    assert!(user_range_ok(USER_CANON_MAX, 1));
+    assert!(!user_range_ok(USER_CANON_MAX + 1, 1));
+    assert!(!user_range_ok(KERNEL_VIRT_BASE, 1));
+    assert!(!user_range_ok(KERNEL_VIRT_BASE - 1, 2));
+}
+
+#[test]
+fn page_align_up_rounds_correctly() {
+    assert_eq!(page_align_up(0), Some(0));
+    assert_eq!(page_align_up(1), Some(PAGE_SIZE));
+    assert_eq!(page_align_up(PAGE_SIZE), Some(PAGE_SIZE));
+}
+
+#[test]
+fn syscall_lookup_finds_known_entry() {
+    let def = lookup_syscall(SYS_GETPID).expect("syscall should exist");
+    assert_eq!(def.name, "getpid");
+}
+
+#[test]
+fn syscall_lookup_includes_vfs_extensions() {
+    assert_eq!(lookup_syscall(SYS_PIPE).map(|d| d.name), Some("pipe"));
+    assert_eq!(lookup_syscall(SYS_SELECT).map(|d| d.name), Some("select"));
+    assert_eq!(lookup_syscall(SYS_STAT).map(|d| d.name), Some("stat"));
+    assert_eq!(lookup_syscall(SYS_LSTAT).map(|d| d.name), Some("lstat"));
+    assert_eq!(lookup_syscall(SYS_KILL).map(|d| d.name), Some("kill"));
+    assert_eq!(lookup_syscall(SYS_UNAME).map(|d| d.name), Some("uname"));
+    assert_eq!(lookup_syscall(SYS_MMAP).map(|d| d.name), Some("mmap"));
+    assert_eq!(
+        lookup_syscall(SYS_MPROTECT).map(|d| d.name),
+        Some("mprotect")
+    );
+    assert_eq!(lookup_syscall(SYS_MUNMAP).map(|d| d.name), Some("munmap"));
+    assert_eq!(lookup_syscall(SYS_MSYNC).map(|d| d.name), Some("msync"));
+    assert_eq!(
+        lookup_syscall(SYS_RT_SIGACTION).map(|d| d.name),
+        Some("rt_sigaction")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_RT_SIGPROCMASK).map(|d| d.name),
+        Some("rt_sigprocmask")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_RT_SIGRETURN).map(|d| d.name),
+        Some("rt_sigreturn")
+    );
+    assert_eq!(lookup_syscall(SYS_WRITEV).map(|d| d.name), Some("writev"));
+    assert_eq!(lookup_syscall(SYS_DUP).map(|d| d.name), Some("dup"));
+    assert_eq!(lookup_syscall(SYS_DUP2).map(|d| d.name), Some("dup2"));
+    assert_eq!(lookup_syscall(SYS_FCNTL).map(|d| d.name), Some("fcntl"));
+    assert_eq!(lookup_syscall(SYS_FSYNC).map(|d| d.name), Some("fsync"));
+    assert_eq!(lookup_syscall(SYS_SHMGET).map(|d| d.name), Some("shmget"));
+    assert_eq!(lookup_syscall(SYS_SHMAT).map(|d| d.name), Some("shmat"));
+    assert_eq!(lookup_syscall(SYS_SHMDT).map(|d| d.name), Some("shmdt"));
+    assert_eq!(lookup_syscall(SYS_SHMCTL).map(|d| d.name), Some("shmctl"));
+    assert_eq!(lookup_syscall(SYS_UMASK).map(|d| d.name), Some("umask"));
+    assert_eq!(lookup_syscall(SYS_MKDIRAT).map(|d| d.name), Some("mkdirat"));
+    assert_eq!(lookup_syscall(SYS_FUTEX).map(|d| d.name), Some("futex"));
+    assert_eq!(
+        lookup_syscall(SYS_NEWFSTATAT).map(|d| d.name),
+        Some("newfstatat")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_GETDENTS64).map(|d| d.name),
+        Some("getdents64")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_UNLINKAT).map(|d| d.name),
+        Some("unlinkat")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_RENAMEAT).map(|d| d.name),
+        Some("renameat")
+    );
+    assert_eq!(lookup_syscall(SYS_DUP3).map(|d| d.name), Some("dup3"));
+    assert_eq!(lookup_syscall(SYS_PIPE2).map(|d| d.name), Some("pipe2"));
+    assert_eq!(lookup_syscall(SYS_EXECVE).map(|d| d.name), Some("execve"));
+    assert_eq!(
+        lookup_syscall(SYS_ARCH_PRCTL).map(|d| d.name),
+        Some("arch_prctl")
+    );
+    assert_eq!(lookup_syscall(SYS_CLONE).map(|d| d.name), Some("clone"));
+    assert_eq!(lookup_syscall(SYS_FORK).map(|d| d.name), Some("fork"));
+    assert_eq!(lookup_syscall(SYS_VFORK).map(|d| d.name), Some("vfork"));
+    assert_eq!(lookup_syscall(SYS_WAIT4).map(|d| d.name), Some("wait4"));
+    assert_eq!(lookup_syscall(SYS_IOCTL).map(|d| d.name), Some("ioctl"));
+    assert_eq!(lookup_syscall(SYS_ACCESS).map(|d| d.name), Some("access"));
+    assert_eq!(
+        lookup_syscall(SYS_FACCESSAT).map(|d| d.name),
+        Some("faccessat")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_FACCESSAT2).map(|d| d.name),
+        Some("faccessat2")
+    );
+    assert_eq!(lookup_syscall(SYS_GETCWD).map(|d| d.name), Some("getcwd"));
+    assert_eq!(lookup_syscall(SYS_CHDIR).map(|d| d.name), Some("chdir"));
+    assert_eq!(lookup_syscall(SYS_FCHDIR).map(|d| d.name), Some("fchdir"));
+    assert_eq!(lookup_syscall(SYS_RENAME).map(|d| d.name), Some("rename"));
+    assert_eq!(lookup_syscall(SYS_LINK).map(|d| d.name), Some("link"));
+    assert_eq!(lookup_syscall(SYS_UNLINK).map(|d| d.name), Some("unlink"));
+    assert_eq!(
+        lookup_syscall(SYS_READLINK).map(|d| d.name),
+        Some("readlink")
+    );
+    assert_eq!(lookup_syscall(SYS_LINKAT).map(|d| d.name), Some("linkat"));
+    assert_eq!(
+        lookup_syscall(SYS_SYMLINKAT).map(|d| d.name),
+        Some("symlinkat")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_READLINKAT).map(|d| d.name),
+        Some("readlinkat")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_UTIMENSAT).map(|d| d.name),
+        Some("utimensat")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_GETTIMEOFDAY).map(|d| d.name),
+        Some("gettimeofday")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_CLOCK_GETTIME).map(|d| d.name),
+        Some("clock_gettime")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_NANOSLEEP).map(|d| d.name),
+        Some("nanosleep")
+    );
+    assert_eq!(lookup_syscall(SYS_GETUID).map(|d| d.name), Some("getuid"));
+    assert_eq!(lookup_syscall(SYS_GETEUID).map(|d| d.name), Some("geteuid"));
+    assert_eq!(lookup_syscall(SYS_GETGID).map(|d| d.name), Some("getgid"));
+    assert_eq!(lookup_syscall(SYS_GETEGID).map(|d| d.name), Some("getegid"));
+    assert_eq!(lookup_syscall(SYS_SETPGID).map(|d| d.name), Some("setpgid"));
+    assert_eq!(lookup_syscall(SYS_SETSID).map(|d| d.name), Some("setsid"));
+    assert_eq!(lookup_syscall(SYS_GETSID).map(|d| d.name), Some("getsid"));
+    assert_eq!(lookup_syscall(SYS_UTIMES).map(|d| d.name), Some("utimes"));
+    assert_eq!(
+        lookup_syscall(SYS_FUTIMESAT).map(|d| d.name),
+        Some("futimesat")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_COPY_FILE_RANGE).map(|d| d.name),
+        Some("copy_file_range")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_MEMFD_CREATE).map(|d| d.name),
+        Some("memfd_create")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_EPOLL_CREATE1).map(|d| d.name),
+        Some("epoll_create1")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_EPOLL_CTL).map(|d| d.name),
+        Some("epoll_ctl")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_EPOLL_WAIT).map(|d| d.name),
+        Some("epoll_wait")
+    );
+    assert_eq!(
+        lookup_syscall(SYS_EPOLL_PWAIT).map(|d| d.name),
+        Some("epoll_pwait")
+    );
+}
+
+#[test]
+fn mmap_prot_translation_sets_expected_bits() {
+    let rw = mmap_prot_to_pte_flags(PROT_READ | PROT_WRITE).expect("rw flags");
+    assert_ne!(rw & vmm::PTE_USER, 0);
+    assert_ne!(rw & vmm::PTE_WRITE, 0);
+    assert_ne!(rw & vmm::PTE_NO_EXECUTE, 0);
+
+    let rx = mmap_prot_to_pte_flags(PROT_READ | PROT_EXEC).expect("rx flags");
+    assert_ne!(rx & vmm::PTE_USER, 0);
+    assert_eq!(rx & vmm::PTE_WRITE, 0);
+    assert_eq!(rx & vmm::PTE_NO_EXECUTE, 0);
+
+    let none = mmap_prot_to_pte_flags(PROT_NONE).expect("none flags");
+    assert_eq!(none & vmm::PTE_USER, 0);
+}
+
+#[test]
+fn mmap_flag_validation_rejects_unknown_bits() {
+    assert!(mmap_flags_are_supported(MAP_PRIVATE | MAP_ANONYMOUS));
+    assert!(!mmap_flags_are_supported(MAP_PRIVATE | 0x8000_0000));
+}
+
+#[test]
+fn mmap_parse_sharing_mode_requires_exactly_one_mode() {
+    assert_eq!(
+        mmap_parse_sharing_mode(MAP_PRIVATE).expect("private mode"),
+        (true, false)
+    );
+    assert_eq!(
+        mmap_parse_sharing_mode(MAP_SHARED).expect("shared mode"),
+        (false, true)
+    );
+    assert_eq!(mmap_parse_sharing_mode(0), Err(-EINVAL));
+    assert_eq!(
+        mmap_parse_sharing_mode(MAP_PRIVATE | MAP_SHARED),
+        Err(-EINVAL)
+    );
+}
+
+#[test]
+fn mmap_regions_unmap_range_splits_middle_mapping() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    regions[0] = VmMapping {
+        start: 0x1000,
+        len: 0x4000,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+
+    mmap_regions_unmap_range(&mut regions, 0x2000, 0x3000).expect("unmap split should work");
+
+    let left = mmap_regions_find_mapping(&regions, 0x1000).expect("left segment");
+    let right = mmap_regions_find_mapping(&regions, 0x3000).expect("right segment");
+    assert_eq!(left.start, 0x1000);
+    assert_eq!(left.len, 0x1000);
+    assert_eq!(right.start, 0x3000);
+    assert_eq!(right.len, 0x2000);
+    assert!(mmap_regions_find_mapping(&regions, 0x2000).is_none());
+}
+
+#[test]
+fn mmap_regions_unmap_range_adjusts_file_offsets() {
+    let mut front_trim = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    front_trim[0] = VmMapping {
+        start: 0x1000,
+        len: 0x4000,
+        file_offset: 0x8000,
+        file_inode: 12,
+        prot: PROT_READ,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    mmap_regions_unmap_range(&mut front_trim, 0x1000, 0x2000).expect("front trim");
+    let trimmed = mmap_regions_find_mapping(&front_trim, 0x2000).expect("trimmed mapping");
+    assert_eq!(trimmed.start, 0x2000);
+    assert_eq!(trimmed.len, 0x3000);
+    assert_eq!(trimmed.file_offset, 0x9000);
+
+    let mut middle_split = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    middle_split[0] = VmMapping {
+        start: 0x1000,
+        len: 0x4000,
+        file_offset: 0xA000,
+        file_inode: 15,
+        prot: PROT_READ,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    mmap_regions_unmap_range(&mut middle_split, 0x2000, 0x3000).expect("middle split");
+    let left = mmap_regions_find_mapping(&middle_split, 0x1000).expect("left split");
+    let right = mmap_regions_find_mapping(&middle_split, 0x3000).expect("right split");
+    assert_eq!(left.file_offset, 0xA000);
+    assert_eq!(right.file_offset, 0xC000);
+}
+
+#[test]
+fn mmap_regions_unmap_range_rolls_back_when_split_slot_unavailable() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    regions[0] = VmMapping {
+        start: 0x1000,
+        len: 0x3000,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+    for (idx, region) in regions.iter_mut().enumerate().skip(1) {
+        *region = VmMapping {
+            start: 0x5000 + ((idx as u64 - 1) * 0x2000),
+            len: 0x1000,
+            file_offset: 0,
+            file_inode: task::USER_FD_NONE,
+            prot: PROT_READ,
+            map_shared: false,
+            map_shared_can_write: false,
+        };
+    }
+    let original = regions;
+
+    assert_eq!(
+        mmap_regions_unmap_range(&mut regions, 0x2000, 0x3000),
+        Err(-ENOMEM)
+    );
+    assert_eq!(regions, original);
+}
+
+#[test]
+fn mmap_regions_protect_range_splits_and_updates_target() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    regions[0] = VmMapping {
+        start: 0x4000,
+        len: 0x4000,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+
+    mmap_regions_protect_range(&mut regions, 0x5000, 0x6000, PROT_READ | PROT_WRITE)
+        .expect("mprotect split should work");
+
+    let left = mmap_regions_find_mapping(&regions, 0x4000).expect("left segment");
+    let middle = mmap_regions_find_mapping(&regions, 0x5000).expect("middle segment");
+    let right = mmap_regions_find_mapping(&regions, 0x6000).expect("right segment");
+    assert_eq!(left.prot, PROT_READ);
+    assert_eq!(middle.prot, PROT_READ | PROT_WRITE);
+    assert_eq!(right.prot, PROT_READ);
+}
+
+#[test]
+fn mmap_regions_protect_range_rejects_shared_write_upgrade_without_mutation() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    regions[0] = VmMapping {
+        start: 0x7000,
+        len: 0x3000,
+        file_offset: 0,
+        file_inode: 5,
+        prot: PROT_READ,
+        map_shared: true,
+        map_shared_can_write: false,
+    };
+    let original = regions;
+
+    assert_eq!(
+        mmap_regions_protect_range(&mut regions, 0x8000, 0x9000, PROT_READ | PROT_WRITE),
+        Err(-EINVAL)
+    );
+    assert_eq!(regions, original);
+}
+
+#[test]
+fn mmap_regions_protect_range_rolls_back_when_split_slot_unavailable() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    regions[0] = VmMapping {
+        start: 0x1000,
+        len: 0x3000,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+    for (idx, region) in regions.iter_mut().enumerate().skip(1) {
+        *region = VmMapping {
+            start: 0x5000 + ((idx as u64 - 1) * 0x2000),
+            len: 0x1000,
+            file_offset: 0,
+            file_inode: task::USER_FD_NONE,
+            prot: PROT_READ,
+            map_shared: false,
+            map_shared_can_write: false,
+        };
+    }
+    let original = regions;
+
+    assert_eq!(
+        mmap_regions_protect_range(&mut regions, 0x2000, 0x3000, PROT_READ | PROT_WRITE),
+        Err(-ENOMEM)
+    );
+    assert_eq!(regions, original);
+}
+
+#[test]
+fn mmap_region_allows_prot_accepts_shared_write_when_capable() {
+    let region = VmMapping {
+        start: 0x9000,
+        len: 0x1000,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    assert!(mmap_region_allows_prot(&region, PROT_READ | PROT_WRITE));
+}
+
+#[test]
+fn mmap_region_reclaimable_only_for_safe_file_backed_cases() {
+    let shared_file = VmMapping {
+        start: 0x1000,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: 7,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    assert!(mmap_region_is_reclaimable(&shared_file));
+
+    let private_ro_file = VmMapping {
+        start: 0x2000,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: 8,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+    assert!(mmap_region_is_reclaimable(&private_ro_file));
+}
+
+#[test]
+fn mmap_region_reclaimable_rejects_unsafe_cases() {
+    let anon_shared = VmMapping {
+        start: 0x3000,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    assert!(!mmap_region_is_reclaimable(&anon_shared));
+
+    let private_writable_file = VmMapping {
+        start: 0x4000,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: 9,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+    assert!(!mmap_region_is_reclaimable(&private_writable_file));
+}
+
+#[test]
+fn mmap_region_reclaimable_rejects_framebuffer_device_mapping() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    let fb = fs::open("/dev/fb0", fs::O_RDWR, 0).expect("open /dev/fb0");
+    let region = VmMapping {
+        start: 0x5000,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: fb.inode,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    assert!(!mmap_region_is_reclaimable(&region));
+}
+
+#[test]
+fn release_unmapped_user_page_treats_framebuffer_as_device_mapping() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    let fb = fs::open("/dev/fb0", fs::O_RDWR, 0).expect("open /dev/fb0");
+    let region = VmMapping {
+        start: 0x6000,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: fb.inode,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    assert_eq!(
+        release_unmapped_user_page(Some(region), PhysAddr::new(0x2000)),
+        UnmappedPageRelease::Device
+    );
+}
+
+#[test]
+fn msync_flag_validation_rejects_unknown_or_conflicting_bits() {
+    assert!(msync_flags_are_valid(0));
+    assert!(msync_flags_are_valid(MS_SYNC));
+    assert!(msync_flags_are_valid(MS_ASYNC));
+    assert!(msync_flags_are_valid(MS_SYNC | MS_INVALIDATE));
+    assert!(!msync_flags_are_valid(MS_SYNC | MS_ASYNC));
+    assert!(!msync_flags_are_valid(0x8000_0000));
+}
+
+#[test]
+fn mmap_prot_fault_access_checks_expected_modes() {
+    assert!(mmap_prot_allows_fault_access(PROT_READ, 0));
+    assert!(mmap_prot_allows_fault_access(
+        PROT_WRITE,
+        PAGE_FAULT_ERROR_WRITE
+    ));
+    assert!(!mmap_prot_allows_fault_access(
+        PROT_READ,
+        PAGE_FAULT_ERROR_WRITE
+    ));
+    assert!(mmap_prot_allows_fault_access(
+        PROT_EXEC,
+        PAGE_FAULT_ERROR_INSTR
+    ));
+    assert!(!mmap_prot_allows_fault_access(
+        PROT_READ,
+        PAGE_FAULT_ERROR_INSTR
+    ));
+    assert!(!mmap_prot_allows_fault_access(PROT_NONE, 0));
+}
+
+#[test]
+fn vm_page_cache_release_unknown_phys_returns_false() {
+    assert!(!vm_page_cache_release_mapped_phys(PhysAddr::new(
+        0x1234_5000
+    )));
+}
+
+#[test]
+fn arch_prctl_set_fs_rejects_kernel_addresses() {
+    assert!(arch_prctl_set_fs_addr_ok(0));
+    assert!(arch_prctl_set_fs_addr_ok(USER_CANON_MAX));
+    assert!(!arch_prctl_set_fs_addr_ok(USER_CANON_MAX + 1));
+    assert!(!arch_prctl_set_fs_addr_ok(KERNEL_VIRT_BASE));
+}
+
+#[test]
+fn fd_cloexec_roundtrip_helpers() {
+    let fd_flags = fd_flags_from_open_flags(fs::O_RDWR | fs::O_APPEND | O_CLOEXEC);
+    assert!(fd_has_cloexec(fd_flags));
+    assert_eq!(fd_open_flags(fd_flags), fs::O_RDWR | fs::O_APPEND);
+
+    let cleared = fd_set_cloexec(fd_flags, false);
+    assert!(!fd_has_cloexec(cleared));
+    assert_eq!(fd_open_flags(cleared), fs::O_RDWR | fs::O_APPEND);
+}
+
+#[test]
+fn fcntl_setfl_applies_nonblock_without_touching_cloexec_or_access_mode() {
+    let initial = fd_flags_from_open_flags(fs::O_RDONLY | O_CLOEXEC);
+    let updated = fd_apply_fcntl_setfl(initial, task::USER_FD_KIND_PIPE, O_NONBLOCK);
+    assert!(fd_has_cloexec(updated));
+    assert_eq!(fd_open_flags(updated) & fs::O_ACCMODE, fs::O_RDONLY);
+    assert!((fd_open_flags(updated) & O_NONBLOCK) != 0);
+}
+
+#[test]
+fn fcntl_setfl_ignores_unsettable_bits_for_descriptor_kind() {
+    let initial = fd_flags_from_open_flags(fs::O_RDONLY);
+    let updated = fd_apply_fcntl_setfl(
+        initial,
+        task::USER_FD_KIND_SOCKET,
+        fs::O_APPEND | O_NONBLOCK,
+    );
+    assert_eq!(fd_open_flags(updated) & fs::O_ACCMODE, fs::O_RDONLY);
+    assert!((fd_open_flags(updated) & O_NONBLOCK) != 0);
+    assert_eq!(fd_open_flags(updated) & fs::O_APPEND, 0);
+}
+
+#[test]
+fn fcntl_setfl_preserves_internal_memfd_tag() {
+    let initial = fd_flags_from_open_flags(fs::O_RDWR) | FD_INTERNAL_MEMFD;
+    let updated = fd_apply_fcntl_setfl(initial, task::USER_FD_KIND_VFS, fs::O_APPEND);
+    assert!(fd_is_memfd(updated));
+    assert_eq!(fd_open_flags(updated) & fs::O_APPEND, fs::O_APPEND);
+}
+
+#[test]
+fn socket_raw_type_parsing_rejects_unknown_bits() {
+    assert_eq!(
+        socket_type_base_and_open_flags(SOCK_STREAM | SOCK_NONBLOCK),
+        Ok((SOCK_STREAM, fs::O_RDWR | O_NONBLOCK))
+    );
+    assert_eq!(
+        socket_type_base_and_open_flags(SOCK_DGRAM),
+        Ok((SOCK_DGRAM, fs::O_RDWR))
+    );
+    assert_eq!(
+        socket_type_base_and_open_flags(SOCK_STREAM | (1 << 30)),
+        Err(-EINVAL)
+    );
+}
+
+#[test]
+fn accept4_flag_parsing_rejects_unsupported_bits() {
+    assert_eq!(
+        accept4_open_flags(SOCK_CLOEXEC | SOCK_NONBLOCK),
+        Ok(fs::O_RDWR | O_CLOEXEC | O_NONBLOCK)
+    );
+    assert_eq!(accept4_open_flags(0x40), Err(-EINVAL));
+}
+
+#[test]
+fn memfd_flag_validation_accepts_cloexec_and_rejects_unsupported() {
+    assert_eq!(memfd_validate_flags(0), Ok(false));
+    assert_eq!(memfd_validate_flags(MFD_CLOEXEC), Ok(true));
+    assert_eq!(memfd_validate_flags(MFD_ALLOW_SEALING), Err(-ENOSYS));
+    assert_eq!(memfd_validate_flags(0x1000), Err(-EINVAL));
+}
+
+#[test]
+fn framebuffer_ioctl_validates_arg_pointer_and_availability() {
+    let ctx = SyscallContext::new(core::ptr::null_mut());
+    assert_eq!(ioctl_framebuffer(&ctx, FBIOGETINFO, 0), -EFAULT);
+    assert_eq!(ioctl_framebuffer(&ctx, FBIOGETINFO, 0x1000), -ENXIO);
+    assert_eq!(ioctl_framebuffer(&ctx, 0xDEAD, 0x1000), -ENOTTY);
+}
+
+#[test]
+fn memfd_name_sanitize_rewrites_unsupported_bytes() {
+    let mut out = [0u8; MEMFD_NAME_MAX];
+    let len = memfd_name_sanitize(b"gui/buffer:\xff", &mut out);
+    assert_eq!(&out[..len], b"gui_buffer__");
+
+    let empty_len = memfd_name_sanitize(b"", &mut out);
+    assert_eq!(&out[..empty_len], b"anon");
+}
+
+#[test]
+fn memfd_build_path_includes_pid_sequence_and_name() {
+    let mut buf = [0u8; fs::VFS_MAX_PATH];
+    let path = memfd_build_path(42, 7, b"front/buf#1", &mut buf).expect("path");
+    assert_eq!(path, "/temp/.memfd/mfd-42-7-front_buf_1");
+}
+
+#[test]
+fn memfd_storage_dir_ready_creates_internal_dir_and_is_idempotent() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+
+    assert_eq!(fs::lookup("/temp/.memfd"), Err(fs::ENOENT));
+    assert_eq!(memfd_storage_dir_ready(), Ok(()));
+
+    let inode = fs::lookup("/temp/.memfd").expect("memfd storage dir");
+    assert_eq!(fs::inode_is_dir(inode), Ok(true));
+    assert_eq!(memfd_storage_dir_ready(), Ok(()));
+}
+
+#[test]
+fn mmap_validate_shared_write_window_tracks_resize_and_bounds() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+
+    let opened = fs::open("/temp/shared-buffer", fs::O_CREAT | fs::O_RDWR, 0o600)
+        .expect("shared buffer create");
+    let inode = opened.inode;
+
+    assert_eq!(
+        mmap_validate_shared_write_window(inode, 0, PAGE_SIZE),
+        Err(-EINVAL)
+    );
+
+    fs::truncate_to(inode, PAGE_SIZE * 2).expect("extend backing file");
+    assert_eq!(
+        mmap_validate_shared_write_window(inode, 0, PAGE_SIZE * 2),
+        Ok(())
+    );
+    assert_eq!(
+        mmap_validate_shared_write_window(inode, PAGE_SIZE, PAGE_SIZE),
+        Ok(())
+    );
+
+    fs::truncate_to(inode, PAGE_SIZE).expect("shrink backing file");
+    assert_eq!(
+        mmap_validate_shared_write_window(inode, 0, PAGE_SIZE),
+        Ok(())
+    );
+    assert_eq!(
+        mmap_validate_shared_write_window(inode, 0, PAGE_SIZE * 2),
+        Err(-EINVAL)
+    );
+    assert_eq!(
+        mmap_validate_shared_write_window(inode, PAGE_SIZE, PAGE_SIZE),
+        Err(-EINVAL)
+    );
+}
+
+#[test]
+fn memfd_object_accounting_deduplicates_by_inode() {
+    let mut task = task::Task::for_test(63);
+    let task_ptr = &mut task as *mut task::Task;
+    let memfd_flags = fd_flags_from_open_flags(fs::O_RDWR) | FD_INTERNAL_MEMFD;
+
+    fd_write_slot(task_ptr, 3, task::USER_FD_KIND_VFS, 40, 0, memfd_flags);
+    fd_write_slot(task_ptr, 4, task::USER_FD_KIND_VFS, 40, 0, memfd_flags);
+    fd_write_slot(task_ptr, 5, task::USER_FD_KIND_VFS, 41, 0, memfd_flags);
+    fd_write_slot(
+        task_ptr,
+        6,
+        task::USER_FD_KIND_VFS,
+        80,
+        0,
+        fd_flags_from_open_flags(fs::O_RDWR),
+    );
+
+    assert_eq!(task_memfd_object_count(task_ptr), 2);
+    assert!(task_memfd_contains_inode(task_ptr, 40));
+    assert!(!task_memfd_contains_inode(task_ptr, 80));
+}
+
+#[test]
+fn memfd_object_limit_blocks_new_inode_only() {
+    let mut task = task::Task::for_test(64);
+    let task_ptr = &mut task as *mut task::Task;
+    let memfd_flags = fd_flags_from_open_flags(fs::O_RDWR) | FD_INTERNAL_MEMFD;
+    let mut fd = 3usize;
+    while fd < 3 + MEMFD_MAX_BUFFERS_PER_TASK {
+        fd_write_slot(
+            task_ptr,
+            fd,
+            task::USER_FD_KIND_VFS,
+            (200 + fd) as u16,
+            0,
+            memfd_flags,
+        );
+        fd += 1;
+    }
+
+    assert_eq!(
+        task_memfd_object_count(task_ptr),
+        MEMFD_MAX_BUFFERS_PER_TASK
+    );
+    assert_eq!(enforce_memfd_create_limit(task_ptr), Err(-EMFILE));
+    assert_eq!(enforce_memfd_object_limit_for_inode(task_ptr, 205), Ok(()));
+    assert_eq!(
+        enforce_memfd_object_limit_for_inode(task_ptr, 999),
+        Err(-EMFILE)
+    );
+}
+
+#[test]
+fn mmap_clone_task_regions_copies_shared_writable_mapping_metadata_per_task() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+
+    let mut parent = task::Task::for_test(201);
+    let mut child = task::Task::for_test(202);
+    let parent_ptr = &mut parent as *mut task::Task;
+    let child_ptr = &mut child as *mut task::Task;
+
+    task::Task::install_for_test(0, parent_ptr);
+    task::Task::install_for_test(1, child_ptr);
+
+    let parent_slot = mmap_prepare_task_slot(parent_ptr).expect("parent slot");
+    let mapping = VmMapping {
+        start: 0x4000_0000,
+        len: PAGE_SIZE * 2,
+        file_offset: PAGE_SIZE,
+        file_inode: 77,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    unsafe {
+        TASK_VM_MAPPINGS[parent_slot][0] = mapping;
+    }
+
+    mmap_clone_task_regions(parent_ptr, child_ptr).expect("clone shared mappings");
+    let child_slot = mmap_prepare_task_slot(child_ptr).expect("child slot");
+    assert_eq!(unsafe { TASK_VM_MAPPINGS[child_slot][0] }, mapping);
+
+    unsafe {
+        TASK_VM_MAPPINGS[parent_slot][0].len = PAGE_SIZE;
+    }
+    assert_eq!(unsafe { TASK_VM_MAPPINGS[child_slot][0] }, mapping);
+}
+
+#[test]
+fn mmap_clear_task_regions_only_clears_target_task_slot() {
+    let _guard = MMAP_TEST_LOCK.lock().expect("mmap test lock");
+    reset_vm_for_test();
+
+    let mut parent = task::Task::for_test(211);
+    let mut child = task::Task::for_test(212);
+    let parent_ptr = &mut parent as *mut task::Task;
+    let child_ptr = &mut child as *mut task::Task;
+
+    task::Task::install_for_test(0, parent_ptr);
+    task::Task::install_for_test(1, child_ptr);
+
+    let parent_slot = mmap_prepare_task_slot(parent_ptr).expect("parent slot");
+    let child_slot = mmap_prepare_task_slot(child_ptr).expect("child slot");
+    let parent_mapping = VmMapping {
+        start: 0x5000_0000,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: 91,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    let child_mapping = VmMapping {
+        start: 0x6000_0000,
+        len: PAGE_SIZE,
+        file_offset: PAGE_SIZE,
+        file_inode: 91,
+        prot: PROT_READ | PROT_WRITE,
+        map_shared: true,
+        map_shared_can_write: true,
+    };
+    unsafe {
+        TASK_VM_MAPPINGS[parent_slot][0] = parent_mapping;
+        TASK_VM_MAPPINGS[child_slot][0] = child_mapping;
+    }
+
+    mmap_clear_task_regions(parent_ptr);
+
+    assert!(unsafe { TASK_VM_MAPPINGS[parent_slot][0].is_empty() });
+    assert_eq!(unsafe { TASK_VM_MAPPINGS[child_slot][0] }, child_mapping);
+}
+
+#[test]
+fn fd_dup_helpers_apply_requested_cloexec() {
+    let mut task = task::Task::for_test(7);
+    let task_ptr = &mut task as *mut task::Task;
+    fd_write_slot(
+        task_ptr,
+        5,
+        task::USER_FD_KIND_VFS,
+        42,
+        11,
+        fd_set_cloexec(fs::O_RDONLY, true),
+    );
+
+    let plain = fd_dup_from(task_ptr, 5, 0, false).expect("dup without cloexec");
+    let plain_idx = plain as usize;
+    assert_eq!(plain_idx, 0);
+    assert!(!fd_has_cloexec(unsafe {
+        (*task_ptr).user_fd_flags[plain_idx]
+    }));
+    assert_eq!(unsafe { (*task_ptr).user_fd_offset[plain_idx] }, 11);
+
+    let clo = fd_dup_from(task_ptr, 5, 1, true).expect("dup with cloexec");
+    let clo_idx = clo as usize;
+    assert_eq!(clo_idx, 1);
+    assert!(fd_has_cloexec(unsafe {
+        (*task_ptr).user_fd_flags[clo_idx]
+    }));
+    assert_eq!(unsafe { (*task_ptr).user_fd_inode[clo_idx] }, 42);
+}
+
+#[test]
+fn epoll_create1_validates_flags_and_installs_fd() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+
+    let mut task = task::Task::for_test(31);
+    let ctx = SyscallContext::new(&mut task as *mut task::Task);
+
+    let bad = SyscallArgs {
+        num: SYS_EPOLL_CREATE1,
+        args: [0x1000, 0, 0, 0, 0, 0],
+    };
+    assert_eq!(sys_epoll_create1(&ctx, &bad), -EINVAL);
+
+    let good = SyscallArgs {
+        num: SYS_EPOLL_CREATE1,
+        args: [EPOLL_CLOEXEC as u64, 0, 0, 0, 0, 0],
+    };
+    let epfd = sys_epoll_create1(&ctx, &good);
+    assert!(epfd >= 0);
+    let idx = epfd as usize;
+    assert_eq!(task.user_fd_kind[idx], task::USER_FD_KIND_EPOLL);
+    assert!(fd_has_cloexec(task.user_fd_flags[idx]));
+    let _ = fd_close(ctx.current, epfd as i32);
+}
+
+#[test]
+fn epoll_pwait_supports_null_sigmask_compat_only() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+
+    let mut task = task::Task::for_test(32);
+    let ctx = SyscallContext::new(&mut task as *mut task::Task);
+
+    let null_sigmask = SyscallArgs {
+        num: SYS_EPOLL_PWAIT,
+        args: [0, 1, 0, 0, 0, 8],
+    };
+    assert_eq!(sys_epoll_pwait(&ctx, &null_sigmask), -EINVAL);
+
+    let masked = SyscallArgs {
+        num: SYS_EPOLL_PWAIT,
+        args: [0, 1, 1, 0, 0x1000, 8],
+    };
+    assert_eq!(sys_epoll_pwait(&ctx, &masked), -ENOSYS);
+}
+
+#[test]
+fn epoll_ctl_add_mod_del_enforces_duplicate_and_missing_semantics() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+
+    let mut owner = task::Task::for_test(41);
+    let owner_ptr = &mut owner as *mut task::Task;
+    let epoll_id = epoll_alloc_instance().expect("epoll alloc");
+    let inst = epoll_instance_get_mut(epoll_id).expect("epoll instance");
+
+    assert_eq!(
+        epoll_ctl_add(
+            inst,
+            41,
+            owner_ptr,
+            5,
+            task::USER_FD_KIND_VFS,
+            9,
+            EPOLLIN,
+            0xAA
+        ),
+        0
+    );
+    assert_eq!(
+        epoll_ctl_add(
+            inst,
+            41,
+            owner_ptr,
+            5,
+            task::USER_FD_KIND_VFS,
+            9,
+            EPOLLIN,
+            0xAA
+        ),
+        -EEXIST
+    );
+    assert_eq!(
+        epoll_ctl_mod(inst, 41, 7, task::USER_FD_KIND_VFS, 9, EPOLLOUT, 0xBB),
+        -ENOENT
+    );
+    assert_eq!(
+        epoll_ctl_mod(inst, 41, 5, task::USER_FD_KIND_VFS, 9, EPOLLOUT, 0xCC),
+        0
+    );
+    let slot = epoll_watch_find(inst, 41, 5).expect("watch slot");
+    assert_eq!(inst.watches[slot].events, EPOLLOUT);
+    assert_eq!(inst.watches[slot].data, 0xCC);
+    assert_eq!(epoll_ctl_del(inst, 41, 6), -ENOENT);
+    assert_eq!(epoll_ctl_del(inst, 41, 5), 0);
+    assert_eq!(inst.watch_count, 0);
+}
+
+#[test]
+fn epoll_owner_watch_limit_and_owner_cleanup_work_across_instances() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+
+    let mut owner = task::Task::for_test(44);
+    let owner_ptr = &mut owner as *mut task::Task;
+    let epoll_a = epoll_alloc_instance().expect("epoll a");
+    let epoll_b = epoll_alloc_instance().expect("epoll b");
+    let inst_a = epoll_instance_get_mut(epoll_a).expect("epoll instance a");
+
+    for fd in 0..40 {
+        assert_eq!(
+            epoll_ctl_add(
+                inst_a,
+                44,
+                owner_ptr,
+                fd,
+                task::USER_FD_KIND_VFS,
+                (1000 + fd) as u16,
+                EPOLLIN,
+                fd as u64,
+            ),
+            0
+        );
+    }
+
+    let inst_b = epoll_instance_get_mut(epoll_b).expect("epoll instance b");
+    for fd in 40..EPOLL_MAX_WATCHES_PER_TASK as i32 {
+        assert_eq!(
+            epoll_ctl_add(
+                inst_b,
+                44,
+                owner_ptr,
+                fd,
+                task::USER_FD_KIND_VFS,
+                (1000 + fd) as u16,
+                EPOLLIN,
+                fd as u64,
+            ),
+            0
+        );
+    }
+    assert_eq!(
+        epoll_ctl_add(
+            inst_b,
+            44,
+            owner_ptr,
+            999,
+            task::USER_FD_KIND_VFS,
+            1999,
+            EPOLLIN,
+            0,
+        ),
+        -ENOSPC
+    );
+    assert_eq!(epoll_watch_count_for_owner(44), EPOLL_MAX_WATCHES_PER_TASK);
+
+    epoll_drop_watches_for_owner(44);
+    assert_eq!(epoll_watch_count_for_owner(44), 0);
+    assert_eq!(inst_a.watch_count, 0);
+    assert_eq!(inst_b.watch_count, 0);
+}
+
+#[test]
+fn epoll_collect_ready_is_level_triggered_for_vfs_fds() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+
+    let mut owner = task::Task::for_test(51);
+    let owner_ptr = &mut owner as *mut task::Task;
+    fd_write_slot(owner_ptr, 3, task::USER_FD_KIND_VFS, 12, 0, fs::O_RDONLY);
+
+    let epoll_id = epoll_alloc_instance().expect("epoll alloc");
+    let inst = epoll_instance_get_mut(epoll_id).expect("epoll instance");
+    assert_eq!(
+        epoll_ctl_add(
+            inst,
+            51,
+            owner_ptr,
+            3,
+            task::USER_FD_KIND_VFS,
+            12,
+            EPOLLIN,
+            0x1234
+        ),
+        0
+    );
+
+    let mut out = [(0u32, 0u64); 2];
+    let ready1 = epoll_collect_ready(inst, &mut out);
+    assert_eq!(ready1, 1);
+    assert_eq!(out[0], (EPOLLIN, 0x1234));
+
+    out[0] = (0, 0);
+    let ready2 = epoll_collect_ready(inst, &mut out);
+    assert_eq!(ready2, 1);
+    assert_eq!(out[0], (EPOLLIN, 0x1234));
+}
+
+#[test]
+fn epoll_collect_ready_drops_stale_watch_after_fd_close() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+
+    let mut owner = task::Task::for_test(61);
+    let owner_ptr = &mut owner as *mut task::Task;
+    fd_write_slot(owner_ptr, 4, task::USER_FD_KIND_VFS, 77, 0, fs::O_RDONLY);
+
+    let epoll_id = epoll_alloc_instance().expect("epoll alloc");
+    let inst = epoll_instance_get_mut(epoll_id).expect("epoll instance");
+    assert_eq!(
+        epoll_ctl_add(
+            inst,
+            61,
+            owner_ptr,
+            4,
+            task::USER_FD_KIND_VFS,
+            77,
+            EPOLLIN,
+            0x55
+        ),
+        0
+    );
+
+    let _ = fd_close(owner_ptr, 4);
+    let mut out = [(0u32, 0u64); 1];
+    let ready = epoll_collect_ready(inst, &mut out);
+    assert_eq!(ready, 0);
+    assert_eq!(inst.watch_count, 0);
+    assert!(epoll_watch_find(inst, 61, 4).is_none());
+}
+
+#[test]
+fn epoll_revents_always_include_hup_and_err_bits() {
+    let events = poll_revents_to_epoll_events(0, POLLHUP | POLLERR);
+    assert_eq!(events & EPOLLHUP, EPOLLHUP);
+    assert_eq!(events & EPOLLERR, EPOLLERR);
+}
+
+#[test]
+fn mmap_regions_total_pages_sums_non_empty_regions() {
+    let mut regions = [VmMapping::EMPTY; MMAP_MAX_REGIONS_PER_TASK];
+    regions[0] = VmMapping {
+        start: 0x1000,
+        len: PAGE_SIZE,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+    regions[1] = VmMapping {
+        start: 0x3000,
+        len: PAGE_SIZE * 2,
+        file_offset: 0,
+        file_inode: task::USER_FD_NONE,
+        prot: PROT_READ,
+        map_shared: false,
+        map_shared_can_write: false,
+    };
+    assert_eq!(mmap_regions_total_pages(&regions).expect("page count"), 3);
+    assert!(mmap_regions_total_pages(&regions).expect("count") < MMAP_MAX_PAGES_PER_TASK);
+}
+
+#[test]
+fn epoll_pipe_read_hup_matches_poll_core_revents() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+    ipc::init();
+
+    let mut owner = task::Task::for_test(71);
+    let owner_ptr = &mut owner as *mut task::Task;
+    let pipe = ipc::pipe_open().expect("pipe open");
+
+    fd_write_slot(owner_ptr, 3, task::USER_FD_KIND_PIPE, pipe, 0, fs::O_RDONLY);
+    fd_write_slot(owner_ptr, 4, task::USER_FD_KIND_PIPE, pipe, 0, fs::O_WRONLY);
+
+    ipc::pipe_close(pipe, false, true).expect("close writer end");
+
+    let requested = EPOLLIN;
+    let poll_requested = epoll_events_to_poll_mask(requested);
+    let revents = poll_fd_revents(owner_ptr, 3, poll_requested);
+    let expected_events = poll_revents_to_epoll_events(requested, revents);
+    assert_eq!(expected_events & EPOLLHUP, EPOLLHUP);
+
+    let epoll_id = epoll_alloc_instance().expect("epoll alloc");
+    let inst = epoll_instance_get_mut(epoll_id).expect("epoll instance");
+    assert_eq!(
+        epoll_ctl_add(
+            inst,
+            71,
+            owner_ptr,
+            3,
+            task::USER_FD_KIND_PIPE,
+            pipe,
+            requested,
+            0xA1
+        ),
+        0
+    );
+
+    let mut out = [(0u32, 0u64); 1];
+    let ready = epoll_collect_ready(inst, &mut out);
+    assert_eq!(ready, 1);
+    assert_eq!(out[0], (expected_events, 0xA1));
+}
+
+#[test]
+fn epoll_pipe_write_err_matches_poll_core_revents() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+    ipc::init();
+
+    let mut owner = task::Task::for_test(72);
+    let owner_ptr = &mut owner as *mut task::Task;
+    let pipe = ipc::pipe_open().expect("pipe open");
+
+    fd_write_slot(owner_ptr, 3, task::USER_FD_KIND_PIPE, pipe, 0, fs::O_RDONLY);
+    fd_write_slot(owner_ptr, 4, task::USER_FD_KIND_PIPE, pipe, 0, fs::O_WRONLY);
+
+    ipc::pipe_close(pipe, true, false).expect("close reader end");
+
+    let requested = EPOLLOUT;
+    let poll_requested = epoll_events_to_poll_mask(requested);
+    let revents = poll_fd_revents(owner_ptr, 4, poll_requested);
+    let expected_events = poll_revents_to_epoll_events(requested, revents);
+    assert_eq!(expected_events & EPOLLERR, EPOLLERR);
+
+    let epoll_id = epoll_alloc_instance().expect("epoll alloc");
+    let inst = epoll_instance_get_mut(epoll_id).expect("epoll instance");
+    assert_eq!(
+        epoll_ctl_add(
+            inst,
+            72,
+            owner_ptr,
+            4,
+            task::USER_FD_KIND_PIPE,
+            pipe,
+            requested,
+            0xB2
+        ),
+        0
+    );
+
+    let mut out = [(0u32, 0u64); 1];
+    let ready = epoll_collect_ready(inst, &mut out);
+    assert_eq!(ready, 1);
+    assert_eq!(out[0], (expected_events, 0xB2));
+}
+
+#[test]
+fn poll_reports_input_devices_only_when_events_are_queued() {
+    let _guard = INPUT_TEST_LOCK.lock().expect("input test lock");
+    crate::input::init();
+    fs::init();
+
+    let mut owner = task::Task::for_test(73);
+    let owner_ptr = &mut owner as *mut task::Task;
+    let opened = fs::open("/dev/input/event0", fs::O_RDONLY, 0).expect("open event0");
+    fd_write_slot(
+        owner_ptr,
+        3,
+        task::USER_FD_KIND_VFS,
+        opened.inode,
+        0,
+        fs::O_RDONLY,
+    );
+
+    assert_eq!(poll_fd_revents(owner_ptr, 3, POLLIN | POLLOUT), 0);
+
+    crate::input::push_keyboard_key(crate::input::KEY_A, true);
+    assert_eq!(poll_fd_revents(owner_ptr, 3, POLLIN | POLLOUT), POLLIN);
+}
+
+#[test]
+fn cmsg_align_rounds_up_to_word_boundary() {
+    assert_eq!(cmsg_align(1), size_of::<usize>());
+    assert_eq!(cmsg_align(size_of::<usize>()), size_of::<usize>());
+    assert_eq!(cmsg_align(size_of::<usize>() + 1), size_of::<usize>() * 2);
+}
+
+#[test]
+fn unix_fd_transfer_rejects_non_transferable_kind() {
+    let mut task = task::Task::for_test(21);
+    let task_ptr = &mut task as *mut task::Task;
+    fd_write_slot(
+        task_ptr,
+        6,
+        task::USER_FD_KIND_CONSOLE,
+        task::USER_FD_NONE,
+        0,
+        fs::O_RDWR,
+    );
+    assert_eq!(unix_fd_transfer_from_task(task_ptr, 6), Err(-EOPNOTSUPP));
+}
+
+#[test]
+fn install_received_right_sets_cloexec_when_requested() {
+    let mut task = task::Task::for_test(22);
+    let task_ptr = &mut task as *mut task::Task;
+
+    let right = socket::UnixRightsFd {
+        kind: task::USER_FD_KIND_VFS,
+        inode: 77,
+        flags: fs::O_RDWR,
+        offset: 123,
+    };
+    let fd = install_received_right(task_ptr, right, true).expect("install right");
+    let idx = fd as usize;
+    assert!(fd_has_cloexec(unsafe { (*task_ptr).user_fd_flags[idx] }));
+    assert_eq!(unsafe { (*task_ptr).user_fd_inode[idx] }, 77);
+    assert_eq!(unsafe { (*task_ptr).user_fd_offset[idx] }, 123);
+}
+
+#[test]
+fn close_cloexec_fds_keeps_non_cloexec_entries() {
+    let mut task = task::Task::for_test(8);
+    let task_ptr = &mut task as *mut task::Task;
+    fd_write_slot(
+        task_ptr,
+        3,
+        task::USER_FD_KIND_VFS,
+        10,
+        0,
+        fd_set_cloexec(fs::O_RDONLY, true),
+    );
+    fd_write_slot(task_ptr, 4, task::USER_FD_KIND_VFS, 11, 3, fs::O_RDWR);
+
+    close_cloexec_fds(task_ptr);
+
+    assert!(!fd_slot_is_open(task_ptr, 3));
+    assert!(fd_slot_is_open(task_ptr, 4));
+    assert_eq!(unsafe { (*task_ptr).user_fd_inode[4] }, 11);
+}
+
+#[test]
+fn unknown_syscall_returns_enosys() {
+    let ret = dispatch_syscall(SyscallArgs {
+        num: 0xFFFF,
+        args: [0; 6],
+    });
+    assert_eq!(ret, -ENOSYS);
+}
+
+#[test]
+fn user_only_syscall_requires_user_task() {
+    let ret = dispatch_syscall(SyscallArgs {
+        num: SYS_BRK,
+        args: [0; 6],
+    });
+    assert_eq!(ret, -EPERM);
+}
+
+#[test]
+fn set_tid_requires_user_task() {
+    let ret = dispatch_syscall(SyscallArgs {
+        num: SYS_SET_TID_ADDRESS,
+        args: [0; 6],
+    });
+    assert_eq!(ret, -EPERM);
+}
+
+#[test]
+fn getpid_without_task_returns_esrch() {
+    let ret = dispatch_syscall(SyscallArgs {
+        num: SYS_GETPID,
+        args: [0; 6],
+    });
+    assert_eq!(ret, -ESRCH);
+}
+
+#[test]
+fn access_mode_validation_rejects_unknown_bits() {
+    assert!(access_mode_is_valid(F_OK));
+    assert!(access_mode_is_valid(R_OK | W_OK | X_OK));
+    assert!(!access_mode_is_valid(0x80));
+}
+
+#[test]
+fn access_allowed_uses_owner_bits_for_current_uid() {
+    let stat = fs::FileStat {
+        ino: 1,
+        mode: STAT_S_IRUSR | STAT_S_IWUSR,
+        uid: 1000,
+        gid: 1000,
+        nlink: 1,
+        size: 0,
+        blksize: 0,
+        blocks: 0,
+        atime: 0,
+        mtime: 0,
+        ctime: 0,
+        file_type: fs::FileType::Regular,
+    };
+    assert!(access_allowed(&stat, R_OK, 1000, 1000));
+    assert!(!access_allowed(&stat, X_OK, 1000, 1000));
+}
+
+#[test]
+fn ticks_to_seconds_nanos_matches_pit_frequency() {
+    assert_eq!(ticks_to_seconds_nanos(100), (1, 0));
+    assert_eq!(ticks_to_seconds_nanos(123), (1, 230_000_000));
+}
+
+#[test]
+fn timespec_to_sleep_ticks_rounds_up_partial_tick() {
+    let one_ns = LinuxTimeSpec {
+        tv_sec: 0,
+        tv_nsec: 1,
+    };
+    assert_eq!(timespec_to_sleep_ticks(&one_ns), Ok(1));
+
+    let ten_ms = LinuxTimeSpec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    assert_eq!(timespec_to_sleep_ticks(&ten_ms), Ok(1));
+
+    let invalid = LinuxTimeSpec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000_000,
+    };
+    assert_eq!(timespec_to_sleep_ticks(&invalid), Err(-EINVAL));
+}
+
+#[test]
+fn utimens_timespec_special_values_are_handled() {
+    assert_eq!(
+        timespec_to_unix_seconds(
+            LinuxTimeSpec {
+                tv_sec: -1,
+                tv_nsec: UTIME_NOW,
+            },
+            77,
+            11
+        ),
+        Ok(77)
+    );
+    assert_eq!(
+        timespec_to_unix_seconds(
+            LinuxTimeSpec {
+                tv_sec: -1,
+                tv_nsec: UTIME_OMIT,
+            },
+            77,
+            11
+        ),
+        Ok(11)
+    );
+}
+
+#[test]
+fn utimens_timespec_rejects_invalid_nsec_or_negative_sec() {
+    assert_eq!(
+        timespec_to_unix_seconds(
+            LinuxTimeSpec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            },
+            1,
+            1
+        ),
+        Err(-EINVAL)
+    );
+    assert_eq!(
+        timespec_to_unix_seconds(
+            LinuxTimeSpec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            },
+            1,
+            1
+        ),
+        Err(-EINVAL)
+    );
+}
+
+#[test]
+fn wait_status_encodes_exit_code_for_waitpid_macros() {
+    assert_eq!(wait_status_from_exit_code(0), 0);
+    assert_eq!(wait_status_from_exit_code(1), 0x0100);
+    assert_eq!(wait_status_from_exit_code(255), 0xFF00_u32 as i32);
+}
+
+#[test]
+fn pid_arg_zero_maps_to_current_pid() {
+    assert_eq!(pid_from_syscall_arg_or_current(0, 42), Ok(42));
+    assert_eq!(pid_from_syscall_arg_or_current(7, 42), Ok(7));
+    assert_eq!(
+        pid_from_syscall_arg_or_current((-1_i64) as u64, 42),
+        Err(-EINVAL)
+    );
+}
+
+#[test]
+fn pgid_arg_zero_maps_to_target_pid() {
+    assert_eq!(pgid_from_syscall_arg_or_target(0, 55), Ok(55));
+    assert_eq!(pgid_from_syscall_arg_or_target(9, 55), Ok(9));
+    assert_eq!(
+        pgid_from_syscall_arg_or_target((-1_i64) as u64, 55),
+        Err(-EINVAL)
+    );
+}
+
+#[test]
+fn setsid_rejects_process_group_leader() {
+    let mut task = task::Task::for_test(99);
+    let ctx = SyscallContext::new(&mut task as *mut task::Task);
+    let call = SyscallArgs {
+        num: 0,
+        args: [0; 6],
+    };
+    assert_eq!(sys_setsid(&ctx, &call), -EPERM);
+}
+
+#[test]
+fn setsid_promotes_non_leader_to_session_leader() {
+    let mut task = task::Task::for_test(100);
+    task.pgid = 77;
+    task.sid = 77;
+    let ctx = SyscallContext::new(&mut task as *mut task::Task);
+    let call = SyscallArgs {
+        num: 0,
+        args: [0; 6],
+    };
+
+    assert_eq!(sys_setsid(&ctx, &call), 100);
+    assert_eq!(task.pgid, 100);
+    assert_eq!(task.sid, 100);
+}
+
+#[test]
+fn getsid_rejects_negative_pid_argument() {
+    let mut task = task::Task::for_test(10);
+    let ctx = SyscallContext::new(&mut task as *mut task::Task);
+    let call = SyscallArgs {
+        num: 0,
+        args: [(-1_i64) as u64, 0, 0, 0, 0, 0],
+    };
+    assert_eq!(sys_getsid(&ctx, &call), -EINVAL);
+}
+
+#[test]
+fn clone_args_accept_fork_compatible_flags() {
+    let call = SyscallArgs {
+        num: SYS_CLONE,
+        args: [SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
+    };
+    assert_eq!(validate_clone_args(&call), Ok(0));
+}
+
+#[test]
+fn clone_args_accept_vfork_compat_flags() {
+    let call = SyscallArgs {
+        num: SYS_CLONE,
+        args: [CLONE_VM | CLONE_VFORK | SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
+    };
+    assert_eq!(validate_clone_args(&call), Ok(0));
+}
+
+#[test]
+fn clone_args_reject_partial_vm_vfork_combo() {
+    let call = SyscallArgs {
+        num: SYS_CLONE,
+        args: [CLONE_VM | SIGCHLD_EXIT_SIGNAL, 0, 0, 0, 0, 0],
+    };
+    assert_eq!(validate_clone_args(&call), Err(-EINVAL));
+}
+
+#[test]
+fn clone_args_reject_nonzero_tid_tls_pointers() {
+    let call = SyscallArgs {
+        num: SYS_CLONE,
+        args: [SIGCHLD_EXIT_SIGNAL, 0, 1, 0, 0, 0],
+    };
+    assert_eq!(validate_clone_args(&call), Err(-EINVAL));
+}

@@ -11,7 +11,7 @@ This document describes the current VFS/filesystem implementation wired into the
 - `crates/fs/src/ext2_journal.rs`
 - `crates/fs/src/ext2_sync.rs`
 - `kernel/src/vfs.rs`
-- `kernel/src/syscall.rs`
+- `kernel/src/syscall/` (`file.rs`, `io.rs`, `fd.rs`)
 - `kernel/src/task.rs`
 - `kernel/src/user.rs`
 

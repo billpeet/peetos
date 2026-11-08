@@ -4,7 +4,7 @@ This document describes the framebuffer initialization path currently wired into
 
 **Where It Lives**
 - `kernel/src/framebuffer.rs`
-- `kernel/src/syscall.rs`
+- `kernel/src/syscall/vm.rs` (framebuffer mmap) and `kernel/src/syscall/ioctl.rs`
 - `crates/fs/src/lib.rs`
 - `kernel/src/mouse.rs`
 - `kernel/src/usb.rs`

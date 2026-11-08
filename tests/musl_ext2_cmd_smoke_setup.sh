@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCHER="${ROOT_DIR}/user/musl_execve_ext2_smoke.c"
 RUNNER="${ROOT_DIR}/scripts/run_toybox_next_smoke.sh"
 KERNEL_CARGO="${ROOT_DIR}/kernel/Cargo.toml"
-SYSCALL_RS="${ROOT_DIR}/kernel/src/syscall.rs"
+SYSCALL_RS="${ROOT_DIR}/kernel/src/syscall/mod.rs"
 MAKEFILE="${ROOT_DIR}/Makefile"
 
 if [[ ! -f "${LAUNCHER}" ]]; then

@@ -5,7 +5,7 @@ This document describes the current baseline IPC/synchronization implementation 
 **Where It Lives**
 - `kernel/src/sync.rs`
 - `kernel/src/ipc.rs`
-- `kernel/src/syscall.rs`
+- `kernel/src/syscall/` (`signals.rs`, `fd.rs` for pipes, `misc.rs` for SysV shm, `sockets.rs` for `AF_UNIX`)
 - `kernel/src/main.rs`
 - `kernel/src/task.rs`
 
