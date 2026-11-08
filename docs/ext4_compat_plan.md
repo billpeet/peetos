@@ -211,6 +211,51 @@ Exit: ext3-style mutation suite and crash-point suite pass on the
 `^metadata_csum` fixture with `e2fsck -fn` clean; QEMU journal smoke runs on
 an ext4 (`^metadata_csum`) root.
 
+**Status: done.**
+- **Read-write gating.** Only `metadata_csum` (ro-compat) and `csum_seed`
+  (incompat) still force a read-only mount. Images with `extent 64bit flex_bg
+  huge_file gdt_csum dir_nlink extra_isize` mount read-write as `ext4`.
+- **Extent writes** (`ext2_bmap.rs`). Every change loads the inode's leaf
+  extents into a sorted list, edits it, merges physically contiguous
+  neighbours, and rewrites the tree: four or fewer extents live in the inode;
+  more get leaf blocks (`eh_max` = (block size - 12) / 12) and, if needed,
+  index levels (up to depth 5). Existing tree blocks are reused first, and
+  leftovers are freed. Writes into unwritten extents split them, zero the
+  block, and mark it initialized. Truncate/unlink detach or free blocks the
+  same way. Credit estimates per step cover a full tree rewrite.
+- **Allocator.** `ext2_alloc_block_goal` tries the block after the
+  logically preceding extent first, then the rest of that group and the
+  other groups. `BLOCK_UNINIT` groups get their bitmap built like
+  `ext4_init_block_bitmap` (superblock/GDT backups with sparse_super,
+  reserved GDT blocks, the group's own metadata when it lives inside it, bits
+  past the end); the result must match `bg_free_blocks_count` or the
+  operation fails with `EIO`. `INODE_UNINIT` bitmaps are zeroed with the tail
+  set. `bg_itable_unused` shrinks as inodes past the initialized part are
+  handed out. `bg_checksum` (crc16 or crc32c) is recomputed after every
+  descriptor change.
+- **Inodes.** New inodes get `EXT4_EXTENTS_FL` with an empty extent root and
+  `i_extra_isize = s_want_extra_isize`. Directories get their first block
+  through the block map. Inline symlinks drop `EXT4_EXTENTS_FL`. `dir_nlink`
+  caps directory link counts at 1 past EXT4_LINK_MAX. Inodes with
+  `EXT4_HUGE_FILE_FL` refuse writes like >4 GiB files.
+- **Tests.** Sequential writes stay one extent; filling a hole in the depth-1
+  tree, truncating it back into the inode, and unlinking restore exact free
+  counts; interleaved writes grow two files to depth 1 and truncation shrinks
+  one back; fast/slow symlinks and new directories use the ext4 layout; group
+  1's `INODE_UNINIT` and `BLOCK_UNINIT` bitmaps are initialized on first use
+  with valid crc16 descriptors; a synced mutation mix (including an htree
+  insert, rename, unlink of the xattr and 5 GiB files) is `e2fsck -fn` clean
+  in `tests/ext3_fsck.sh`; the reordering-cache crash test runs on the ext4
+  image too (~244 recovered crash points, all `e2fsck` clean); and
+  `tests/musl_ext4_journal_smoke.sh` runs the QEMU SIGKILL/recovery smoke on a
+  writable ext4 root.
+- **Gaps.** The whole-tree rewrite costs a tree walk per mapping change,
+  which is fine for the small files PeetOS writes today (`TMPFS_MAX_FILE_SIZE`
+  caps file size at 32 KiB) but not a final design. `crtime` and nanosecond
+  timestamps are not set (left zero). Goal allocation only looks one block
+  ahead; there is no Linux-style group/orlov placement. `s_free_blocks_count_hi`
+  and other high halves are never updated (sizes below 2^32 blocks).
+
 ### M3 - `metadata_csum` read-write (stock ext4)
 
 1. crc32c computed on every metadata write: superblock, GDT (crc32c low

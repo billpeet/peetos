@@ -175,3 +175,37 @@ if ! e2fsck -fn "${EXT4_IMG}"; then
   exit 1
 fi
 echo "[ext3-fsck] e2fsck accepts the kernel's recovery of a csum-v3 ext4 journal"
+
+# ext4 writes (M2): extent trees, lazy group init, gdt_csum descriptors,
+# extra_isize inodes, fast/slow symlinks on user/sample_ext4_nocsum.img.
+EXT4_MUT_IMG="${WORK_DIR}/ext4_mutated.img"
+PEETOS_EXT4_FSCK_IMAGE="${EXT4_MUT_IMG}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::ext4_mutations_sync_and_remount
+if [[ ! -s "${EXT4_MUT_IMG}" ]]; then
+  echo "[ext3-fsck] ext4 mutation test did not export an image" >&2
+  exit 1
+fi
+if ! e2fsck -fn "${EXT4_MUT_IMG}"; then
+  echo "[ext3-fsck] e2fsck reported problems in the kernel-written ext4 image" >&2
+  exit 1
+fi
+echo "[ext3-fsck] e2fsck clean on kernel-written ext4 (extents, uninit_bg)"
+
+EXT4_CRASH_DIR="${WORK_DIR}/ext4_crash_points"
+mkdir -p "${EXT4_CRASH_DIR}"
+PEETOS_EXT4_CRASH_DIR="${EXT4_CRASH_DIR}" cargo test -p fs --target "${HOST}" --quiet \
+  -- --exact tests::ext4_crash_at_every_write_with_reordering_cache_stays_consistent
+checked=0
+for img in "${EXT4_CRASH_DIR}"/*.img; do
+  if ! e2fsck -fn "${img}" >"${img}.fsck" 2>&1; then
+    echo "[ext3-fsck] inconsistent ext4 filesystem after recovery: $(basename "${img}")" >&2
+    cat "${img}.fsck" >&2
+    exit 1
+  fi
+  checked=$((checked + 1))
+done
+if [[ "${checked}" -eq 0 ]]; then
+  echo "[ext3-fsck] ext4 crash-point test produced no images" >&2
+  exit 1
+fi
+echo "[ext3-fsck] ${checked} recovered ext4 crash-point images are e2fsck clean"

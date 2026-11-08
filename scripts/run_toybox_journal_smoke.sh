@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # QEMU crash/recovery smoke for the ext3 journal on real (emulated) AHCI I/O.
 #
-#  1. Convert a copy of the runtime musl image to ext3 (tune2fs -j).
+#  1. Convert a copy of the runtime musl image to ext3 (tune2fs -j), or with
+#     PEETOS_JOURNAL_SMOKE_FS=ext4 rebuild it as writable ext4 (mke2fs -t
+#     ext4 -O ^metadata_csum,uninit_bg: extents, 64bit, flex_bg, lazy-init
+#     groups, crc16 descriptor checksums; docs/ext4_compat_plan.md M2).
 #  2. Boot 1: bin/journal_smoke.sh syncs a baseline file, writes files until
 #     dirty-pressure commits sit uncheckpointed in the journal, and prints a
 #     crash point. QEMU is SIGKILLed there: everything still in the PeetOS
@@ -20,6 +23,7 @@ IMAGE="${ROOT_DIR}/build/peetos.img"
 EXT2_IMG="${ROOT_DIR}/user/sample_ext2_musl.img"
 WORK_DIR="$(mktemp -d)"
 EXT3_IMG="${WORK_DIR}/ext3.img"
+FS_KIND="${PEETOS_JOURNAL_SMOKE_FS:-ext3}"
 LOG1="${WORK_DIR}/boot1.log"
 LOG2="${WORK_DIR}/boot2.log"
 
@@ -52,13 +56,24 @@ done
 
 make -C "${ROOT_DIR}" image PROFILE=release KERNEL_FEATURES=musl-ext3-journal-smoke
 
-# Grow the runtime image so a 1 MiB journal fits, then add the journal.
-cp "${EXT2_IMG}" "${EXT3_IMG}"
-truncate -s +3M "${EXT3_IMG}"
-e2fsck -fy "${EXT3_IMG}" >/dev/null 2>&1 || true
-resize2fs -f "${EXT3_IMG}" >/dev/null 2>&1
-tune2fs -j -J size=1 "${EXT3_IMG}" >/dev/null
-dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -q has_journal || fail "tune2fs did not add a journal"
+if [[ "${FS_KIND}" == "ext4" ]]; then
+  # Rebuild the runtime image's contents as writable ext4 (no metadata_csum).
+  STAGE="${WORK_DIR}/stage"
+  mkdir -p "${STAGE}"
+  debugfs -R "rdump / ${STAGE}" "${EXT2_IMG}" >/dev/null 2>&1 || true
+  [[ -x "${STAGE}/bin/toybox" ]] || fail "rdump did not recover bin/toybox"
+  payload_kib="$(du -sk "${STAGE}" | awk '{print $1}')"
+  mke2fs -q -t ext4 -F -O ^metadata_csum,uninit_bg -L PEETOS_EXT4 -d "${STAGE}"     "${EXT3_IMG}" $((payload_kib * 2 + 16384))
+  dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "filesystem features" | grep -q extent     || fail "mke2fs did not produce an ext4 image"
+else
+  # Grow the runtime image so a 1 MiB journal fits, then add the journal.
+  cp "${EXT2_IMG}" "${EXT3_IMG}"
+  truncate -s +3M "${EXT3_IMG}"
+  e2fsck -fy "${EXT3_IMG}" >/dev/null 2>&1 || true
+  resize2fs -f "${EXT3_IMG}" >/dev/null 2>&1
+  tune2fs -j -J size=1 "${EXT3_IMG}" >/dev/null
+fi
+dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -q has_journal || fail "image has no journal"
 
 # Boots the kernel with the ext3 image as disk1; returns once `marker`
 # appears in the serial log (QEMU is then killed) or the timeout expires.
@@ -97,7 +112,10 @@ boot_until() {
 
 boot_until "${LOG1}" "[ext3-journal-smoke] crash-point" 60 \
   || fail "boot 1 never reached the crash point"
-grep -aq "\[VFS\] Mounted ext3 from block dev1" "${LOG1}" || fail "boot 1 did not mount the image as ext3"
+grep -aq "\[VFS\] Mounted ${FS_KIND} from block dev1" "${LOG1}"   || fail "boot 1 did not mount the image as ${FS_KIND}"
+if grep -aq "read-only" <(grep -a "\[VFS\] Mounted" "${LOG1}"); then
+  fail "boot 1 mounted the root read-only"
+fi
 grep -aq "\[ext3-journal-smoke\] baseline synced" "${LOG1}" || fail "boot 1 did not sync the baseline"
 
 # Debug aid: PEETOS_JOURNAL_SMOKE_KEEP=<dir> keeps the crashed image and the
@@ -146,4 +164,4 @@ if dumpe2fs -h "${EXT3_IMG}" 2>/dev/null | grep -i "filesystem features" | grep 
   fail "needs_recovery still set after kernel recovery and sync"
 fi
 
-echo "ext3 journal crash/recovery smoke completed successfully."
+echo "${FS_KIND} journal crash/recovery smoke completed successfully."

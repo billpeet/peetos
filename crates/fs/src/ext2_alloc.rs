@@ -15,23 +15,62 @@ pub(super) fn ext2_alloc_block(
     state: &mut VfsState,
     journal_handle: Option<Ext2JournalHandle>,
 ) -> Result<u32, i64> {
+    ext2_alloc_block_goal(state, journal_handle, 0)
+}
+
+/// Allocates a zeroed block, preferring `goal` and the blocks after it in
+/// its group, then the other groups in order (wrapping), so extent files
+/// stay contiguous. `goal` 0 means "anywhere" (first fit from group 0).
+pub(super) fn ext2_alloc_block_goal(
+    state: &mut VfsState,
+    journal_handle: Option<Ext2JournalHandle>,
+    goal: u32,
+) -> Result<u32, i64> {
     if !state.ext2_mounted {
         return Err(EINVAL);
     }
 
     let meta = state.ext2_meta;
+    let (goal_group, goal_bit) = if goal >= meta.first_data_block && goal < meta.total_blocks {
+        ext2_block_group_and_bit(&meta, goal)?
+    } else {
+        (0, 0)
+    };
 
-    let mut group = 0u32;
-    while group < meta.group_count {
+    // Visit the goal group from the goal bit, the other groups from bit 0,
+    // and finally the goal group's bits before the goal.
+    let mut pass = 0u32;
+    while pass <= meta.group_count {
+        let (group, first_bit, last_bit) = if pass == 0 {
+            (goal_group, goal_bit, meta.blocks_per_group)
+        } else if pass < meta.group_count {
+            ((goal_group + pass) % meta.group_count, 0, meta.blocks_per_group)
+        } else {
+            (goal_group, 0, goal_bit)
+        };
+        pass += 1;
+        if first_bit >= last_bit {
+            continue;
+        }
+
         let desc_offset = ext2_group_desc_offset(&meta, group)?;
         ext2_ensure_range_resident(state, desc_offset, meta.desc_size)?;
+        if super::ext2_gd_block_bitmap_uninit(state, &meta, group)? {
+            super::ext2_journal::with_handle_restartable_phase(
+                state,
+                journal_handle,
+                super::Ext2JournalPhaseKind::AllocBlockBookkeeping,
+                super::EXT2_JOURNAL_CREDITS_HELPER_ALLOC_BLOCK_BOOKKEEPING,
+                |state| super::ext2_init_block_bitmap(state, &meta, group),
+            )?;
+        }
         let bitmap_block = ext2_group_block_bitmap_block_state(state, &meta, group)?;
         let mut found = None;
 
         {
             let bitmap = ext2_block_slice_state(state, bitmap_block)?;
-            let mut bit = 0u32;
-            while bit < meta.blocks_per_group {
+            let mut bit = first_bit;
+            while bit < last_bit {
                 let block_num = meta
                     .first_data_block
                     .saturating_add(group.saturating_mul(meta.blocks_per_group))
@@ -86,8 +125,6 @@ pub(super) fn ext2_alloc_block(
             )?;
             return Ok(block_num);
         }
-
-        group += 1;
     }
 
     Err(ENOSPC)
@@ -161,6 +198,15 @@ pub(super) fn ext2_alloc_inode(
     while group < meta.group_count {
         let desc_offset = ext2_group_desc_offset(&meta, group)?;
         ext2_ensure_range_resident(state, desc_offset, meta.desc_size)?;
+        if super::ext2_gd_inode_bitmap_uninit(state, &meta, group)? {
+            super::ext2_journal::with_handle_restartable_phase(
+                state,
+                journal_handle,
+                super::Ext2JournalPhaseKind::AllocInodeBookkeeping,
+                super::EXT2_JOURNAL_CREDITS_HELPER_ALLOC_INODE_BOOKKEEPING,
+                |state| super::ext2_init_inode_bitmap(state, &meta, group),
+            )?;
+        }
         let bitmap_block = ext2_group_inode_bitmap_block_state(state, &meta, group)?;
         let mut found = None;
 
@@ -207,6 +253,7 @@ pub(super) fn ext2_alloc_inode(
                         -1,
                         if is_dir { 1 } else { 0 },
                     )?;
+                    super::ext2_gd_note_inode_used(state, &meta, ino)?;
                     ext2_mark_dirty_range(state, EXT2_SUPERBLOCK_OFFSET, 1024)?;
                     let desc_offset = ext2_group_desc_offset(&meta, group)?;
                     ext2_mark_dirty_range(state, desc_offset, meta.desc_size)?;

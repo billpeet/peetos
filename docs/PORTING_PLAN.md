@@ -231,6 +231,10 @@ current Rust kernel implementation and forward roadmap.
   M1 is done: stock ext4 images mount read-only with extent reads,
   `metadata_csum` verification, and recovery of Linux `64bit`/`csum_v3`
   journals; a QEMU smoke boots from an ext4 root (`make run-ext4-ro-smoke`).
+  M2 is done: ext4 without `metadata_csum` mounts read-write (extent tree
+  writes, lazy group init, crc16 descriptors, ext4 inode layout), checked by
+  `e2fsck`, the crash-point suite, and a QEMU crash/recovery smoke on an
+  ext4 root.
 - Add additional filesystem support (for example FAT-family support) as needed.
 - Improve durability guarantees around writeback scheduling and crash handling.
 
