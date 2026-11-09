@@ -4,7 +4,9 @@
  * /dev/fb0 with --fbdev or when no DRM device is available).
  *
  * Globals: wl_compositor (v4), wl_shm, wl_seat (v5, pointer + keyboard),
- * wl_output (v3), xdg_wm_base (v6; toplevels, popups are dismissed).
+ * wl_output (v3), xdg_wm_base (v6; toplevels, popups are dismissed),
+ * wl_subcompositor, xdg-decoration (always server-side) and
+ * wl_data_device_manager (v3; clipboard selection, no drag and drop).
  *
  * Window management is deliberately small: toplevels are cascaded, get
  * server-side decorations (title bar with a close box), are raised and focused
@@ -221,6 +223,9 @@ struct server {
     struct surface *keyboard_focus;
     struct toplevel *grab;
     int grab_dx, grab_dy;
+    /* clipboard (wl_data_device) */
+    struct wl_list data_devices;
+    struct data_source *selection;
 
     /* clients we spawned */
     pid_t children[MAX_CLIENTS];
@@ -618,6 +623,7 @@ static void send_keyboard_enter(struct server *srv, struct wl_resource *kb, stru
 }
 
 static void send_toplevel_configure(struct server *srv, struct toplevel *top);
+static void send_selection_to_client(struct server *srv, struct wl_client *client);
 
 static void set_keyboard_focus(struct server *srv, struct surface *s) {
     if (srv->keyboard_focus == s) {
@@ -637,6 +643,8 @@ static void set_keyboard_focus(struct server *srv, struct surface *s) {
     srv->keyboard_focus = s;
     if (s != NULL) {
         struct wl_client *client = wl_resource_get_client(s->resource);
+        /* The selection goes out right before keyboard enter. */
+        send_selection_to_client(srv, client);
         wl_resource_for_each(res, &srv->keyboards) {
             if (wl_resource_get_client(res) == client) {
                 send_keyboard_enter(srv, res, s);
@@ -1230,31 +1238,169 @@ static void bind_subcompositor(struct wl_client *c, void *data, uint32_t version
 }
 
 /* ------------------------------------------------------------------ */
-/* wl_data_device_manager (clipboard): objects exist, no transfers yet */
+/* wl_data_device_manager: clipboard selection (no drag and drop)      */
 /* ------------------------------------------------------------------ */
+/*
+ * One selection per seat. A client sets it with wl_data_device.set_selection;
+ * the client with keyboard focus is sent a fresh wl_data_offer (listing the
+ * source's mime types) and wl_data_device.selection, right before
+ * wl_keyboard.enter and again whenever the selection changes. A
+ * wl_data_offer.receive is forwarded to the source as wl_data_source.send with
+ * the same fd, so the bytes travel client to client through a pipe and never
+ * pass through the compositor.
+ */
 
-static void data_offer_str(struct wl_client *c, struct wl_resource *r, const char *s) {
-    (void)c;
-    (void)r;
-    (void)s;
-}
+struct data_source {
+    struct server *srv;
+    struct wl_resource *resource;
+    struct wl_array mimes; /* char * (owned) */
+    struct wl_list offers; /* wl_data_offer resource links */
+};
 
 static void data_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c;
     wl_resource_destroy(r);
 }
 
-static void data_source_set_actions(struct wl_client *c, struct wl_resource *r, uint32_t actions) {
+static void send_selection_to_client(struct server *srv, struct wl_client *client);
+
+static void selection_changed(struct server *srv) {
+    if (srv->keyboard_focus != NULL) {
+        send_selection_to_client(srv, wl_resource_get_client(srv->keyboard_focus->resource));
+    }
+}
+
+/* wl_data_offer: user data is the data_source, or NULL once it is gone. */
+
+static void offer_accept(struct wl_client *c, struct wl_resource *r, uint32_t serial,
+                         const char *mime) {
+    (void)c;
+    (void)r;
+    (void)serial;
+    (void)mime;
+}
+
+static void offer_receive(struct wl_client *c, struct wl_resource *r, const char *mime, int32_t fd) {
+    (void)c;
+    struct data_source *src = wl_resource_get_user_data(r);
+    if (src != NULL && src->srv->selection == src) {
+        wl_data_source_send_send(src->resource, mime, fd);
+        if (src->srv->smoke) {
+            printf("[peetwl] selection transfer mime=%s\n", mime);
+        }
+    }
+    /* libwayland dup'd the fd when sending; ours is no longer needed. A stale
+     * offer just gets EOF on its pipe. */
+    close(fd);
+}
+
+static void offer_finish(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
+    (void)r; /* drag and drop only */
+}
+
+static void offer_set_actions(struct wl_client *c, struct wl_resource *r, uint32_t actions,
+                              uint32_t preferred) {
+    (void)c;
+    (void)r;
+    (void)actions;
+    (void)preferred;
+}
+
+static const struct wl_data_offer_interface data_offer_impl = {
+    .accept = offer_accept,
+    .receive = offer_receive,
+    .destroy = data_destroy,
+    .finish = offer_finish,
+    .set_actions = offer_set_actions,
+};
+
+static void offer_resource_destroy(struct wl_resource *r) {
+    wl_list_remove(wl_resource_get_link(r));
+}
+
+/* wl_data_source */
+
+static void source_offer(struct wl_client *c, struct wl_resource *r, const char *mime) {
+    struct data_source *src = wl_resource_get_user_data(r);
+    char **slot = wl_array_add(&src->mimes, sizeof(char *));
+    if (slot == NULL || (*slot = strdup(mime)) == NULL) {
+        wl_client_post_no_memory(c);
+    }
+}
+
+static void source_set_actions(struct wl_client *c, struct wl_resource *r, uint32_t actions) {
     (void)c;
     (void)r;
     (void)actions;
 }
 
 static const struct wl_data_source_interface data_source_impl = {
-    .offer = data_offer_str,
+    .offer = source_offer,
     .destroy = data_destroy,
-    .set_actions = data_source_set_actions,
+    .set_actions = source_set_actions,
 };
+
+static void source_resource_destroy(struct wl_resource *r) {
+    struct data_source *src = wl_resource_get_user_data(r);
+    struct server *srv = src->srv;
+    /* Outstanding offers now point at nothing. */
+    struct wl_resource *offer, *tmp;
+    wl_resource_for_each_safe(offer, tmp, &src->offers) {
+        wl_resource_set_user_data(offer, NULL);
+        wl_list_remove(wl_resource_get_link(offer));
+        wl_list_init(wl_resource_get_link(offer));
+    }
+    char **mime;
+    wl_array_for_each(mime, &src->mimes) {
+        free(*mime);
+    }
+    wl_array_release(&src->mimes);
+    if (srv->selection == src) {
+        srv->selection = NULL;
+        if (srv->smoke) {
+            printf("[peetwl] selection cleared (source destroyed)\n");
+        }
+        /* Skip the source's own client: it may be disconnecting, and must
+         * not get new objects while libwayland tears it down. */
+        struct surface *f = srv->keyboard_focus;
+        if (f != NULL && wl_resource_get_client(f->resource) != wl_resource_get_client(r)) {
+            selection_changed(srv);
+        }
+    }
+    free(src);
+}
+
+/* Offer the current selection (or none) to every data device of `client`. */
+static void send_selection_to_client(struct server *srv, struct wl_client *client) {
+    struct data_source *src = srv->selection;
+    struct wl_resource *dev;
+    wl_resource_for_each(dev, &srv->data_devices) {
+        if (wl_resource_get_client(dev) != client) {
+            continue;
+        }
+        if (src == NULL) {
+            wl_data_device_send_selection(dev, NULL);
+            continue;
+        }
+        struct wl_resource *offer =
+            wl_resource_create(client, &wl_data_offer_interface, wl_resource_get_version(dev), 0);
+        if (offer == NULL) {
+            wl_client_post_no_memory(client);
+            continue;
+        }
+        wl_resource_set_implementation(offer, &data_offer_impl, src, offer_resource_destroy);
+        wl_list_insert(&src->offers, wl_resource_get_link(offer));
+        wl_data_device_send_data_offer(dev, offer);
+        char **mime;
+        wl_array_for_each(mime, &src->mimes) {
+            wl_data_offer_send_offer(offer, *mime);
+        }
+        wl_data_device_send_selection(dev, offer);
+    }
+}
+
+/* wl_data_device */
 
 static void data_device_start_drag(struct wl_client *c, struct wl_resource *r, struct wl_resource *source,
                                    struct wl_resource *origin, struct wl_resource *icon, uint32_t serial) {
@@ -1271,12 +1417,24 @@ static void data_device_start_drag(struct wl_client *c, struct wl_resource *r, s
 static void data_device_set_selection(struct wl_client *c, struct wl_resource *r,
                                       struct wl_resource *source, uint32_t serial) {
     (void)c;
-    (void)r;
-    (void)serial;
-    if (source != NULL) {
-        /* No other clients can receive it yet; tell the source it lost. */
-        wl_data_source_send_cancelled(source);
+    (void)serial; /* not validated against input serials */
+    struct server *srv = wl_resource_get_user_data(r);
+    struct data_source *src = source != NULL ? wl_resource_get_user_data(source) : NULL;
+    if (src == srv->selection) {
+        return;
     }
+    struct data_source *old = srv->selection;
+    srv->selection = src;
+    if (old != NULL) {
+        wl_data_source_send_cancelled(old->resource);
+    }
+    if (srv->smoke) {
+        struct surface *f = srv->keyboard_focus;
+        printf("[peetwl] selection %s (focus '%s', %zu mime type(s))\n",
+               src != NULL ? "set" : "cleared", surface_title(f),
+               src != NULL ? src->mimes.size / sizeof(char *) : (size_t)0);
+    }
+    selection_changed(srv);
 }
 
 static const struct wl_data_device_interface data_device_impl = {
@@ -1286,23 +1444,43 @@ static const struct wl_data_device_interface data_device_impl = {
 };
 
 static void ddm_create_data_source(struct wl_client *c, struct wl_resource *r, uint32_t id) {
-    struct wl_resource *res = wl_resource_create(c, &wl_data_source_interface, wl_resource_get_version(r), id);
-    if (res == NULL) {
+    struct server *srv = wl_resource_get_user_data(r);
+    struct data_source *src = calloc(1, sizeof(*src));
+    if (src == NULL) {
         wl_client_post_no_memory(c);
         return;
     }
-    wl_resource_set_implementation(res, &data_source_impl, NULL, NULL);
+    src->resource = wl_resource_create(c, &wl_data_source_interface, wl_resource_get_version(r), id);
+    if (src->resource == NULL) {
+        free(src);
+        wl_client_post_no_memory(c);
+        return;
+    }
+    src->srv = srv;
+    wl_array_init(&src->mimes);
+    wl_list_init(&src->offers);
+    wl_resource_set_implementation(src->resource, &data_source_impl, src, source_resource_destroy);
+}
+
+static void data_device_resource_destroy(struct wl_resource *r) {
+    wl_list_remove(wl_resource_get_link(r));
 }
 
 static void ddm_get_data_device(struct wl_client *c, struct wl_resource *r, uint32_t id,
                                 struct wl_resource *seat) {
     (void)seat;
+    struct server *srv = wl_resource_get_user_data(r);
     struct wl_resource *res = wl_resource_create(c, &wl_data_device_interface, wl_resource_get_version(r), id);
     if (res == NULL) {
         wl_client_post_no_memory(c);
         return;
     }
-    wl_resource_set_implementation(res, &data_device_impl, NULL, NULL);
+    wl_resource_set_implementation(res, &data_device_impl, srv, data_device_resource_destroy);
+    wl_list_insert(&srv->data_devices, wl_resource_get_link(res));
+    /* A client that already has keyboard focus learns the selection now. */
+    if (srv->keyboard_focus != NULL && wl_resource_get_client(srv->keyboard_focus->resource) == c) {
+        send_selection_to_client(srv, c);
+    }
 }
 
 static const struct wl_data_device_manager_interface ddm_impl = {
@@ -2256,6 +2434,7 @@ int main(int argc, char **argv) {
     wl_list_init(&srv.frame_callbacks);
     wl_list_init(&srv.pointers);
     wl_list_init(&srv.keyboards);
+    wl_list_init(&srv.data_devices);
 
     int drm_status = force_fbdev ? -1 : open_drm(&srv);
     if (drm_status == -2 || (drm_status != 0 && open_framebuffer(&srv) != 0)) {

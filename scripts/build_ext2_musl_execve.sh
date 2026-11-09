@@ -613,10 +613,12 @@ fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/unix_rights_smoke.sh"
 
-# Runs inside foot: proves the terminal shows output and passes keyboard
-# input through its pty to the shell.
+# Runs inside foot: proves the terminal shows output, passes keyboard input
+# through its pty to the shell, and pastes the clipboard (Ctrl+Shift+V). The
+# first line is the word the driver selects and copies (Ctrl+Shift+C).
 cat > "${STAGE_ROOT}/bin/foot_child.sh" <<'EOS'
 echo "[foot-child] started TERM=$TERM" > /dev/console
+echo "COPYME-1234"
 echo "Hello from foot on PeetOS!"
 echo "fcft + fontconfig + freetype + pixman, under peetwl via DRM/KMS"
 echo
@@ -627,19 +629,29 @@ echo "[foot-child] prompt shown" > /dev/console
 line=$(head -n 1)
 echo "you typed: $line"
 echo "[foot-child] got $line" > /dev/console
-sleep 1
+printf 'paste here: '
+echo "[foot-child] paste prompt shown" > /dev/console
+line=$(head -n 1)
+echo "pasted: $line"
+echo "[foot-child] pasted $line" > /dev/console
+printf 'press Enter to exit: '
+head -n 1 > /dev/null
+echo "[foot-child] exiting" > /dev/console
 EOS
 
 cat > "${STAGE_ROOT}/bin/foot_smoke.sh" <<'EOS'
 fail=0
 export LANG=C.UTF-8 HOME=/tmp
 
-if [ ! -x bin/peetwl ] || [ ! -x bin/foot ]; then
-  echo [musl-ext2-foot-smoke] missing bin/peetwl or bin/foot
+if [ ! -x bin/peetwl ] || [ ! -x bin/foot ] || [ ! -x bin/wl-demo ]; then
+  echo [musl-ext2-foot-smoke] missing bin/peetwl, bin/foot or bin/wl-demo
   fail=1
 else
+  # wl-demo is the other clipboard party: it offers clip-from-demo and logs
+  # whatever selection it is offered (foot's copy).
   bin/peetwl --smoke \
-    --client "/mnt/ext2/bin/foot -e /mnt/ext2/bin/toybox sh /mnt/ext2/bin/foot_child.sh" || fail=1
+    --client "/mnt/ext2/bin/foot -e /mnt/ext2/bin/toybox sh /mnt/ext2/bin/foot_child.sh" \
+    --client "/mnt/ext2/bin/wl-demo Clip 0x3070c0 --size 600x100 --copy clip-from-demo --paste" || fail=1
 fi
 
 echo [musl-ext2-foot-smoke] done
@@ -649,13 +661,15 @@ fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/foot_smoke.sh"
 
-# Interactive foot session (make run-foot-demo): peetwl runs one foot
-# window with a toybox shell. `exit` or ^D closes foot; peetwl (not in
-# --smoke mode) keeps running with an empty desktop until QEMU is closed.
+# Interactive foot session (make run-foot-demo): peetwl runs two foot
+# windows with toybox shells, so copy and paste between them can be tried.
+# `exit` or ^D closes a window; peetwl (not in --smoke mode) keeps running
+# with an empty desktop until QEMU is closed.
 cat > "${STAGE_ROOT}/bin/foot_demo_shell.sh" <<'EOS'
 cd /mnt/ext2
 echo "Welcome to foot on PeetOS."
 echo "This is toybox sh in a pty; there is no line editing or history yet."
+echo "Copy: select with the mouse, then Ctrl+Shift+C. Paste: Ctrl+Shift+V."
 echo
 exec toybox sh -i
 EOS
@@ -666,8 +680,9 @@ if [ ! -x bin/peetwl ] || [ ! -x bin/foot ]; then
   echo [musl-ext2-foot-demo] missing bin/peetwl or bin/foot
   exit 1
 fi
-echo [musl-ext2-foot-demo] starting peetwl with an interactive foot terminal
+echo [musl-ext2-foot-demo] starting peetwl with two interactive foot terminals
 exec bin/peetwl \
+  --client "/mnt/ext2/bin/foot -e /mnt/ext2/bin/toybox sh /mnt/ext2/bin/foot_demo_shell.sh" \
   --client "/mnt/ext2/bin/foot -e /mnt/ext2/bin/toybox sh /mnt/ext2/bin/foot_demo_shell.sh"
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/foot_demo.sh"

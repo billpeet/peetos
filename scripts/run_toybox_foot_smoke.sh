@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# End-to-end foot terminal smoke: boots the compositor-first profile,
-# injects real PS/2 input through the QEMU monitor, and verifies window
-# contents, focus, move and close behaviour from screendumps and the log.
+# End-to-end foot terminal smoke: boots the compositor-first profile with
+# peetwl running foot and a wl-demo clipboard peer, injects real PS/2 input
+# through the QEMU monitor, and checks terminal output, typed input, and
+# copy/paste in both directions (see scripts/foot_smoke_driver.py).
 # Set FOOT_SHOTS=<dir> to keep PNG copies of the screendumps.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -66,7 +67,7 @@ for _ in $(seq 1 100); do
   sleep 0.2
 done
 
-grep -E '\[(peetwl|foot-child)\] (output|ready|mapped|unmapped|all clients|pass|FAIL|started|prompt|got)|drm flips' "${LOG_FILE}" || true
+grep -E '\[(peetwl|foot-child|wl-demo:Clip)\] (output|ready|mapped|unmapped|all clients|pass|FAIL|started|prompt|got|paste|selection|clipboard|exiting)|drm flips' "${LOG_FILE}" || true
 
 if [[ "${driver_status}" -ne 0 ]]; then
   echo "foot terminal smoke driver failed" >&2

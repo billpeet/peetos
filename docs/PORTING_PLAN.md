@@ -194,13 +194,16 @@ current Rust kernel implementation and forward roadmap.
   - User-range checks now stop at the end of the lower canonical half, so user mappings can't reach the shared kernel half.
 - DRM/KMS: `/dev/dri/card0` is a simpledrm-style device over the boot framebuffer (`docs/drm.md`). It supports legacy mode setting, dumb buffers, page flips with completion events, DIRTYFB and PRIME. libdrm 2.4.123 is ported (`make -C wayland`). `peetwl` now presents through DRM page flips and paces frame callbacks on flip completion. `make run-drm-smoke` covers it, and `make run-wlcomp-smoke` covers it through the compositor.
 - Software rendering stack (`docs/rendering.md`): pixman, expat, freetype, fontconfig and DejaVu fonts, cross-built with meson into a staged sysroot (`wayland/out/stage`) and shipped as shared musl libraries. `make run-text-smoke` renders anti-aliased text with fontconfig + freetype + pixman and shows it through DRM. It needed an 8 MiB lazily populated main-thread stack (was a fixed 32 KiB), `chmod(2)` and `fadvise64(2)`.
-- The foot terminal (1.18.1, with tllist and fcft 3.1.8) runs under `peetwl`, which gained `wl_subcompositor`, a minimal `wl_data_device_manager` and server-side `xdg-decoration`. `make run-foot-smoke` types into the shell running inside foot, and `make run-foot-demo` opens an interactive foot session. The kernel work foot needed:
+- The foot terminal (1.18.1, with tllist and fcft 3.1.8) runs under `peetwl`, which gained `wl_subcompositor`, a `wl_data_device_manager` clipboard (copy/paste between clients, no drag and drop) and server-side `xdg-decoration`. `make run-foot-smoke` types into the shell running inside foot, and `make run-foot-demo` opens an interactive foot session. The kernel work foot needed:
   - `epoll_pwait`/`ppoll` signal masks with Linux restore semantics;
   - pty `ONLCR` output processing;
   - `prctl` and `membarrier`;
   - 1 GiB sparse memfds and a 4 GiB per-process mapping budget.
 - C++ toolchain and runtime (`docs/cxx.md`): GCC 15.2 cross-built for `x86_64-linux-musl` (`make -C toolchain`), with libstdc++, libsupc++, libgcc_s and libatomic shipped as shared libraries. `make run-cxx-smoke` (2 CPUs) covers static constructors/destructors, exceptions thrown across shared objects and out of a `dlopen()`ed plugin, RTTI, iostreams, `std::format`, `std::filesystem`, `std::thread`/`mutex`/`condition_variable`/`async`, `thread_local` destructors and thread-safe statics. No kernel changes were needed.
 - harfbuzz 10.1.0 (built with the cross g++) and utf8proc 2.9.0 joined the rendering stack. `make run-text-smoke` now checks GPOS kerning, mark composition and Arabic joining forms and draws shaped text; fcft is built with grapheme and run shaping, foot with grapheme clustering.
+- Two foot windows at once (`make run-foot-demo`) exposed two SMP/threading bugs, both fixed and covered by unit tests:
+  - a COW write fault that another thread of the same process had already resolved killed the thread with SIGSEGV;
+  - private futexes were keyed by address alone across processes, so two processes of the same binary stole each other's wakeups and hung.
 - The path from here to a full desktop is tracked in `docs/desktop_roadmap.md`.
 - libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the region slots per task (32 then, 256 now).
 

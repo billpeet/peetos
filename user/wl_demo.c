@@ -8,8 +8,12 @@
  *     with libxkbcommon from the compositor's XKB_V1 keymap); 'q' exits
  *   - xdg_toplevel.close (the compositor's close box) exits
  * With --animate it redraws continuously, paced by frame callbacks.
+ * With --copy TEXT it takes the clipboard selection (as text) the first time
+ * it gets keyboard focus and serves it to other clients; with --paste it reads
+ * every text selection it is offered and logs it.
  *
  * Usage: wl-demo <title> <0xRRGGBB> [--size WxH] [--animate]
+ *                [--copy TEXT] [--paste]
  *
  * Log markers are prefixed "[wl-demo:<title>]".
  */
@@ -19,6 +23,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <poll.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -59,6 +64,18 @@ struct app {
     struct xdg_wm_base *wm_base;
     struct wl_pointer *pointer;
     struct wl_keyboard *keyboard;
+    struct wl_data_device_manager *ddm;
+    struct wl_data_device *data_device;
+    /* clipboard */
+    const char *copy_text;
+    int copied;
+    struct wl_data_source *source;
+    int paste;
+    struct wl_data_offer *pending_offer;
+    int offer_mime; /* index into TEXT_MIMES, -1 if no text type */
+    int paste_fd;
+    char paste_buf[4096];
+    size_t paste_len;
     struct xkb_context *xkb_ctx;
     struct xkb_keymap *keymap;
     struct xkb_state *xkb_state;
@@ -389,14 +406,226 @@ static void keyboard_keymap(void *data, struct wl_keyboard *k, uint32_t format, 
            xkb_keymap_layout_get_name(keymap, 0));
 }
 
+/* ------------------------------------------------------------------ */
+/* Clipboard (--copy / --paste)                                        */
+/* ------------------------------------------------------------------ */
+
+static const char *const TEXT_MIMES[] = {"text/plain;charset=utf-8", "text/plain", "UTF8_STRING"};
+
+static void source_target(void *data, struct wl_data_source *s, const char *mime) {
+    (void)data;
+    (void)s;
+    (void)mime;
+}
+
+static void source_send(void *data, struct wl_data_source *s, const char *mime, int32_t fd) {
+    (void)s;
+    struct app *app = data;
+    const char *p = app->copy_text;
+    size_t left = strlen(p);
+    while (left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n <= 0) {
+            break;
+        }
+        p += n;
+        left -= (size_t)n;
+    }
+    close(fd);
+    printf("[wl-demo:%s] clipboard sent '%s' as %s\n", app->title, app->copy_text, mime);
+}
+
+static void source_cancelled(void *data, struct wl_data_source *s) {
+    struct app *app = data;
+    printf("[wl-demo:%s] clipboard ownership lost\n", app->title);
+    wl_data_source_destroy(s);
+    if (app->source == s) {
+        app->source = NULL;
+    }
+}
+
+static void source_dnd_drop_performed(void *data, struct wl_data_source *s) {
+    (void)data;
+    (void)s;
+}
+
+static void source_dnd_finished(void *data, struct wl_data_source *s) {
+    (void)data;
+    (void)s;
+}
+
+static void source_action(void *data, struct wl_data_source *s, uint32_t action) {
+    (void)data;
+    (void)s;
+    (void)action;
+}
+
+static const struct wl_data_source_listener source_listener = {
+    .target = source_target,
+    .send = source_send,
+    .cancelled = source_cancelled,
+    .dnd_drop_performed = source_dnd_drop_performed,
+    .dnd_finished = source_dnd_finished,
+    .action = source_action,
+};
+
+/* Take the selection once, with the serial of our first keyboard enter. */
+static void maybe_copy(struct app *app, uint32_t serial) {
+    if (app->copy_text == NULL || app->copied || app->data_device == NULL) {
+        return;
+    }
+    app->source = wl_data_device_manager_create_data_source(app->ddm);
+    wl_data_source_add_listener(app->source, &source_listener, app);
+    for (size_t i = 0; i < sizeof(TEXT_MIMES) / sizeof(TEXT_MIMES[0]); i++) {
+        wl_data_source_offer(app->source, TEXT_MIMES[i]);
+    }
+    wl_data_device_set_selection(app->data_device, app->source, serial);
+    app->copied = 1;
+    printf("[wl-demo:%s] clipboard set '%s'\n", app->title, app->copy_text);
+}
+
+static void offer_offer(void *data, struct wl_data_offer *o, const char *mime) {
+    struct app *app = data;
+    if (o != app->pending_offer) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(TEXT_MIMES) / sizeof(TEXT_MIMES[0]); i++) {
+        if (strcmp(mime, TEXT_MIMES[i]) == 0 && (app->offer_mime < 0 || (int)i < app->offer_mime)) {
+            app->offer_mime = (int)i;
+        }
+    }
+}
+
+static void offer_source_actions(void *data, struct wl_data_offer *o, uint32_t actions) {
+    (void)data;
+    (void)o;
+    (void)actions;
+}
+
+static void offer_action(void *data, struct wl_data_offer *o, uint32_t action) {
+    (void)data;
+    (void)o;
+    (void)action;
+}
+
+static const struct wl_data_offer_listener offer_listener = {
+    .offer = offer_offer,
+    .source_actions = offer_source_actions,
+    .action = offer_action,
+};
+
+static void device_data_offer(void *data, struct wl_data_device *d, struct wl_data_offer *o) {
+    (void)d;
+    struct app *app = data;
+    if (app->pending_offer != NULL) {
+        wl_data_offer_destroy(app->pending_offer);
+    }
+    app->pending_offer = o;
+    app->offer_mime = -1;
+    wl_data_offer_add_listener(o, &offer_listener, app);
+}
+
+static void paste_finish(struct app *app) {
+    app->paste_buf[app->paste_len] = '\0';
+    printf("[wl-demo:%s] paste '%s'\n", app->title, app->paste_buf);
+    close(app->paste_fd);
+    app->paste_fd = -1;
+}
+
+static void device_selection(void *data, struct wl_data_device *d, struct wl_data_offer *o) {
+    (void)d;
+    struct app *app = data;
+    if (o == NULL) {
+        printf("[wl-demo:%s] selection empty\n", app->title);
+        return;
+    }
+    if (!app->paste || o != app->pending_offer || app->offer_mime < 0) {
+        return;
+    }
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) {
+        printf("[wl-demo:%s] FAIL pipe errno=%d\n", app->title, errno);
+        return;
+    }
+    if (app->paste_fd >= 0) {
+        close(app->paste_fd);
+    }
+    wl_data_offer_receive(o, TEXT_MIMES[app->offer_mime], fds[1]);
+    close(fds[1]);
+    /* Read in the poll loop: we may be the source, and our own `send` must
+     * still be dispatched while the pipe is open. */
+    app->paste_fd = fds[0];
+    app->paste_len = 0;
+    fcntl(app->paste_fd, F_SETFL, O_NONBLOCK);
+}
+
+static void paste_readable(struct app *app) {
+    for (;;) {
+        size_t room = sizeof(app->paste_buf) - 1 - app->paste_len;
+        if (room == 0) {
+            paste_finish(app);
+            return;
+        }
+        ssize_t n = read(app->paste_fd, app->paste_buf + app->paste_len, room);
+        if (n > 0) {
+            app->paste_len += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+            return;
+        }
+        paste_finish(app); /* EOF or error */
+        return;
+    }
+}
+
+static void device_enter(void *data, struct wl_data_device *d, uint32_t serial,
+                         struct wl_surface *s, wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *o) {
+    (void)data;
+    (void)d;
+    (void)serial;
+    (void)s;
+    (void)x;
+    (void)y;
+    (void)o;
+}
+
+static void device_leave(void *data, struct wl_data_device *d) {
+    (void)data;
+    (void)d;
+}
+
+static void device_motion(void *data, struct wl_data_device *d, uint32_t t, wl_fixed_t x,
+                          wl_fixed_t y) {
+    (void)data;
+    (void)d;
+    (void)t;
+    (void)x;
+    (void)y;
+}
+
+static void device_drop(void *data, struct wl_data_device *d) {
+    (void)data;
+    (void)d;
+}
+
+static const struct wl_data_device_listener device_listener = {
+    .data_offer = device_data_offer,
+    .enter = device_enter,
+    .leave = device_leave,
+    .motion = device_motion,
+    .drop = device_drop,
+    .selection = device_selection,
+};
+
 static void keyboard_enter(void *data, struct wl_keyboard *k, uint32_t serial,
                            struct wl_surface *s, struct wl_array *keys) {
     (void)k;
-    (void)serial;
     (void)s;
     (void)keys;
     struct app *app = data;
     printf("[wl-demo:%s] keyboard enter\n", app->title);
+    maybe_copy(app, serial);
 }
 
 static void keyboard_leave(void *data, struct wl_keyboard *k, uint32_t serial,
@@ -504,6 +733,8 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
     } else if (strcmp(iface, wl_seat_interface.name) == 0) {
         app->seat = wl_registry_bind(reg, name, &wl_seat_interface, min_u32(version, 5));
         wl_seat_add_listener(app->seat, &seat_listener, app);
+    } else if (strcmp(iface, wl_data_device_manager_interface.name) == 0) {
+        app->ddm = wl_registry_bind(reg, name, &wl_data_device_manager_interface, min_u32(version, 3));
     } else if (strcmp(iface, xdg_wm_base_interface.name) == 0) {
         app->wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, min_u32(version, 6));
         xdg_wm_base_add_listener(app->wm_base, &wm_base_listener, app);
@@ -525,7 +756,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     static struct app app;
     if (argc < 3) {
-        printf("usage: wl-demo <title> <0xRRGGBB> [--size WxH] [--animate]\n");
+        printf("usage: wl-demo <title> <0xRRGGBB> [--size WxH] [--animate] [--copy TEXT] [--paste]\n");
         return 2;
     }
     app.title = argv[1];
@@ -534,11 +765,17 @@ int main(int argc, char **argv) {
     app.width = 280;
     app.height = 180;
     app.running = 1;
+    app.paste_fd = -1;
+    app.offer_mime = -1;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--animate") == 0) {
             app.animate = 1;
         } else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
             sscanf(argv[++i], "%dx%d", &app.width, &app.height);
+        } else if (strcmp(argv[i], "--copy") == 0 && i + 1 < argc) {
+            app.copy_text = argv[++i];
+        } else if (strcmp(argv[i], "--paste") == 0) {
+            app.paste = 1;
         }
     }
 
@@ -554,6 +791,14 @@ int main(int argc, char **argv) {
         printf("[wl-demo:%s] FAIL missing globals\n", app.title);
         return 1;
     }
+    if ((app.copy_text != NULL || app.paste) && (app.ddm == NULL || app.seat == NULL)) {
+        printf("[wl-demo:%s] FAIL no wl_data_device_manager\n", app.title);
+        return 1;
+    }
+    if (app.ddm != NULL && app.seat != NULL && (app.copy_text != NULL || app.paste)) {
+        app.data_device = wl_data_device_manager_get_data_device(app.ddm, app.seat);
+        wl_data_device_add_listener(app.data_device, &device_listener, &app);
+    }
     if (create_buffers(&app) != 0) {
         return 1;
     }
@@ -567,7 +812,41 @@ int main(int argc, char **argv) {
     xdg_toplevel_set_app_id(app.toplevel, "peetos.wl-demo");
     wl_surface_commit(app.surface);
 
-    while (app.running && wl_display_dispatch(app.display) != -1) {
+    /* Poll loop rather than wl_display_dispatch: a paste pipe is read
+     * alongside the display connection. */
+    while (app.running) {
+        while (wl_display_prepare_read(app.display) != 0) {
+            wl_display_dispatch_pending(app.display);
+        }
+        if (wl_display_flush(app.display) < 0 && errno != EAGAIN) {
+            wl_display_cancel_read(app.display);
+            break;
+        }
+        struct pollfd pfd[2] = {
+            {.fd = wl_display_get_fd(app.display), .events = POLLIN},
+            {.fd = app.paste_fd, .events = POLLIN},
+        };
+        int nfds = app.paste_fd >= 0 ? 2 : 1;
+        if (poll(pfd, (nfds_t)nfds, -1) < 0) {
+            wl_display_cancel_read(app.display);
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pfd[0].revents & (POLLIN | POLLERR | POLLHUP)) {
+            if (wl_display_read_events(app.display) < 0) {
+                break;
+            }
+        } else {
+            wl_display_cancel_read(app.display);
+        }
+        if (wl_display_dispatch_pending(app.display) < 0) {
+            break;
+        }
+        if (nfds == 2 && app.paste_fd >= 0 && (pfd[1].revents & (POLLIN | POLLERR | POLLHUP))) {
+            paste_readable(&app);
+        }
     }
 
     printf("[wl-demo:%s] exiting after %d frames\n", app.title, app.frames);

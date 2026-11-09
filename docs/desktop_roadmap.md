@@ -93,7 +93,8 @@ later.
   libinput, libevdev and a minimal seat/udev substitute.
 - [ ] Run **labwc** (Openbox-like stacking, closest to Windows behaviour) or a
   custom shell on wlroots. This brings layer-shell (panels, docks), popups,
-  xdg-decoration, data-device (clipboard, drag and drop), viewporter,
+  xdg-decoration, data-device (drag and drop; `peetwl` already has the
+  clipboard), primary selection, viewporter,
   fractional scaling, cursor-shape, presentation-time and linux-dmabuf.
 - [ ] Keep `peetwl` as the minimal test and fallback compositor.
 

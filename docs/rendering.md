@@ -42,14 +42,15 @@ foot 1.18.1 runs under `peetwl`. That is the roadmap's first milestone: a real t
 - foot looks `wayland-scanner` up as a native dependency. The script writes a build-machine `wayland-scanner.pc` pointing at the host scanner and passes it with `-Dbuild.pkg_config_path`.
 - libwayland-cursor (with its built-in fallback cursors) is now built by `scripts/build_wayland.sh`. `<linux/input-event-codes.h>` is vendored in `wayland/peetos/uapi/linux/` (a Linux uapi header under the syscall-note exception), and the whole uapi shim directory is installed with libdrm.
 - The ext2 image ships `/bin/foot` and `/etc/xdg/foot/foot.ini`.
-- `make run-foot-smoke` (part of `make test`) boots the `compositor-first musl-ext2-foot-smoke` profile. It runs `peetwl --smoke --client "foot -e toybox sh foot_child.sh"`. `scripts/foot_smoke_driver.py` then:
-  - waits for foot's window;
+- `make run-foot-smoke` (part of `make test`) boots the `compositor-first musl-ext2-foot-smoke` profile. It runs `peetwl --smoke` with two clients: `foot -e toybox sh foot_child.sh` and `wl-demo Clip --copy clip-from-demo --paste` as the other clipboard party. `scripts/foot_smoke_driver.py` then:
+  - waits for both windows;
   - checks the screendump shows `peetwl`'s focused title bar and terminal text;
-  - types `hello` with real PS/2 key presses;
-  - waits for the shell inside foot to report the line on the serial console.
+  - types `hello` with real PS/2 key presses and waits for the shell inside foot to report the line on the serial console;
+  - presses Ctrl+Shift+V in foot, and the shell must receive `clip-from-demo` from wl-demo;
+  - drag-selects `COPYME-1234` in foot and presses Ctrl+Shift+C, then focuses wl-demo, which must log the pasted text.
 
   The runner also requires DRM page flips. Screenshots go to `$FOOT_SHOTS` when set.
-- `make run-foot-demo` is the interactive version. It boots the `compositor-first musl-ext2-foot-demo usb-tablet` profile in a QEMU window (1 GiB, 2 CPUs; override with `FOOT_DEMO_MEM` and `QEMU_SMP`). `peetwl` (not in smoke mode) runs one foot window holding `toybox sh -i`. Click the QEMU window to give it the keyboard, then type into foot; drag the title bar to move the window. `exit` or ^D closes foot and leaves an empty desktop. The profile is left out of `make run`'s feature set so `make run` is unchanged.
+- `make run-foot-demo` is the interactive version. It boots the `compositor-first musl-ext2-foot-demo usb-tablet` profile in a QEMU window (1 GiB, 2 CPUs; override with `FOOT_DEMO_MEM` and `QEMU_SMP`). `peetwl` (not in smoke mode) runs two foot windows, each holding `toybox sh -i`. Click the QEMU window to give it the keyboard, then type into foot; drag a title bar to move a window. Copy with a mouse selection plus Ctrl+Shift+C, and paste with Ctrl+Shift+V, within a window or between them. `exit` or ^D closes a window, and once both are gone the desktop stays empty. The profile is left out of `make run`'s feature set so `make run` is unchanged.
 
 **Kernel work foot needed**
 - **`epoll_pwait` and `ppoll` honour their signal mask.** It is installed for the wait and restored on syscall exit, or saved in the signal frame when a signal is delivered under it, like Linux's `TIF_RESTORE_SIGMASK`. foot's event loop depends on this (it unblocks SIGCHLD only while waiting). Before, `epoll_pwait` with a mask returned `ENOSYS` and `ppoll` ignored it.
@@ -78,8 +79,8 @@ foot 1.18.1 runs under `peetwl`. That is the roadmap's first milestone: a real t
 The runner saves a QEMU screendump of the frame to `build/text_smoke.png`.
 
 Limitations / Simplifications
-- foot runs without terminfo. Toybox's shell has no line editing or job control, and there is no clipboard transfer through `peetwl`. `fallocate(PUNCH_HOLE)` is not supported, so foot disables its scrolling-by-offset optimization and redraws instead.
-- The interactive demo has a single foot window, which cannot be reopened after the shell exits (there is no launcher), and `make test` does not cover it; its init payload and scripts mirror the smoke's.
+- foot runs without terminfo. Toybox's shell has no line editing or job control. The clipboard works (Ctrl+Shift+C/V), but there is no primary selection, so select-to-copy and middle-click paste do not work. `fallocate(PUNCH_HOLE)` is not supported, so foot disables its scrolling-by-offset optimization and redraws instead.
+- The interactive demo's two foot windows cannot be reopened after their shells exit (there is no launcher), and `make test` does not cover it; its init payload and scripts mirror the smoke's.
 - harfbuzz has no glib, ICU or graphite2 integration and no `hb-view`/`hb-shape` utilities. The shaping smoke checks Latin kerning, mark composition and Arabic joining with DejaVu Sans only; other scripts depend on font coverage, and only two fonts are staged. libpng, cairo and pango are not ported yet.
 - Building the stack now needs the C++ cross toolchain (about 4 minutes on top of the rest).
 - Only two fonts (DejaVu Sans and DejaVu Sans Mono) are staged. There is no fontconfig cache built ahead of time: the first `FcInit` in each process scans the font directory, which is fast with two fonts but grows with more.

@@ -98,13 +98,13 @@ make run-wayland-smoke   # or: tests/musl_ext2_wayland_smoke.sh
   - `xdg_wm_base` v6 and `zxdg_decoration_manager_v1` v1.
 - Subsurfaces are drawn above their parent with alpha blending (premultiplied ARGB) and nest. Their commits apply at once (desynchronized semantics), and `place_above`/`place_below` are accepted but stacking stays in creation order.
 - `zxdg_toplevel_decoration_v1` always answers `server_side`, so clients such as foot leave the title bar and border to `peetwl`.
-- `wl_data_device_manager`: data sources and devices can be created, but there is no clipboard transfer yet. `set_selection` cancels the source, and drags are cancelled.
+- `wl_data_device_manager` (clipboard): one selection for the seat. `wl_data_device.set_selection` makes a source the selection and cancels the previous one. The client with keyboard focus gets a new `wl_data_offer` listing the source's mime types, then `wl_data_device.selection`. That happens right before `wl_keyboard.enter`, again whenever the selection changes, and when a focused client creates its data device. `wl_data_offer.receive` is forwarded to the source as `wl_data_source.send` with the same fd, so the data goes client to client through a pipe and never through the compositor. Destroying the selection's source (including its client disconnecting) clears the selection; offers left behind just get EOF. With `--smoke` it logs `selection set/cleared` and each `selection transfer`.
 - xdg-shell: toplevels get an initial configure, must `ack_configure` before attaching a buffer, and receive `activated` state changes on focus. `xdg_toplevel.move` starts an interactive move. Popups are created and immediately dismissed (`popup_done`); positioners are accepted and ignored.
 - Window management: new toplevels are cascaded and focused. Server-side decorations (title bar with the toplevel title, focus-coloured border, close box) are drawn by the compositor. Clicking raises and focuses a window, dragging the title bar moves it, and the close box sends `xdg_toplevel.close`.
 - Input: reads `/dev/input/event0` (keyboard) and `/dev/input/event1` (relative PS/2 or absolute tablet pointer), draws a software cursor, does pointer hit-testing for `wl_pointer` enter/leave/motion/button/frame, and delivers keys with an XKB keymap and xkb_state-tracked modifiers (see Keyboard Keymaps).
 - Clients: `--client "<cmd> [args]"` spawns clients after the socket is up; `--smoke` adds cursor/focus logging, exits when every spawned client has exited, and enforces a watchdog. The compositor learns about exited children through a `SIGCHLD` signalfd source.
 
-`user/wl_demo.c` (`wl-demo <title> <0xRRGGBB> [--size WxH] [--animate]`) is a small xdg-shell client: double-buffered shm pool, activated-state accent bar, left click toggles its colour, every key press is logged, `q` or the close box exits, and `--animate` redraws continuously paced by frame callbacks.
+`user/wl_demo.c` (`wl-demo <title> <0xRRGGBB> [--size WxH] [--animate] [--copy TEXT] [--paste]`) is a small xdg-shell client: double-buffered shm pool, activated-state accent bar, left click toggles its colour, every key press is logged, `q` or the close box exits, and `--animate` redraws continuously paced by frame callbacks. `--copy TEXT` takes the clipboard (as `text/plain;charset=utf-8`, `text/plain` and `UTF8_STRING`) the first time it gets keyboard focus. `--paste` reads every text selection it is offered and logs it as `paste '<text>'`. It uses a poll loop so it can read a paste while still serving its own selection.
 
 Running it:
 ```bash
@@ -127,7 +127,8 @@ Limitations / Simplifications
 - The compositor always draws its own cursor and ignores `wl_pointer.set_cursor`. There is no touch support, and scroll/axis events are never sent.
 - Committed buffers are copied into compositor memory on every commit (whole surface, ignoring `wl_surface.damage`), and only XRGB8888/ARGB8888 `wl_shm` buffers are supported. Alpha is ignored: windows are drawn opaque.
 - xdg-shell subset: no popups (dismissed immediately), no interactive resize, maximise, fullscreen or minimise, configures always suggest 0x0 (client-chosen size), and window geometry is ignored. Placement is a fixed cascade.
-- No subsurfaces (`wl_subcompositor`), no `wl_data_device_manager` (clipboard/drag and drop), no multi-output or output scaling.
+- Clipboard: no drag and drop (`start_drag` cancels the source), no primary selection (`zwp_primary_selection`, so foot's select-to-copy and middle-click paste are unavailable), and `set_selection` serials are not checked against recent input. The compositor keeps no copy, so the selection disappears when its owner exits.
+- No multi-output or output scaling.
 - Repaint is timer-driven at up to ~60 Hz with a single damage rectangle; there is no vblank synchronisation.
 - Only the core library is ported: no `libwayland-cursor` or `libwayland-egl`, and from wayland-protocols only `xdg-shell` is built.
 - Both static and shared builds exist. `peetwl` and `wl_demo` are dynamic. `wayland_smoke` and the upstream test binaries stay static, so both link modes stay covered.
