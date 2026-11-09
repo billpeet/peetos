@@ -133,7 +133,7 @@ ALL_KERNEL_FEATURES := $(strip $(shell awk '\
 		gsub(/[[:space:]]/, "", parts[1]); \
 		printf "%s ", parts[1]; \
 	}' kernel/Cargo.toml))
-RUN_ALL_FEATURES ?= $(filter-out default test-exit vga compositor-first musl-ext2-foot-demo %-smoke,$(ALL_KERNEL_FEATURES))
+RUN_ALL_FEATURES ?= $(filter-out default test-exit vga compositor-first sched-trace musl-ext2-foot-demo %-smoke,$(ALL_KERNEL_FEATURES))
 
 ifneq ($(findstring musl-ext2-quickjs-smoke,$(KERNEL_FEATURES)),)
 USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_QUICKJS_BIN) quickjs/test_hello.js quickjs/test_math.js

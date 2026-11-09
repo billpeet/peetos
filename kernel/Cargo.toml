@@ -48,3 +48,5 @@ net-tcp-smoke = []
 net-socket-smoke = []
 usb-tablet = []
 compositor-first = []
+# Log every scheduler block (task name and reason) to serial. Debug only.
+sched-trace = []

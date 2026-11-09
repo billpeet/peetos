@@ -85,4 +85,11 @@ if ! grep -q '\[musl-ext2-foot-smoke\] done' "${LOG_FILE}" \
   exit 1
 fi
 
+# Per-block scheduler tracing is opt-in (`sched-trace`); foot blocks on
+# every keystroke and frame, so a default build must not log it.
+if grep -q '\[SCHED\] Blocking task' "${LOG_FILE}"; then
+  echo "scheduler block tracing is on in a default build (expected only with sched-trace)" >&2
+  exit 1
+fi
+
 echo "foot terminal smoke completed successfully."

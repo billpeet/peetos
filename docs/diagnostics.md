@@ -35,6 +35,13 @@ Limitations / Simplifications
 - No unwind or recovery path; the kernel halts on panic.
 - No crash dump persistence or structured panic metadata yet.
 
+**Scheduler Block Tracing**
+Building with the `sched-trace` feature makes `sched::block` print `[SCHED] Blocking task '<name>' (<reason>)` every time a task blocks (for example `pty-sread`, `futex-wait`, `pipe-read`). It is useful for working out where a task is stuck, but it fires on every keystroke, futex wait and frame in an interactive session, so it is off by default and left out of `make run`'s feature set. Enable it explicitly, for example `make run-current` after `make image KERNEL_FEATURES="... sched-trace"`. `make run-foot-smoke` fails if the line appears in a build without the feature.
+
+Limitations / Simplifications
+- All-or-nothing: there is no per-task or per-reason filter and no rate limit.
+- Output goes through the synchronous serial path, so tracing slows the system and changes its timing.
+
 **QEMU Test Exit**
 `kernel/src/qemu.rs` writes a magic value to port `0xF4` (isa-debug-exit) to signal success during smoke tests. This is gated behind the `test-exit` feature and only used in test builds.
 

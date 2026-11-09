@@ -495,6 +495,9 @@ pub fn block(reason: &str) {
     if crate::signal::wait_interrupted(current) {
         return;
     }
+    // One line per block is far too chatty for normal runs (every keystroke,
+    // futex wait and pipe read), so it is only printed with `sched-trace`.
+    #[cfg(feature = "sched-trace")]
     unsafe {
         serial_println!(
             "[SCHED] Blocking task '{}' ({})",
@@ -502,6 +505,8 @@ pub fn block(reason: &str) {
             reason
         );
     }
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = reason;
 
     // The state change is applied by schedule_from under SCHED_LOCK.
     // Interrupts stay off until then so a preemption cannot apply it early.
@@ -743,6 +748,7 @@ fn schedule_from(current_rsp: u64, requeue_current: bool, irq_acquired_bkl: bool
     }
 }
 
+#[cfg(feature = "sched-trace")]
 fn task_name(task: &Task) -> &str {
     let name = &task.name;
     let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
