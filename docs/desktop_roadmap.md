@@ -108,16 +108,18 @@ later.
 - [x] GTK 3.24 (Wayland backend) with libepoxy, ATK and gdk-pixbuf
   (`make run-gtk-smoke`; see `docs/gtk.md`).
 - [x] File manager: Thunar 4.20 (`make run-thunar-smoke`; see
-  `docs/thunar.md`), without D-Bus, inotify or SVG icons.
+  `docs/thunar.md`), with xfconf settings on the session bus, but without
+  inotify, a thumbnailer or SVG icons.
 - [ ] More GTK applications: a text editor (mousepad) and settings
-  applications. D-Bus, inotify and librsvg would make them (and Thunar)
-  fully functional.
+  applications. inotify and librsvg would make them (and Thunar) fully
+  functional.
 - [ ] GTK 4 (needs Mesa/EGL).
 
 ### 6. Session services
 
-- [ ] D-Bus (kernel side still needs `SCM_CREDENTIALS` and abstract Unix
-  sockets).
+- [x] D-Bus session bus (dbus 1.16; `make run-dbus-smoke`, see `docs/dbus.md`).
+  Abstract Unix sockets and a system bus are still missing, and nothing
+  starts a session bus automatically yet.
 - [ ] A session/login manager instead of `init` launching a compositor directly.
 - [ ] Notifications; audio (Intel HDA or virtio-snd driver plus PipeWire).
 - [ ] Networking basics: DHCP and DNS.
@@ -132,7 +134,8 @@ later.
 5. ~~C++ runtime, then harfbuzz~~ Done (GCC + libstdc++; fcft/foot now shape text).
 6. ~~libpng, cairo, pango (with GLib)~~ Done.
 7. ~~gdk-pixbuf, libepoxy, GTK 3~~ Done.
-8. ~~A GTK application: Thunar~~ Done. Next: inotify and D-Bus (Thunar refresh, settings, thumbnails), xdg window geometry in `peetwl` for GTK's client-side decorations, then wlroots + labwc.
+8. ~~A GTK application: Thunar~~ Done.
+9. ~~D-Bus session bus~~ Done (Thunar settings through xfconf). Next: inotify (Thunar refresh), a session launcher that starts the bus and compositor, xdg window geometry in `peetwl` for GTK's client-side decorations, then wlroots + labwc.
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports. *(Reached: foot renders

@@ -2148,6 +2148,49 @@ pub fn try_handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
     mmap_fault_map_page(pml4, page_addr, mapping).is_ok()
 }
 
+/// Populate a lazily mapped page of `task_ptr`'s address space for a kernel
+/// access to it (user copies), as a user-mode fault on that page would. The
+/// kernel reaches user memory through the physical map, so it never takes
+/// these faults itself; without this a syscall argument in a page the process
+/// had not touched yet (a string in a library's read-only data, a fresh
+/// buffer) failed with `EFAULT`.
+pub(super) fn fault_in_user_page(task_ptr: *mut task::Task, page_addr: u64, write: bool) -> bool {
+    if task_ptr.is_null()
+        || page_addr < PAGE_SIZE
+        || page_addr >= USER_SPACE_END
+        || page_addr > USER_CANON_MAX
+    {
+        return false;
+    }
+    let pml4 = unsafe { PhysAddr::new((*task_ptr).pml4_phys) };
+    if pml4.as_u64() == 0 {
+        return false;
+    }
+    // The region tables and the fault path are serialised by the big kernel
+    // lock, like the page-fault exception. Lock-free syscalls copy without
+    // it, so take it here (no VMM lock is held at this point, keeping the
+    // BKL -> VMM order).
+    let took_bkl = !crate::bkl::held_by_me();
+    if took_bkl {
+        crate::bkl::acquire();
+    }
+    let resolved = (|| {
+        let slot = mmap_prepare_task_slot(task_ptr)?;
+        let page_addr = align_down(page_addr, PAGE_SIZE);
+        let mapping = unsafe { mmap_regions_find_mapping(&TASK_VM_MAPPINGS[slot], page_addr) }?;
+        let access = PAGE_FAULT_ERROR_USER | if write { PAGE_FAULT_ERROR_WRITE } else { 0 };
+        if !mmap_prot_allows_fault_access(mapping.prot, access) {
+            return None;
+        }
+        mmap_fault_map_page(pml4, page_addr, mapping).ok()
+    })()
+    .is_some();
+    if took_bkl {
+        crate::bkl::release();
+    }
+    resolved
+}
+
 pub fn terminate_current_user_fault(
     frame: &InterruptFrame,
     error_code: u64,

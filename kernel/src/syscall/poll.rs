@@ -435,6 +435,67 @@ pub(super) fn epoll_drop_watches_for_owner(owner_pid: i32) {
     }
 }
 
+/// `fork`: the child inherits the parent's descriptors, including epoll
+/// descriptors, and on Linux the watches belong to the shared epoll instance
+/// (keyed by file and fd), so they keep working in the child after the parent
+/// exits. Watches here are per owner process, so give the child its own copy
+/// of each of the parent's watches. `epoll_collect_ready` reports a watch and
+/// its inherited copies once.
+///
+/// Best effort: a copy that does not fit is dropped (logged) rather than
+/// failing the fork; most children exec at once, closing CLOEXEC epoll fds.
+pub(super) fn epoll_inherit_watches(parent_owner: i32, child_owner: i32, child_task: *mut task::Task) {
+    let _ = child_task;
+    if parent_owner <= 0 || child_owner <= 0 {
+        return;
+    }
+    unsafe {
+        for inst_idx in 0..EPOLL_MAX_INSTANCES {
+            let inst = &mut EPOLL_INSTANCES[inst_idx];
+            if !inst.used || inst.watch_count == 0 {
+                continue;
+            }
+            for watch_idx in 0..EPOLL_MAX_WATCHES {
+                let watch = inst.watches[watch_idx];
+                if !watch.used || watch.owner_pid != parent_owner {
+                    continue;
+                }
+                let mut copy = watch;
+                copy.owner_pid = child_owner;
+                #[cfg(test)]
+                {
+                    copy.owner_task = child_task;
+                }
+                if epoll_watch_add(inst, copy).is_err() {
+                    sys_log!(
+                        "[EPOLL] fork: no room to inherit watch fd {} into pid {}",
+                        copy.fd,
+                        child_owner
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Whether an earlier live watch in `inst` is the same Linux watch as
+/// `inst.watches[idx]` (same fd number on the same object, as after `fork`).
+fn epoll_watch_is_duplicate(inst: &EpollInstance, idx: usize) -> bool {
+    let watch = inst.watches[idx];
+    for j in 0..idx {
+        let other = inst.watches[j];
+        if other.used
+            && other.fd == watch.fd
+            && other.kind == watch.kind
+            && other.inode == watch.inode
+            && !epoll_watch_stale(&other)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[inline]
 pub(super) fn epoll_watch_add(inst: &mut EpollInstance, watch: EpollWatch) -> Result<(), i64> {
     let mut idx = 0usize;
@@ -608,6 +669,8 @@ pub(super) fn epoll_ctl_add(
             inode,
             events,
             data,
+            last_ready: 0,
+            disarmed: false,
         },
     ) {
         Ok(()) => 0,
@@ -632,6 +695,10 @@ pub(super) fn epoll_ctl_mod(
     inst.watches[idx].inode = inode;
     inst.watches[idx].events = events;
     inst.watches[idx].data = data;
+    // MOD re-arms one-shot watches and makes edge-triggered ones report the
+    // current state again, as on Linux.
+    inst.watches[idx].last_ready = 0;
+    inst.watches[idx].disarmed = false;
     0
 }
 
@@ -682,6 +749,24 @@ pub(super) fn epoll_watch_stale(watch: &EpollWatch) -> bool {
     kind != watch.kind || inode != watch.inode
 }
 
+/// Apply `EPOLLET` and `EPOLLONESHOT` to the readiness `ep_events` of
+/// `watch`, returning what to report. Edge-triggered watches report a bit
+/// only when it becomes set (an approximation of Linux, which also reports
+/// new data arriving while the fd stays readable).
+pub(super) fn epoll_events_to_report(watch: &mut EpollWatch, ep_events: u32) -> u32 {
+    let report = if (watch.events & EPOLLET) != 0 {
+        let fresh = ep_events & !watch.last_ready;
+        watch.last_ready = ep_events;
+        fresh
+    } else {
+        ep_events
+    };
+    if report != 0 && (watch.events & EPOLLONESHOT) != 0 {
+        watch.disarmed = true;
+    }
+    report
+}
+
 pub(super) fn epoll_collect_ready(inst: &mut EpollInstance, out: &mut [(u32, u64)]) -> usize {
     let mut ready = 0usize;
     let maxevents = out.len();
@@ -705,6 +790,10 @@ pub(super) fn epoll_collect_ready(inst: &mut EpollInstance, out: &mut [(u32, u64
             idx += 1;
             continue;
         }
+        if watch.disarmed || epoll_watch_is_duplicate(inst, idx) {
+            idx += 1;
+            continue;
+        }
 
         let poll_requested = epoll_events_to_poll_mask(watch.events);
         let revents = poll_fd_revents(owner, watch.fd, poll_requested);
@@ -715,8 +804,9 @@ pub(super) fn epoll_collect_ready(inst: &mut EpollInstance, out: &mut [(u32, u64
         }
 
         let ep_events = poll_revents_to_epoll_events(watch.events, revents);
-        if ep_events != 0 {
-            out[ready] = (ep_events, watch.data);
+        let report = epoll_events_to_report(&mut inst.watches[idx], ep_events);
+        if report != 0 {
+            out[ready] = (report, watch.data);
             ready += 1;
         }
         idx += 1;

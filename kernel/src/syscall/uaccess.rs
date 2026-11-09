@@ -42,6 +42,7 @@ pub(super) fn copy_user_bytes(
 
     let mut remaining = len;
     let mut copied = 0usize;
+    let mut faulted_in = false;
 
     while remaining > 0 {
         let vaddr = user_addr + copied as u64;
@@ -66,10 +67,18 @@ pub(super) fn copy_user_bytes(
         match result {
             Ok(()) => {}
             Err(vmm::UserPageError::NoAddressSpace) => return Err(EINVAL),
-            Err(vmm::UserPageError::NotMapped) => return Err(EFAULT),
+            Err(vmm::UserPageError::NotMapped) => {
+                // A lazily populated mapping: fault the page in, then retry it.
+                if !faulted_in && fault_in_user_page(task_ptr, page_vaddr, to_user) {
+                    faulted_in = true;
+                    continue;
+                }
+                return Err(EFAULT);
+            }
             Err(vmm::UserPageError::NoMemory) => return Err(ENOMEM),
         }
 
+        faulted_in = false;
         copied += bytes_in_page;
         remaining -= bytes_in_page;
     }

@@ -100,7 +100,7 @@ The runner saves a QEMU screendump of the frame to `build/text_smoke.png`.
 Limitations / Simplifications
 - foot runs without terminfo. Toybox's shell has no line editing or job control. The clipboard works (Ctrl+Shift+C/V), but there is no primary selection, so select-to-copy and middle-click paste do not work. `fallocate(PUNCH_HOLE)` is not supported, so foot disables its scrolling-by-offset optimization and redraws instead.
 - The interactive demo's two foot windows cannot be reopened after their shells exit (there is no launcher), and `make test` does not cover it; its init payload and scripts mirror the smoke's.
-- GLib is built without NLS (messages are untranslated), introspection, SELinux, xattr or libmount. There is no D-Bus session bus, so the GDBus parts of GIO are untested, and no GSettings schemas are compiled. GIO's file monitoring (inotify) and network modules are untested. pcre2 has no JIT.
+- GLib is built without NLS (messages are untranslated), introspection, SELinux, xattr or libmount. GDBus is exercised against the session bus by `make run-dbus-smoke` (`docs/dbus.md`), and no GSettings schemas are compiled. GIO's file monitoring (inotify) and network modules are untested. pcre2 has no JIT.
 - cairo has no X11 or GL backends, and its PDF/SVG output is only checked for headers and size.
 - pango has no libthai (Thai line breaking). Only regular DejaVu faces are staged, so bold and italic are synthesised.
 - harfbuzz has no glib, ICU or graphite2 integration and no `hb-view`/`hb-shape` utilities. The shaping smoke checks Latin kerning, mark composition and Arabic joining with DejaVu Sans only; other scripts depend on font coverage, and only two fonts are staged.

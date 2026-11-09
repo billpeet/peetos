@@ -116,6 +116,10 @@ Current implemented handlers:
 - `utimensat` baseline atime/mtime updates with `UTIME_NOW`/`UTIME_OMIT`
 - `copy_file_range` baseline buffered VFS-to-VFS copy path
 - `execve(path, argv, envp)` with in-kernel argument/environment copy, VFS-backed ELF load, and direct frame handoff to the new image entry. The strings are copied into one heap buffer of up to 28 KiB total (any single string may use all of it), with at most 64 `argv` and 64 `envp` entries; more is `-E2BIG`.
+- `clock_getres` reports the 10 ms PIT tick for `CLOCK_REALTIME`/`CLOCK_MONOTONIC`; `fdatasync` is `fsync`.
+- `sendmsg`/`recvmsg` carry `SCM_CREDENTIALS` and `setsockopt`/`getsockopt` handle `SO_PASSCRED` on `AF_UNIX` sockets (see `docs/ipc.md`); `SO_PEERSEC`/`SO_PEERGROUPS`/`SO_PEERPIDFD` fail with `ENOPROTOOPT`.
+- `pidfd_open` is registered and returns `-ENOSYS` (dbus-daemon falls back to plain pids).
+- Syscall arguments may point into pages the process has not touched yet: user copies fault lazily mapped pages in (they used to fail with `EFAULT`).
 - `inotify_init`/`inotify_init1`/`inotify_add_watch`/`inotify_rm_watch` are registered but return `-ENOSYS` (no inotify yet), so callers like GLib fall back quietly instead of tripping the unknown-syscall log.
 - `fork()` with a copy-on-write address-space clone plus task metadata/fd table copy and shm inheritance (see `docs/process_model.md`)
 - `clone(flags, child_stack, ptid, ctid, tls)`: fork-compatible process creation (`SIGCHLD` exit signal, optional child stack, `CLONE_VM|CLONE_VFORK` compatibility) and `CLONE_THREAD` threads that share VM/files/fs/signal handlers (musl `pthread_create` flag set), with `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`

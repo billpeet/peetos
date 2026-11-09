@@ -11,7 +11,8 @@ wayland-protocols, libxkbcommon and libdrm, plus the software rendering stack
 (pixman, expat, freetype, fontconfig, harfbuzz, utf8proc), the DejaVu
 fonts, the 2D toolkit libraries (zlib, libpng, pcre2, GLib, fribidi, cairo,
 pango), the GTK 3 stack (libepoxy, ATK, gdk-pixbuf, GTK, the hicolor icon
-theme), and tllist, fcft and the foot terminal.
+theme), the Xfce libraries and Thunar, D-Bus, and tllist, fcft and the
+foot terminal.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -163,6 +164,10 @@ SHARED_MIME_INFO_VERSION="2.4"
 SHARED_MIME_INFO_URL="https://gitlab.freedesktop.org/xdg/shared-mime-info/-/archive/${SHARED_MIME_INFO_VERSION}/shared-mime-info-${SHARED_MIME_INFO_VERSION}.tar.gz"
 SHARED_MIME_INFO_SHA256="531291d0387eb94e16e775d7e73788d06d2b2fdd8cd2ac6b6b15287593b6a2de"
 
+DBUS_VERSION="1.16.2"
+DBUS_URL="https://dbus.freedesktop.org/releases/dbus/dbus-${DBUS_VERSION}.tar.xz"
+DBUS_SHA256="0ba2a1a4b16afe7bceb2c07e9ce99a8c2c3508e5dec290dbb643384bd6beb7e2"
+
 FOOT_VERSION="1.18.1"
 FOOT_URL="https://codeberg.org/dnkl/foot/archive/${FOOT_VERSION}.tar.gz"
 FOOT_SHA256="f1438298117b1346405f175e8a052ba9828a610e061971cc8dde9153939344c5"
@@ -292,5 +297,6 @@ fetch_one "adwaita-icon-theme-legacy ${ADWAITA_LEGACY_VERSION}" "${ADWAITA_LEGAC
   "${OUTPUT_DIR}/adwaita-icon-theme-legacy-src" "adwaita-icon-theme-legacy-${ADWAITA_LEGACY_VERSION}.tar.xz"
 fetch_one "shared-mime-info ${SHARED_MIME_INFO_VERSION}" "${SHARED_MIME_INFO_URL}" "${SHARED_MIME_INFO_SHA256}" \
   "${OUTPUT_DIR}/shared-mime-info-src" "shared-mime-info-${SHARED_MIME_INFO_VERSION}.tar.gz"
+fetch_one "dbus ${DBUS_VERSION}" "${DBUS_URL}" "${DBUS_SHA256}"   "${OUTPUT_DIR}/dbus-src" "dbus-${DBUS_VERSION}.tar.xz"
 fetch_one "foot ${FOOT_VERSION}" "${FOOT_URL}" "${FOOT_SHA256}" \
   "${OUTPUT_DIR}/foot-src" "foot-${FOOT_VERSION}.tar.gz"

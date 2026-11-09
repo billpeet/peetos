@@ -139,7 +139,7 @@ So timer preemption and task switching continue on every CPU even while another 
 Limitations / Simplifications
 - **Big kernel lock still covers most kernel code.** All other syscalls, device IRQs and exceptions are serialised by it. Kernel code that busy-waits without yielding still holds other syscalls out.
   - Next: give VFS, net and IPC their own locks, then move more syscalls to the lock-free path.
-- **User copies hold the global `VMM_LOCK` for each page.** A per-address-space lock would scale better. Copies still do not fault in lazily mapped pages (an untouched anonymous page gives `EFAULT`, as before), and they do not check the PTE's user/write bits.
+- **User copies hold the global `VMM_LOCK` for each page.** A per-address-space lock would scale better. A copy that meets a not-present page faults it in through the mmap fault path (`fault_in_user_page`), taking the big kernel lock for that if the syscall runs lock-free, and retries once. Copies do not check the PTE's user/write bits.
 - **Zombies in kernel mode are never preempted.** A task that has marked itself a zombie is still running its exit path in the kernel and leaves the CPU voluntarily, so `sched::isr_hook` skips it.
 - **One shared run queue.** No per-CPU queues, no load balancing, no CPU affinity. Tasks migrate freely.
 - **Device IRQs and the PIT go to the BSP only.** There is no IRQ balancing, no MSI/MSI-X, and no `_PRT`/AML evaluation. PCI devices use their legacy ISA line plus MADT overrides.

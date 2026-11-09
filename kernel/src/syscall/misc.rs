@@ -228,6 +228,31 @@ pub(super) fn sys_clock_gettime(ctx: &SyscallContext, call: &SyscallArgs) -> i64
     }
 }
 
+/// `clock_getres(clock_id, res)`: the PIT tick period for the clocks
+/// `clock_gettime` supports. A null `res` only validates the clock.
+pub(super) fn sys_clock_getres(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let clock_id = call.arg(0) as i32;
+    if clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC {
+        return -EINVAL;
+    }
+    if call.arg(1) == 0 {
+        return 0;
+    }
+    let ts = clock_resolution();
+    match write_struct_to_user(ctx.current, call.arg(1), &ts) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
+}
+
+pub(super) fn clock_resolution() -> LinuxTimeSpec {
+    let (sec, nsec) = ticks_to_seconds_nanos(1);
+    LinuxTimeSpec {
+        tv_sec: sec,
+        tv_nsec: nsec,
+    }
+}
+
 pub(super) fn sys_nanosleep(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let req = match read_struct_from_user::<LinuxTimeSpec>(ctx.current, call.arg(0)) {
         Ok(req) => req,
@@ -509,6 +534,12 @@ pub(super) fn sys_membarrier(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 /// `-ENOSYS` quietly; GLib then reports directory monitoring as unsupported
 /// and file managers simply do not auto-refresh on outside changes.
 pub(super) fn sys_inotify_unsupported(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    -ENOSYS
+}
+
+/// `pidfd_open(pid, flags)`: no pidfds yet. dbus-daemon probes it and
+/// falls back to plain process ids.
+pub(super) fn sys_pidfd_open_unsupported(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     -ENOSYS
 }
 

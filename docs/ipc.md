@@ -81,7 +81,9 @@ This document describes the current baseline IPC/synchronization implementation 
 - `epoll_create1(flags)` supports baseline instance creation with `EPOLL_CLOEXEC`.
 - `epoll_ctl(epfd, op, fd, event)` supports `EPOLL_CTL_ADD`/`MOD`/`DEL` with duplicate/add/remove validation.
 - `epoll_wait(epfd, events, maxevents, timeout)` supports timeout waiting, level-triggered readiness delivery, and returns `-EINTR` when interrupted by pending unblocked signals.
+- `EPOLLET` (edge-triggered: a readiness bit is reported when it becomes set) and `EPOLLONESHOT` (silent after one report until `EPOLL_CTL_MOD`) are supported; `EPOLLRDHUP`, `EPOLLWAKEUP` and `EPOLLEXCLUSIVE` are accepted. dbus-daemon uses `EPOLLET` for watches it has disabled.
 - Per-task epoll watch ownership is capped (`64` watches across all instances), and task teardown now drops owner watches defensively.
+- `fork` gives the child a copy of each of the parent's watches, so an inherited epoll fd keeps working after the parent exits (dbus-daemon `--fork` sets up its epoll set before forking). A watch and its inherited copies refer to the same fd on the same object and are reported once.
 
 **Event FDs (`eventfd`, `timerfd`, `signalfd`)**
 - Object state lives in `kernel/src/evfd.rs` (refcounted tables: 32 eventfds, 32 timerfds, 16 signalfds); syscalls and read/write/poll hooks are in `kernel/src/syscall/eventfds.rs`. Each is its own fd kind (`USER_FD_KIND_EVENTFD`/`_TIMERFD`/`_SIGNALFD`) and works with `poll`/`select`/`epoll`, `dup*`, `fork`, `fcntl(F_SETFL, O_NONBLOCK)`, and close-on-exec.
@@ -162,13 +164,17 @@ Limitations / Simplifications
 - Event fds are baseline-only: object tables are fixed-size, timer resolution is the 10 ms PIT tick, `TFD_TIMER_CANCEL_ON_SET` is accepted but ignored (there is no settable realtime clock), blocking reads busy-yield instead of sleeping on a wait queue, `signalfd_siginfo` carries only the signal number, and eventfd/timerfd/signalfd descriptors cannot be passed over `SCM_RIGHTS` yet.
 - Signal handling: delivery happens at syscall-return boundaries and requires `SA_RESTORER`. Handlers get a Linux `rt_sigframe` (`siginfo_t`, `ucontext_t`), signals 1..=64 are supported, and blocking waits are interrupted with `SA_RESTART`-aware restart. There are no alternate signal stacks or queued real-time payloads. See `docs/process_model.md`.
 - Unix ancillary coverage is baseline-only:
-  - `SCM_RIGHTS` is implemented, but `SCM_CREDENTIALS` is not
+  - `SCM_RIGHTS` is implemented
+  - `SCM_CREDENTIALS`: a sent `struct ucred` is validated like Linux (only root may claim another pid/uid/gid); with `SO_PASSCRED` set (inherited by accepted sockets) `recvmsg` returns the peer's credentials as an `SCM_CREDENTIALS` message, ahead of any `SCM_RIGHTS`. They are the peer's credentials at connection time, not the per-message sender's, which differs only when another process writes to the same socket (after `fork`).
+  - `SO_PEERSEC`, `SO_PEERGROUPS` and `SO_PEERPIDFD` fail with `ENOPROTOOPT` (no LSM, group lists or pidfds); other unknown socket options still read back as zero
   - `SO_PEERCRED` reports the peer's pid/uid/gid captured when the connection formed (`socketpair`, or `connect` against a listener, which records the listening process's credentials at `listen`)
   - ancillary/data atomicity is simplified for stream sockets
   - Unix abstract-namespace addresses are not implemented
 - `epoll` coverage is baseline-only:
-  - level-triggered `epoll_create1`/`epoll_ctl`/`epoll_wait` is implemented
+  - `epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait` with level-triggered, `EPOLLET` and `EPOLLONESHOT` watches
+  - `EPOLLET` is approximated by state changes: new data arriving while an fd stays readable does not produce a new event (Linux reports one)
+  - `EPOLLRDHUP` is never reported on its own (only as `EPOLLHUP` on a full close)
+  - watches are per owner process: after `fork` each side has its own copy, so `EPOLL_CTL_MOD`/`DEL` in one process does not affect the other's (on Linux the watch is shared); a copy that does not fit the instance (128 watches) is dropped with a log line
   - per-task watch ownership is capped (`64`) for hardening
-  - advanced flags/variants (`EPOLLET`, `EPOLLONESHOT`, `epoll_pwait*`) are deferred
 - Socket tables are static: 256 sockets system-wide (`MAX_SOCKETS`, about 2.3 KiB each including the 2 KiB stream buffer) and 128 `AF_UNIX` pathname bindings. A bound socket's filesystem node is a regular file (`stat` does not report `S_IFSOCK`).
 - No message-queue IPC primitives are implemented yet.

@@ -176,6 +176,26 @@ if [[ -x "${RENDER_STAGE}/usr/bin/thunar" ]]; then
   cp -a "${RENDER_STAGE}/etc/gtk-3.0" "${STAGE_ROOT}/etc/"
   cp -a "${RENDER_STAGE}/etc/xdg/Thunar" "${RENDER_STAGE}/etc/xdg/xfce4" "${STAGE_ROOT}/etc/xdg/"
 fi
+# D-Bus (scripts/build_dbus.sh): the session bus daemon, its tools and
+# configuration (with the activation files installed by xfconf and Thunar),
+# GLib's gdbus tool, and xfconf's daemon and query tool. libdbus comes with
+# the other shared libraries.
+if [[ -x "${RENDER_STAGE}/usr/bin/dbus-daemon" ]]; then
+  mkdir -p "${STAGE_ROOT}/usr/bin" "${STAGE_ROOT}/usr/share"
+  for tool in dbus-daemon dbus-send dbus-monitor dbus-uuidgen dbus-run-session gdbus; do
+    cp "${RENDER_STAGE}/usr/bin/${tool}" "${STAGE_ROOT}/usr/bin/${tool}"
+  done
+  cp -a "${RENDER_STAGE}/usr/share/dbus-1" "${STAGE_ROOT}/usr/share/"
+  if [[ -x "${RENDER_STAGE}/usr/lib/xfce4/xfconf/xfconfd" ]]; then
+    mkdir -p "${STAGE_ROOT}/usr/lib/xfce4/xfconf"
+    cp "${RENDER_STAGE}/usr/lib/xfce4/xfconf/xfconfd" "${STAGE_ROOT}/usr/lib/xfce4/xfconf/"
+    cp "${RENDER_STAGE}/usr/bin/xfconf-query" "${STAGE_ROOT}/usr/bin/"
+  fi
+  # Thunar's activation files start /usr/bin/Thunar.
+  if [[ -x "${STAGE_ROOT}/bin/thunar" ]]; then
+    ln -f "${STAGE_ROOT}/bin/thunar" "${STAGE_ROOT}/usr/bin/Thunar"
+  fi
+fi
 if [[ -x "${ROOT_DIR}/user/gtk_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/gtk_smoke.elf" "${STAGE_ROOT}/bin/gtk_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/gtk_smoke"
@@ -811,6 +831,12 @@ i=0
 while [ "$i" -lt 240 ]; do
   if [ -d /tmp/thunar-demo/Documents/made-by-thunar ]; then
     echo "[thunar-watch] found /tmp/thunar-demo/Documents/made-by-thunar" > /dev/console
+    # On the session bus Thunar owns the Xfce file manager name.
+    if [ -n "$DBUS_SESSION_BUS_ADDRESS" ]; then
+      owner="$(/usr/bin/gdbus call --session --timeout 20 --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner org.xfce.FileManager 2>&1)"
+      echo "[thunar-watch] org.xfce.FileManager owned: $owner" > /dev/console
+    fi
     exit 0
   fi
   if [ -d /tmp/thunar-demo/made-by-thunar ]; then
@@ -848,9 +874,35 @@ else
     ls -lid /tmp/churn-dir /tmp/churn-file /tmp/thunar-demo
     fail=1
   fi
+  # A session bus, as a desktop session has: Thunar keeps its settings in
+  # xfconf (xfconfd is bus-activated) and registers its D-Bus names.
+  if [ -x /usr/bin/dbus-daemon ]; then
+    /usr/bin/dbus-uuidgen --ensure=/etc/machine-id
+    /usr/bin/dbus-daemon --session --fork --address=unix:path=/tmp/dbus-session --print-pid=1 > /tmp/dbus.pid
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session
+    echo "[musl-ext2-thunar-smoke] session bus at $DBUS_SESSION_BUS_ADDRESS (pid $(cat /tmp/dbus.pid))"
+  fi
   bin/peetwl --smoke --watchdog-ms 180000 --client "/mnt/ext2/bin/thunar /tmp/thunar-demo" \
     --client "/mnt/ext2/bin/toybox sh /mnt/ext2/bin/thunar_watch.sh" || fail=1
 fi
+  if [ -n "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    # Thunar stores its view settings in xfconf; xfconfd writes the channel
+    # when it exits.
+    xpid="$(/usr/bin/gdbus call --session --timeout 20 --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.GetConnectionUnixProcessID org.xfce.Xfconf 2>&1 | toybox sed -n 's/^(uint32 \([0-9]*\),)$/\1/p')"
+    [ -n "$xpid" ] && kill -TERM "$xpid"
+    i=0
+    while [ -n "$xpid" ] && kill -0 "$xpid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    TXML=/tmp/.config/xfce4/xfconf/xfce-perchannel-xml/thunar.xml
+    if toybox grep -q 'name="last-view"' "$TXML" 2>/dev/null; then
+      echo "[musl-ext2-thunar-smoke] Thunar settings saved through xfconf"
+    else
+      echo "[musl-ext2-thunar-smoke] Thunar settings were not saved through xfconf"
+      cat "$TXML" 2>&1
+      fail=1
+    fi
+    kill -TERM "$(cat /tmp/dbus.pid)" 2>/dev/null
+  fi
 
 echo [musl-ext2-thunar-smoke] done
 if [ "$fail" -ne 0 ]; then
@@ -858,6 +910,100 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/thunar_smoke.sh"
+
+# D-Bus smoke: a session bus, libdbus (dbus-send) and GDBus (gdbus) clients,
+# bus activation of xfconfd, and xfconf settings saved to disk.
+cat > "${STAGE_ROOT}/bin/dbus_smoke.sh" <<'EOS'
+fail=0
+export HOME=/tmp LANG=C.UTF-8
+BUS=unix:path=/tmp/dbus-session
+XML=/tmp/.config/xfce4/xfconf/xfce-perchannel-xml/peetos-smoke.xml
+
+ok() { echo "[dbus-smoke] $1 ok"; }
+bad() { echo "[dbus-smoke] FAIL $1"; fail=1; }
+
+if [ ! -x /usr/bin/dbus-daemon ] || [ ! -x /usr/lib/xfce4/xfconf/xfconfd ]; then
+  echo [musl-ext2-dbus-smoke] missing dbus-daemon or xfconfd
+  fail=1
+else
+  if /usr/bin/dbus-uuidgen --ensure=/etc/machine-id && [ "$(toybox wc -c < /etc/machine-id)" -eq 33 ]; then
+    ok "machine-id $(cat /etc/machine-id)"
+  else
+    bad "dbus-uuidgen --ensure"
+  fi
+
+  /usr/bin/dbus-daemon --session --fork --address="$BUS" --print-pid=1 > /tmp/dbus.pid 2>/tmp/dbus.err
+  i=0
+  while [ ! -e /tmp/dbus-session ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  if [ -e /tmp/dbus-session ]; then
+    ok "dbus-daemon started (pid $(cat /tmp/dbus.pid))"
+  else
+    bad "dbus-daemon start: $(cat /tmp/dbus.err)"
+  fi
+  export DBUS_SESSION_BUS_ADDRESS="$BUS"
+
+  # libdbus client: EXTERNAL authentication through SO_PEERCRED.
+  out="$(/usr/bin/dbus-send --session --reply-timeout=20000 --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1)"
+  case "$out" in
+    *'"org.freedesktop.DBus"'*) ok "dbus-send ListNames" ;;
+    *) bad "dbus-send ListNames: $out" ;;
+  esac
+
+  # GDBus client: authenticates with SCM_CREDENTIALS.
+  out="$(/usr/bin/gdbus call --session --timeout 20 --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.GetConnectionUnixProcessID org.freedesktop.DBus 2>&1)"
+  if [ "$out" = "(uint32 $(cat /tmp/dbus.pid),)" ]; then
+    ok "gdbus call sees the daemon's pid"
+  else
+    bad "gdbus GetConnectionUnixProcessID: $out (daemon $(cat /tmp/dbus.pid))"
+  fi
+  out="$(/usr/bin/gdbus call --session --timeout 20 --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.GetConnectionUnixUser org.freedesktop.DBus 2>&1)"
+  [ "$out" = "(uint32 0,)" ] && ok "gdbus GetConnectionUnixUser" || bad "gdbus GetConnectionUnixUser: $out"
+
+  # Bus activation: xfconf-query talks to org.xfce.Xfconf, which the daemon
+  # starts from its .service file.
+  if /usr/bin/xfconf-query -c peetos-smoke -p /greeting -n -t string -s "hello from xfconf" 2>/tmp/xq.err; then
+    ok "xfconf-query set (xfconfd activated)"
+  else
+    bad "xfconf-query set: $(cat /tmp/xq.err)"
+  fi
+  out="$(/usr/bin/xfconf-query -c peetos-smoke -p /greeting 2>&1)"
+  [ "$out" = "hello from xfconf" ] && ok "xfconf-query get" || bad "xfconf-query get: $out"
+  out="$(/usr/bin/dbus-send --session --reply-timeout=20000 --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1)"
+  case "$out" in
+    *'"org.xfce.Xfconf"'*) ok "org.xfce.Xfconf is on the bus" ;;
+    *) bad "org.xfce.Xfconf not on the bus: $out" ;;
+  esac
+
+  # xfconfd writes the channel when it shuts down; a new query activates it
+  # again and reads the value back from disk.
+  xpid="$(/usr/bin/gdbus call --session --timeout 20 --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.GetConnectionUnixProcessID org.xfce.Xfconf 2>&1 | toybox sed -n 's/^(uint32 \([0-9]*\),)$/\1/p')"
+  if [ -z "$xpid" ]; then
+    bad "no pid for org.xfce.Xfconf"
+  elif kill -TERM "$xpid"; then
+    i=0
+    while kill -0 "$xpid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  fi
+  if toybox grep -q 'hello from xfconf' "$XML" 2>/dev/null; then
+    ok "xfconfd saved the channel"
+  else
+    bad "xfconfd did not save $XML"
+  fi
+  out="$(/usr/bin/xfconf-query -c peetos-smoke -p /greeting 2>&1)"
+  [ "$out" = "hello from xfconf" ] && ok "re-activated xfconfd reads the saved value" || bad "re-activated xfconfd: $out"
+
+  kill -TERM "$(cat /tmp/dbus.pid)" 2>/dev/null
+  [ -s /tmp/dbus.err ] && toybox sed 's/^/[dbus-smoke] daemon: /' /tmp/dbus.err
+fi
+
+echo [musl-ext2-dbus-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-dbus-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/dbus_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
 fail=0

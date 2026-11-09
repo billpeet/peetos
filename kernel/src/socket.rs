@@ -111,6 +111,8 @@ struct SocketEntry {
     unix_peer_cred_valid: bool,
     /// Credentials of the process that called `listen()` (handed to clients).
     unix_listen_cred: UnixCred,
+    /// `SO_PASSCRED`: `recvmsg` reports the peer's credentials.
+    unix_passcred: bool,
     used: bool,
     refs: u16,
     protocol: u8,
@@ -144,6 +146,7 @@ impl SocketEntry {
             unix_peer_cred: UnixCred::NONE,
             unix_peer_cred_valid: false,
             unix_listen_cred: UnixCred::NONE,
+            unix_passcred: false,
             used: false,
             refs: 0,
             protocol: 0,
@@ -176,6 +179,7 @@ impl SocketEntry {
         self.unix_peer_cred = UnixCred::NONE;
         self.unix_peer_cred_valid = false;
         self.unix_listen_cred = UnixCred::NONE;
+        self.unix_passcred = false;
         self.used = false;
         self.refs = 0;
         self.protocol = 0;
@@ -998,6 +1002,8 @@ pub fn socket_connect_unix(id: u16, path: &[u8], nonblocking: bool) -> Result<()
         server.state = STATE_CONNECTED;
         server.unix_peer = id;
         server.unix_peer_open = true;
+        // Linux copies socket flags such as SO_PASSCRED to accepted sockets.
+        server.unix_passcred = listener.unix_passcred;
 
         client.state = STATE_CONNECTED;
         client.unix_peer = server_id;
@@ -1682,6 +1688,20 @@ pub fn socket_set_peer_cred(id: u16, cred: UnixCred) -> Result<(), i64> {
     s.unix_peer_cred = cred;
     s.unix_peer_cred_valid = true;
     Ok(())
+}
+
+/// `SO_PASSCRED` on an `AF_UNIX` socket. Other families accept and ignore it.
+pub fn socket_set_passcred(id: u16, on: bool) -> Result<(), i64> {
+    let s = get_socket(id)?;
+    if s.protocol == PROTO_UNIX {
+        s.unix_passcred = on;
+    }
+    Ok(())
+}
+
+pub fn socket_passcred(id: u16) -> Result<bool, i64> {
+    let s = get_socket(id)?;
+    Ok(s.protocol == PROTO_UNIX && s.unix_passcred)
 }
 
 /// Record the credentials of the process listening on `id`.

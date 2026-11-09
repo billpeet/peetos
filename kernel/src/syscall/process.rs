@@ -362,6 +362,9 @@ pub(super) fn create_fork_child(
         fork_cleanup_child(child);
         return Err(err);
     }
+    let (parent_owner, child_owner) =
+        unsafe { ((*crate::task::leader_of(parent)).tgid, (*child).pid) };
+    epoll_inherit_watches(parent_owner, child_owner, child);
     if let Err(err) = apply_clone_tid_flags(parent, child, req) {
         fork_cleanup_child(child);
         return Err(err);

@@ -68,7 +68,7 @@ for _ in $(seq 1 100); do
   sleep 0.2
 done
 
-grep -E '\[(peetwl|thunar-watch)\] (output|ready|mapped|unmapped|focus|title|all clients|pass|FAIL|found|wrong|waiting)|drm flips|Gtk-|GLib-|Gdk-|thunar' "${LOG_FILE}" || true
+grep -E '\[(peetwl|thunar-watch)\] (output|ready|mapped|unmapped|focus|title|all clients|pass|FAIL|found|wrong|waiting|org)|drm flips|Gtk-|GLib-|Gdk-|thunar' "${LOG_FILE}" || true
 
 if [[ "${driver_status}" -ne 0 ]]; then
   echo "Thunar smoke driver failed" >&2
@@ -88,6 +88,17 @@ if ! grep -q '\[musl-ext2-thunar-smoke\] done' "${LOG_FILE}" \
 fi
 
 # Thunar must not hit kernel syscall gaps or log GTK/GLib criticals.
+for marker in   '[thunar-watch] org.xfce.FileManager owned: (true,)'   '[musl-ext2-thunar-smoke] Thunar settings saved through xfconf'; do
+  if ! grep -qF "${marker}" "${LOG_FILE}"; then
+    echo "Thunar smoke is missing marker: ${marker}" >&2
+    exit 1
+  fi
+done
+if grep -q "Failed to initialize Xfconf" "${LOG_FILE}"; then
+  echo "Thunar could not reach xfconf on the session bus" >&2
+  exit 1
+fi
+
 if grep -q "Unhandled syscall" "${LOG_FILE}"; then
   echo "Thunar smoke hit an unhandled syscall:" >&2
   grep "Unhandled syscall" "${LOG_FILE}" | sort | uniq -c >&2

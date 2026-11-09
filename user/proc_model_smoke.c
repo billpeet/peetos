@@ -8,6 +8,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -895,6 +896,137 @@ static void test_socket_waits(void) {
 }
 
 /*
+ * Syscall arguments in pages the process has not touched yet. mmap regions
+ * are populated lazily, and the kernel copies user memory through the
+ * physical map, so it has to fault such pages in itself (dbus-daemon opens
+ * "/dev/null" from a libdbus read-only page nothing had touched).
+ */
+static void test_lazy_user_copies(void) {
+    long page = sysconf(_SC_PAGESIZE);
+
+    /* A path string in an untouched file-backed page. */
+    char path[64];
+    snprintf(path, sizeof(path), "/temp/lazy-path-%d", (int)getpid());
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0, "lazy: create file");
+    char content[64];
+    memset(content, 0, sizeof(content));
+    strcpy(content, "/dev/null");
+    CHECK(write(fd, content, sizeof(content)) == (ssize_t)sizeof(content), "lazy: write file");
+    char *map = mmap(NULL, page, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(map != MAP_FAILED, "lazy: mmap file");
+    if (map != MAP_FAILED) {
+        int nfd = open(map, O_RDWR);
+        CHECK(nfd >= 0, "lazy: open() a path in an untouched file page");
+        if (nfd >= 0) {
+            close(nfd);
+        }
+        munmap(map, page);
+    }
+    close(fd);
+    unlink(path);
+
+    /* read() into, and write() from, untouched anonymous pages. */
+    char *anon = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(anon != MAP_FAILED, "lazy: mmap anonymous");
+    if (anon != MAP_FAILED) {
+        int p[2];
+        CHECK(pipe(p) == 0, "lazy: pipe");
+        CHECK(write(p[1], anon + page, 16) == 16, "lazy: write() from an untouched page");
+        CHECK(read(p[0], anon, 16) == 16 && anon[0] == 0, "lazy: read() into an untouched page");
+        struct timespec *ts = (struct timespec *)(anon + 2 * page);
+        CHECK(clock_gettime(CLOCK_MONOTONIC, ts) == 0, "lazy: lock-free clock_gettime into a fresh page");
+        close(p[0]);
+        close(p[1]);
+        munmap(anon, 3 * page);
+    }
+}
+
+/*
+ * SCM_CREDENTIALS / SO_PASSCRED, as D-Bus authentication uses them: a client
+ * sends its credentials with a byte (GDBus does), and a server that set
+ * SO_PASSCRED on its listening socket reads the client's pid/uid/gid with
+ * that byte on the accepted socket.
+ */
+static void test_unix_passcred(void) {
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "/temp/passcred-%d.sock", (int)getpid());
+    unlink(addr.sun_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int one = 1;
+    CHECK(lfd >= 0 && bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0 && listen(lfd, 1) == 0,
+          "passcred: listen");
+    CHECK(setsockopt(lfd, SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) == 0, "passcred: set SO_PASSCRED");
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (c < 0 || connect(c, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            _exit(80);
+        }
+        struct ucred me = {.pid = getpid(), .uid = getuid(), .gid = getgid()};
+        char byte = 0;
+        struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+        union {
+            char buf[CMSG_SPACE(sizeof(struct ucred))];
+            struct cmsghdr align;
+        } ctl;
+        memset(&ctl, 0, sizeof(ctl));
+        struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl.buf,
+                             .msg_controllen = sizeof(ctl.buf)};
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_CREDENTIALS;
+        cm->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+        memcpy(CMSG_DATA(cm), &me, sizeof(me));
+        if (sendmsg(c, &msg, 0) != 1) {
+            _exit(81);
+        }
+        char ack;
+        (void)read(c, &ack, 1);
+        _exit(0);
+    }
+
+    int a = accept(lfd, NULL, NULL);
+    CHECK(a >= 0, "passcred: accept");
+    int v = 0;
+    socklen_t vlen = sizeof(v);
+    CHECK(getsockopt(a, SOL_SOCKET, SO_PASSCRED, &v, &vlen) == 0 && v == 1,
+          "passcred: accepted socket inherits SO_PASSCRED");
+
+    char byte = 1;
+    struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+    union {
+        char buf[CMSG_SPACE(sizeof(struct ucred)) + CMSG_SPACE(4 * sizeof(int))];
+        struct cmsghdr align;
+    } ctl;
+    memset(&ctl, 0, sizeof(ctl));
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl.buf,
+                         .msg_controllen = sizeof(ctl.buf)};
+    CHECK(recvmsg(a, &msg, 0) == 1 && byte == 0, "passcred: recvmsg byte");
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    struct ucred got = {0, 0, 0};
+    if (cm != NULL && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_CREDENTIALS &&
+        cm->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
+        memcpy(&got, CMSG_DATA(cm), sizeof(got));
+    }
+    CHECK(got.pid == pid && got.uid == getuid() && got.gid == getgid(),
+          "passcred: SCM_CREDENTIALS carries the client's pid/uid/gid");
+    CHECK((msg.msg_flags & MSG_CTRUNC) == 0, "passcred: no control truncation");
+
+    /* Without SO_PASSCRED no credentials are delivered. */
+    int off = 0;
+    CHECK(setsockopt(a, SOL_SOCKET, SO_PASSCRED, &off, sizeof(off)) == 0, "passcred: clear SO_PASSCRED");
+    CHECK(write(a, "k", 1) == 1, "passcred: ack");
+    CHECK(wait_exit_status(pid) == 0, "passcred: client sent SCM_CREDENTIALS");
+    close(a);
+    close(lfd);
+    unlink(addr.sun_path);
+}
+
+/*
  * Lock-free user copies vs. concurrent munmap (SMP).
  *
  * clock_gettime runs without the kernel's big lock and copies its result
@@ -1028,6 +1160,8 @@ int main(int argc, char **argv) {
     test_exec_from_thread();
     test_exec_long_strings();
     test_socket_waits();
+    test_lazy_user_copies();
+    test_unix_passcred();
     test_uaccess_race();
 
     if (failures == 0) {

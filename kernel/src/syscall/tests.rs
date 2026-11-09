@@ -2539,3 +2539,112 @@ fn inotify_syscalls_are_known_and_unsupported() {
         assert_eq!((def.handler)(&ctx, &SyscallArgs { num, args: [0; 6] }), -ENOSYS);
     }
 }
+
+#[test]
+fn sent_ucred_must_match_sender_unless_root() {
+    let me = socket::UnixCred {
+        pid: 42,
+        uid: 1000,
+        gid: 1000,
+    };
+    assert_eq!(check_sent_ucred(me, &ucred_bytes(me)), Ok(()));
+    let mut other_pid = me;
+    other_pid.pid = 7;
+    assert_eq!(check_sent_ucred(me, &ucred_bytes(other_pid)), Err(-EPERM));
+    let mut other_uid = me;
+    other_uid.uid = 0;
+    assert_eq!(check_sent_ucred(me, &ucred_bytes(other_uid)), Err(-EPERM));
+    // Root may send any credentials (CAP_SYS_ADMIN/CAP_SETUID/CAP_SETGID).
+    let root = socket::UnixCred {
+        pid: 1,
+        uid: 0,
+        gid: 0,
+    };
+    assert_eq!(check_sent_ucred(root, &ucred_bytes(me)), Ok(()));
+}
+
+#[test]
+fn clock_getres_is_one_pit_tick() {
+    let res = clock_resolution();
+    assert_eq!(res.tv_sec, 0);
+    assert_eq!(res.tv_nsec, 1_000_000_000 / pit::TIMER_FREQUENCY as i64);
+    assert_eq!(lookup_syscall(SYS_CLOCK_GETRES).map(|d| d.name), Some("clock_getres"));
+}
+
+#[test]
+fn unanswerable_peer_sockopts_are_not_faked() {
+    assert!(is_unsupported_peer_sockopt(SO_PEERSEC));
+    assert!(is_unsupported_peer_sockopt(SO_PEERGROUPS));
+    assert!(is_unsupported_peer_sockopt(SO_PEERPIDFD));
+    assert!(!is_unsupported_peer_sockopt(SO_PEERCRED));
+    assert!(!is_unsupported_peer_sockopt(SO_PASSCRED));
+    assert_eq!(lookup_syscall(SYS_PIDFD_OPEN).map(|d| d.name), Some("pidfd_open"));
+}
+
+#[test]
+fn fork_inherits_epoll_watches_and_reports_them_once() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+
+    let mut parent = task::Task::for_test(50);
+    let parent_ptr = &mut parent as *mut task::Task;
+    let mut child = task::Task::for_test(51);
+    let child_ptr = &mut child as *mut task::Task;
+    let id = epoll_alloc_instance().expect("epoll");
+    let inst = epoll_instance_get_mut(id).expect("instance");
+    for fd in 0..EPOLL_MAX_WATCHES_PER_TASK as i32 {
+        assert_eq!(
+            epoll_ctl_add(inst, 50, parent_ptr, fd, task::USER_FD_KIND_VFS, (2000 + fd) as u16, EPOLLIN, fd as u64),
+            0
+        );
+    }
+
+    epoll_inherit_watches(50, 51, child_ptr);
+    assert_eq!(epoll_watch_count_for_owner(51), EPOLL_MAX_WATCHES_PER_TASK);
+    // A watch and its inherited copy are the same Linux watch.
+    let parent_idx = epoll_watch_find(inst, 50, 7).expect("parent watch");
+    let child_idx = epoll_watch_find(inst, 51, 7).expect("child watch");
+    assert!(child_idx > parent_idx);
+
+    // The parent exiting leaves the child's watches in place.
+    epoll_drop_watches_for_owner(50);
+    assert_eq!(epoll_watch_count_for_owner(50), 0);
+    assert_eq!(epoll_watch_count_for_owner(51), EPOLL_MAX_WATCHES_PER_TASK);
+    let _ = child_ptr;
+}
+
+#[test]
+fn epoll_edge_triggered_and_oneshot_reporting() {
+    let mut w = EpollWatch::EMPTY;
+    w.events = EPOLLIN | EPOLLET;
+    assert_eq!(epoll_events_to_report(&mut w, EPOLLIN), EPOLLIN);
+    // Still readable: no new edge.
+    assert_eq!(epoll_events_to_report(&mut w, EPOLLIN), 0);
+    // Drained, then readable again: a new edge.
+    assert_eq!(epoll_events_to_report(&mut w, 0), 0);
+    assert_eq!(epoll_events_to_report(&mut w, EPOLLIN), EPOLLIN);
+    // dbus "disabled" watches: EPOLLET alone still reports HUP once.
+    let mut d = EpollWatch::EMPTY;
+    d.events = EPOLLET;
+    assert_eq!(epoll_events_to_report(&mut d, EPOLLHUP), EPOLLHUP);
+    assert_eq!(epoll_events_to_report(&mut d, EPOLLHUP), 0);
+
+    let mut o = EpollWatch::EMPTY;
+    o.events = EPOLLIN | EPOLLONESHOT;
+    assert_eq!(epoll_events_to_report(&mut o, EPOLLIN), EPOLLIN);
+    assert!(o.disarmed);
+    assert_eq!(EPOLL_SUPPORTED_EVENTS_MASK & (EPOLLET | EPOLLONESHOT | EPOLLRDHUP), EPOLLET | EPOLLONESHOT | EPOLLRDHUP);
+}
+
+#[test]
+fn fdatasync_is_registered() {
+    assert_eq!(lookup_syscall(SYS_FDATASYNC).map(|d| d.name), Some("fdatasync"));
+}
+
+#[test]
+fn unix_credentials_carry_the_process_id_not_the_thread_id() {
+    let mut thread = task::Task::for_test(77);
+    thread.tgid = 70;
+    let cred = current_unix_cred(&mut thread as *mut task::Task);
+    assert_eq!(cred.pid, 70);
+}

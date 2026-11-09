@@ -211,6 +211,12 @@ current Rust kernel implementation and forward roadmap.
   - `newfstatat` accepts `AT_SYMLINK_NOFOLLOW`/`AT_NO_AUTOMOUNT`;
   - `execve` strings share a 28 KiB buffer instead of a 256-byte per-string cap;
   - inotify syscalls return `-ENOSYS` quietly.
+- D-Bus 1.16.2 session bus (`docs/dbus.md`), built by `scripts/build_dbus.sh`. `make run-dbus-smoke` covers libdbus and GDBus clients, bus activation of xfconfd and settings saved to disk; the Thunar smoke runs Thunar on the bus (xfconf settings, `org.xfce.FileManager`). Kernel work it needed:
+  - `SCM_CREDENTIALS` and `SO_PASSCRED` on `AF_UNIX` sockets; `SO_PEERSEC`/`SO_PEERGROUPS`/`SO_PEERPIDFD` fail with `ENOPROTOOPT` instead of fake zeros;
+  - user copies fault in lazily mapped pages instead of failing with `EFAULT`;
+  - a forked child inherits the parent's epoll watches; `EPOLLET` and `EPOLLONESHOT`;
+  - `clock_getres`, `fdatasync`, and a `pidfd_open` stub;
+  - a `syscall-trace` debug feature.
 - The path from here to a full desktop is tracked in `docs/desktop_roadmap.md`.
 - libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the region slots per task (32 then, 256 now).
 

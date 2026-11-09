@@ -65,6 +65,7 @@ const EISDIR: i64 = 21;
 const ENFILE: i64 = 23;
 const ENOTEMPTY: i64 = 39;
 const ENOSYS: i64 = 38;
+const ENOPROTOOPT: i64 = 92;
 const ENOSPC: i64 = 28;
 const ENOTSOCK: i64 = 88;
 const EPROTONOSUPPORT: i64 = 93;
@@ -117,6 +118,7 @@ const SYS_SHMAT: u64 = 30;
 const SYS_SHMCTL: u64 = 31;
 const SYS_FCNTL: u64 = 72;
 const SYS_FSYNC: u64 = 74;
+const SYS_FDATASYNC: u64 = 75;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
 const SYS_FCHDIR: u64 = 81;
@@ -153,6 +155,7 @@ const SYS_INOTIFY_INIT: u64 = 253;
 const SYS_INOTIFY_ADD_WATCH: u64 = 254;
 const SYS_INOTIFY_RM_WATCH: u64 = 255;
 const SYS_INOTIFY_INIT1: u64 = 294;
+const SYS_PIDFD_OPEN: u64 = 434;
 const SYS_GETTID: u64 = 186;
 const SYS_TKILL: u64 = 200;
 const SYS_TGKILL: u64 = 234;
@@ -162,6 +165,7 @@ const SYS_GETDENTS64: u64 = 217;
 const SYS_EXIT_GROUP: u64 = 231;
 const SYS_UTIMES: u64 = 235;
 const SYS_CLOCK_GETTIME: u64 = 228;
+const SYS_CLOCK_GETRES: u64 = 229;
 const SYS_OPENAT: u64 = 257;
 const SYS_MKDIRAT: u64 = 258;
 const SYS_FCHOWNAT: u64 = 260;
@@ -350,12 +354,18 @@ const MSG_DONTWAIT: u32 = 0x40;
 const MSG_CTRUNC: u32 = 0x08;
 const MSG_CMSG_CLOEXEC: u32 = 0x40000000;
 const SCM_RIGHTS: u32 = 1;
+const SCM_CREDENTIALS: u32 = 2;
 const EPOLL_CLOEXEC: u32 = O_CLOEXEC;
 const EPOLLIN: u32 = 0x0000_0001;
 const EPOLLPRI: u32 = 0x0000_0002;
 const EPOLLOUT: u32 = 0x0000_0004;
 const EPOLLERR: u32 = 0x0000_0008;
 const EPOLLHUP: u32 = 0x0000_0010;
+const EPOLLRDHUP: u32 = 0x0000_2000;
+const EPOLLEXCLUSIVE: u32 = 1 << 28;
+const EPOLLWAKEUP: u32 = 1 << 29;
+const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLLET: u32 = 1 << 31;
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
 const EPOLL_CTL_MOD: i32 = 3;
@@ -363,7 +373,11 @@ const EPOLL_CTL_MOD: i32 = 3;
 // Socket option levels/names
 const SOL_SOCKET: u32 = 1;
 const SO_ERROR: u32 = 4;
+const SO_PASSCRED: u32 = 16;
 const SO_PEERCRED: u32 = 17;
+const SO_PEERSEC: u32 = 31;
+const SO_PEERGROUPS: u32 = 59;
+const SO_PEERPIDFD: u32 = 77;
 const SO_REUSEADDR: u32 = 2;
 const SO_KEEPALIVE: u32 = 9;
 const IPPROTO_ICMP: u32 = 1;
@@ -424,10 +438,23 @@ const MEMFD_CREATE_MAX_RETRIES: usize = 64;
 const MEMFD_STORAGE_DIR: &str = "/temp/.memfd";
 const MEMFD_PATH_PREFIX: &[u8] = b"/temp/.memfd/mfd-";
 const EPOLL_MAX_INSTANCES: usize = 32;
-const EPOLL_MAX_WATCHES: usize = 64;
+/// Twice the per-process limit, so a forked child's inherited copies of a
+/// full parent's watches fit (`epoll_inherit_watches`).
+const EPOLL_MAX_WATCHES: usize = 128;
 const EPOLL_MAX_WATCHES_PER_TASK: usize = 64;
 const EPOLL_EVENT_SIZE: usize = 12;
-const EPOLL_SUPPORTED_EVENTS_MASK: u32 = EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP;
+/// `EPOLLRDHUP` is accepted but only reported as part of `EPOLLHUP` (full
+/// close); `EPOLLWAKEUP` and `EPOLLEXCLUSIVE` are accepted hints.
+const EPOLL_SUPPORTED_EVENTS_MASK: u32 = EPOLLIN
+    | EPOLLPRI
+    | EPOLLOUT
+    | EPOLLERR
+    | EPOLLHUP
+    | EPOLLRDHUP
+    | EPOLLEXCLUSIVE
+    | EPOLLWAKEUP
+    | EPOLLONESHOT
+    | EPOLLET;
 
 const PAGE_FAULT_ERROR_PRESENT: u64 = 1 << 0;
 const PAGE_FAULT_ERROR_WRITE: u64 = 1 << 1;
@@ -518,6 +545,11 @@ struct EpollWatch {
     inode: u16,
     events: u32,
     data: u64,
+    /// `EPOLLET`: readiness bits seen at the last collection; only bits that
+    /// become set since are reported.
+    last_ready: u32,
+    /// `EPOLLONESHOT`: reported once, silent until `EPOLL_CTL_MOD`.
+    disarmed: bool,
 }
 
 impl EpollWatch {
@@ -531,6 +563,8 @@ impl EpollWatch {
         inode: task::USER_FD_NONE,
         events: 0,
         data: 0,
+        last_ready: 0,
+        disarmed: false,
     };
 }
 
@@ -761,6 +795,8 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_GETSID, "getsid", SyscallMode::UserTask, sys_getsid),
     syscall_def(SYS_FCNTL, "fcntl", SyscallMode::UserTask, sys_fcntl),
     syscall_def(SYS_FSYNC, "fsync", SyscallMode::UserTask, sys_fsync),
+    // fdatasync: fsync (there is no metadata-only writeback to skip).
+    syscall_def(SYS_FDATASYNC, "fdatasync", SyscallMode::UserTask, sys_fsync),
     syscall_def(SYS_FADVISE64, "fadvise64", SyscallMode::UserTask, sys_fadvise64),
     syscall_def(SYS_PRCTL, "prctl", SyscallMode::UserTask, sys_prctl),
     syscall_def(SYS_MEMBARRIER, "membarrier", SyscallMode::UserTask, sys_membarrier),
@@ -779,6 +815,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         sys_inotify_unsupported,
     ),
     syscall_def(SYS_INOTIFY_INIT1, "inotify_init1", SyscallMode::UserTask, sys_inotify_unsupported),
+    syscall_def(SYS_PIDFD_OPEN, "pidfd_open", SyscallMode::UserTask, sys_pidfd_open_unsupported),
     syscall_def(SYS_UNLINK, "unlink", SyscallMode::UserTask, sys_unlink),
     syscall_def(
         SYS_ARCH_PRCTL,
@@ -815,6 +852,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
         SyscallMode::UserTask,
         sys_clock_gettime,
     ),
+    syscall_def(SYS_CLOCK_GETRES, "clock_getres", SyscallMode::UserTask, sys_clock_getres),
     syscall_def(SYS_FUTEX, "futex", SyscallMode::UserTask, sys_futex),
     syscall_def(SYS_OPENAT, "openat", SyscallMode::UserTask, sys_openat),
     syscall_def(SYS_MKDIRAT, "mkdirat", SyscallMode::UserTask, sys_mkdirat),
@@ -1427,7 +1465,22 @@ fn dispatch_syscall(call: SyscallArgs) -> i64 {
     }
 
     let _ = def.name;
-    (def.handler)(&ctx, &call)
+    #[cfg(feature = "syscall-trace")]
+    let pid = if ctx.current.is_null() { -1 } else { unsafe { (*ctx.current).pid } };
+    #[cfg(feature = "syscall-trace")]
+    sys_log!(
+        "[STRACE] {} {}({:#x}, {:#x}, {:#x}, {:#x})",
+        pid,
+        def.name,
+        call.args[0],
+        call.args[1],
+        call.args[2],
+        call.args[3]
+    );
+    let ret = (def.handler)(&ctx, &call);
+    #[cfg(feature = "syscall-trace")]
+    sys_log!("[STRACE] {} {} -> {}", pid, def.name, ret);
+    ret
 }
 
 #[inline]

@@ -40,7 +40,7 @@ Limitations / Simplifications
 - GTK 3 only. GTK 4 effectively requires EGL/GL (Mesa), which is not ported yet.
 - **Decorations.** GTK 3 only does server-side decorations through the KDE decoration protocol, which `peetwl` doesn't offer (it has `xdg-decoration`). A decorated GTK window would draw its own client-side title bar inside `peetwl`'s frame, so the smoke's window is undecorated. Client-side decorations, resizing from GTK's edges, and shadows are untested.
 - **No SVG loader** (librsvg, which is written in Rust, is not ported). Adwaita theme assets that are SVG-only log `Could not load a pixbuf from .../*.svg` and fall back. Symbolic icons come from GTK's built-in PNGs. No icon theme beyond the hicolor index is installed.
-- **No D-Bus session bus.** Accessibility (at-spi), portals, `GtkApplication` uniqueness and the settings portal are unavailable. GTK uses its built-in defaults.
+- **D-Bus.** A session bus is available (`docs/dbus.md`), but accessibility (at-spi), portals and the settings portal are not ported, so GTK uses its built-in defaults. `GtkApplication` uniqueness works when a session bus is running.
 - No input-method framework beyond GTK's built-in input methods, no primary selection, and no drag and drop between applications.
 - The file chooser and printing are built but untested. Only the file print backend exists.
 - gdk-pixbuf has no JPEG or TIFF loaders.

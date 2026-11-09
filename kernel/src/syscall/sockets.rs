@@ -576,11 +576,36 @@ pub(super) fn parse_sendmsg_rights(
         if msg_len < cmsg_hdr_len || off + msg_len > ctrl_len {
             return Err(-EINVAL);
         }
-        if cmsg.cmsg_level as u32 != SOL_SOCKET || cmsg.cmsg_type as u32 != SCM_RIGHTS {
+        if cmsg.cmsg_level as u32 != SOL_SOCKET {
+            return Err(-EOPNOTSUPP);
+        }
+        let payload_len = msg_len - cmsg_hdr_len;
+        if cmsg.cmsg_type as u32 == SCM_CREDENTIALS {
+            // The receiver always gets the kernel's view of the sender (see
+            // recvmsg), so the claimed values are only validated.
+            if payload_len != UCRED_SIZE {
+                return Err(-EINVAL);
+            }
+            let mut raw = [0u8; UCRED_SIZE];
+            if let Err(e) = copy_from_user_task(
+                task_ptr,
+                hdr.msg_control + (off + cmsg_hdr_len) as u64,
+                &mut raw,
+            ) {
+                return Err(-e);
+            }
+            check_sent_ucred(current_unix_cred(task_ptr), &raw)?;
+            let adv = cmsg_align(msg_len);
+            if adv == 0 {
+                break;
+            }
+            off += adv;
+            continue;
+        }
+        if cmsg.cmsg_type as u32 != SCM_RIGHTS {
             return Err(-EOPNOTSUPP);
         }
 
-        let payload_len = msg_len - cmsg_hdr_len;
         if (payload_len % size_of::<i32>()) != 0 {
             return Err(-EINVAL);
         }
@@ -611,6 +636,30 @@ pub(super) fn parse_sendmsg_rights(
     }
 
     Ok((rights, count))
+}
+
+pub(super) fn is_unsupported_peer_sockopt(optname: u32) -> bool {
+    matches!(optname, SO_PEERSEC | SO_PEERGROUPS | SO_PEERPIDFD)
+}
+
+const UCRED_SIZE: usize = 12;
+/// Linux `overflowuid`/`overflowgid`.
+const OVERFLOW_ID: u32 = 65534;
+
+/// Validate a sent `SCM_CREDENTIALS` payload like Linux: a process may only
+/// claim its own pid, uid and gid, unless it is root (which has the
+/// `CAP_SYS_ADMIN`/`CAP_SETUID`/`CAP_SETGID` overrides).
+pub(super) fn check_sent_ucred(own: socket::UnixCred, raw: &[u8; UCRED_SIZE]) -> Result<(), i64> {
+    let pid = i32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let uid = u32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let gid = u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    if own.uid == 0 {
+        return Ok(());
+    }
+    if pid != own.pid || uid != own.uid || gid != own.gid {
+        return Err(-EPERM);
+    }
+    Ok(())
 }
 
 pub(super) fn install_received_right(
@@ -846,6 +895,41 @@ pub(super) fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     out_hdr.msg_controllen = 0;
     out_hdr.msg_flags = 0;
 
+    // SO_PASSCRED: the peer's credentials come first, as on Linux. With no
+    // known peer Linux reports pid 0 and the overflow uid/gid.
+    let mut ctrl_base = 0usize;
+    if domain == AF_UNIX && socket::socket_passcred(sock_id).unwrap_or(false) {
+        let cred = socket::socket_peer_cred(sock_id).unwrap_or(socket::UnixCred {
+            pid: 0,
+            uid: OVERFLOW_ID,
+            gid: OVERFLOW_ID,
+        });
+        let cmsg_len = size_of::<LinuxCmsgHdr>() + UCRED_SIZE;
+        if hdr.msg_control == 0 || (hdr.msg_controllen as usize) < cmsg_len {
+            out_hdr.msg_flags |= MSG_CTRUNC;
+        } else {
+            let cmsg = LinuxCmsgHdr {
+                cmsg_len: cmsg_len as u64,
+                cmsg_level: SOL_SOCKET as i32,
+                cmsg_type: SCM_CREDENTIALS as i32,
+            };
+            if let Err(e) = write_struct_to_user(ctx.current, hdr.msg_control, &cmsg) {
+                return -e;
+            }
+            if let Err(e) = copy_to_user_task(
+                ctx.current,
+                hdr.msg_control + size_of::<LinuxCmsgHdr>() as u64,
+                &ucred_bytes(cred),
+            ) {
+                return -e;
+            }
+            ctrl_base = core::cmp::min(cmsg_align(cmsg_len), hdr.msg_controllen as usize);
+            out_hdr.msg_controllen = ctrl_base as u64;
+        }
+    }
+    let ctrl_ptr = hdr.msg_control + ctrl_base as u64;
+    let ctrl_room = (hdr.msg_controllen as usize).saturating_sub(ctrl_base);
+
     if domain == AF_UNIX {
         let rights_msg = match socket::socket_recv_rights(sock_id) {
             Ok(v) => v,
@@ -857,11 +941,11 @@ pub(super) fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             let cmsg_hdr_len = size_of::<LinuxCmsgHdr>();
             let data_item_len = size_of::<i32>();
 
-            if hdr.msg_control == 0 || hdr.msg_controllen < cmsg_hdr_len as u64 {
+            if hdr.msg_control == 0 || ctrl_room < cmsg_hdr_len {
                 out_hdr.msg_flags |= MSG_CTRUNC;
                 socket::socket_release_rights(&msg.fds[..msg.count]);
             } else {
-                let ctrl_cap = hdr.msg_controllen as usize;
+                let ctrl_cap = ctrl_room;
                 let max_fds_fit = (ctrl_cap - cmsg_hdr_len) / data_item_len;
                 let fd_count = msg.count.min(max_fds_fit);
 
@@ -896,7 +980,7 @@ pub(super) fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                         cmsg_level: SOL_SOCKET as i32,
                         cmsg_type: SCM_RIGHTS as i32,
                     };
-                    if let Err(e) = write_struct_to_user(ctx.current, hdr.msg_control, &cmsg) {
+                    if let Err(e) = write_struct_to_user(ctx.current, ctrl_ptr, &cmsg) {
                         let mut i = 0usize;
                         while i < installed_count {
                             let _ = fd_close(ctx.current, installed[i]);
@@ -909,7 +993,7 @@ pub(super) fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                     while i < installed_count {
                         if let Err(e) = write_i32_to_user(
                             ctx.current,
-                            hdr.msg_control + (cmsg_hdr_len + i * data_item_len) as u64,
+                            ctrl_ptr + (cmsg_hdr_len + i * data_item_len) as u64,
                             installed[i],
                         ) {
                             let mut j = 0usize;
@@ -923,7 +1007,7 @@ pub(super) fn sys_recvmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                         i += 1;
                     }
 
-                    out_hdr.msg_controllen = cmsg_align(cmsg_len) as u64;
+                    out_hdr.msg_controllen = (ctrl_base + cmsg_align(cmsg_len)) as u64;
                     if installed_count < msg.count {
                         out_hdr.msg_flags |= MSG_CTRUNC;
                         socket::socket_release_rights(&msg.fds[installed_count..msg.count]);
@@ -1070,8 +1154,27 @@ pub(super) fn sys_socketpair(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 
     0
 }
 
-pub(super) fn sys_setsockopt(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
-    // Stub: silently accept common options
+pub(super) fn sys_setsockopt(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let level = call.arg(1) as u32;
+    let optname = call.arg(2) as u32;
+    if level == SOL_SOCKET && optname == SO_PASSCRED {
+        let (_, sock_id) = match fd_to_socket_id(ctx.current, call.arg(0) as i32) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if (call.arg(4) as u32) < 4 {
+            return -EINVAL;
+        }
+        let mut raw = [0u8; 4];
+        if let Err(e) = copy_from_user_task(ctx.current, call.arg(3), &mut raw) {
+            return -e;
+        }
+        return match socket::socket_set_passcred(sock_id, i32::from_ne_bytes(raw) != 0) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
+    }
+    // Other options are accepted and ignored.
     0
 }
 
@@ -1079,9 +1182,11 @@ pub(super) fn current_unix_cred(task_ptr: *mut task::Task) -> socket::UnixCred {
     if task_ptr.is_null() {
         return socket::UnixCred::NONE;
     }
+    // The process id (thread-group id), as Linux reports in `struct ucred`:
+    // GDBus, for one, connects and authenticates from a worker thread.
     unsafe {
         socket::UnixCred {
-            pid: (*task_ptr).pid,
+            pid: (*task_ptr).tgid,
             uid: (*task_ptr).user_uid,
             gid: (*task_ptr).user_gid,
         }
@@ -1147,6 +1252,22 @@ pub(super) fn sys_getsockopt(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             Err(err) => return err,
         };
         return write_sockopt_bytes(ctx.current, optval_ptr, optlen_ptr, &ucred_bytes(cred));
+    }
+
+    // Peer options PeetOS cannot answer. Reporting success with a zero value
+    // (the generic fallback below) would hand callers such as dbus-daemon a
+    // bogus pidfd 0, an empty security label or a fake group list, so fail
+    // the way Linux does without the feature (no LSM: SO_PEERSEC).
+    if level == SOL_SOCKET && is_unsupported_peer_sockopt(optname) {
+        return -ENOPROTOOPT;
+    }
+
+    if level == SOL_SOCKET && optname == SO_PASSCRED {
+        let on = match socket::socket_passcred(sock_id) {
+            Ok(v) => v as i32,
+            Err(e) => return e,
+        };
+        return write_sockopt_bytes(ctx.current, optval_ptr, optlen_ptr, &on.to_ne_bytes());
     }
 
     // Return 0 for SO_ERROR and other common queries
