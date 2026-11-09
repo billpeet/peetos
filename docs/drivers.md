@@ -51,7 +51,7 @@ The kernel then performs:
 A minimal kernel block layer now provides:
 - device inventory/registration
 - per-device read/write callback dispatch (`block::read`, `block::write`)
-- a bounded page-sized write-back cache for block I/O (`block::write_cached`, `block::read_cached`, `block::flush_cached_device`)
+- a bounded page-sized write-back cache for block I/O (`block::write_cached`, `block::read_cached`, `block::flush_cached_device`). The uncached `block::read`/`block::write` stay coherent with it: a raw read first writes back dirty lines it overlaps, and a raw write writes back and drops them. Cached I/O of a different size does the same for overlapping lines. (The ext2 backend writes through the cache but reads raw; before this, a dirty metadata block that ext2 evicted and reloaded came back stale and runtime-created inodes reverted to mode 0.)
 - an optional per-device `BlockOps.flush` (AHCI: ATA `FLUSH CACHE EXT`, issued as a non-data command) and `block::flush_device(index)`, a durability barrier that writes back the device's dirty cache lines and then flushes the drive's volatile write cache. The ext3 journal uses it to order log, commit, and checkpoint writes, and `sync`/`fsync`/`msync` use it so data reaches stable media before returning.
 
 The registry records discovered disks from both paths:
@@ -125,6 +125,7 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
 Limitations / Simplifications
 - AHCI command execution is polling-based; interrupts and async completion are not wired.
 - Barriers are full drains (all dirty lines of the device plus a device flush); there is no FUA or tagged ordering, so each journal commit costs two device flushes.
+- Block-cache coherence for uncached and mixed-size I/O is a linear scan of the 64 lines per request, and the cache is one global array with no lock of its own (it relies on the callers' serialisation).
 - AHCI DMA transfer size is currently capped to one page (`4 KiB`) per command through a bounce buffer.
 - ATA (`ata-pio`) devices are inventory-only for now; read/write callbacks are currently wired for AHCI devices.
 - VFS now mounts ext2 through a native block backend with sparse/lazy block residency and dirty-run sync-back; it no longer preloads a full image into RAM at mount.

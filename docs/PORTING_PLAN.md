@@ -206,6 +206,11 @@ current Rust kernel implementation and forward roadmap.
   - private futexes were keyed by address alone across processes, so two processes of the same binary stole each other's wakeups and hung.
 - 2D toolkit libraries (`docs/rendering.md`): zlib 1.3.1, libpng 1.6.44, pcre2 10.44, GLib 2.82.2, fribidi 1.0.16, cairo 1.18.2 and pango 1.54.0, built into the staged sysroot by `scripts/build_cairo_pango.sh`. `make run-pango-smoke` covers the GLib main loop, threads, GRegex, GObject and GIO; cairo PNG/PDF/SVG output; pango markup, wrapping, bidi and font resolution; and a cairo + pango frame on screen. The kernel gained `statx(2)` and accepts Linux `mmap` hint flags (`MAP_NORESERVE` and friends; harfbuzz maps fonts with it).
 - GTK 3.24.43 (`docs/gtk.md`): libepoxy, ATK, gdk-pixbuf and GTK with the Wayland backend only, built by `scripts/build_gtk.sh`. `make run-gtk-smoke` runs a GTK window under `peetwl` and drives it with real PS/2 key presses and pointer clicks (typed text in a `GtkEntry`, a `GtkButton` click). The kernel gained `getresuid`/`getresgid`.
+- Thunar 4.20 (`docs/thunar.md`), the first full GTK application: libxfce4util, xfconf, libxfce4ui (Wayland only), exo and Thunar built by `scripts/build_thunar.sh`, with a shared-mime-info database and the AdwaitaLegacy PNG icon theme. `make run-thunar-smoke` opens a demo folder, navigates with the keyboard and creates a folder through Thunar's dialog. Kernel fixes it needed:
+  - the uncached block read/write paths now stay coherent with the write-back cache. Before, ext2 reloaded evicted dirty metadata stale from disk and runtime-created inodes reverted to mode 0;
+  - `newfstatat` accepts `AT_SYMLINK_NOFOLLOW`/`AT_NO_AUTOMOUNT`;
+  - `execve` strings share a 28 KiB buffer instead of a 256-byte per-string cap;
+  - inotify syscalls return `-ENOSYS` quietly.
 - The path from here to a full desktop is tracked in `docs/desktop_roadmap.md`.
 - libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the region slots per task (32 then, 256 now).
 

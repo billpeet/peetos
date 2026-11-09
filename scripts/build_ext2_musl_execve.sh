@@ -162,6 +162,20 @@ if [[ -f "${RENDER_STAGE}/usr/lib/libgtk-3.so.0" ]]; then
   cp -a "${RENDER_STAGE}/usr/share/glib-2.0/schemas" "${STAGE_ROOT}/usr/share/glib-2.0/"
   cp -a "${RENDER_STAGE}/usr/share/icons/hicolor" "${STAGE_ROOT}/usr/share/icons/"
 fi
+# Thunar: the binary, its plugins and helpers, its default custom actions,
+# the MIME database, the AdwaitaLegacy icon theme and the GTK settings that
+# select it (scripts/build_thunar.sh).
+if [[ -x "${RENDER_STAGE}/usr/bin/thunar" ]]; then
+  cp "${RENDER_STAGE}/usr/bin/thunar" "${STAGE_ROOT}/bin/thunar"
+  mkdir -p "${STAGE_ROOT}/usr/lib" "${STAGE_ROOT}/usr/share" "${STAGE_ROOT}/etc/xdg"
+  cp -a "${RENDER_STAGE}/usr/lib/thunarx-3" "${STAGE_ROOT}/usr/lib/"
+  rm -f "${STAGE_ROOT}"/usr/lib/thunarx-3/*.la
+  cp -a "${RENDER_STAGE}/usr/share/mime" "${STAGE_ROOT}/usr/share/"
+  rm -rf "${STAGE_ROOT}/usr/share/mime/packages"
+  cp -a "${RENDER_STAGE}/usr/share/icons/AdwaitaLegacy" "${STAGE_ROOT}/usr/share/icons/"
+  cp -a "${RENDER_STAGE}/etc/gtk-3.0" "${STAGE_ROOT}/etc/"
+  cp -a "${RENDER_STAGE}/etc/xdg/Thunar" "${RENDER_STAGE}/etc/xdg/xfce4" "${STAGE_ROOT}/etc/xdg/"
+fi
 if [[ -x "${ROOT_DIR}/user/gtk_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/gtk_smoke.elf" "${STAGE_ROOT}/bin/gtk_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/gtk_smoke"
@@ -789,6 +803,61 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/gtk_smoke.sh"
+
+# Thunar smoke: a demo folder, Thunar on it, and a watcher that reports
+# where Thunar's New Folder dialog created "made-by-thunar".
+cat > "${STAGE_ROOT}/bin/thunar_watch.sh" <<'EOS'
+i=0
+while [ "$i" -lt 240 ]; do
+  if [ -d /tmp/thunar-demo/Documents/made-by-thunar ]; then
+    echo "[thunar-watch] found /tmp/thunar-demo/Documents/made-by-thunar" > /dev/console
+    exit 0
+  fi
+  if [ -d /tmp/thunar-demo/made-by-thunar ]; then
+    echo "[thunar-watch] wrong place /tmp/thunar-demo/made-by-thunar" > /dev/console
+    exit 0
+  fi
+  sleep 0.5
+  i=$((i + 1))
+done
+echo "[thunar-watch] waiting timed out" > /dev/console
+EOS
+
+cat > "${STAGE_ROOT}/bin/thunar_smoke.sh" <<'EOS'
+fail=0
+export LANG=C.UTF-8 HOME=/tmp
+
+if [ ! -x bin/peetwl ] || [ ! -x bin/thunar ]; then
+  echo [musl-ext2-thunar-smoke] missing bin/peetwl or bin/thunar
+  fail=1
+else
+  mkdir -p /tmp/thunar-demo/Documents /tmp/thunar-demo/Pictures /tmp/thunar-demo/Music
+  echo "Notes from PeetOS" > /tmp/thunar-demo/notes.txt
+  echo "#!/bin/sh" > /tmp/thunar-demo/hello.sh
+  cp /usr/share/icons/AdwaitaLegacy/48x48/places/folder.png /tmp/thunar-demo/Pictures/folder.png
+  cp /usr/share/icons/AdwaitaLegacy/48x48/places/user-home.png /tmp/thunar-demo/screenshot.png
+  # Regression for block-cache coherence: files created now must survive
+  # several MiB of reads that churn the ext2 and block caches (dirty
+  # metadata used to be reloaded stale, reverting new inodes to mode 0).
+  mkdir /tmp/churn-dir && echo churn > /tmp/churn-file
+  cat /usr/share/icons/AdwaitaLegacy/*/*/* > /dev/null 2>&1
+  if [ -d /tmp/churn-dir ] && [ "$(cat /tmp/churn-file)" = churn ] && [ -d /tmp/thunar-demo/Documents ]; then
+    echo "[musl-ext2-thunar-smoke] new files survive cache churn"
+  else
+    echo "[musl-ext2-thunar-smoke] new files lost after cache churn"
+    ls -lid /tmp/churn-dir /tmp/churn-file /tmp/thunar-demo
+    fail=1
+  fi
+  bin/peetwl --smoke --watchdog-ms 180000 --client "/mnt/ext2/bin/thunar /tmp/thunar-demo" \
+    --client "/mnt/ext2/bin/toybox sh /mnt/ext2/bin/thunar_watch.sh" || fail=1
+fi
+
+echo [musl-ext2-thunar-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-thunar-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/thunar_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
 fail=0

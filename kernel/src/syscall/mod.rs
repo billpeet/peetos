@@ -149,6 +149,10 @@ const SYS_PRCTL: u64 = 157;
 const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_MEMBARRIER: u64 = 324;
 const SYS_STATX: u64 = 332;
+const SYS_INOTIFY_INIT: u64 = 253;
+const SYS_INOTIFY_ADD_WATCH: u64 = 254;
+const SYS_INOTIFY_RM_WATCH: u64 = 255;
+const SYS_INOTIFY_INIT1: u64 = 294;
 const SYS_GETTID: u64 = 186;
 const SYS_TKILL: u64 = 200;
 const SYS_TGKILL: u64 = 234;
@@ -391,7 +395,10 @@ const UNKNOWN_SYSCALL_LOG_LIMIT: u32 = 8;
 const CLEAR_TID_SIZE: usize = 4;
 const EXEC_MAX_ARGV: usize = 64;
 const EXEC_MAX_ENVP: usize = 64;
-const EXEC_MAX_STR_LEN: usize = 256;
+/// Shared byte budget for execve argument and environment strings (see
+/// `ExecStrings`): they must fit the 32 KiB eagerly mapped top of the new
+/// user stack together with the pointer arrays and auxv.
+const EXEC_STRINGS_MAX: usize = 28 * 1024;
 const EXEC_MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 const UTS_FIELD_LEN: usize = 65;
 /// Region slots per task. Adjacent compatible regions are merged on insert
@@ -758,6 +765,20 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_PRCTL, "prctl", SyscallMode::UserTask, sys_prctl),
     syscall_def(SYS_MEMBARRIER, "membarrier", SyscallMode::UserTask, sys_membarrier),
     syscall_def(SYS_STATX, "statx", SyscallMode::UserTask, sys_statx),
+    syscall_def(SYS_INOTIFY_INIT, "inotify_init", SyscallMode::UserTask, sys_inotify_unsupported),
+    syscall_def(
+        SYS_INOTIFY_ADD_WATCH,
+        "inotify_add_watch",
+        SyscallMode::UserTask,
+        sys_inotify_unsupported,
+    ),
+    syscall_def(
+        SYS_INOTIFY_RM_WATCH,
+        "inotify_rm_watch",
+        SyscallMode::UserTask,
+        sys_inotify_unsupported,
+    ),
+    syscall_def(SYS_INOTIFY_INIT1, "inotify_init1", SyscallMode::UserTask, sys_inotify_unsupported),
     syscall_def(SYS_UNLINK, "unlink", SyscallMode::UserTask, sys_unlink),
     syscall_def(
         SYS_ARCH_PRCTL,

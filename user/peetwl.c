@@ -1647,6 +1647,10 @@ static void toplevel_set_parent(struct wl_client *c, struct wl_resource *r,
 static void toplevel_set_title(struct wl_client *c, struct wl_resource *r, const char *title) {
     (void)c;
     struct toplevel *top = wl_resource_get_user_data(r);
+    if (strncmp(top->title, title, sizeof(top->title) - 1) != 0 && top->title[0] != '\0') {
+        /* Title changes after the first one (file managers name the current folder). */
+        printf("[peetwl] title '%s' -> '%s'\n", top->title, title);
+    }
     snprintf(top->title, sizeof(top->title), "%s", title);
     if (top->xdg != NULL && top->xdg->surface != NULL) {
         damage_toplevel(top->xdg->surface->srv, top);
@@ -2408,6 +2412,7 @@ int main(int argc, char **argv) {
     int nclients = 0;
     const char *xkb_layout = NULL, *xkb_variant = NULL, *xkb_options = NULL;
     int force_fbdev = 0;
+    int watchdog_ms = SMOKE_WATCHDOG_MS;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--smoke") == 0) {
@@ -2422,8 +2427,10 @@ int main(int argc, char **argv) {
             xkb_options = argv[++i];
         } else if (strcmp(argv[i], "--fbdev") == 0) {
             force_fbdev = 1;
+        } else if (strcmp(argv[i], "--watchdog-ms") == 0 && i + 1 < argc) {
+            watchdog_ms = atoi(argv[++i]);
         } else {
-            printf("usage: peetwl [--smoke] [--fbdev] [--xkb-layout L] [--xkb-variant V] "
+            printf("usage: peetwl [--smoke] [--watchdog-ms N] [--fbdev] [--xkb-layout L] [--xkb-variant V] "
                    "[--xkb-options O] [--client \"cmd args\"]...\n");
             return 2;
         }
@@ -2476,7 +2483,7 @@ int main(int argc, char **argv) {
     wl_event_loop_add_signal(srv.loop, SIGINT, on_terminate, &srv);
     if (srv.smoke) {
         struct wl_event_source *wd = wl_event_loop_add_timer(srv.loop, on_watchdog, &srv);
-        wl_event_source_timer_update(wd, SMOKE_WATCHDOG_MS);
+        wl_event_source_timer_update(wd, watchdog_ms > 0 ? watchdog_ms : SMOKE_WATCHDOG_MS);
     }
 
     int kbd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);

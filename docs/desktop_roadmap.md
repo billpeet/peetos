@@ -107,9 +107,11 @@ later.
 - [ ] Panel/taskbar and launcher (for example waybar or sfwbar, fuzzel or wofi).
 - [x] GTK 3.24 (Wayland backend) with libepoxy, ATK and gdk-pixbuf
   (`make run-gtk-smoke`; see `docs/gtk.md`).
-- [ ] GTK applications: a file manager (Thunar, PCManFM), a text editor
-  (mousepad) and settings applications. They need D-Bus, librsvg for SVG
-  icons, and an icon theme.
+- [x] File manager: Thunar 4.20 (`make run-thunar-smoke`; see
+  `docs/thunar.md`), without D-Bus, inotify or SVG icons.
+- [ ] More GTK applications: a text editor (mousepad) and settings
+  applications. D-Bus, inotify and librsvg would make them (and Thunar)
+  fully functional.
 - [ ] GTK 4 (needs Mesa/EGL).
 
 ### 6. Session services
@@ -129,7 +131,8 @@ later.
 4. ~~fcft + foot (without harfbuzz at first)~~ Done.
 5. ~~C++ runtime, then harfbuzz~~ Done (GCC + libstdc++; fcft/foot now shape text).
 6. ~~libpng, cairo, pango (with GLib)~~ Done.
-7. ~~gdk-pixbuf, libepoxy, GTK 3~~ Done. Next: wlroots + labwc, or D-Bus and librsvg for real GTK applications.
+7. ~~gdk-pixbuf, libepoxy, GTK 3~~ Done.
+8. ~~A GTK application: Thunar~~ Done. Next: inotify and D-Bus (Thunar refresh, settings, thumbnails), xdg window geometry in `peetwl` for GTK's client-side decorations, then wlroots + labwc.
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports. *(Reached: foot renders

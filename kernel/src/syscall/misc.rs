@@ -504,6 +504,14 @@ pub(super) fn sys_membarrier(_ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     membarrier_result(call.arg(0))
 }
 
+/// `inotify_init`/`inotify_init1`/`inotify_add_watch`/`inotify_rm_watch`:
+/// not implemented. Known (rather than unknown) syscalls so they return
+/// `-ENOSYS` quietly; GLib then reports directory monitoring as unsupported
+/// and file managers simply do not auto-refresh on outside changes.
+pub(super) fn sys_inotify_unsupported(_ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
+    -ENOSYS
+}
+
 pub(super) fn membarrier_result(cmd: u64) -> i64 {
     if cmd == 0 {
         0

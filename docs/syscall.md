@@ -107,7 +107,7 @@ Current implemented handlers:
 - `shmget/shmat/shmdt/shmctl(IPC_RMID)` via baseline in-kernel System V shared-memory segments
 - `access/faccessat/faccessat2` baseline path existence + permission checks
 - `umask(mask)` baseline process umask tracking (used by userspace runtime bring-up)
-- `stat`/`lstat`/`fstat`/`newfstatat` baseline file metadata paths (legacy + modern entry points)
+- `stat`/`lstat`/`fstat`/`newfstatat` baseline file metadata paths (legacy + modern entry points). `newfstatat` accepts `AT_EMPTY_PATH`, `AT_SYMLINK_NOFOLLOW` (`ls -l` and GLib pass it) and `AT_NO_AUTOMOUNT`.
 - `getresuid`/`getresgid`: real, effective and saved ids, all the process's single id (there is no setuid model)
 - `statx(dirfd, path, flags, mask, buf)`: the `newfstatat` lookup reported in the 256-byte `struct statx` layout. The returned `stx_mask` is always `STATX_BASIC_STATS` (no birth time, attributes or mount id); unknown flags, both `AT_STATX_*_SYNC` bits, or the reserved mask bit are `-EINVAL`. GLib/GIO use it for file metadata.
 - `linkat` baseline hard-link creation for regular files (ext2-backed hard links; tmpfs baseline fallback)
@@ -115,7 +115,8 @@ Current implemented handlers:
 - `readlinkat` baseline `/proc/self/exe` handling plus non-symlink `-EINVAL` behavior
 - `utimensat` baseline atime/mtime updates with `UTIME_NOW`/`UTIME_OMIT`
 - `copy_file_range` baseline buffered VFS-to-VFS copy path
-- `execve(path, argv, envp)` with in-kernel argument/environment copy, VFS-backed ELF load, and direct frame handoff to the new image entry
+- `execve(path, argv, envp)` with in-kernel argument/environment copy, VFS-backed ELF load, and direct frame handoff to the new image entry. The strings are copied into one heap buffer of up to 28 KiB total (any single string may use all of it), with at most 64 `argv` and 64 `envp` entries; more is `-E2BIG`.
+- `inotify_init`/`inotify_init1`/`inotify_add_watch`/`inotify_rm_watch` are registered but return `-ENOSYS` (no inotify yet), so callers like GLib fall back quietly instead of tripping the unknown-syscall log.
 - `fork()` with a copy-on-write address-space clone plus task metadata/fd table copy and shm inheritance (see `docs/process_model.md`)
 - `clone(flags, child_stack, ptid, ctid, tls)`: fork-compatible process creation (`SIGCHLD` exit signal, optional child stack, `CLONE_VM|CLONE_VFORK` compatibility) and `CLONE_THREAD` threads that share VM/files/fs/signal handlers (musl `pthread_create` flag set), with `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
 - `vfork()` as a copy-on-write fork (no parent suspension)

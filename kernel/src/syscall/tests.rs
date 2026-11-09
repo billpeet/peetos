@@ -2511,3 +2511,31 @@ fn getresuid_and_getresgid_are_registered() {
     assert_eq!(lookup_syscall(SYS_GETRESUID).map(|d| d.name), Some("getresuid"));
     assert_eq!(lookup_syscall(SYS_GETRESGID).map(|d| d.name), Some("getresgid"));
 }
+
+#[test]
+fn newfstatat_accepts_lstat_flags() {
+    assert!(newfstatat_flags_ok(0));
+    assert!(newfstatat_flags_ok(AT_EMPTY_PATH));
+    // ls -l and GLib call fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW).
+    assert!(newfstatat_flags_ok(AT_SYMLINK_NOFOLLOW));
+    assert!(newfstatat_flags_ok(AT_SYMLINK_NOFOLLOW | 0x800)); // AT_NO_AUTOMOUNT
+    assert!(!newfstatat_flags_ok(0x1));
+    assert!(!newfstatat_flags_ok(0x2000)); // AT_STATX_FORCE_SYNC is statx-only
+}
+
+#[test]
+fn inotify_syscalls_are_known_and_unsupported() {
+    // Known to the table (no "Unhandled syscall" log), answered with -ENOSYS
+    // so GLib falls back to "monitoring unsupported".
+    for (num, name) in [
+        (SYS_INOTIFY_INIT, "inotify_init"),
+        (SYS_INOTIFY_ADD_WATCH, "inotify_add_watch"),
+        (SYS_INOTIFY_RM_WATCH, "inotify_rm_watch"),
+        (SYS_INOTIFY_INIT1, "inotify_init1"),
+    ] {
+        let def = lookup_syscall(num).expect("inotify syscall registered");
+        assert_eq!(def.name, name);
+        let ctx = SyscallContext::new(core::ptr::null_mut());
+        assert_eq!((def.handler)(&ctx, &SyscallArgs { num, args: [0; 6] }), -ENOSYS);
+    }
+}

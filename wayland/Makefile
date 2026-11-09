@@ -22,7 +22,8 @@
 #                              then zlib, libpng, pcre2, GLib, fribidi,
 #                              cairo and pango (scripts/build_cairo_pango.sh),
 #                              then libepoxy, ATK, gdk-pixbuf and GTK 3
-#                              (scripts/build_gtk.sh),
+#                              (scripts/build_gtk.sh), then the Xfce
+#                              libraries and Thunar (scripts/build_thunar.sh),
 #                              then tllist, fcft and foot (scripts/build_foot.sh)
 #   lib/lib*.so.N, lib/lib*.so shared builds of libffi, libwayland-server,
 #                              libwayland-client and libxkbcommon (need
@@ -41,7 +42,7 @@ all: build
 fetch:
 	./fetch-wayland.sh
 
-wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src egl-registry-src libepoxy-src atk-src gdk-pixbuf-src gtk-src hicolor-icon-theme-src tllist-src fcft-src foot-src:
+wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src egl-registry-src libepoxy-src atk-src gdk-pixbuf-src gtk-src hicolor-icon-theme-src libxfce4util-src xfconf-src libxfce4ui-src exo-src thunar-src adwaita-icon-theme-legacy-src shared-mime-info-src tllist-src fcft-src foot-src:
 	$(MAKE) fetch
 
 ../musl/shared/lib/libc.so:
@@ -51,7 +52,7 @@ wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-
 ../toolchain/out/bin/x86_64-linux-musl-g++: ../musl/shared/lib/libc.so
 	$(MAKE) -C ../toolchain
 
-build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src egl-registry-src libepoxy-src atk-src gdk-pixbuf-src gtk-src hicolor-icon-theme-src tllist-src fcft-src foot-src ../musl/shared/lib/libc.so ../toolchain/out/bin/x86_64-linux-musl-g++
+build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src egl-registry-src libepoxy-src atk-src gdk-pixbuf-src gtk-src hicolor-icon-theme-src libxfce4util-src xfconf-src libxfce4ui-src exo-src thunar-src adwaita-icon-theme-legacy-src shared-mime-info-src tllist-src fcft-src foot-src ../musl/shared/lib/libc.so ../toolchain/out/bin/x86_64-linux-musl-g++
 	../scripts/build_wayland.sh \
 		--wayland-src "$(CURDIR)/wayland-src" \
 		--libffi-src "$(CURDIR)/libffi-src" \
@@ -69,13 +70,14 @@ build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src 
 	../scripts/build_render_stack.sh
 	../scripts/build_cairo_pango.sh
 	../scripts/build_gtk.sh
+	../scripts/build_thunar.sh
 	../scripts/build_foot.sh
 
 clean:
 	rm -rf "$(OUT_DIR)" build
 
 distclean: clean
-	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src egl-registry-src libepoxy-src atk-src gdk-pixbuf-src gtk-src hicolor-icon-theme-src tllist-src fcft-src foot-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2 harfbuzz-*.tar.xz utf8proc-*.tar.gz zlib-*.tar.gz libpng-*.tar.xz pcre2-*.tar.bz2 glib-*.tar.xz fribidi-*.tar.xz cairo-*.tar.xz pango-*.tar.xz egl-registry-*.tar.gz libepoxy-*.tar.gz atk-*.tar.xz gdk-pixbuf-*.tar.xz gtk+-*.tar.xz hicolor-icon-theme-*.tar.xz tllist-*.tar.gz fcft-*.tar.gz foot-*.tar.gz
+	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src egl-registry-src libepoxy-src atk-src gdk-pixbuf-src gtk-src hicolor-icon-theme-src libxfce4util-src xfconf-src libxfce4ui-src exo-src thunar-src adwaita-icon-theme-legacy-src shared-mime-info-src tllist-src fcft-src foot-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2 harfbuzz-*.tar.xz utf8proc-*.tar.gz zlib-*.tar.gz libpng-*.tar.xz pcre2-*.tar.bz2 glib-*.tar.xz fribidi-*.tar.xz cairo-*.tar.xz pango-*.tar.xz egl-registry-*.tar.gz libepoxy-*.tar.gz atk-*.tar.xz gdk-pixbuf-*.tar.xz gtk+-*.tar.xz hicolor-icon-theme-*.tar.xz libxfce4util-*.tar.bz2 xfconf-*.tar.bz2 libxfce4ui-*.tar.bz2 exo-*.tar.bz2 thunar-*.tar.bz2 adwaita-icon-theme-legacy-*.tar.xz shared-mime-info-*.tar.gz tllist-*.tar.gz fcft-*.tar.gz foot-*.tar.gz
 
 info:
 	@echo "OUT_DIR=$(OUT_DIR)"

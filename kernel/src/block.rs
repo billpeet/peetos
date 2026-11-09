@@ -443,6 +443,44 @@ fn flush_line(cache: &mut BlockCache, line_index: usize) -> Result<(), BlockIoEr
     Ok(())
 }
 
+/// Keep uncached I/O and differently-sized cached I/O coherent with the
+/// write-back cache: write back every dirty line of `device_index` that
+/// overlaps `[lba, lba + len)` (bytes `len`, `logical`-byte sectors). With `invalidate`, the overlapping lines are also dropped
+/// (used before a write that makes their contents stale).
+///
+/// Without this, a block written through `write_cached` and later read with
+/// the raw `read` (or with a different chunk size) came back from the device
+/// with its pre-write contents for as long as the dirty line stayed cached.
+fn sync_overlapping_lines(
+    cache: &mut BlockCache,
+    device_index: usize,
+    lba: u64,
+    len: usize,
+    logical: usize,
+    invalidate: bool,
+) -> Result<(), BlockIoError> {
+    if len == 0 || logical == 0 {
+        return Ok(());
+    }
+    let start = lba;
+    let end = lba.saturating_add(len.div_ceil(logical) as u64);
+    let mut i = 0usize;
+    while i < cache.lines.len() {
+        let line = &cache.lines[i];
+        if line.valid && line.device_index == device_index {
+            let line_end = line.lba.saturating_add(line.len.div_ceil(logical) as u64);
+            if line.lba < end && start < line_end {
+                flush_line(cache, i)?;
+                if invalidate {
+                    cache.lines[i].valid = false;
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 fn cache_store_chunk(
     cache: &mut BlockCache,
     device_index: usize,
@@ -468,6 +506,11 @@ fn cache_store_chunk(
     }
 
     cache.misses = cache.misses.saturating_add(1);
+    // A line of a different size may cover part of this range: write it back
+    // and drop it so the device and the cache never disagree about the order
+    // of writes, and later lookups cannot return its stale bytes.
+    let logical = lookup_entry(device_index)?.device.logical_block_size as usize;
+    sync_overlapping_lines(cache, device_index, lba, len, logical, true)?;
     let victim = cache.pick_victim();
     if cache.lines[victim].valid {
         cache.evictions = cache.evictions.saturating_add(1);
@@ -536,6 +579,11 @@ pub fn read(index: usize, lba: u64, out: &mut [u8]) -> Result<(), BlockIoError> 
     }
 
     let entry = lookup_entry(index)?;
+    // Dirty write-back lines are newer than the media: write them back first.
+    let logical = entry.device.logical_block_size as usize;
+    with_cache_mut(|cache| {
+        sync_overlapping_lines(cache, index, lba, out.len(), logical, false)
+    })?;
     dispatch_read(entry, lba, out)
 }
 
@@ -545,6 +593,12 @@ pub fn write(index: usize, lba: u64, data: &[u8]) -> Result<(), BlockIoError> {
     }
 
     let entry = lookup_entry(index)?;
+    // Write back (to keep the write order) and drop overlapping cached lines,
+    // which this write makes stale.
+    let logical = entry.device.logical_block_size as usize;
+    with_cache_mut(|cache| {
+        sync_overlapping_lines(cache, index, lba, data.len(), logical, true)
+    })?;
     dispatch_write(entry, lba, data)
 }
 
@@ -583,6 +637,9 @@ pub fn read_cached(index: usize, lba: u64, out: &mut [u8]) -> Result<(), BlockIo
 
         if !hit {
             let dst = &mut out[bytes_done..bytes_done + chunk_len];
+            with_cache_mut(|cache| {
+                sync_overlapping_lines(cache, index, chunk_lba, chunk_len, logical, false)
+            })?;
             dispatch_read(entry, chunk_lba, dst)?;
             with_cache_mut(|cache| {
                 let _ = cache_store_chunk(cache, index, chunk_lba, dst, false);
@@ -969,5 +1026,113 @@ mod tests {
         flush_device(index).expect("barrier without device flush");
         assert_eq!(CACHE_WRITE_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(flush_device(99), Err(BlockIoError::InvalidDevice));
+    }
+
+    // A RAM-backed device, so tests can check what actually reached "media".
+    const RAM_DEV_BYTES: usize = 64 * 1024;
+
+    fn ram_dev() -> &'static Mutex<Vec<u8>> {
+        static RAM: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+        RAM.get_or_init(|| Mutex::new(vec![0u8; RAM_DEV_BYTES]))
+    }
+
+    fn ram_read(
+        _ctx: BlockOpContext,
+        _dev: &BlockDevice,
+        lba: u64,
+        out: &mut [u8],
+    ) -> Result<(), BlockIoError> {
+        let ram = ram_dev().lock().unwrap();
+        let off = lba as usize * 512;
+        out.copy_from_slice(&ram[off..off + out.len()]);
+        Ok(())
+    }
+
+    fn ram_write(
+        _ctx: BlockOpContext,
+        _dev: &BlockDevice,
+        lba: u64,
+        data: &[u8],
+    ) -> Result<(), BlockIoError> {
+        let mut ram = ram_dev().lock().unwrap();
+        let off = lba as usize * 512;
+        ram[off..off + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn register_ram_dev() -> usize {
+        ram_dev().lock().unwrap().fill(0);
+        register_with_ops(
+            BlockDevice {
+                sectors: (RAM_DEV_BYTES / 512) as u64,
+                ..BlockDevice::EMPTY
+            },
+            BlockOps {
+                read: Some(ram_read),
+                write: Some(ram_write),
+                flush: None,
+            },
+            BlockOpContext::EMPTY,
+        )
+        .unwrap()
+    }
+
+    /// Regression: the ext2 backend writes through `write_cached` and reads
+    /// with the raw `read`. A dirty line must be visible to that read, or a
+    /// metadata block the fs crate evicted and reloaded came back with its
+    /// pre-write contents (runtime-created inodes reverted to mode 0).
+    #[test]
+    fn raw_read_sees_dirty_cached_write() {
+        let _guard = global_registry_lock().lock().unwrap();
+        reset();
+        let index = register_ram_dev();
+
+        write_cached(index, 4, &[0x11u8; 1024]).expect("cached write");
+        let mut out = [0u8; 1024];
+        read(index, 4, &mut out).expect("raw read");
+        assert!(out.iter().all(|b| *b == 0x11));
+
+        // A read that only partly overlaps the dirty line sees it too.
+        let mut wide = [0u8; 2048];
+        read(index, 3, &mut wide).expect("overlapping raw read");
+        assert!(wide[..512].iter().all(|b| *b == 0));
+        assert!(wide[512..1536].iter().all(|b| *b == 0x11));
+        assert!(wide[1536..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn raw_write_replaces_cached_line() {
+        let _guard = global_registry_lock().lock().unwrap();
+        reset();
+        let index = register_ram_dev();
+
+        write_cached(index, 8, &[0x22u8; 1024]).expect("cached write");
+        write(index, 8, &[0x33u8; 1024]).expect("raw write");
+        // The stale dirty line must not be written back over the raw write
+        // or served by a later cached read.
+        flush_cached_device(index).expect("flush");
+        let mut out = [0u8; 1024];
+        read_cached(index, 8, &mut out).expect("cached read");
+        assert!(out.iter().all(|b| *b == 0x33));
+        read(index, 8, &mut out).expect("raw read");
+        assert!(out.iter().all(|b| *b == 0x33));
+    }
+
+    #[test]
+    fn cached_io_of_different_sizes_stays_coherent() {
+        let _guard = global_registry_lock().lock().unwrap();
+        reset();
+        let index = register_ram_dev();
+
+        // An older 4 KiB dirty line, then a newer 1 KiB write inside it.
+        write_cached(index, 16, &[0x44u8; 4096]).expect("wide cached write");
+        write_cached(index, 18, &[0x55u8; 1024]).expect("narrow cached write");
+        flush_cached_device(index).expect("flush");
+
+        let mut out = [0u8; 4096];
+        read_cached(index, 16, &mut out).expect("cached read");
+        assert!(out[..1024].iter().all(|b| *b == 0x44));
+        assert!(out[1024..2048].iter().all(|b| *b == 0x55));
+        assert!(out[2048..].iter().all(|b| *b == 0x44));
     }
 }

@@ -2,51 +2,66 @@
 
 use super::*;
 
-#[derive(Clone, Copy)]
-pub(super) struct ExecCString {
-    pub(super) len: usize,
-    pub(super) bytes: [u8; EXEC_MAX_STR_LEN],
-}
-
-impl ExecCString {
-    const EMPTY: Self = Self {
-        len: 0,
-        bytes: [0; EXEC_MAX_STR_LEN],
-    };
-
-    pub(super) fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
 pub(super) fn arch_prctl_set_fs_addr_ok(addr: u64) -> bool {
     addr <= USER_CANON_MAX && addr < KERNEL_VIRT_BASE
 }
 
-pub(super) fn read_exec_cstr_vector(
-    task_ptr: *mut task::Task,
-    vector_ptr: u64,
-    out: &mut [ExecCString],
-) -> Result<usize, i64> {
-    if vector_ptr == 0 {
-        return Ok(0);
-    }
+/// `execve` argument and environment strings, packed into one heap buffer.
+/// The whole set must fit the eagerly mapped part of the new user stack along
+/// with the pointer arrays and auxv (`user::exec_current_image` checks), so
+/// the budget is shared: one string may use most of it, as on Linux where
+/// single arguments of many kilobytes are normal.
+pub(super) struct ExecStrings {
+    buf: *mut u8,
+    used: usize,
+    spans: [(u32, u32); EXEC_MAX_ARGV + EXEC_MAX_ENVP],
+    count: usize,
+}
 
-    for idx in 0..out.len() {
-        let slot_ptr = vector_ptr + (idx * size_of::<u64>()) as u64;
-        let entry_ptr = match read_u64_from_user(task_ptr, slot_ptr) {
-            Ok(ptr) => ptr,
-            Err(err) => return Err(-err),
-        };
-        if entry_ptr == 0 {
-            return Ok(idx);
+impl ExecStrings {
+    pub(super) fn new() -> Result<Self, i64> {
+        let buf = heap::kmalloc(EXEC_STRINGS_MAX);
+        if buf.is_null() {
+            return Err(-ENOMEM);
         }
-
-        let len = copy_cstr_from_user_task(task_ptr, entry_ptr, &mut out[idx].bytes)?;
-        out[idx].len = len + 1;
+        Ok(Self { buf, used: 0, spans: [(0, 0); EXEC_MAX_ARGV + EXEC_MAX_ENVP], count: 0 })
     }
 
-    Err(-E2BIG)
+    /// Copy the NULL-terminated user vector at `vector_ptr` (at most `max`
+    /// strings), each with its NUL. Returns how many strings were read.
+    pub(super) fn read_vector(&mut self, task_ptr: *mut task::Task, vector_ptr: u64, max: usize) -> Result<usize, i64> {
+        if vector_ptr == 0 {
+            return Ok(0);
+        }
+        for idx in 0..=max {
+            let slot_ptr = vector_ptr + (idx * size_of::<u64>()) as u64;
+            let entry_ptr = read_u64_from_user(task_ptr, slot_ptr).map_err(|err| -err)?;
+            if entry_ptr == 0 {
+                return Ok(idx);
+            }
+            if idx == max || self.count == self.spans.len() || self.used >= EXEC_STRINGS_MAX {
+                return Err(-E2BIG);
+            }
+            let room = unsafe { core::slice::from_raw_parts_mut(self.buf.add(self.used), EXEC_STRINGS_MAX - self.used) };
+            let len = copy_cstr_from_user_task(task_ptr, entry_ptr, room)?;
+            self.spans[self.count] = (self.used as u32, (len + 1) as u32);
+            self.count += 1;
+            self.used += len + 1;
+        }
+        Err(-E2BIG)
+    }
+
+    /// String `idx` (in read order) including its NUL.
+    pub(super) fn get(&self, idx: usize) -> &[u8] {
+        let (start, len) = self.spans[idx];
+        unsafe { core::slice::from_raw_parts(self.buf.add(start as usize), len as usize) }
+    }
+}
+
+impl Drop for ExecStrings {
+    fn drop(&mut self) {
+        heap::kfree(self.buf);
+    }
 }
 
 pub(super) struct ExecImage {
@@ -126,72 +141,33 @@ pub(super) fn execve_common(
         return Err(-EINVAL);
     }
 
-    let argv_buf_size = size_of::<ExecCString>() * EXEC_MAX_ARGV;
-    let argv_buf_ptr = heap::kmalloc(argv_buf_size) as *mut ExecCString;
-    if argv_buf_ptr.is_null() {
-        return Err(-ENOMEM);
-    }
-    unsafe {
-        ptr::write_bytes(argv_buf_ptr as *mut u8, 0, argv_buf_size);
-    }
-    let argv_buf = unsafe { core::slice::from_raw_parts_mut(argv_buf_ptr, EXEC_MAX_ARGV) };
-    let argc = match read_exec_cstr_vector(ctx.current, argv_ptr, argv_buf) {
-        Ok(argc) => argc,
-        Err(err) => {
-            heap::kfree(argv_buf_ptr as *mut u8);
-            return Err(err);
-        }
-    };
-
-    let env_buf_size = size_of::<ExecCString>() * EXEC_MAX_ENVP;
-    let env_buf_ptr = heap::kmalloc(env_buf_size) as *mut ExecCString;
-    if env_buf_ptr.is_null() {
-        heap::kfree(argv_buf_ptr as *mut u8);
-        return Err(-ENOMEM);
-    }
-    unsafe {
-        ptr::write_bytes(env_buf_ptr as *mut u8, 0, env_buf_size);
-    }
-    let env_buf = unsafe { core::slice::from_raw_parts_mut(env_buf_ptr, EXEC_MAX_ENVP) };
-    let envc = match read_exec_cstr_vector(ctx.current, envp_ptr, env_buf) {
-        Ok(envc) => envc,
-        Err(err) => {
-            heap::kfree(env_buf_ptr as *mut u8);
-            heap::kfree(argv_buf_ptr as *mut u8);
-            return Err(err);
-        }
-    };
-
+    let mut strings = ExecStrings::new()?;
+    let argc = strings.read_vector(ctx.current, argv_ptr, EXEC_MAX_ARGV)?;
+    let envc = strings.read_vector(ctx.current, envp_ptr, EXEC_MAX_ENVP)?;
     let mut argv = [&[][..]; EXEC_MAX_ARGV];
     for idx in 0..argc {
-        argv[idx] = argv_buf[idx].as_bytes();
+        argv[idx] = strings.get(idx);
     }
     let mut env = [&[][..]; EXEC_MAX_ENVP];
     for idx in 0..envc {
-        env[idx] = env_buf[idx].as_bytes();
+        env[idx] = strings.get(argc + idx);
     }
 
     let dir_inode = match resolve_dir_for_path(ctx, fs::AT_FDCWD, path) {
         Ok(d) => d,
         Err(err) => {
-            heap::kfree(env_buf_ptr as *mut u8);
-            heap::kfree(argv_buf_ptr as *mut u8);
             return Err(err);
         }
     };
     let inode = match fs::lookupat(dir_inode, path) {
         Ok(i) => i,
         Err(err) => {
-            heap::kfree(env_buf_ptr as *mut u8);
-            heap::kfree(argv_buf_ptr as *mut u8);
             return Err(-fs_to_errno(err));
         }
     };
     let image = match read_exec_image_from_inode(inode) {
         Ok(image) => image,
         Err(err) => {
-            heap::kfree(env_buf_ptr as *mut u8);
-            heap::kfree(argv_buf_ptr as *mut u8);
             return Err(err);
         }
     };
@@ -201,14 +177,11 @@ pub(super) fn execve_common(
     // Point of no return: the new image was read, so the other threads go
     // now (failures before this leave the process untouched).
     if let Err(err) = exec_prepare_thread_group(ctx) {
-        heap::kfree(env_buf_ptr as *mut u8);
-        heap::kfree(argv_buf_ptr as *mut u8);
         heap::kfree(image.ptr);
         return Err(err);
     }
     let result = user::exec_current_image(image.as_slice(), &argv[..argc], &env[..envc], execfn);
-    heap::kfree(env_buf_ptr as *mut u8);
-    heap::kfree(argv_buf_ptr as *mut u8);
+    drop(strings);
     heap::kfree(image.ptr);
     if result.is_ok() {
         mmap_clear_task_regions(ctx.current);

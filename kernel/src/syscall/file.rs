@@ -999,13 +999,21 @@ pub(super) fn synthetic_fd_stat_identity(kind: u8) -> Option<(u64, u32, u64)> {
 
 pub(super) fn sys_newfstatat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let flags = call.arg(3) as u32;
-    if flags & !AT_EMPTY_PATH != 0 {
+    if !newfstatat_flags_ok(flags) {
         return -EINVAL;
     }
     match fstatat_raw(ctx, call.arg(0) as i32, call.arg(1), flags) {
         Ok(raw) => write_linux_stat(ctx.current, call.arg(2), &raw),
         Err(err) => err,
     }
+}
+
+/// `fstatat` flags Linux accepts: `AT_EMPTY_PATH`, `AT_SYMLINK_NOFOLLOW`
+/// (lstat semantics, which `stat` already has here: symlinks are not followed
+/// for the final component) and `AT_NO_AUTOMOUNT`. Rejecting
+/// `AT_SYMLINK_NOFOLLOW` broke `ls -l` and GLib's file queries.
+pub(super) fn newfstatat_flags_ok(flags: u32) -> bool {
+    flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) == 0
 }
 
 /// The lookup behind `newfstatat` and `statx`: `path` relative to `dirfd`,

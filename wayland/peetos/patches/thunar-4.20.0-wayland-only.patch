@@ -1,0 +1,16 @@
+Build Thunar against a Wayland-only GTK 3: <gdk/gdkx.h> is only installed
+when GTK has its X11 backend, and the session client only uses it under
+HAVE_LIBSM (X11 session management), which a Wayland-only build lacks.
+
+--- a/thunar/thunar-session-client.c
++++ b/thunar/thunar-session-client.c
+@@ -42,7 +42,9 @@
+ #include "thunar/thunar-private.h"
+ #include "thunar/thunar-session-client.h"
+
++#ifdef GDK_WINDOWING_X11
+ #include <gdk/gdkx.h>
++#endif
+ #include <glib/gstdio.h>
+
+

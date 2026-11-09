@@ -786,6 +786,42 @@ static void test_exec_from_thread(void) {
 }
 
 /* Mode used by test_exec_from_thread for the exec'd image. */
+/* execve with long strings: a 6000-byte argument and a 4000-byte environment
+ * variable must arrive intact (the kernel used to cap each at 256 bytes and
+ * fail with E2BIG). */
+#define LONG_ARG_LEN 6000
+#define LONG_ENV_LEN 4000
+
+static int long_arg_child_main(const char *arg) {
+    const char *env = getenv("PEETOS_LONG_ENV");
+    int ok = strlen(arg) == LONG_ARG_LEN && arg[0] == 'a' && arg[LONG_ARG_LEN - 1] == 'z' && env != NULL &&
+             strlen(env) == LONG_ENV_LEN && env[LONG_ENV_LEN - 1] == 'e';
+    return ok ? 0 : 1;
+}
+
+static void test_exec_long_strings(void) {
+    static char arg[LONG_ARG_LEN + 1];
+    static char env[sizeof("PEETOS_LONG_ENV=") + LONG_ENV_LEN];
+    memset(arg, 'm', LONG_ARG_LEN);
+    arg[0] = 'a';
+    arg[LONG_ARG_LEN - 1] = 'z';
+    arg[LONG_ARG_LEN] = 0;
+    strcpy(env, "PEETOS_LONG_ENV=");
+    size_t off = strlen(env);
+    memset(env + off, 'e', LONG_ENV_LEN);
+    env[off + LONG_ENV_LEN] = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = {(char *)self_path, (char *)"--long-arg-child", arg, NULL};
+        char *envp[] = {env, NULL};
+        execve(self_path, argv, envp);
+        _exit(errno == E2BIG ? 3 : 2);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "execve passes a 6000-byte argument and 4000-byte env string");
+}
+
 static int exec_child_main(const char *expected_pid) {
     int ok = getpid() == atoi(expected_pid) && gettid_raw() == getpid();
     printf("[proc-smoke] exec-child %s (pid=%d tid=%d)\n", ok ? "ok" : "BAD", (int)getpid(),
@@ -964,6 +1000,9 @@ int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "--exec-child") == 0) {
         return exec_child_main(argv[2]);
     }
+    if (argc >= 3 && strcmp(argv[1], "--long-arg-child") == 0) {
+        return long_arg_child_main(argv[2]);
+    }
     printf("[proc-smoke] start pid=%d\n", (int)getpid());
 
     test_cow_fork_isolation();
@@ -987,6 +1026,7 @@ int main(int argc, char **argv) {
 
     test_cancellation();
     test_exec_from_thread();
+    test_exec_long_strings();
     test_socket_waits();
     test_uaccess_race();
 

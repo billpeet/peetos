@@ -133,6 +133,36 @@ HICOLOR_VERSION="0.18"
 HICOLOR_URL="https://icon-theme.freedesktop.org/releases/hicolor-icon-theme-${HICOLOR_VERSION}.tar.xz"
 HICOLOR_SHA256="db0e50a80aa3bf64bb45cbca5cf9f75efd9348cf2ac690b907435238c3cf81d7"
 
+XFCE_URL="https://archive.xfce.org/src/xfce"
+
+LIBXFCE4UTIL_VERSION="4.20.0"
+LIBXFCE4UTIL_URL="${XFCE_URL}/libxfce4util/4.20/libxfce4util-${LIBXFCE4UTIL_VERSION}.tar.bz2"
+LIBXFCE4UTIL_SHA256="21493f9c9995a282823db93839f6b9f06ae31edb094191ba9acf04d932a2b592"
+
+XFCONF_VERSION="4.20.0"
+XFCONF_URL="${XFCE_URL}/xfconf/4.20/xfconf-${XFCONF_VERSION}.tar.bz2"
+XFCONF_SHA256="8bc43c60f1716b13cf35fc899e2a36ea9c6cdc3478a8f051220eef0f53567efd"
+
+LIBXFCE4UI_VERSION="4.20.0"
+LIBXFCE4UI_URL="${XFCE_URL}/libxfce4ui/4.20/libxfce4ui-${LIBXFCE4UI_VERSION}.tar.bz2"
+LIBXFCE4UI_SHA256="75e8996984f20375aadecd5c16f5147c211ed0bd26d7861ab0257561eb76eaee"
+
+EXO_VERSION="4.20.0"
+EXO_URL="${XFCE_URL}/exo/4.20/exo-${EXO_VERSION}.tar.bz2"
+EXO_SHA256="4277f799245f1efde01cd917fd538ba6b12cf91c9f8a73fe2035fd5456ec078d"
+
+THUNAR_VERSION="4.20.0"
+THUNAR_URL="${XFCE_URL}/thunar/4.20/thunar-${THUNAR_VERSION}.tar.bz2"
+THUNAR_SHA256="27731a76f3aecf3752b1ca35afad89e264c52244f70083d933507dd4a17548b0"
+
+ADWAITA_LEGACY_VERSION="46.2"
+ADWAITA_LEGACY_URL="https://download.gnome.org/sources/adwaita-icon-theme-legacy/46/adwaita-icon-theme-legacy-${ADWAITA_LEGACY_VERSION}.tar.xz"
+ADWAITA_LEGACY_SHA256="548480f58589a54b72d18833b755b15ffbd567e3187249d74e2e1f8f99f22fb4"
+
+SHARED_MIME_INFO_VERSION="2.4"
+SHARED_MIME_INFO_URL="https://gitlab.freedesktop.org/xdg/shared-mime-info/-/archive/${SHARED_MIME_INFO_VERSION}/shared-mime-info-${SHARED_MIME_INFO_VERSION}.tar.gz"
+SHARED_MIME_INFO_SHA256="531291d0387eb94e16e775d7e73788d06d2b2fdd8cd2ac6b6b15287593b6a2de"
+
 FOOT_VERSION="1.18.1"
 FOOT_URL="https://codeberg.org/dnkl/foot/archive/${FOOT_VERSION}.tar.gz"
 FOOT_SHA256="f1438298117b1346405f175e8a052ba9828a610e061971cc8dde9153939344c5"
@@ -248,5 +278,19 @@ fetch_one "GTK ${GTK3_VERSION}" "${GTK3_URL}" "${GTK3_SHA256}" \
   "${OUTPUT_DIR}/gtk-src" "gtk+-${GTK3_VERSION}.tar.xz"
 fetch_one "hicolor-icon-theme ${HICOLOR_VERSION}" "${HICOLOR_URL}" "${HICOLOR_SHA256}" \
   "${OUTPUT_DIR}/hicolor-icon-theme-src" "hicolor-icon-theme-${HICOLOR_VERSION}.tar.xz"
+fetch_one "libxfce4util ${LIBXFCE4UTIL_VERSION}" "${LIBXFCE4UTIL_URL}" "${LIBXFCE4UTIL_SHA256}" \
+  "${OUTPUT_DIR}/libxfce4util-src" "libxfce4util-${LIBXFCE4UTIL_VERSION}.tar.bz2"
+fetch_one "xfconf ${XFCONF_VERSION}" "${XFCONF_URL}" "${XFCONF_SHA256}" \
+  "${OUTPUT_DIR}/xfconf-src" "xfconf-${XFCONF_VERSION}.tar.bz2"
+fetch_one "libxfce4ui ${LIBXFCE4UI_VERSION}" "${LIBXFCE4UI_URL}" "${LIBXFCE4UI_SHA256}" \
+  "${OUTPUT_DIR}/libxfce4ui-src" "libxfce4ui-${LIBXFCE4UI_VERSION}.tar.bz2"
+fetch_one "exo ${EXO_VERSION}" "${EXO_URL}" "${EXO_SHA256}" \
+  "${OUTPUT_DIR}/exo-src" "exo-${EXO_VERSION}.tar.bz2"
+fetch_one "Thunar ${THUNAR_VERSION}" "${THUNAR_URL}" "${THUNAR_SHA256}" \
+  "${OUTPUT_DIR}/thunar-src" "thunar-${THUNAR_VERSION}.tar.bz2"
+fetch_one "adwaita-icon-theme-legacy ${ADWAITA_LEGACY_VERSION}" "${ADWAITA_LEGACY_URL}" "${ADWAITA_LEGACY_SHA256}" \
+  "${OUTPUT_DIR}/adwaita-icon-theme-legacy-src" "adwaita-icon-theme-legacy-${ADWAITA_LEGACY_VERSION}.tar.xz"
+fetch_one "shared-mime-info ${SHARED_MIME_INFO_VERSION}" "${SHARED_MIME_INFO_URL}" "${SHARED_MIME_INFO_SHA256}" \
+  "${OUTPUT_DIR}/shared-mime-info-src" "shared-mime-info-${SHARED_MIME_INFO_VERSION}.tar.gz"
 fetch_one "foot ${FOOT_VERSION}" "${FOOT_URL}" "${FOOT_SHA256}" \
   "${OUTPUT_DIR}/foot-src" "foot-${FOOT_VERSION}.tar.gz"
