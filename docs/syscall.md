@@ -89,7 +89,7 @@ Current implemented handlers:
 - `open/openat/close/read/write/writev/lseek` via baseline VFS descriptors (tmpfs + virtual `devfs`/`procfs`)
 - `dup/dup2/dup3/fcntl` baseline descriptor operations (`F_GETFD`, `F_SETFD`, `F_GETFL`, `F_SETFL`, `F_DUPFD`, `F_DUPFD_CLOEXEC`) with `FD_CLOEXEC` and runtime `O_NONBLOCK` updates on sockets/pipes/PTYs
 - `memfd_create(name, flags)` anonymous shared-buffer fds backed by page-based shmem objects up to 256 MiB (`MFD_CLOEXEC`, `MFD_ALLOW_SEALING` with `F_ADD_SEALS`/`F_GET_SEALS`) with per-task shared-buffer object caps
-- `mmap/mprotect/munmap` for baseline userspace mapping management (anonymous/private plus file-backed private/shared mappings from VFS fds, fixed/fixed-noreplace handling, per-task VMA metadata, lazy page-fault mapping, transactional VMA split/update handling, page-level protection updates, and per-task mapped-page caps)
+- `mmap/mprotect/munmap` for baseline userspace mapping management (anonymous/private plus file-backed private/shared mappings from VFS fds, fixed/fixed-noreplace handling, the Linux hint flags `MAP_NORESERVE`/`MAP_POPULATE`/`MAP_NONBLOCK`/`MAP_STACK`/`MAP_LOCKED` accepted without effect, per-task VMA metadata, lazy page-fault mapping, transactional VMA split/update handling, page-level protection updates, and per-task mapped-page caps)
 - `msync` baseline shared-file mapping writeback path (range walk + page-cache dirty writeback + backing ext2 sync/flush)
 - `kill`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` for baseline signal control and user-handler return
 - `pipe/pipe2` via in-kernel anonymous pipe state and per-task fd tables (`pipe2` supports `O_CLOEXEC` and `O_NONBLOCK`)
@@ -108,6 +108,7 @@ Current implemented handlers:
 - `access/faccessat/faccessat2` baseline path existence + permission checks
 - `umask(mask)` baseline process umask tracking (used by userspace runtime bring-up)
 - `stat`/`lstat`/`fstat`/`newfstatat` baseline file metadata paths (legacy + modern entry points)
+- `statx(dirfd, path, flags, mask, buf)`: the `newfstatat` lookup reported in the 256-byte `struct statx` layout. The returned `stx_mask` is always `STATX_BASIC_STATS` (no birth time, attributes or mount id); unknown flags, both `AT_STATX_*_SYNC` bits, or the reserved mask bit are `-EINVAL`. GLib/GIO use it for file metadata.
 - `linkat` baseline hard-link creation for regular files (ext2-backed hard links; tmpfs baseline fallback)
 - `symlinkat` baseline symlink inode creation with target payload storage
 - `readlinkat` baseline `/proc/self/exe` handling plus non-symlink `-EINVAL` behavior

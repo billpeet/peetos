@@ -914,12 +914,27 @@ pub(super) fn sys_lstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 }
 
 pub(super) fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
-    let idx = match fd_index(call.arg(0) as i32) {
-        Ok(idx) => idx,
-        Err(err) => return err,
+    match fstat_raw(ctx, call.arg(0) as i32) {
+        Ok(raw) => write_linux_stat(ctx.current, call.arg(1), &raw),
+        Err(err) => err,
+    }
+}
+
+fn write_linux_stat(task_ptr: *mut task::Task, dst: u64, raw: &LinuxStat) -> i64 {
+    let bytes = unsafe {
+        core::slice::from_raw_parts((raw as *const LinuxStat) as *const u8, core::mem::size_of::<LinuxStat>())
     };
+    match copy_to_user_task(task_ptr, dst, bytes) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
+}
+
+/// `fstat(fd)` as a kernel `struct stat`, for any descriptor kind.
+fn fstat_raw(ctx: &SyscallContext, fd: i32) -> Result<LinuxStat, i64> {
+    let idx = fd_index(fd)?;
     if !fd_slot_is_open(ctx.current, idx) {
-        return -EBADF;
+        return Err(-EBADF);
     }
 
     let (kind, inode) = unsafe {
@@ -929,7 +944,7 @@ pub(super) fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         )
     };
     if let Some((st_dev, st_mode, st_rdev)) = synthetic_fd_stat_identity(kind) {
-        let synthetic = LinuxStat {
+        return Ok(LinuxStat {
             st_dev,
             st_ino: inode as u64 + 1,
             st_nlink: 1,
@@ -948,26 +963,13 @@ pub(super) fn sys_fstat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             st_ctime: 0,
             st_ctime_nsec: 0,
             __unused: [0; 3],
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                (&synthetic as *const LinuxStat) as *const u8,
-                core::mem::size_of::<LinuxStat>(),
-            )
-        };
-        return match copy_to_user_task(ctx.current, call.arg(1), bytes) {
-            Ok(()) => 0,
-            Err(err) => -err,
-        };
+        });
     }
     if kind != task::USER_FD_KIND_VFS {
-        return -EBADF;
+        return Err(-EBADF);
     }
-    let stat = match vfs_stat(inode) {
-        Ok(stat) => stat,
-        Err(err) => return -fs_to_errno(err),
-    };
-    write_stat_to_user(ctx.current, call.arg(1), stat)
+    let stat = vfs_stat(inode).map_err(|err| -fs_to_errno(err))?;
+    Ok(LinuxStat::from_fs(stat))
 }
 
 /// `fstat` identity for descriptors that are not VFS files:
@@ -1000,42 +1002,113 @@ pub(super) fn sys_newfstatat(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     if flags & !AT_EMPTY_PATH != 0 {
         return -EINVAL;
     }
+    match fstatat_raw(ctx, call.arg(0) as i32, call.arg(1), flags) {
+        Ok(raw) => write_linux_stat(ctx.current, call.arg(2), &raw),
+        Err(err) => err,
+    }
+}
+
+/// The lookup behind `newfstatat` and `statx`: `path` relative to `dirfd`,
+/// or the descriptor itself for an empty path with `AT_EMPTY_PATH`.
+/// `AT_SYMLINK_NOFOLLOW` makes no difference yet (see `stat_path`).
+fn fstatat_raw(ctx: &SyscallContext, dirfd: i32, path_ptr: u64, flags: u32) -> Result<LinuxStat, i64> {
     let mut path_buf = [0u8; fs::VFS_MAX_PATH];
-    let path = match read_user_path(call.arg(1), &mut path_buf) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
-    let dirfd = call.arg(0) as i32;
+    let path = read_user_path(path_ptr, &mut path_buf)?;
     if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 && dirfd != fs::AT_FDCWD {
         // fstatat(fd, "", AT_EMPTY_PATH) is fstat(fd) for any descriptor
         // kind, not just directories.
-        let wrapped = SyscallArgs {
-            num: SYS_FSTAT,
-            args: [dirfd as i64 as u64, call.arg(2), 0, 0, 0, 0],
-        };
-        return sys_fstat(ctx, &wrapped);
+        return fstat_raw(ctx, dirfd);
     }
-    let dir_inode = match resolve_dir_for_path(ctx, call.arg(0) as i32, path) {
-        Ok(inode) => inode,
-        Err(err) => return err,
-    };
+    let dir_inode = resolve_dir_for_path(ctx, dirfd, path)?;
 
     let inode = if path.is_empty() {
         if (flags & AT_EMPTY_PATH) == 0 {
-            return -ENOENT;
+            return Err(-ENOENT);
         }
         dir_inode
     } else {
-        match fs::lookupat(dir_inode, path) {
-            Ok(inode) => inode,
-            Err(err) => return -fs_to_errno(err),
-        }
+        fs::lookupat(dir_inode, path).map_err(|err| -fs_to_errno(err))?
     };
-    let stat = match vfs_stat(inode) {
-        Ok(stat) => stat,
-        Err(err) => return -fs_to_errno(err),
+    let stat = vfs_stat(inode).map_err(|err| -fs_to_errno(err))?;
+    Ok(LinuxStat::from_fs(stat))
+}
+
+pub(super) const STATX_SIZE: usize = 0x100;
+/// `STATX_BASIC_STATS`: everything in `struct stat` (no birth time).
+pub(super) const STATX_BASIC_STATS: u32 = 0x7ff;
+const STATX_RESERVED: u32 = 0x8000_0000;
+const AT_NO_AUTOMOUNT: u32 = 0x800;
+const AT_STATX_SYNC_TYPE: u32 = 0x6000;
+
+/// Validate `statx` flags and mask like Linux: unknown flags, both sync
+/// types at once, or the reserved mask bit are `EINVAL`.
+pub(super) fn statx_check_args(flags: u32, mask: u32) -> Result<(), i64> {
+    let known = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
+    if flags & !known != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE || mask & STATX_RESERVED != 0 {
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
+/// Linux `new_decode_dev` halves of a 64-bit `dev_t`: (major, minor).
+pub(super) fn dev_major_minor(dev: u64) -> (u32, u32) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major as u32, minor as u32)
+}
+
+/// Encode a kernel `struct stat` as a `struct statx` (256 bytes). The
+/// returned mask is `STATX_BASIC_STATS` whatever was requested, as Linux
+/// allows (callers must check `stx_mask`).
+pub(super) fn statx_from_stat(st: &LinuxStat) -> [u8; STATX_SIZE] {
+    let mut out = [0u8; STATX_SIZE];
+    let put32 = |out: &mut [u8; STATX_SIZE], off: usize, v: u32| out[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+    let put64 = |out: &mut [u8; STATX_SIZE], off: usize, v: u64| out[off..off + 8].copy_from_slice(&v.to_ne_bytes());
+    put32(&mut out, 0x00, STATX_BASIC_STATS);
+    put32(&mut out, 0x04, st.st_blksize as u32);
+    put32(&mut out, 0x10, st.st_nlink as u32);
+    put32(&mut out, 0x14, st.st_uid);
+    put32(&mut out, 0x18, st.st_gid);
+    out[0x1c..0x1e].copy_from_slice(&(st.st_mode as u16).to_ne_bytes());
+    put64(&mut out, 0x20, st.st_ino);
+    put64(&mut out, 0x28, st.st_size as u64);
+    put64(&mut out, 0x30, st.st_blocks as u64);
+    // statx_timestamp { i64 tv_sec; u32 tv_nsec; i32 reserved }: atime at
+    // 0x40, btime 0x50 (not reported), ctime 0x60, mtime 0x70.
+    for (off, sec, nsec) in [
+        (0x40, st.st_atime, st.st_atime_nsec),
+        (0x60, st.st_ctime, st.st_ctime_nsec),
+        (0x70, st.st_mtime, st.st_mtime_nsec),
+    ] {
+        put64(&mut out, off, sec as u64);
+        put32(&mut out, off + 8, nsec as u32);
+    }
+    let (rdev_major, rdev_minor) = dev_major_minor(st.st_rdev);
+    let (dev_major, dev_minor) = dev_major_minor(st.st_dev);
+    put32(&mut out, 0x80, rdev_major);
+    put32(&mut out, 0x84, rdev_minor);
+    put32(&mut out, 0x88, dev_major);
+    put32(&mut out, 0x8c, dev_minor);
+    out
+}
+
+/// `statx(dirfd, path, flags, mask, buf)`: the `newfstatat` lookup, reported
+/// in the extended layout. GLib/GIO use it for file metadata.
+pub(super) fn sys_statx(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let flags = call.arg(2) as u32;
+    let mask = call.arg(3) as u32;
+    if let Err(err) = statx_check_args(flags, mask) {
+        return err;
+    }
+    let raw = match fstatat_raw(ctx, call.arg(0) as i32, call.arg(1), flags) {
+        Ok(raw) => raw,
+        Err(err) => return err,
     };
-    write_stat_to_user(ctx.current, call.arg(2), stat)
+    let bytes = statx_from_stat(&raw);
+    match copy_to_user_task(ctx.current, call.arg(4), &bytes) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
 }
 
 pub(super) fn dirent_record_len(name_len: usize) -> usize {

@@ -149,6 +149,16 @@ if [[ -f "${CXX_RUNTIME_DIR}/libstdc++.so.6" ]]; then
     cp -L "${CXX_RUNTIME_DIR}/${lib}" "${STAGE_ROOT}/usr/lib/${lib}"
   done
 fi
+# pango's command-line tools (the libraries come with the staged sysroot).
+for tool in pango-view pango-list; do
+  if [[ -x "${RENDER_STAGE}/usr/bin/${tool}" ]]; then
+    cp "${RENDER_STAGE}/usr/bin/${tool}" "${STAGE_ROOT}/bin/${tool}"
+  fi
+done
+if [[ -x "${ROOT_DIR}/user/pango_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/pango_smoke.elf" "${STAGE_ROOT}/bin/pango_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/pango_smoke"
+fi
 if [[ -x "${ROOT_DIR}/user/cxx_smoke.elf" ]]; then
   mkdir -p "${STAGE_ROOT}/usr/lib"
   cp "${ROOT_DIR}/user/cxx_smoke.elf" "${STAGE_ROOT}/bin/cxx_smoke"
@@ -724,6 +734,33 @@ fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/cxx_smoke.sh"
 
+cat > "${STAGE_ROOT}/bin/pango_smoke.sh" <<'EOS'
+export HOME=/tmp
+fail=0
+
+if [ ! -x bin/pango_smoke ] || [ ! -f /usr/lib/libpangocairo-1.0.so.0 ]; then
+  echo [musl-ext2-pango-smoke] missing bin/pango_smoke or /usr/lib/libpangocairo-1.0.so.0
+  fail=1
+else
+  echo [musl-ext2-pango-smoke] pango-list:
+  bin/pango-list | head -n 12 || fail=1
+  bin/pango-view --backend=cairo -q --font="Sans 24" --text="pango-view on PeetOS" -o /tmp/pango_view.png || fail=1
+  if [ -s /tmp/pango_view.png ]; then
+    echo [musl-ext2-pango-smoke] pango-view wrote a PNG
+  else
+    echo [musl-ext2-pango-smoke] pango-view did not write /tmp/pango_view.png
+    fail=1
+  fi
+  bin/pango_smoke || fail=1
+fi
+
+echo [musl-ext2-pango-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-pango-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/pango_smoke.sh"
+
 cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
 fail=0
 
@@ -1035,8 +1072,10 @@ TMP_IMG="${TMP_DIR}/ext2.img"
 # Keep image compact but size it from staged payload so larger binaries
 # (for example QuickJS qjs) do not overflow ext2 population.
 payload_kib="$(du -sk "${STAGE_ROOT}" | awk '{print $1}')"
-# Keep a modest metadata/slack margin above staged payload size.
-img_kib=$((payload_kib + 1024))
+# Margin above the staged payload: ext2 metadata (block maps, inode tables)
+# grows with the payload at 1 KiB blocks, so the slack is proportional, plus
+# 2 MiB for files the smokes write at run time (PNG/PDF output, logs).
+img_kib=$((payload_kib + payload_kib / 16 + 2048))
 if [[ -d "${STAGE_ROOT}/wltests" ]]; then
   # Upstream libwayland tests create sockets, locks and temp dirs in /tmp.
   img_kib=$((img_kib + 1024))

@@ -44,6 +44,7 @@ USER_MUSL_EXT2_TEXT_SMOKE_ELF := user/musl_execve_ext2_text_smoke.elf
 USER_MUSL_EXT2_FOOT_SMOKE_ELF := user/musl_execve_ext2_foot_smoke.elf
 USER_MUSL_EXT2_FOOT_DEMO_ELF := user/musl_execve_ext2_foot_demo.elf
 USER_MUSL_EXT2_CXX_SMOKE_ELF := user/musl_execve_ext2_cxx_smoke.elf
+USER_MUSL_EXT2_PANGO_SMOKE_ELF := user/musl_execve_ext2_pango_smoke.elf
 USER_MUSL_EXT2_WAYLAND_TESTS_ELF := user/musl_execve_ext2_wayland_tests.elf
 USER_MUSL_EXT3_JOURNAL_SMOKE_ELF := user/musl_execve_ext3_journal_smoke.elf
 USER_JOURNAL_SMOKE_HELPER_BIN := user/journal_smoke_helper.elf
@@ -62,12 +63,15 @@ USER_DYNLINK_SMOKE_BIN := user/dynlink_smoke.elf
 USER_DRM_SMOKE_BIN := user/drm_smoke.elf
 USER_TEXT_SMOKE_BIN := user/text_smoke.elf
 USER_CXX_SMOKE_BIN := user/cxx_smoke.elf
+USER_PANGO_SMOKE_BIN := user/pango_smoke.elf
 # PeetOS cross g++ and C++ runtime (toolchain/build-toolchain.sh).
 CXX_TOOLCHAIN_STAMP := toolchain/out/bin/x86_64-linux-musl-g++
 # Staged sysroot of the software rendering stack (scripts/build_render_stack.sh).
 RENDER_STAGE = $(WAYLAND_OUT)/stage
 RENDER_STAMP = $(RENDER_STAGE)/usr/lib/libpixman-1.so.0
 FOOT_STAMP = $(RENDER_STAGE)/usr/bin/foot
+# zlib, libpng, GLib, cairo, pango (scripts/build_cairo_pango.sh).
+PANGO_STAMP = $(RENDER_STAGE)/usr/lib/libpangocairo-1.0.so.0
 MUSL_SHARED_LIBC := musl/shared/lib/libc.so
 WAYLAND_OUT := wayland/out
 # Shared builds (soname files), linked by the dynamic peetwl/wl_demo and
@@ -211,6 +215,10 @@ ifneq ($(findstring musl-ext2-text-smoke,$(KERNEL_FEATURES)),)
 USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_TEXT_SMOKE_BIN)
 endif
 
+ifneq ($(findstring musl-ext2-pango-smoke,$(KERNEL_FEATURES)),)
+USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_PANGO_SMOKE_BIN)
+endif
+
 ifneq ($(findstring musl-ext2-cxx-smoke,$(KERNEL_FEATURES)),)
 USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_CXX_SMOKE_BIN)
 endif
@@ -231,7 +239,7 @@ ifneq ($(findstring musl-ext3-journal-smoke,$(KERNEL_FEATURES)),)
 USER_EXT2_MUSL_OPTIONAL_DEPS += $(USER_JOURNAL_SMOKE_HELPER_BIN)
 endif
 
-.PHONY: all image bootloader kernel user user-elf user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke user-musl-ext2-unix-rights-smoke user-musl-ext2-epoll-smoke user-musl-ext2-gui-smoke user-musl-ext2-gui-demo user-musl-ext2-shared-buffer-smoke user-musl-ext2-console-first-smoke user-musl-ext2-peet-gui-smoke user-musl-ext2-peet-shell-demo user-musl-ext2-quickjs-smoke user-musl-ext2-micropython-smoke user-musl-ext2-dropbear-smoke user-musl-ext2-fpu-smoke user-musl-ext2-proc-smoke user-musl-ext2-wayland-smoke user-musl-ext2-wayland-tests user-musl-ext2-wlcomp-smoke user-musl-ext2-wayland-demo user-musl-ext2-dynlink-smoke user-musl-ext2-drm-smoke user-musl-ext2-text-smoke user-musl-ext2-foot-smoke user-musl-ext2-foot-demo user-musl-ext2-cxx-smoke clean run run-current run-image run-tablet run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke run-unix-rights-smoke run-epoll-smoke run-gui-smoke run-gui-demo run-shared-buffer-smoke run-console-first-smoke run-gui-fallback-smoke run-peet-gui-smoke run-peet-shell-demo run-peet-shell-demo-smoke run-quickjs-smoke run-micropython-smoke run-dropbear-smoke run-fpu-smoke run-proc-smoke run-wayland-smoke run-wayland-tests run-wlcomp-smoke run-wayland-demo run-dynlink-smoke run-drm-smoke run-text-smoke run-foot-smoke run-foot-demo run-cxx-smoke user-musl-ext3-journal-smoke run-journal-smoke run-ext4-ro-smoke test ext2-image \
+.PHONY: all image bootloader kernel user user-elf user-musl-smoke user-musl-ext2-exec user-musl-ext2-cmd-smoke user-musl-ext2-ping-smoke user-musl-ext2-unix-rights-smoke user-musl-ext2-epoll-smoke user-musl-ext2-gui-smoke user-musl-ext2-gui-demo user-musl-ext2-shared-buffer-smoke user-musl-ext2-console-first-smoke user-musl-ext2-peet-gui-smoke user-musl-ext2-peet-shell-demo user-musl-ext2-quickjs-smoke user-musl-ext2-micropython-smoke user-musl-ext2-dropbear-smoke user-musl-ext2-fpu-smoke user-musl-ext2-proc-smoke user-musl-ext2-wayland-smoke user-musl-ext2-wayland-tests user-musl-ext2-wlcomp-smoke user-musl-ext2-wayland-demo user-musl-ext2-dynlink-smoke user-musl-ext2-drm-smoke user-musl-ext2-text-smoke user-musl-ext2-foot-smoke user-musl-ext2-foot-demo user-musl-ext2-cxx-smoke user-musl-ext2-pango-smoke clean run run-current run-image run-tablet run-shell run-net-shell run-net run-net-udp-smoke run-net-tcp-smoke run-net-socket-smoke run-ping-smoke run-unix-rights-smoke run-epoll-smoke run-gui-smoke run-gui-demo run-shared-buffer-smoke run-console-first-smoke run-gui-fallback-smoke run-peet-gui-smoke run-peet-shell-demo run-peet-shell-demo-smoke run-quickjs-smoke run-micropython-smoke run-dropbear-smoke run-fpu-smoke run-proc-smoke run-wayland-smoke run-wayland-tests run-wlcomp-smoke run-wayland-demo run-dynlink-smoke run-drm-smoke run-text-smoke run-foot-smoke run-foot-demo run-cxx-smoke run-pango-smoke user-musl-ext3-journal-smoke run-journal-smoke run-ext4-ro-smoke test ext2-image \
 	musl-fetch musl-configure musl musl-clean musl-distclean musl-info \
 	toybox-fetch toybox-configure toybox toybox-clean toybox-distclean toybox-info \
 	quickjs-fetch quickjs quickjs-clean quickjs-distclean quickjs-info \
@@ -388,7 +396,7 @@ $(CXX_TOOLCHAIN_STAMP): $(MUSL_SHARED_LIBC)
 $(USER_CXX_SMOKE_BIN): user/cxx_smoke.cpp user/cxx/peetcxx.h user/cxx/libpeetcxx.cpp user/cxx/plugin.cpp scripts/build_cxx_smoke.sh $(CXX_TOOLCHAIN_STAMP)
 	scripts/build_cxx_smoke.sh
 
-$(RENDER_STAMP) $(FOOT_STAMP): $(WAYLAND_SHLIBS)
+$(RENDER_STAMP) $(FOOT_STAMP) $(PANGO_STAMP): $(WAYLAND_SHLIBS)
 	$(MAKE) -C wayland
 
 $(USER_MUSL_EXT2_FOOT_SMOKE_ELF): user/musl_execve_ext2_foot_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
@@ -396,6 +404,12 @@ $(USER_MUSL_EXT2_FOOT_SMOKE_ELF): user/musl_execve_ext2_foot_smoke.c $(USER_MUSL
 
 $(USER_MUSL_EXT2_FOOT_DEMO_ELF): user/musl_execve_ext2_foot_demo.c $(USER_MUSL_SMOKE_SCRIPT)
 	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
+
+$(USER_MUSL_EXT2_PANGO_SMOKE_ELF): user/musl_execve_ext2_pango_smoke.c $(USER_MUSL_SMOKE_SCRIPT)
+	$(USER_MUSL_SMOKE_SCRIPT) --src $< --out $@
+
+$(USER_PANGO_SMOKE_BIN): user/pango_smoke.c $(USER_MUSL_DYN_SCRIPT) $(PANGO_STAMP)
+	$(USER_MUSL_DYN_SCRIPT) --src $< --out $@ -- $$(PKG_CONFIG_LIBDIR=$(RENDER_STAGE)/usr/lib/pkgconfig PKG_CONFIG_SYSROOT_DIR=$(abspath $(RENDER_STAGE)) pkg-config --cflags --libs pangocairo gio-2.0 cairo-pdf cairo-svg libdrm) -Wl,-rpath-link,$(abspath $(RENDER_STAGE))/usr/lib
 
 $(USER_TEXT_SMOKE_BIN): user/text_smoke.c $(USER_MUSL_DYN_SCRIPT) $(RENDER_STAMP)
 	$(USER_MUSL_DYN_SCRIPT) --src $< --out $@ -- -I$(RENDER_STAGE)/usr/include -I$(RENDER_STAGE)/usr/include/freetype2 -I$(RENDER_STAGE)/usr/include/harfbuzz -I$(RENDER_STAGE)/usr/include/pixman-1 -I$(RENDER_STAGE)/usr/include/libdrm -L$(RENDER_STAGE)/usr/lib -Wl,-rpath-link,$(abspath $(RENDER_STAGE))/usr/lib -lfontconfig -lharfbuzz -lfreetype -lpixman-1 -ldrm
@@ -583,6 +597,12 @@ else
 KERNEL_MUSL_EXT2_TEXT_SMOKE_DEP :=
 endif
 
+ifneq ($(findstring musl-ext2-pango-smoke,$(KERNEL_FEATURES)),)
+KERNEL_MUSL_EXT2_PANGO_SMOKE_DEP := $(USER_MUSL_EXT2_PANGO_SMOKE_ELF) $(USER_PANGO_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
+else
+KERNEL_MUSL_EXT2_PANGO_SMOKE_DEP :=
+endif
+
 ifneq ($(findstring musl-ext2-cxx-smoke,$(KERNEL_FEATURES)),)
 KERNEL_MUSL_EXT2_CXX_SMOKE_DEP := $(USER_MUSL_EXT2_CXX_SMOKE_ELF) $(USER_CXX_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
 else
@@ -642,14 +662,16 @@ user-musl-ext2-dynlink-smoke: $(USER_MUSL_EXT2_DYNLINK_SMOKE_ELF) $(USER_DYNLINK
 user-musl-ext2-drm-smoke: $(USER_MUSL_EXT2_DRM_SMOKE_ELF) $(USER_DRM_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-text-smoke: $(USER_MUSL_EXT2_TEXT_SMOKE_ELF) $(USER_TEXT_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-foot-smoke: $(USER_MUSL_EXT2_FOOT_SMOKE_ELF) $(USER_PEETWL_BIN) $(USER_WL_DEMO_BIN) $(FOOT_STAMP) $(USER_EXT2_MUSL_IMG)
+user-musl-ext2-pango-smoke: $(USER_MUSL_EXT2_PANGO_SMOKE_ELF) $(USER_PANGO_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-cxx-smoke: $(USER_MUSL_EXT2_CXX_SMOKE_ELF) $(USER_CXX_SMOKE_BIN) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-foot-demo: $(USER_MUSL_EXT2_FOOT_DEMO_ELF) $(USER_PEETWL_BIN) $(FOOT_STAMP) $(USER_EXT2_MUSL_IMG)
 user-musl-ext2-wayland-tests: $(USER_MUSL_EXT2_WAYLAND_TESTS_ELF) $(WAYLAND_TESTS_STAMP) $(USER_EXT2_MUSL_IMG)
 user-musl-ext3-journal-smoke: $(USER_MUSL_EXT3_JOURNAL_SMOKE_ELF) $(USER_JOURNAL_SMOKE_HELPER_BIN) $(USER_EXT2_MUSL_IMG)
 
-kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PING_SMOKE_DEP) $(KERNEL_MUSL_EXT2_UNIX_RIGHTS_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EPOLL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_SHARED_BUFFER_SMOKE_DEP) $(KERNEL_MUSL_EXT2_CONSOLE_FIRST_SMOKE_DEP) $(KERNEL_MUSL_EXT2_GUI_SMOKE_DEP) $(KERNEL_MUSL_EXT2_GUI_DEMO_DEP) $(KERNEL_MUSL_EXT2_PEET_GUI_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PEET_SHELL_DEMO_DEP) $(KERNEL_MUSL_EXT2_QUICKJS_SMOKE_DEP) $(KERNEL_MUSL_EXT2_MICROPYTHON_SMOKE_DEP) $(KERNEL_MUSL_EXT2_DROPBEAR_SMOKE_DEP) $(KERNEL_MUSL_EXT2_FPU_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PROC_SMOKE_DEP) $(KERNEL_MUSL_EXT2_WAYLAND_SMOKE_DEP) $(KERNEL_MUSL_EXT2_WLCOMP_SMOKE_DEP) $(KERNEL_MUSL_EXT2_WAYLAND_DEMO_DEP) $(KERNEL_MUSL_EXT2_DYNLINK_SMOKE_DEP) $(KERNEL_MUSL_EXT2_DRM_SMOKE_DEP) $(KERNEL_MUSL_EXT2_TEXT_SMOKE_DEP) $(KERNEL_MUSL_EXT2_FOOT_SMOKE_DEP) $(KERNEL_MUSL_EXT2_FOOT_DEMO_DEP) $(KERNEL_MUSL_EXT2_CXX_SMOKE_DEP) $(KERNEL_MUSL_EXT2_WAYLAND_TESTS_DEP) $(KERNEL_MUSL_EXT3_JOURNAL_SMOKE_DEP)
+kernel: $(ENTRY_OBJ) $(USER_ELF) $(USER_DYN_ELF) $(USER_INTERP_SO) $(USER_EXT2_IMG) $(KERNEL_MUSL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EXEC_DEP) $(KERNEL_MUSL_EXT2_CMD_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PING_SMOKE_DEP) $(KERNEL_MUSL_EXT2_UNIX_RIGHTS_SMOKE_DEP) $(KERNEL_MUSL_EXT2_EPOLL_SMOKE_DEP) $(KERNEL_MUSL_EXT2_SHARED_BUFFER_SMOKE_DEP) $(KERNEL_MUSL_EXT2_CONSOLE_FIRST_SMOKE_DEP) $(KERNEL_MUSL_EXT2_GUI_SMOKE_DEP) $(KERNEL_MUSL_EXT2_GUI_DEMO_DEP) $(KERNEL_MUSL_EXT2_PEET_GUI_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PEET_SHELL_DEMO_DEP) $(KERNEL_MUSL_EXT2_QUICKJS_SMOKE_DEP) $(KERNEL_MUSL_EXT2_MICROPYTHON_SMOKE_DEP) $(KERNEL_MUSL_EXT2_DROPBEAR_SMOKE_DEP) $(KERNEL_MUSL_EXT2_FPU_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PROC_SMOKE_DEP) $(KERNEL_MUSL_EXT2_WAYLAND_SMOKE_DEP) $(KERNEL_MUSL_EXT2_WLCOMP_SMOKE_DEP) $(KERNEL_MUSL_EXT2_WAYLAND_DEMO_DEP) $(KERNEL_MUSL_EXT2_DYNLINK_SMOKE_DEP) $(KERNEL_MUSL_EXT2_DRM_SMOKE_DEP) $(KERNEL_MUSL_EXT2_TEXT_SMOKE_DEP) $(KERNEL_MUSL_EXT2_FOOT_SMOKE_DEP) $(KERNEL_MUSL_EXT2_FOOT_DEMO_DEP) $(KERNEL_MUSL_EXT2_CXX_SMOKE_DEP) $(KERNEL_MUSL_EXT2_PANGO_SMOKE_DEP) $(KERNEL_MUSL_EXT2_WAYLAND_TESTS_DEP) $(KERNEL_MUSL_EXT3_JOURNAL_SMOKE_DEP)
 	RUSTFLAGS="-C link-arg=$(ENTRY_OBJ) -C link-arg=-T$(abspath linker/kernel.ld) -C link-arg=-no-pie" cargo build -p kernel $(CARGO_FLAGS) $(CARGO_FEATURES)
 	@case " $(KERNEL_FEATURES) " in \
+		*" musl-ext2-pango-smoke "*) init_dep="musl_execve_ext2_pango_smoke.elf" ;; \
 		*" musl-ext2-cxx-smoke "*) init_dep="musl_execve_ext2_cxx_smoke.elf" ;; \
 		*" musl-ext3-journal-smoke "*) init_dep="musl_execve_ext3_journal_smoke.elf" ;; \
 		*" musl-ext2-dynlink-smoke "*) init_dep="musl_execve_ext2_dynlink_smoke.elf" ;; \
@@ -915,6 +937,9 @@ run-text-smoke:
 
 run-cxx-smoke:
 	scripts/run_toybox_cxx_smoke.sh
+
+run-pango-smoke:
+	scripts/run_toybox_pango_smoke.sh
 
 run-foot-smoke:
 	scripts/run_toybox_foot_smoke.sh

@@ -115,6 +115,7 @@ On initialization, the kernel creates:
   - `openat` (`257`)
   - `mkdirat` (`258`)
   - `newfstatat` (`262`)
+  - `statx` (`332`)
   - `unlinkat` (`263`)
   - `renameat` (`264`)
   - `linkat` (`265`)

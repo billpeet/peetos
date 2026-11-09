@@ -567,9 +567,17 @@ pub(super) fn mmap_flags_are_supported(flags: u32) -> bool {
         | MAP_ANONYMOUS
         | MAP_DENYWRITE
         | MAP_EXECUTABLE
-        | MAP_FIXED_NOREPLACE;
+        | MAP_FIXED_NOREPLACE
+        | MAP_HINT_FLAGS;
     (flags & !supported) == 0
 }
+
+/// Flags Linux treats as hints, accepted here without effect: no swap
+/// reservation exists to skip (`MAP_NORESERVE`, which harfbuzz uses to map
+/// fonts), pages are populated on fault anyway (`MAP_POPULATE`,
+/// `MAP_NONBLOCK`), `MAP_STACK` is advisory, and nothing is ever paged out
+/// (`MAP_LOCKED`).
+pub(super) const MAP_HINT_FLAGS: u32 = MAP_LOCKED | MAP_NORESERVE | MAP_POPULATE | MAP_NONBLOCK | MAP_STACK;
 
 pub(super) fn mmap_parse_sharing_mode(flags: u32) -> Result<(bool, bool), i64> {
     let is_private = (flags & MAP_PRIVATE) != 0;

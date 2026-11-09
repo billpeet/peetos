@@ -34,6 +34,25 @@ curl -LO https://ftp.gnu.org/gnu/gperf/gperf-3.1.tar.gz && tar xf gperf-3.1.tar.
   - pixman uses its default x86_64 SIMD paths (SSE2/SSSE3), with no tests, demos, GTK or libpng.
 - **Ext2 image.** The image builder copies every staged shared library into `/usr/lib` under its soname. It also adds `/etc/fonts` (with the `conf.d` symlinks resolved to plain files), `/usr/share/fontconfig`, `/usr/share/fonts`, an empty `/var/cache/fontconfig`, and `fc-list`/`fc-match`/`fc-cache` in `/bin`.
 
+**2D toolkit libraries: cairo, pango and GLib**
+`scripts/build_cairo_pango.sh` (run by `make -C wayland` after the rendering stack) builds the next layer into the same stage. These are the libraries GTK and most desktop applications draw text and graphics with:
+- **zlib 1.3.1** with its own configure script; **libpng 1.6.44** and **pcre2 10.44** (8-bit only, no JIT) with autotools.
+- **GLib 2.82.2** (glib, gobject, gio, gmodule, girepository) with meson: no NLS, introspection, SELinux, xattr, libmount, docs or tests. Its code generators (`glib-mkenums`, `glib-genmarshal`, `gdbus-codegen`) are Python scripts staged in `usr/bin`. A build-machine pkg-config directory points meson projects that use them (pango) at the staged copies.
+- **fribidi 1.0.16** for the Unicode bidirectional algorithm.
+- **cairo 1.18.2** with the image, recording, PNG, PDF, PostScript, SVG and script backends and freetype/fontconfig fonts. There are no X11, Quartz or Win32 backends.
+- **pango 1.54.0** with cairo, freetype/fontconfig and harfbuzz; no libthai or Xft. `pango-view` and `pango-list` are staged in the image's `/bin`.
+- **Cross file.** The meson cross file now sets `needs_exe_wrapper = true`. Target programs need the musl loader, which the build machine doesn't have, so meson must not run them during configure. GLib's run-time checks are answered with properties instead (`have_c99_vsnprintf`, `va_val_copy`, ...).
+
+`make run-pango-smoke` (part of `make test`) boots the `musl-ext2-pango-smoke` profile. It runs `pango-list`, renders a PNG with `pango-view`, and then runs `user/pango_smoke.c`, which checks:
+- **GLib:** a `GMainLoop` running timeout sources, `GThread` workers with a `GMutex`, `GRegex` (pcre2) captures, `GHashTable`, UTF-8 validation, GObject property notification, and GIO reading a file and querying its size and type. `statx(2)` is checked directly against `stat(2)`.
+- **cairo:** a linear gradient, a filled antialiased circle, a PNG written and read back pixel-for-pixel through libpng and zlib, a PDF with an embedded font, and an SVG.
+- **pango:** `Sans` resolves to DejaVu Sans through fontconfig; markup is parsed; Latin and Arabic text have no unknown (hex-box) glyphs; a paragraph wraps to a width; an Arabic paragraph resolves right to left through fribidi; mixed scripts are itemized into separate runs.
+- **On screen:** a card drawn with cairo (gradient, rounded rectangle, antialiased shapes) holding pango-rendered markup and bidirectional text, presented through DRM and read back from `/dev/fb0`. The runner saves a screendump to `build/pango_smoke.png`. It also fails if the kernel logs an unhandled syscall.
+
+Kernel work this layer needed:
+- **`statx(2)`** (syscall 332), which GIO uses for file metadata. It shares its lookup with `newfstatat` and reports `STATX_BASIC_STATS`.
+- **`mmap` hint flags.** harfbuzz maps font files with `MAP_PRIVATE | MAP_NORESERVE`, which the kernel rejected with `EINVAL`. pango then shaped with an empty face, and every glyph became a hex box. `MAP_NORESERVE`, `MAP_POPULATE`, `MAP_NONBLOCK`, `MAP_STACK` and `MAP_LOCKED` are now accepted as hints, as on Linux.
+
 **foot**
 foot 1.18.1 runs under `peetwl`. That is the roadmap's first milestone: a real terminal emulator with fonts and a shell.
 - `scripts/build_foot.sh` (run by `make -C wayland` after the rendering stack) builds tllist 1.1.0, fcft 3.1.8 and foot with meson against the stage:
@@ -81,7 +100,10 @@ The runner saves a QEMU screendump of the frame to `build/text_smoke.png`.
 Limitations / Simplifications
 - foot runs without terminfo. Toybox's shell has no line editing or job control. The clipboard works (Ctrl+Shift+C/V), but there is no primary selection, so select-to-copy and middle-click paste do not work. `fallocate(PUNCH_HOLE)` is not supported, so foot disables its scrolling-by-offset optimization and redraws instead.
 - The interactive demo's two foot windows cannot be reopened after their shells exit (there is no launcher), and `make test` does not cover it; its init payload and scripts mirror the smoke's.
-- harfbuzz has no glib, ICU or graphite2 integration and no `hb-view`/`hb-shape` utilities. The shaping smoke checks Latin kerning, mark composition and Arabic joining with DejaVu Sans only; other scripts depend on font coverage, and only two fonts are staged. libpng, cairo and pango are not ported yet.
+- GLib is built without NLS (messages are untranslated), introspection, SELinux, xattr or libmount. There is no D-Bus session bus, so the GDBus parts of GIO are untested, and no GSettings schemas are compiled. GIO's file monitoring (inotify) and network modules are untested. pcre2 has no JIT.
+- cairo has no X11 or GL backends, and its PDF/SVG output is only checked for headers and size.
+- pango has no libthai (Thai line breaking). Only regular DejaVu faces are staged, so bold and italic are synthesised.
+- harfbuzz has no glib, ICU or graphite2 integration and no `hb-view`/`hb-shape` utilities. The shaping smoke checks Latin kerning, mark composition and Arabic joining with DejaVu Sans only; other scripts depend on font coverage, and only two fonts are staged.
 - Building the stack now needs the C++ cross toolchain (about 4 minutes on top of the rest).
 - Only two fonts (DejaVu Sans and DejaVu Sans Mono) are staged. There is no fontconfig cache built ahead of time: the first `FcInit` in each process scans the font directory, which is fast with two fonts but grows with more.
 - The stage seeds pkg-config files by hand for the libraries built outside meson. Their versions and flags are hard-coded in `scripts/build_render_stack.sh`.

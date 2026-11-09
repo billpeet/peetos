@@ -46,6 +46,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - A software rendering stack (pixman, freetype, fontconfig with DejaVu fonts) is ported as shared libraries. `make run-text-smoke` renders anti-aliased text on screen through DRM; see `docs/rendering.md`.
 - C++ programs run on PeetOS: `make -C toolchain` builds a GCC 15.2 cross toolchain for musl, and libstdc++, libgcc_s and libatomic ship in the image. `make run-cxx-smoke` checks exceptions across shared objects, RTTI, iostreams, `std::thread`, `thread_local` and `dlopen()`ed C++ plugins; see `docs/cxx.md`.
 - harfbuzz (built with that compiler) and utf8proc are part of the rendering stack, so text is shaped: kerning, combining marks and Arabic joining in `make run-text-smoke`, and fcft/foot use them for shaping and grapheme clustering.
+- cairo, pango and GLib are ported (with zlib, libpng, pcre2 and fribidi): `make run-pango-smoke` draws a cairo + pango frame with markup and bidirectional text, and checks GLib, GIO and cairo's PNG/PDF/SVG output (see `docs/rendering.md`).
 - The foot terminal runs under `peetwl`, with fcft/freetype text and a shell inside it: `make run-foot-demo` opens two foot windows in a QEMU window, with copy and paste between them (Ctrl+Shift+C/V), and `make run-foot-smoke` is the automated test (see `docs/rendering.md`).
 - The kernel manages up to 4 GiB of RAM through a direct map of physical memory; give QEMU more with `-m` (the dynamic-linking smoke uses 512 MiB). Per process there are 256 VM region slots and a 256 MiB mapping budget. System-wide, there are 256 tasks and 256 sockets, and memfd objects can be up to 256 MiB.
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
@@ -228,6 +229,7 @@ make run-dynlink-smoke
 make run-drm-smoke
 make run-text-smoke
 make run-cxx-smoke
+make run-pango-smoke
 make run-foot-smoke
 make run-foot-demo
 make run-gui-smoke

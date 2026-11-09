@@ -80,7 +80,8 @@ later.
   through DRM (`docs/rendering.md`).
 - [x] harfbuzz 10.1.0 and utf8proc 2.9.0: text shaping in fcft and grapheme
   clustering in foot (`docs/rendering.md`).
-- [ ] libpng, cairo, pango.
+- [x] zlib, libpng, pcre2, GLib 2.82, fribidi, cairo 1.18 and pango 1.54
+  (`make run-pango-smoke`; see `docs/rendering.md`).
 - [x] A C++ runtime for musl: GCC 15.2 cross toolchain with libstdc++,
   libgcc_s and libatomic (`make -C toolchain`, `make run-cxx-smoke`; see
   `docs/cxx.md`), needed by Mesa, Qt and many applications.
@@ -123,6 +124,7 @@ later.
 
 4. ~~fcft + foot (without harfbuzz at first)~~ Done.
 5. ~~C++ runtime, then harfbuzz~~ Done (GCC + libstdc++; fcft/foot now shape text).
+6. ~~libpng, cairo, pango (with GLib)~~ Done. Next: the rest of the GTK stack (gdk-pixbuf, libepoxy, GTK) or wlroots.
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports. *(Reached: foot renders

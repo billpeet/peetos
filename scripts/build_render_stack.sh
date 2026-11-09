@@ -123,6 +123,16 @@ endian = 'little'
 [properties]
 sys_root = '${STAGE}'
 pkg_config_libdir = '${STAGE}/usr/lib/pkgconfig:${STAGE}/usr/share/pkgconfig'
+# Target binaries need the musl loader, which the build machine doesn't have,
+# so meson must not try to run them. GLib's run-time configure checks are
+# answered here instead (values for musl on x86_64).
+needs_exe_wrapper = true
+growing_stack = false
+have_c99_vsnprintf = true
+have_c99_snprintf = true
+have_unix98_printf = true
+va_val_copy = false
+have_strlcpy = true
 
 [built-in options]
 c_link_args = ['-L${MUSL_SHARED_LIB}', '-L${STAGE}/usr/lib', '-Wl,-rpath-link,${STAGE}/usr/lib', '-Wl,-z,max-page-size=0x1000']

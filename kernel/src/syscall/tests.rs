@@ -353,6 +353,16 @@ fn mmap_flag_validation_rejects_unknown_bits() {
 }
 
 #[test]
+fn mmap_accepts_linux_hint_flags() {
+    // harfbuzz maps font files with MAP_PRIVATE | MAP_NORESERVE.
+    assert!(mmap_flags_are_supported(MAP_PRIVATE | MAP_NORESERVE));
+    assert!(mmap_flags_are_supported(MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK | MAP_POPULATE));
+    assert!(mmap_flags_are_supported(MAP_SHARED | MAP_LOCKED | MAP_NONBLOCK));
+    // MAP_HUGETLB (0x40000) is not a hint: there are no huge pages to give.
+    assert!(!mmap_flags_are_supported(MAP_PRIVATE | MAP_ANONYMOUS | 0x40000));
+}
+
+#[test]
 fn mmap_parse_sharing_mode_requires_exactly_one_mode() {
     assert_eq!(
         mmap_parse_sharing_mode(MAP_PRIVATE).expect("private mode"),
@@ -2430,4 +2440,68 @@ fn temporary_sigmask_restores_on_exit_or_through_the_frame() {
     crate::signal::restore_temporary_mask(tp);
     assert_eq!(t.signal_blocked, usr1);
     assert!(!t.restore_sigmask);
+}
+
+#[test]
+fn statx_is_registered() {
+    assert_eq!(lookup_syscall(SYS_STATX).map(|d| d.name), Some("statx"));
+}
+
+#[test]
+fn statx_layout_matches_linux() {
+    let st = LinuxStat {
+        st_dev: (8 << 8) | 1,
+        st_ino: 4242,
+        st_nlink: 3,
+        st_mode: 0o100644,
+        st_uid: 1000,
+        st_gid: 100,
+        __pad0: 0,
+        st_rdev: (226 << 8) | 0x80, // /dev/dri/card128-style rdev
+        st_size: 123_456,
+        st_blksize: 4096,
+        st_blocks: 248,
+        st_atime: 1_700_000_001,
+        st_atime_nsec: 11,
+        st_mtime: 1_700_000_002,
+        st_mtime_nsec: 22,
+        st_ctime: 1_700_000_003,
+        st_ctime_nsec: 33,
+        __unused: [0; 3],
+    };
+    let b = statx_from_stat(&st);
+    let u32_at = |o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_ne_bytes(b[o..o + 8].try_into().unwrap());
+    assert_eq!(b.len(), 256);
+    assert_eq!(u32_at(0x00), STATX_BASIC_STATS);
+    assert_eq!(u32_at(0x04), 4096);
+    assert_eq!(u32_at(0x10), 3);
+    assert_eq!((u32_at(0x14), u32_at(0x18)), (1000, 100));
+    assert_eq!(u16::from_ne_bytes([b[0x1c], b[0x1d]]), 0o100644);
+    assert_eq!((u64_at(0x20), u64_at(0x28), u64_at(0x30)), (4242, 123_456, 248));
+    assert_eq!((u64_at(0x40), u32_at(0x48)), (1_700_000_001, 11)); // atime
+    assert_eq!((u64_at(0x50), u32_at(0x58)), (0, 0)); // btime not reported
+    assert_eq!((u64_at(0x60), u32_at(0x68)), (1_700_000_003, 33)); // ctime
+    assert_eq!((u64_at(0x70), u32_at(0x78)), (1_700_000_002, 22)); // mtime
+    assert_eq!((u32_at(0x80), u32_at(0x84)), (226, 0x80));
+    assert_eq!((u32_at(0x88), u32_at(0x8c)), (8, 1));
+}
+
+#[test]
+fn dev_numbers_decode_like_linux() {
+    assert_eq!(dev_major_minor((5 << 8) | 1), (5, 1));
+    assert_eq!(dev_major_minor(136 << 8), (136, 0));
+    // Large minors use bits 20..: makedev(259, 0x12345).
+    let dev: u64 = (0x45) | (259 << 8) | (0x123 << 20);
+    assert_eq!(dev_major_minor(dev), (259, 0x12345));
+}
+
+#[test]
+fn statx_rejects_bad_flags_and_reserved_mask() {
+    assert_eq!(statx_check_args(0, STATX_BASIC_STATS), Ok(()));
+    assert_eq!(statx_check_args(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, 0xfff), Ok(()));
+    assert_eq!(statx_check_args(0x2000, STATX_BASIC_STATS), Ok(())); // AT_STATX_FORCE_SYNC
+    assert_eq!(statx_check_args(0x6000, STATX_BASIC_STATS), Err(-EINVAL)); // both sync types
+    assert_eq!(statx_check_args(0x1, STATX_BASIC_STATS), Err(-EINVAL)); // unknown flag
+    assert_eq!(statx_check_args(0, 0x8000_0000), Err(-EINVAL)); // STATX__RESERVED
 }

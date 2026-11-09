@@ -146,6 +146,7 @@ const SYS_GETSID: u64 = 124;
 const SYS_PRCTL: u64 = 157;
 const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_MEMBARRIER: u64 = 324;
+const SYS_STATX: u64 = 332;
 const SYS_GETTID: u64 = 186;
 const SYS_TKILL: u64 = 200;
 const SYS_TGKILL: u64 = 234;
@@ -313,6 +314,11 @@ const MAP_FIXED: u32 = 0x10;
 const MAP_ANONYMOUS: u32 = 0x20;
 const MAP_DENYWRITE: u32 = 0x0800;
 const MAP_EXECUTABLE: u32 = 0x1000;
+const MAP_LOCKED: u32 = 0x2000;
+const MAP_NORESERVE: u32 = 0x4000;
+const MAP_POPULATE: u32 = 0x8000;
+const MAP_NONBLOCK: u32 = 0x10000;
+const MAP_STACK: u32 = 0x20000;
 const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 const MS_ASYNC: u32 = 0x1;
 const MS_INVALIDATE: u32 = 0x2;
@@ -747,6 +753,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_FADVISE64, "fadvise64", SyscallMode::UserTask, sys_fadvise64),
     syscall_def(SYS_PRCTL, "prctl", SyscallMode::UserTask, sys_prctl),
     syscall_def(SYS_MEMBARRIER, "membarrier", SyscallMode::UserTask, sys_membarrier),
+    syscall_def(SYS_STATX, "statx", SyscallMode::UserTask, sys_statx),
     syscall_def(SYS_UNLINK, "unlink", SyscallMode::UserTask, sys_unlink),
     syscall_def(
         SYS_ARCH_PRCTL,

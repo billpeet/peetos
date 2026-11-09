@@ -9,7 +9,8 @@ Download, verify, and extract the pinned source releases of the PeetOS
 graphics userland into <name>-src/ directories: libwayland, libffi,
 wayland-protocols, libxkbcommon and libdrm, plus the software rendering stack
 (pixman, expat, freetype, fontconfig, harfbuzz, utf8proc), the DejaVu
-fonts, and tllist, fcft and the foot terminal.
+fonts, the 2D toolkit libraries (zlib, libpng, pcre2, GLib, fribidi, cairo,
+pango), and tllist, fcft and the foot terminal.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -77,6 +78,34 @@ HARFBUZZ_SHA256="6ce3520f2d089a33cef0fc48321334b8e0b72141f6a763719aaaecd2779ecb8
 UTF8PROC_VERSION="2.9.0"
 UTF8PROC_URL="https://github.com/JuliaStrings/utf8proc/archive/refs/tags/v${UTF8PROC_VERSION}.tar.gz"
 UTF8PROC_SHA256="18c1626e9fc5a2e192311e36b3010bfc698078f692888940f1fa150547abb0c1"
+
+ZLIB_VERSION="1.3.1"
+ZLIB_URL="https://zlib.net/fossils/zlib-${ZLIB_VERSION}.tar.gz"
+ZLIB_SHA256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+
+LIBPNG_VERSION="1.6.44"
+LIBPNG_URL="https://download.sourceforge.net/libpng/libpng-${LIBPNG_VERSION}.tar.xz"
+LIBPNG_SHA256="60c4da1d5b7f0aa8d158da48e8f8afa9773c1c8baa5d21974df61f1886b8ce8e"
+
+PCRE2_VERSION="10.44"
+PCRE2_URL="https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.bz2"
+PCRE2_SHA256="d34f02e113cf7193a1ebf2770d3ac527088d485d4e047ed10e5d217c6ef5de96"
+
+GLIB_VERSION="2.82.2"
+GLIB_URL="https://download.gnome.org/sources/glib/2.82/glib-${GLIB_VERSION}.tar.xz"
+GLIB_SHA256="ab45f5a323048b1659ee0fbda5cecd94b099ab3e4b9abf26ae06aeb3e781fd63"
+
+FRIBIDI_VERSION="1.0.16"
+FRIBIDI_URL="https://github.com/fribidi/fribidi/releases/download/v${FRIBIDI_VERSION}/fribidi-${FRIBIDI_VERSION}.tar.xz"
+FRIBIDI_SHA256="1b1cde5b235d40479e91be2f0e88a309e3214c8ab470ec8a2744d82a5a9ea05c"
+
+CAIRO_VERSION="1.18.2"
+CAIRO_URL="https://cairographics.org/releases/cairo-${CAIRO_VERSION}.tar.xz"
+CAIRO_SHA256="a62b9bb42425e844cc3d6ddde043ff39dbabedd1542eba57a2eb79f85889d45a"
+
+PANGO_VERSION="1.54.0"
+PANGO_URL="https://download.gnome.org/sources/pango/1.54/pango-${PANGO_VERSION}.tar.xz"
+PANGO_SHA256="8a9eed75021ee734d7fc0fdf3a65c3bba51dfefe4ae51a9b414a60c70b2d1ed8"
 
 FOOT_VERSION="1.18.1"
 FOOT_URL="https://codeberg.org/dnkl/foot/archive/${FOOT_VERSION}.tar.gz"
@@ -167,5 +196,19 @@ fetch_one "fcft ${FCFT_VERSION}" "${FCFT_URL}" "${FCFT_SHA256}" \
   "${OUTPUT_DIR}/fcft-src" "fcft-${FCFT_VERSION}.tar.gz"
 fetch_one "harfbuzz ${HARFBUZZ_VERSION}" "${HARFBUZZ_URL}" "${HARFBUZZ_SHA256}"   "${OUTPUT_DIR}/harfbuzz-src" "harfbuzz-${HARFBUZZ_VERSION}.tar.xz"
 fetch_one "utf8proc ${UTF8PROC_VERSION}" "${UTF8PROC_URL}" "${UTF8PROC_SHA256}"   "${OUTPUT_DIR}/utf8proc-src" "utf8proc-${UTF8PROC_VERSION}.tar.gz"
+fetch_one "zlib ${ZLIB_VERSION}" "${ZLIB_URL}" "${ZLIB_SHA256}" \
+  "${OUTPUT_DIR}/zlib-src" "zlib-${ZLIB_VERSION}.tar.gz"
+fetch_one "libpng ${LIBPNG_VERSION}" "${LIBPNG_URL}" "${LIBPNG_SHA256}" \
+  "${OUTPUT_DIR}/libpng-src" "libpng-${LIBPNG_VERSION}.tar.xz"
+fetch_one "pcre2 ${PCRE2_VERSION}" "${PCRE2_URL}" "${PCRE2_SHA256}" \
+  "${OUTPUT_DIR}/pcre2-src" "pcre2-${PCRE2_VERSION}.tar.bz2"
+fetch_one "GLib ${GLIB_VERSION}" "${GLIB_URL}" "${GLIB_SHA256}" \
+  "${OUTPUT_DIR}/glib-src" "glib-${GLIB_VERSION}.tar.xz"
+fetch_one "fribidi ${FRIBIDI_VERSION}" "${FRIBIDI_URL}" "${FRIBIDI_SHA256}" \
+  "${OUTPUT_DIR}/fribidi-src" "fribidi-${FRIBIDI_VERSION}.tar.xz"
+fetch_one "cairo ${CAIRO_VERSION}" "${CAIRO_URL}" "${CAIRO_SHA256}" \
+  "${OUTPUT_DIR}/cairo-src" "cairo-${CAIRO_VERSION}.tar.xz"
+fetch_one "pango ${PANGO_VERSION}" "${PANGO_URL}" "${PANGO_SHA256}" \
+  "${OUTPUT_DIR}/pango-src" "pango-${PANGO_VERSION}.tar.xz"
 fetch_one "foot ${FOOT_VERSION}" "${FOOT_URL}" "${FOOT_SHA256}" \
   "${OUTPUT_DIR}/foot-src" "foot-${FOOT_VERSION}.tar.gz"

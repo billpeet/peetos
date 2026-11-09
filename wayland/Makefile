@@ -18,9 +18,10 @@
 #                              everything above plus expat, freetype,
 #                              fontconfig, pixman, harfbuzz (C++, built
 #                              with ../toolchain's g++), utf8proc and the
-#                              DejaVu fonts
-#                              (scripts/build_render_stack.sh), then
-#                              tllist, fcft and foot (scripts/build_foot.sh)
+#                              DejaVu fonts (scripts/build_render_stack.sh),
+#                              then zlib, libpng, pcre2, GLib, fribidi,
+#                              cairo and pango (scripts/build_cairo_pango.sh),
+#                              then tllist, fcft and foot (scripts/build_foot.sh)
 #   lib/lib*.so.N, lib/lib*.so shared builds of libffi, libwayland-server,
 #                              libwayland-client and libxkbcommon (need
 #                              ../musl/shared from `make -C musl shared`)
@@ -38,7 +39,7 @@ all: build
 fetch:
 	./fetch-wayland.sh
 
-wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src tllist-src fcft-src foot-src:
+wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src tllist-src fcft-src foot-src:
 	$(MAKE) fetch
 
 ../musl/shared/lib/libc.so:
@@ -48,7 +49,7 @@ wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-
 ../toolchain/out/bin/x86_64-linux-musl-g++: ../musl/shared/lib/libc.so
 	$(MAKE) -C ../toolchain
 
-build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src tllist-src fcft-src foot-src ../musl/shared/lib/libc.so ../toolchain/out/bin/x86_64-linux-musl-g++
+build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src tllist-src fcft-src foot-src ../musl/shared/lib/libc.so ../toolchain/out/bin/x86_64-linux-musl-g++
 	../scripts/build_wayland.sh \
 		--wayland-src "$(CURDIR)/wayland-src" \
 		--libffi-src "$(CURDIR)/libffi-src" \
@@ -64,13 +65,14 @@ build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src 
 		--out "$(OUT_DIR)" \
 		--musl-cc "$(MUSL_CC)"
 	../scripts/build_render_stack.sh
+	../scripts/build_cairo_pango.sh
 	../scripts/build_foot.sh
 
 clean:
 	rm -rf "$(OUT_DIR)" build
 
 distclean: clean
-	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src tllist-src fcft-src foot-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2 harfbuzz-*.tar.xz utf8proc-*.tar.gz tllist-*.tar.gz fcft-*.tar.gz foot-*.tar.gz
+	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src zlib-src libpng-src pcre2-src glib-src fribidi-src cairo-src pango-src tllist-src fcft-src foot-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2 harfbuzz-*.tar.xz utf8proc-*.tar.gz zlib-*.tar.gz libpng-*.tar.xz pcre2-*.tar.bz2 glib-*.tar.xz fribidi-*.tar.xz cairo-*.tar.xz pango-*.tar.xz tllist-*.tar.gz fcft-*.tar.gz foot-*.tar.gz
 
 info:
 	@echo "OUT_DIR=$(OUT_DIR)"
