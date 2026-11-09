@@ -39,9 +39,10 @@ This document describes the current baseline IPC/synchronization implementation 
 - `pipe_close()` decrements read/write endpoint counts and wakes blocked peers.
 
 **Futex**
-- `futex_wait(task, addr, deadline)` registers a waiter keyed by user address and blocks, optionally until a PIT-tick deadline (`ETIMEDOUT`). A signal interrupts the wait (`EINTR` when timed, `ERESTARTSYS` otherwise).
-- `futex_wake(addr, count)` wakes up to `count` waiters for that address.
-- `futex_requeue(addr, addr2, nr_wake, nr_requeue)` wakes some waiters and moves others to `addr2`.
+- Every futex call takes a `space`: the caller's PML4 for `FUTEX_PRIVATE_FLAG` operations, `FUTEX_SPACE_GLOBAL` (0) otherwise. Waiters only match within their space, so private futexes of different processes at the same address are independent.
+- `futex_wait(task, space, addr, deadline)` registers a waiter keyed by space and user address and blocks, optionally until a PIT-tick deadline (`ETIMEDOUT`). A signal interrupts the wait (`EINTR` when timed, `ERESTARTSYS` otherwise).
+- `futex_wake(space, addr, count)` wakes up to `count` waiters for that address.
+- `futex_requeue(space, addr, addr2, nr_wake, nr_requeue)` wakes some waiters and moves others to `addr2` in the same space.
 - `remove_task_waiters(task)` removes stale waiters during task teardown.
 
 **Shared Memory (System V Baseline)**
@@ -147,7 +148,7 @@ This document describes the current baseline IPC/synchronization implementation 
   - `lseek` on pipes returns `-ESPIPE`
   - `close` tears down pipe endpoints
 - Exit behavior:
-  - `clear_child_tid` now does best-effort zero + `futex_wake(addr, 1)`
+  - `clear_child_tid` now does best-effort zero + `futex_wake(FUTEX_SPACE_GLOBAL, addr, 1)` (a shared wake, as on Linux)
   - task exit removes pending IPC waiters for the exiting task, detaches shared-memory mappings, drops owner epoll watches, and tears down user mappings/address-space backing
 
 Limitations / Simplifications

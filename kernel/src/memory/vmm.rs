@@ -1018,10 +1018,42 @@ fn leaf_pte_slot(pml4: PhysAddr, virt: u64) -> Option<(PhysAddr, usize)> {
     Some((pte_addr(pde), pt_index(virt)))
 }
 
-/// Break copy-on-write sharing for the page containing `virt`.
+/// Whether a user write fault on a page whose PTE is now `pte` needs no work
+/// because the page is already user-writable. That happens when two threads of
+/// one address space write to the same COW page on different CPUs: both fault,
+/// the first breaks the sharing, and the second finds a plain writable PTE.
+/// Its faulting instruction just has to be retried.
+pub const fn write_fault_already_resolved(pte: u64) -> bool {
+    let need = PTE_PRESENT | PTE_WRITE | PTE_USER;
+    (pte & need) == need && (pte & PTE_COW) == 0
+}
+
+/// Break copy-on-write sharing for the page containing `virt`, for a user
+/// write fault. A fault another thread already resolved counts as resolved.
 pub fn resolve_cow_in(target_pml4: PhysAddr, virt: VirtAddr) -> CowResolve {
     let _guard = VMM_LOCK.lock();
-    resolve_cow_in_locked(target_pml4, virt)
+    match resolve_cow_in_locked(target_pml4, virt) {
+        CowResolve::NotCow => {
+            let pml4 = if target_pml4.as_u64() == 0 {
+                unsafe { PML4_PHYS }
+            } else {
+                target_pml4
+            };
+            let page = virt.align_down();
+            match leaf_pte_slot(pml4, page.as_u64()) {
+                Some((pt, idx)) if write_fault_already_resolved(read_pte(pt, idx)) => {
+                    // The #PF already dropped this CPU's stale entry; flush it
+                    // anyway so the retry sees the new PTE.
+                    if is_active_here(pml4) {
+                        invalidate_page(page);
+                    }
+                    CowResolve::Resolved
+                }
+                _ => CowResolve::NotCow,
+            }
+        }
+        other => other,
+    }
 }
 
 fn resolve_cow_in_locked(target_pml4: PhysAddr, virt: VirtAddr) -> CowResolve {
@@ -1406,6 +1438,23 @@ mod tests {
             CowAction::None
         );
         assert_eq!(cow_action(PHYS | PTE_COW, true), CowAction::None);
+    }
+
+    #[test]
+    fn write_fault_on_page_another_thread_resolved_is_retried() {
+        // After the first thread breaks COW the PTE is plain user-writable:
+        // the second thread's in-flight fault must count as resolved.
+        let cow = cow_share_pte(PHYS | PTE_PRESENT | PTE_WRITE | PTE_USER);
+        let resolved = match cow_action(cow, true) {
+            CowAction::Copy(flags) => PHYS | flags,
+            other => panic!("unexpected {:?}", other),
+        };
+        assert!(write_fault_already_resolved(resolved));
+        // Still COW, read-only, kernel-only or absent pages are real faults.
+        assert!(!write_fault_already_resolved(cow));
+        assert!(!write_fault_already_resolved(PHYS | PTE_PRESENT | PTE_USER));
+        assert!(!write_fault_already_resolved(PHYS | PTE_PRESENT | PTE_WRITE));
+        assert!(!write_fault_already_resolved(PHYS | PTE_WRITE | PTE_USER));
     }
 
     #[test]

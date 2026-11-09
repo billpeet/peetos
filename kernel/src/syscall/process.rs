@@ -633,6 +633,14 @@ pub(super) fn sys_futex(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let op = call.arg(1) as u32;
     let cmd = op & 0x7F;
     let val = call.arg(2) as u32;
+    // Private futexes are per address space: two processes of the same
+    // binary use the same addresses, and a wake in one must not consume a
+    // waiter of the other. Shared ones keep the global address key.
+    let space = if (op & ipc::FUTEX_PRIVATE_FLAG) != 0 {
+        unsafe { (*ctx.current).pml4_phys }
+    } else {
+        ipc::FUTEX_SPACE_GLOBAL
+    };
 
     match cmd {
         ipc::FUTEX_WAIT | ipc::FUTEX_WAIT_BITSET => {
@@ -657,17 +665,17 @@ pub(super) fn sys_futex(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                     return -ETIMEDOUT;
                 }
             }
-            match ipc::futex_wait(ctx.current, uaddr, deadline) {
+            match ipc::futex_wait(ctx.current, space, uaddr, deadline) {
                 Ok(()) => 0,
                 Err(err) => -ipc_to_errno(err),
             }
         }
-        ipc::FUTEX_WAKE => ipc::futex_wake(uaddr, val) as i64,
+        ipc::FUTEX_WAKE => ipc::futex_wake(space, uaddr, val) as i64,
         ipc::FUTEX_WAKE_BITSET => {
             if call.arg(5) as u32 == 0 {
                 return -EINVAL;
             }
-            ipc::futex_wake(uaddr, val) as i64
+            ipc::futex_wake(space, uaddr, val) as i64
         }
         ipc::FUTEX_REQUEUE | ipc::FUTEX_CMP_REQUEUE => {
             // The timeout slot carries the requeue limit for these ops.
@@ -685,7 +693,7 @@ pub(super) fn sys_futex(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                     return -EAGAIN;
                 }
             }
-            ipc::futex_requeue(uaddr, uaddr2, val, nr_requeue) as i64
+            ipc::futex_requeue(space, uaddr, uaddr2, val, nr_requeue) as i64
         }
         _ => -ENOSYS,
     }
@@ -1072,7 +1080,8 @@ pub(super) fn clear_child_tid(ctx: &SyscallContext) {
 
     let zero = [0u8; CLEAR_TID_SIZE];
     let _ = copy_to_user_task(ctx.current, clear_tid, &zero);
-    let _ = ipc::futex_wake(clear_tid, 1);
+    // Linux wakes CLONE_CHILD_CLEARTID waiters as a shared futex.
+    let _ = ipc::futex_wake(ipc::FUTEX_SPACE_GLOBAL, clear_tid, 1);
     unsafe {
         (*ctx.current).user_clear_tid = 0;
     }

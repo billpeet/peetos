@@ -16,6 +16,12 @@ pub const FUTEX_REQUEUE: u32 = 3;
 pub const FUTEX_CMP_REQUEUE: u32 = 4;
 pub const FUTEX_WAIT_BITSET: u32 = 9;
 pub const FUTEX_WAKE_BITSET: u32 = 10;
+pub const FUTEX_PRIVATE_FLAG: u32 = 128;
+
+/// Futex namespace shared by every process: non-private futexes are keyed by
+/// virtual address alone, so a word mapped at the same address in several
+/// processes (fork-inherited `MAP_SHARED` memory) is one futex.
+pub const FUTEX_SPACE_GLOBAL: u64 = 0;
 
 const PIPE_CAPACITY: usize = 1024;
 const IPC_MAX_PIPES: usize = 64;
@@ -55,6 +61,9 @@ impl Pipe {
 struct Waiter {
     used: bool,
     key: u64,
+    /// Address space for private futexes (the owner's PML4), otherwise
+    /// `FUTEX_SPACE_GLOBAL`. Pipe waits always use the global space.
+    space: u64,
     task: usize,
 }
 
@@ -63,8 +72,13 @@ impl Waiter {
         Self {
             used: false,
             key: 0,
+            space: FUTEX_SPACE_GLOBAL,
             task: 0,
         }
+    }
+
+    fn matches(&self, key: u64, space: u64) -> bool {
+        self.used && self.key == key && self.space == space
     }
 }
 
@@ -99,7 +113,12 @@ fn futex_key(addr: u64) -> u64 {
     ((WAIT_KIND_FUTEX as u64) << 56) | (addr & 0x00FF_FFFF_FFFF_FFFF)
 }
 
-fn register_waiter_locked(state: &mut IpcState, key: u64, task: *mut Task) -> Result<(), i64> {
+fn register_waiter_locked(
+    state: &mut IpcState,
+    key: u64,
+    space: u64,
+    task: *mut Task,
+) -> Result<(), i64> {
     if task.is_null() {
         return Err(EAGAIN);
     }
@@ -107,7 +126,7 @@ fn register_waiter_locked(state: &mut IpcState, key: u64, task: *mut Task) -> Re
     let mut idx = 0usize;
     while idx < IPC_MAX_WAITERS {
         let waiter = &state.waiters[idx];
-        if waiter.used && waiter.task == task as usize && waiter.key == key {
+        if waiter.matches(key, space) && waiter.task == task as usize {
             return Ok(());
         }
         idx += 1;
@@ -119,6 +138,7 @@ fn register_waiter_locked(state: &mut IpcState, key: u64, task: *mut Task) -> Re
             state.waiters[idx] = Waiter {
                 used: true,
                 key,
+                space,
                 task: task as usize,
             };
             return Ok(());
@@ -133,7 +153,7 @@ fn remove_waiter_locked(state: &mut IpcState, key: u64, task: *mut Task) {
     let mut idx = 0usize;
     while idx < IPC_MAX_WAITERS {
         let waiter = &mut state.waiters[idx];
-        if waiter.used && waiter.key == key && waiter.task == task as usize {
+        if waiter.matches(key, FUTEX_SPACE_GLOBAL) && waiter.task == task as usize {
             *waiter = Waiter::empty();
         }
         idx += 1;
@@ -143,6 +163,7 @@ fn remove_waiter_locked(state: &mut IpcState, key: u64, task: *mut Task) {
 fn collect_waiters_locked(
     state: &mut IpcState,
     key: u64,
+    space: u64,
     max_count: usize,
     out: &mut [*mut Task; WAKE_BATCH],
 ) -> usize {
@@ -150,7 +171,7 @@ fn collect_waiters_locked(
     let mut idx = 0usize;
     while idx < IPC_MAX_WAITERS && count < max_count && count < out.len() {
         let waiter = &mut state.waiters[idx];
-        if waiter.used && waiter.key == key && waiter.task != 0 {
+        if waiter.matches(key, space) && waiter.task != 0 {
             out[count] = waiter.task as *mut Task;
             *waiter = Waiter::empty();
             count += 1;
@@ -161,6 +182,10 @@ fn collect_waiters_locked(
 }
 
 fn wake_key(key: u64, max_count: usize) -> usize {
+    wake_key_in(key, FUTEX_SPACE_GLOBAL, max_count)
+}
+
+fn wake_key_in(key: u64, space: u64, max_count: usize) -> usize {
     let mut total = 0usize;
     let mut remaining = max_count;
 
@@ -168,7 +193,7 @@ fn wake_key(key: u64, max_count: usize) -> usize {
         let mut tasks = [ptr::null_mut::<Task>(); WAKE_BATCH];
         let woke = {
             let mut state = IPC_STATE.lock();
-            collect_waiters_locked(&mut state, key, remaining, &mut tasks)
+            collect_waiters_locked(&mut state, key, space, remaining, &mut tasks)
         };
 
         if woke == 0 {
@@ -379,7 +404,7 @@ pub fn pipe_read(
             } else if nonblocking {
                 return Err(EAGAIN);
             } else {
-                register_waiter_locked(&mut state, read_key, task)?;
+                register_waiter_locked(&mut state, read_key, FUTEX_SPACE_GLOBAL, task)?;
                 should_block = true;
             }
         }
@@ -442,7 +467,7 @@ pub fn pipe_write(
                 }
                 return Err(EAGAIN);
             } else {
-                register_waiter_locked(&mut state, write_key, task)?;
+                register_waiter_locked(&mut state, write_key, FUTEX_SPACE_GLOBAL, task)?;
                 should_block = true;
             }
         }
@@ -505,18 +530,24 @@ fn take_futex_waiter_locked(state: &mut IpcState, task: *mut Task) -> bool {
     found
 }
 
-/// Sleep on futex word `addr` until woken, until the PIT tick `deadline`
-/// (if any), or until a signal interrupts the wait.
+/// Sleep on futex word `addr` in address space `space` (a PML4 for private
+/// futexes, `FUTEX_SPACE_GLOBAL` otherwise) until woken, until the PIT tick
+/// `deadline` (if any), or until a signal interrupts the wait.
 ///
 /// Errors: `ETIMEDOUT` when the deadline passed; for a signal, `EINTR` on a
 /// timed wait and `ERESTARTSYS` on an untimed one (so `SA_RESTART` handlers
 /// resume the wait transparently). A return without either may be spurious;
 /// callers re-check the futex word, as with Linux.
-pub fn futex_wait(task: *mut Task, addr: u64, deadline: Option<u64>) -> Result<(), i64> {
+pub fn futex_wait(
+    task: *mut Task,
+    space: u64,
+    addr: u64,
+    deadline: Option<u64>,
+) -> Result<(), i64> {
     let key = futex_key(addr);
     {
         let mut state = IPC_STATE.lock();
-        register_waiter_locked(&mut state, key, task)?;
+        register_waiter_locked(&mut state, key, space, task)?;
     }
     match deadline {
         Some(deadline) => block_current_until("futex-wait", deadline),
@@ -547,11 +578,11 @@ pub fn futex_wait(task: *mut Task, addr: u64, deadline: Option<u64>) -> Result<(
 /// FUTEX_REQUEUE: wake up to `nr_wake` waiters on `addr`, then move up to
 /// `nr_requeue` of the remaining waiters to `addr2` without waking them.
 /// Returns the number woken plus the number moved.
-pub fn futex_requeue(addr: u64, addr2: u64, nr_wake: u32, nr_requeue: u32) -> usize {
+pub fn futex_requeue(space: u64, addr: u64, addr2: u64, nr_wake: u32, nr_requeue: u32) -> usize {
     let woke = if nr_wake == 0 {
         0
     } else {
-        wake_key(futex_key(addr), nr_wake as usize)
+        wake_key_in(futex_key(addr), space, nr_wake as usize)
     };
     let from = futex_key(addr);
     let to = futex_key(addr2);
@@ -561,7 +592,7 @@ pub fn futex_requeue(addr: u64, addr2: u64, nr_wake: u32, nr_requeue: u32) -> us
         let mut idx = 0usize;
         while idx < IPC_MAX_WAITERS && moved < nr_requeue as usize {
             let waiter = &mut state.waiters[idx];
-            if waiter.used && waiter.key == from {
+            if waiter.matches(from, space) {
                 waiter.key = to;
                 moved += 1;
             }
@@ -573,21 +604,22 @@ pub fn futex_requeue(addr: u64, addr2: u64, nr_wake: u32, nr_requeue: u32) -> us
 
 /// Number of tasks waiting on futex word `addr` (test helper).
 #[cfg(test)]
-pub fn futex_waiter_count(addr: u64) -> usize {
+pub fn futex_waiter_count(space: u64, addr: u64) -> usize {
     let key = futex_key(addr);
     let state = IPC_STATE.lock();
     state
         .waiters
         .iter()
-        .filter(|w| w.used && w.key == key)
+        .filter(|w| w.matches(key, space))
         .count()
 }
 
-pub fn futex_wake(addr: u64, count: u32) -> usize {
+/// Wake up to `count` waiters on futex word `addr` in address space `space`.
+pub fn futex_wake(space: u64, addr: u64, count: u32) -> usize {
     if count == 0 {
         return 0;
     }
-    wake_key(futex_key(addr), count as usize)
+    wake_key_in(futex_key(addr), space, count as usize)
 }
 
 pub fn remove_task_waiters(task: *mut Task) {
@@ -689,16 +721,40 @@ mod tests {
         {
             let mut state = IPC_STATE.lock();
             let key = futex_key(addr);
-            register_waiter_locked(&mut state, key, t1).expect("waiter 1");
-            register_waiter_locked(&mut state, key, t2).expect("waiter 2");
+            register_waiter_locked(&mut state, key, FUTEX_SPACE_GLOBAL, t1).expect("waiter 1");
+            register_waiter_locked(&mut state, key, FUTEX_SPACE_GLOBAL, t2).expect("waiter 2");
         }
 
-        let woke = futex_wake(addr, 1);
+        let woke = futex_wake(FUTEX_SPACE_GLOBAL, addr, 1);
         assert_eq!(woke, 1);
-        let woke2 = futex_wake(addr, 8);
+        let woke2 = futex_wake(FUTEX_SPACE_GLOBAL, addr, 8);
         assert_eq!(woke2, 1);
-        let woke3 = futex_wake(addr, 1);
+        let woke3 = futex_wake(FUTEX_SPACE_GLOBAL, addr, 1);
         assert_eq!(woke3, 0);
+    }
+
+    #[test]
+    fn private_futexes_of_different_address_spaces_do_not_collide() {
+        // Two processes of the same binary use the same addresses. A private
+        // wake in one must not consume a waiter of the other, or that
+        // process's own waiter sleeps forever.
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        let addr = 0x7000u64;
+        let (space_a, space_b) = (0xA000u64, 0xB000u64);
+        {
+            let mut state = IPC_STATE.lock();
+            register_waiter_locked(&mut state, futex_key(addr), space_b, 0x51 as *mut Task)
+                .expect("waiter in B");
+            register_waiter_locked(&mut state, futex_key(addr), space_a, 0x52 as *mut Task)
+                .expect("waiter in A");
+        }
+        assert_eq!(futex_wake(space_a, addr, 1), 1);
+        assert_eq!(futex_waiter_count(space_a, addr), 0);
+        assert_eq!(futex_waiter_count(space_b, addr), 1);
+        // Shared (global) wakes do not reach private waiters either.
+        assert_eq!(futex_wake(FUTEX_SPACE_GLOBAL, addr, 8), 0);
+        assert_eq!(futex_wake(space_b, addr, 8), 1);
     }
 
     #[test]
@@ -709,15 +765,15 @@ mod tests {
         {
             let mut state = IPC_STATE.lock();
             for t in [0x10usize, 0x20, 0x30, 0x40] {
-                register_waiter_locked(&mut state, futex_key(a), t as *mut Task).expect("waiter");
+                register_waiter_locked(&mut state, futex_key(a), FUTEX_SPACE_GLOBAL, t as *mut Task).expect("waiter");
             }
         }
         // Wake one, move two, leave one behind.
-        assert_eq!(futex_requeue(a, b, 1, 2), 3);
-        assert_eq!(futex_waiter_count(a), 1);
-        assert_eq!(futex_waiter_count(b), 2);
-        assert_eq!(futex_wake(b, 8), 2);
-        assert_eq!(futex_wake(a, 8), 1);
+        assert_eq!(futex_requeue(FUTEX_SPACE_GLOBAL, a, b, 1, 2), 3);
+        assert_eq!(futex_waiter_count(FUTEX_SPACE_GLOBAL, a), 1);
+        assert_eq!(futex_waiter_count(FUTEX_SPACE_GLOBAL, b), 2);
+        assert_eq!(futex_wake(FUTEX_SPACE_GLOBAL, b, 8), 2);
+        assert_eq!(futex_wake(FUTEX_SPACE_GLOBAL, a, 8), 1);
     }
 
     #[test]
@@ -731,13 +787,13 @@ mod tests {
         // Host tests do not block, so the waiter is never woken: past the
         // deadline that is a timeout.
         TEST_NOW_TICKS.store(100, core::sync::atomic::Ordering::Relaxed);
-        assert_eq!(futex_wait(task, addr, Some(50)), Err(ETIMEDOUT));
-        assert_eq!(futex_waiter_count(addr), 0);
+        assert_eq!(futex_wait(task, FUTEX_SPACE_GLOBAL, addr, Some(50)), Err(ETIMEDOUT));
+        assert_eq!(futex_waiter_count(FUTEX_SPACE_GLOBAL, addr), 0);
 
         // Before the deadline (or with none) it is a spurious wakeup.
-        assert_eq!(futex_wait(task, addr, Some(500)), Ok(()));
-        assert_eq!(futex_wait(task, addr, None), Ok(()));
-        assert_eq!(futex_waiter_count(addr), 0);
+        assert_eq!(futex_wait(task, FUTEX_SPACE_GLOBAL, addr, Some(500)), Ok(()));
+        assert_eq!(futex_wait(task, FUTEX_SPACE_GLOBAL, addr, None), Ok(()));
+        assert_eq!(futex_waiter_count(FUTEX_SPACE_GLOBAL, addr), 0);
         TEST_NOW_TICKS.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
@@ -749,11 +805,11 @@ mod tests {
         let task = &mut t as *mut Task;
         crate::signal::send(task, crate::signal::SIGTERM).expect("send");
         assert_eq!(
-            futex_wait(task, 0x6000, None),
+            futex_wait(task, FUTEX_SPACE_GLOBAL, 0x6000, None),
             Err(crate::signal::ERESTARTSYS)
         );
         assert_eq!(
-            futex_wait(task, 0x6000, Some(u64::MAX)),
+            futex_wait(task, FUTEX_SPACE_GLOBAL, 0x6000, Some(u64::MAX)),
             Err(crate::signal::EINTR)
         );
     }

@@ -30,7 +30,11 @@ shares the parent's private pages instead of copying them:
    - if the frame is still shared, the page is copied into a new frame mapped
      writable, and the old frame's share count drops;
    - if this mapping is the last owner, the existing frame is made writable
-     again in place.
+     again in place;
+   - if the page is already plain user-writable, another thread of the same
+     address space resolved it first (both threads wrote to the page on
+     different CPUs and both faulted). The fault counts as handled and the
+     write is retried. Before this, the second thread was killed with SIGSEGV.
 3. `pmm::free_page` drops one reference and only releases a frame once no
    other mapping holds it, so every existing unmap/teardown path (`munmap`,
    `brk` shrink, `execve`, exit) is share-aware without changes.
@@ -152,8 +156,16 @@ Pipe writes that already moved data return the partial count.
   not filter wakeups.
 - `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` wake some waiters and move others to
   a second futex word without waking them.
-- `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME` are accepted. Other
-  operations (`WAKE_OP`, PI futexes) return `-ENOSYS`.
+- Futexes with `FUTEX_PRIVATE_FLAG` are keyed by address space (the
+  caller's PML4) and address. Without it, the key is the address alone,
+  shared by all processes. That covers `pthread_join`'s wait on the TID
+  word, which the kernel's `clear_child_tid` wakes as a shared futex. It
+  also covers fork-inherited `MAP_SHARED` words at the same address. Before
+  private futexes had their own namespace, two processes of the same binary
+  (same addresses, no ASLR) could consume each other's wakeups. That hung
+  the second of two foot terminals about half the time.
+- `FUTEX_CLOCK_REALTIME` is accepted. Other operations (`WAKE_OP`, PI
+  futexes) return `-ENOSYS`.
 
 ## Exit and Reaping
 
@@ -187,9 +199,12 @@ Pipe writes that already moved data return the partial count.
   an ordinary thread that is terminated with the other siblings.
 
 Limitations / Simplifications
-- Single core only. Fork, COW resolution and thread bookkeeping rely on
-  syscalls and fault handlers running with interrupts masked; there is no TLB
-  shootdown.
+- COW resolution and page-table updates are serialized by `VMM_LOCK`, and
+  other CPUs running the address space are flushed with a TLB-shootdown IPI.
+  Thread bookkeeping still relies on the big kernel lock.
+- Shared futexes are keyed by virtual address, not by the underlying page, so
+  a `MAP_SHARED` word mapped at different addresses in two processes is two
+  different futexes. Linux keys them by page.
 - Partial sharing is rejected: `CLONE_VM`, `CLONE_FILES`, `CLONE_FS` or
   `CLONE_SIGHAND` without `CLONE_THREAD` return `-EINVAL` (except the existing
   `CLONE_VM | CLONE_VFORK` compatibility path, which behaves as a COW fork:
