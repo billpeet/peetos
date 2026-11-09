@@ -633,6 +633,29 @@ fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/foot_smoke.sh"
 
+# Interactive foot session (make run-foot-demo): peetwl runs one foot
+# window with a toybox shell. `exit` or ^D closes foot; peetwl (not in
+# --smoke mode) keeps running with an empty desktop until QEMU is closed.
+cat > "${STAGE_ROOT}/bin/foot_demo_shell.sh" <<'EOS'
+cd /mnt/ext2
+echo "Welcome to foot on PeetOS."
+echo "This is toybox sh in a pty; there is no line editing or history yet."
+echo
+exec toybox sh -i
+EOS
+
+cat > "${STAGE_ROOT}/bin/foot_demo.sh" <<'EOS'
+export LANG=C.UTF-8 HOME=/tmp
+if [ ! -x bin/peetwl ] || [ ! -x bin/foot ]; then
+  echo [musl-ext2-foot-demo] missing bin/peetwl or bin/foot
+  exit 1
+fi
+echo [musl-ext2-foot-demo] starting peetwl with an interactive foot terminal
+exec bin/peetwl \
+  --client "/mnt/ext2/bin/foot -e /mnt/ext2/bin/toybox sh /mnt/ext2/bin/foot_demo_shell.sh"
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/foot_demo.sh"
+
 cat > "${STAGE_ROOT}/bin/text_smoke.sh" <<'EOS'
 fail=0
 

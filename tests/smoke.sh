@@ -26,7 +26,6 @@ run_qemu() {
     -serial stdio \
     -display none \
     -no-reboot \
-    -no-shutdown \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     > "${LOG_FILE}" 2>&1
   status=$?

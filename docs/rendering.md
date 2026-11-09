@@ -46,6 +46,7 @@ foot 1.18.1 runs under `peetwl`. That is the roadmap's first milestone: a real t
   - waits for the shell inside foot to report the line on the serial console.
 
   The runner also requires DRM page flips. Screenshots go to `$FOOT_SHOTS` when set.
+- `make run-foot-demo` is the interactive version. It boots the `compositor-first musl-ext2-foot-demo usb-tablet` profile in a QEMU window (1 GiB, 2 CPUs; override with `FOOT_DEMO_MEM` and `QEMU_SMP`). `peetwl` (not in smoke mode) runs one foot window holding `toybox sh -i`. Click the QEMU window to give it the keyboard, then type into foot; drag the title bar to move the window. `exit` or ^D closes foot and leaves an empty desktop. The profile is left out of `make run`'s feature set so `make run` is unchanged.
 
 **Kernel work foot needed**
 - **`epoll_pwait` and `ppoll` honour their signal mask.** It is installed for the wait and restored on syscall exit, or saved in the signal frame when a signal is delivered under it, like Linux's `TIF_RESTORE_SIGMASK`. foot's event loop depends on this (it unblocks SIGCHLD only while waiting). Before, `epoll_pwait` with a mask returned `ENOSYS` and `ppoll` ignored it.
@@ -70,7 +71,7 @@ The runner saves a QEMU screendump of the frame to `build/text_smoke.png`.
 
 Limitations / Simplifications
 - foot runs without text shaping (no harfbuzz), grapheme clustering (no utf8proc) or terminfo. Toybox's shell has no line editing or job control, and there is no clipboard transfer through `peetwl`. `fallocate(PUNCH_HOLE)` is not supported, so foot disables its scrolling-by-offset optimization and redraws instead.
-- There is no interactive foot session target yet (only the automated smoke).
+- The interactive demo has a single foot window, which cannot be reopened after the shell exits (there is no launcher), and `make test` does not cover it; its init payload and scripts mirror the smoke's.
 - No harfbuzz yet. It needs a C++ runtime, which musl does not provide, so there is no complex-script shaping, and fcft/foot will build without it at first. libpng, cairo and pango are not ported yet.
 - Only two fonts (DejaVu Sans and DejaVu Sans Mono) are staged. There is no fontconfig cache built ahead of time: the first `FcInit` in each process scans the font directory, which is fast with two fonts but grows with more.
 - The stage seeds pkg-config files by hand for the libraries built outside meson. Their versions and flags are hard-coded in `scripts/build_render_stack.sh`.

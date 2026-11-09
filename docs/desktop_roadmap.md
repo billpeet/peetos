@@ -97,7 +97,7 @@ later.
 ### 5. Desktop shell and core applications
 
 - [x] **foot** terminal: foot 1.18.1 with fcft 3.1.8 runs under `peetwl`
-  (`make run-foot-smoke`, see `docs/rendering.md`). It still lacks harfbuzz
+  (`make run-foot-demo`, `make run-foot-smoke`; see `docs/rendering.md`). It still lacks harfbuzz
   shaping and terminfo.
 - [ ] Panel/taskbar and launcher (for example waybar or sfwbar, fuzzel or wofi).
 - [ ] GTK3/4 (GLib, GObject, gdk-pixbuf, libepoxy), unlocking a file manager
