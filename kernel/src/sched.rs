@@ -696,6 +696,9 @@ fn schedule_from(current_rsp: u64, requeue_current: bool, irq_acquired_bkl: bool
         let current = cpu.current;
         let idle = cpu.idle;
         (*current).saved_rsp = current_rsp;
+        if !task::stack_canary_intact(current) {
+            task::report_stack_overflow(current);
+        }
         (*current).bkl_resume = crate::bkl::held_by_me() && !irq_acquired_bkl;
         if let Some(state) = cpu.block_as.take() {
             (*current).state = state;

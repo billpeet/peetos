@@ -1,12 +1,12 @@
 use core::mem::{size_of, MaybeUninit};
 use core::ptr;
 
-use arch_x86_64::addr::VirtAddr;
+use arch_x86_64::addr::{PhysAddr, VirtAddr};
 use arch_x86_64::fpu::FxSaveArea;
 use arch_x86_64::idt::InterruptFrame;
 use arch_x86_64::syscall as arch_syscall;
 
-use crate::memory::pmm;
+use crate::memory::{pmm, vmm};
 use crate::serial_println;
 
 pub type Pid = i32;
@@ -100,6 +100,9 @@ pub struct Task {
     pub(crate) kernel_stack_base: u64,
     pub(crate) kernel_stack_top: u64,
     pub(crate) pml4_phys: u64,
+    /// Syscall number and arguments this task last entered (for fault reports).
+    pub(crate) last_syscall: u64,
+    pub(crate) last_syscall_args: [u64; 6],
     pub(crate) user_entry: u64,
     pub(crate) user_stack_bottom: u64,
     pub(crate) user_stack_top: u64,
@@ -163,6 +166,155 @@ pub struct Task {
 
 /// Physically contiguous pages backing one `Task` (see `task_alloc`).
 const TASK_STRUCT_PAGES: usize = 2;
+
+/// Words at the bottom of every kernel stack. Kernel stacks have no guard
+/// page and are allocated back to back, so a syscall that needs more than
+/// `KERNEL_STACK_SIZE` silently overwrites the top of the neighbouring
+/// task's stack; the canary turns that into a report at the next switch.
+const STACK_CANARY: u64 = 0x5045_4554_5354_4b21; // "PEETSTK!"
+const STACK_CANARY_WORDS: usize = 4;
+
+fn write_stack_canary(stack_base: u64) {
+    let words = stack_base as *mut u64;
+    for i in 0..STACK_CANARY_WORDS {
+        unsafe { words.add(i).write_volatile(STACK_CANARY) };
+    }
+}
+
+/// Fill a new kernel stack with the canary pattern, so its high-water mark
+/// can be measured later (`kernel_stack_high_water`).
+fn paint_kernel_stack(stack_base: u64) {
+    let words = stack_base as *mut u64;
+    for i in 0..(KERNEL_STACK_SIZE / 8) as usize {
+        unsafe { words.add(i).write_volatile(STACK_CANARY) };
+    }
+}
+
+/// Bytes of the task's kernel stack that have ever been written (the
+/// painted pattern is gone), counting down from the top.
+pub fn kernel_stack_high_water(task: *const Task) -> u64 {
+    let base = unsafe { (*task).kernel_stack_base };
+    if base == 0 {
+        return 0;
+    }
+    let words = base as *const u64;
+    let total = (KERNEL_STACK_SIZE / 8) as usize;
+    let untouched = (0..total).take_while(|&i| unsafe { words.add(i).read_volatile() } == STACK_CANARY).count();
+    KERNEL_STACK_SIZE - untouched as u64 * 8
+}
+
+/// Fault diagnostics: every task's kernel stack high-water mark.
+pub fn report_kernel_stack_usage() {
+    unsafe {
+        for slot in 0..MAX_TASKS {
+            let t = TASK_TABLE[slot];
+            if t.is_null() || (*t).kernel_stack_base == 0 {
+                continue;
+            }
+            let used = kernel_stack_high_water(t);
+            let name = &(*t).name;
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            serial_println!(
+                "[TASK] pid {} '{}' kernel stack high-water {} of {} bytes{}",
+                (*t).pid,
+                core::str::from_utf8(&name[..len]).unwrap_or("?"),
+                used,
+                KERNEL_STACK_SIZE,
+                if used >= KERNEL_STACK_SIZE { " (OVERFLOWED)" } else { "" }
+            );
+        }
+    }
+}
+
+/// True when the task's kernel stack canary is intact (or it has none).
+pub fn stack_canary_intact(task: *const Task) -> bool {
+    if task.is_null() {
+        return true;
+    }
+    let base = unsafe { (*task).kernel_stack_base };
+    if base == 0 {
+        return true;
+    }
+    let words = base as *const u64;
+    (0..STACK_CANARY_WORDS).all(|i| unsafe { words.add(i).read_volatile() } == STACK_CANARY)
+}
+
+/// Report a kernel stack overflow (canary destroyed) once per task.
+pub fn report_stack_overflow(task: *mut Task) {
+    unsafe {
+        let name = &(*task).name;
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        serial_println!(
+            "[TASK] BUG: kernel stack overflow in pid {} '{}' (last syscall {} args {:x?}); the neighbouring stack below 0x{:x} is corrupt",
+            (*task).pid,
+            core::str::from_utf8(&name[..len]).unwrap_or("?"),
+            (*task).last_syscall,
+            (*task).last_syscall_args,
+            (*task).kernel_stack_base
+        );
+        // Re-arm so a second overflow by the same task is reported too.
+        write_stack_canary((*task).kernel_stack_base);
+    }
+}
+
+/// Fault diagnostics: for a direct-map kernel address (such as a faulting
+/// kernel RSP), report any process that maps its frame from user space, and
+/// dump the 128 bytes at the address.
+pub fn report_user_mappings_of_kernel_addr(addr: u64) {
+    if addr < arch_x86_64::addr::DIRECT_MAP_BASE {
+        return;
+    }
+    let phys = VirtAddr::new(addr & !0xfff).to_phys();
+    let mut found = false;
+    unsafe {
+        for slot in 0..MAX_TASKS {
+            let t = TASK_TABLE[slot];
+            if t.is_null() || (*t).pml4_phys == 0 {
+                continue;
+            }
+            if let Some(va) = vmm::find_user_mapping_of(PhysAddr::new((*t).pml4_phys), phys, 1) {
+                serial_println!(
+                    "[EXC] frame 0x{:x} of 0x{:x} is mapped at user 0x{:x} in pid {}",
+                    phys.as_u64(),
+                    addr,
+                    va,
+                    (*t).pid
+                );
+                found = true;
+            }
+        }
+        if !found {
+            serial_println!("[EXC] frame 0x{:x} of 0x{:x} has no user mappings", phys.as_u64(), addr);
+        }
+        let words = core::slice::from_raw_parts(addr as *const u64, 16);
+        serial_println!("[EXC] memory at 0x{:x}: {:x?}", addr, words);
+    }
+}
+
+/// Log loudly if frames just allocated for a kernel structure are still
+/// mapped into some process: the PMM handed out a frame that was freed while
+/// in use (a reference-count bug), and user writes would corrupt it.
+fn check_frames_unmapped(what: &str, phys: PhysAddr, count: usize) {
+    unsafe {
+        for slot in 0..MAX_TASKS {
+            let t = TASK_TABLE[slot];
+            if t.is_null() || (*t).pml4_phys == 0 {
+                continue;
+            }
+            let pml4 = PhysAddr::new((*t).pml4_phys);
+            if let Some(va) = vmm::find_user_mapping_of(pml4, phys, count) {
+                serial_println!(
+                    "[TASK] BUG: new {} at 0x{:x} is still mapped at user 0x{:x} in pid {}",
+                    what,
+                    phys.as_u64(),
+                    va,
+                    (*t).pid
+                );
+                return;
+            }
+        }
+    }
+}
 const _: () = assert!(size_of::<Task>() <= TASK_STRUCT_PAGES * 4096);
 
 static mut TASK_TABLE: [*mut Task; MAX_TASKS] = [ptr::null_mut(); MAX_TASKS];
@@ -221,6 +373,8 @@ pub fn init() {
             kernel_stack_base: 0,
             kernel_stack_top: 0,
             pml4_phys: 0,
+            last_syscall: 0,
+            last_syscall_args: [0; 6],
             user_entry: 0,
             user_stack_bottom: 0,
             user_stack_top: 0,
@@ -306,6 +460,10 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         pmm::free_pages(task_phys, TASK_STRUCT_PAGES);
         return ptr::null_mut();
     }
+    pmm::set_kernel_owned(task_phys, TASK_STRUCT_PAGES, true);
+    pmm::set_kernel_owned(stack_phys, KERNEL_STACK_PAGES, true);
+    check_frames_unmapped("kernel stack", stack_phys, KERNEL_STACK_PAGES);
+    check_frames_unmapped("task struct", task_phys, TASK_STRUCT_PAGES);
     let stack_base = stack_phys.to_virt().as_u64();
     let stack_top = stack_base + KERNEL_STACK_SIZE;
 
@@ -326,6 +484,7 @@ pub fn task_alloc(name: &str, flags: u32) -> *mut Task {
         task.exit_code = 0;
         task.kernel_stack_base = stack_base;
         task.kernel_stack_top = stack_top;
+        paint_kernel_stack(stack_base);
         task.pml4_phys = 0;
         task.user_entry = 0;
         task.user_stack_bottom = 0;
@@ -416,10 +575,12 @@ pub fn task_destroy(task: *mut Task) {
         let stack_base = (*task).kernel_stack_base;
         if stack_base != 0 {
             let stack_phys = VirtAddr::new(stack_base).to_phys();
+            pmm::set_kernel_owned(stack_phys, KERNEL_STACK_PAGES, false);
             pmm::free_pages(stack_phys, KERNEL_STACK_PAGES);
         }
 
         let task_phys = VirtAddr::new(task as u64).to_phys();
+        pmm::set_kernel_owned(task_phys, TASK_STRUCT_PAGES, false);
         pmm::free_pages(task_phys, TASK_STRUCT_PAGES);
     }
 }
@@ -737,6 +898,8 @@ impl Task {
             kernel_stack_base: 0,
             kernel_stack_top: 0,
             pml4_phys: 0,
+            last_syscall: 0,
+            last_syscall_args: [0; 6],
             user_entry: 0,
             user_stack_bottom: 0,
             user_stack_top: 0,

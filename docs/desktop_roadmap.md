@@ -105,8 +105,12 @@ later.
   (`make run-foot-demo`, `make run-foot-smoke`; see `docs/rendering.md`), with
   harfbuzz shaping and utf8proc grapheme clustering. It still lacks terminfo.
 - [ ] Panel/taskbar and launcher (for example waybar or sfwbar, fuzzel or wofi).
-- [ ] GTK3/4 (GLib, GObject, gdk-pixbuf, libepoxy), unlocking a file manager
-  (Thunar, PCManFM), a text editor and settings applications.
+- [x] GTK 3.24 (Wayland backend) with libepoxy, ATK and gdk-pixbuf
+  (`make run-gtk-smoke`; see `docs/gtk.md`).
+- [ ] GTK applications: a file manager (Thunar, PCManFM), a text editor
+  (mousepad) and settings applications. They need D-Bus, librsvg for SVG
+  icons, and an icon theme.
+- [ ] GTK 4 (needs Mesa/EGL).
 
 ### 6. Session services
 
@@ -124,7 +128,8 @@ later.
 
 4. ~~fcft + foot (without harfbuzz at first)~~ Done.
 5. ~~C++ runtime, then harfbuzz~~ Done (GCC + libstdc++; fcft/foot now shape text).
-6. ~~libpng, cairo, pango (with GLib)~~ Done. Next: the rest of the GTK stack (gdk-pixbuf, libepoxy, GTK) or wlroots.
+6. ~~libpng, cairo, pango (with GLib)~~ Done.
+7. ~~gdk-pixbuf, libepoxy, GTK 3~~ Done. Next: wlroots + labwc, or D-Bus and librsvg for real GTK applications.
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports. *(Reached: foot renders

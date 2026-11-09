@@ -87,6 +87,12 @@ mod fb_console {
     pub fn set_active(_active: bool, _redraw: bool) {}
     pub fn tick() {}
     pub fn write_bytes(_bytes: &[u8]) {}
+    pub fn activate_for_fatal_report() -> bool {
+        true
+    }
+    pub fn lock_holder() -> (&'static str, Option<&'static core::panic::Location<'static>>, i32) {
+        ("none", None, -1)
+    }
 }
 
 #[cfg(not(feature = "test-exit"))]
@@ -300,7 +306,9 @@ pub extern "C" fn kmain() -> ! {
 fn panic(info: &PanicInfo) -> ! {
     serial::init();
     display_mode::activate_console();
-    fb_console::set_active(true, true);
+    // Never wait for the console lock here: the panic may come from code
+    // that holds it.
+    fb_console::activate_for_fatal_report();
     mouse::sync_display_owner();
     serial_println!("KERNEL PANIC: {}", info);
 
@@ -311,15 +319,69 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+/// Set once a fatal exception is being reported, so a fault inside the
+/// reporting path (console redraw) does not recurse into it again.
+static IN_FATAL_REPORT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn report_current_task() {
+    let current = task::current();
+    if !current.is_null() {
+        let name = unsafe { &(*current).name };
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        serial_println!(
+            "[EXC] current task pid {} '{}', last syscall {} args {:x?}",
+            unsafe { (*current).pid },
+            core::str::from_utf8(&name[..len]).unwrap_or("?"),
+            unsafe { (*current).last_syscall },
+            unsafe { (*current).last_syscall_args }
+        );
+    }
+}
+
 extern "C" fn default_exception_handler(frame: &mut idt::InterruptFrame) {
     serial::init();
     if exception::handle(frame) {
         return;
     }
-    display_mode::activate_console();
-    fb_console::set_active(true, true);
-    mouse::sync_display_owner();
+    let nested = IN_FATAL_REPORT.swap(true, core::sync::atomic::Ordering::SeqCst);
+
+    // Report to serial first, before touching the console: redrawing it is
+    // the riskiest step, and the original fault must not be lost if it fails.
+    // While the compositor owns the display, console writes go to serial only.
+    if nested {
+        serial_println!("[EXC] fault while reporting an earlier fatal exception");
+    }
+    report_current_task();
     exception::report(frame);
+    if frame.cs & 3 == 0 {
+        // Kernel-mode fault: if the stack page was overwritten, say whether a
+        // process still maps that frame.
+        task::report_user_mappings_of_kernel_addr(frame.rsp);
+        task::report_kernel_stack_usage();
+    }
+
+    if !nested {
+        display_mode::activate_console();
+        // Never wait for the console lock here: the faulting code may hold it
+        // (interrupts are off, so it could never release it).
+        if fb_console::activate_for_fatal_report() {
+            // Repeat the report on the now-visible console.
+            exception::report(frame);
+        } else {
+            let (site, caller, pid) = fb_console::lock_holder();
+            match caller {
+                Some(loc) => serial_println!(
+                    "[EXC] console busy at the fault (held by {} from {}:{} in pid {})",
+                    site,
+                    loc.file(),
+                    loc.line(),
+                    pid
+                ),
+                None => serial_println!("[EXC] console busy at the fault (held by {} in pid {})", site, pid),
+            }
+        }
+        mouse::sync_display_owner();
+    }
 
     loop {
         unsafe {

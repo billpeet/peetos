@@ -73,6 +73,11 @@ static PMM_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 /// bumps this; `free_page` drops one reference and only releases the frame
 /// when the count is already zero.
 static mut PAGE_EXTRA_REFS: [u16; PMM_MAX_PAGES as usize] = [0; PMM_MAX_PAGES as usize];
+/// Frames the kernel owns for its own structures (task kernel stacks and
+/// task structs). Freeing one outside its owner's release path, or mapping
+/// one into user space, is a use-after-free in the making and is logged
+/// with the caller (`[PMM] BUG ...`, `[VMM] BUG ...`).
+static mut KERNEL_OWNED_BITS: [u8; (PMM_MAX_PAGES as usize).div_ceil(8)] = [0; (PMM_MAX_PAGES as usize).div_ceil(8)];
 
 extern "C" {
     static __kernel_start: u8;
@@ -307,13 +312,15 @@ pub fn alloc_page() -> PhysAddr {
 }
 
 #[cfg(target_os = "none")]
+#[track_caller]
 pub fn free_page(addr: PhysAddr) {
+    let caller = core::panic::Location::caller();
     let _guard = PMM_LOCK.lock();
-    free_page_locked(addr)
+    free_page_locked(addr, caller)
 }
 
 #[cfg(target_os = "none")]
-fn free_page_locked(addr: PhysAddr) {
+fn free_page_locked(addr: PhysAddr, caller: &'static core::panic::Location<'static>) {
     unsafe {
         if !PMM_INITIALIZED {
             serial_println!("[PMM] ERROR: PMM not initialized!");
@@ -336,6 +343,17 @@ fn free_page_locked(addr: PhysAddr) {
             serial_println!(
                 "[PMM] WARNING: Double-free detected at: 0x{:x}",
                 addr.as_u64()
+            );
+            return;
+        }
+
+        if kernel_owned(pfn) {
+            serial_println!(
+                "[PMM] BUG: freeing kernel-owned frame 0x{:x} (refs {}) from {}:{}; not freed",
+                addr.as_u64(),
+                PAGE_EXTRA_REFS[pfn as usize],
+                caller.file(),
+                caller.line()
             );
             return;
         }
@@ -420,11 +438,46 @@ pub fn alloc_pages(_count: usize) -> PhysAddr {
 }
 
 #[cfg(target_os = "none")]
+#[track_caller]
 pub fn free_pages(addr: PhysAddr, count: usize) {
+    let caller = core::panic::Location::caller();
     let _guard = PMM_LOCK.lock();
     for i in 0..count {
-        free_page_locked(addr + (i as u64 * PAGE_SIZE));
+        free_page_locked(addr + (i as u64 * PAGE_SIZE), caller);
     }
+}
+
+fn kernel_owned(pfn: u64) -> bool {
+    if pfn >= PMM_MAX_PAGES {
+        return false;
+    }
+    unsafe { KERNEL_OWNED_BITS[(pfn / 8) as usize] & (1 << (pfn % 8)) != 0 }
+}
+
+/// Mark (or unmark, just before freeing) `count` frames from `addr` as owned
+/// by a kernel structure; see `KERNEL_OWNED_BITS`.
+pub fn set_kernel_owned(addr: PhysAddr, count: usize, owned: bool) {
+    let _guard = PMM_LOCK.lock();
+    let first = addr.align_down().to_pfn();
+    for pfn in first..first + count as u64 {
+        if pfn >= PMM_MAX_PAGES {
+            break;
+        }
+        unsafe {
+            let byte = &mut KERNEL_OWNED_BITS[(pfn / 8) as usize];
+            if owned {
+                *byte |= 1 << (pfn % 8);
+            } else {
+                *byte &= !(1 << (pfn % 8));
+            }
+        }
+    }
+}
+
+/// True when the frame holds a live kernel structure (task stack or struct).
+pub fn is_kernel_owned(addr: PhysAddr) -> bool {
+    let _guard = PMM_LOCK.lock();
+    kernel_owned(addr.align_down().to_pfn())
 }
 
 #[cfg(not(target_os = "none"))]

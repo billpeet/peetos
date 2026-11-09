@@ -61,7 +61,7 @@ if grep -q '\[musl-ext2-fpu-smoke\] failures' "${LOG_FILE}" || grep -q '\[fpu-sm
   exit 1
 fi
 
-for marker in '\[fpu-smoke\] preempt ok' '\[fpu-smoke\] signal ok' '\[fpu-smoke\] exec ok' '\[fpu-smoke\] pass'; do
+for marker in '\[fpu-smoke\] preempt ok' '\[fpu-smoke\] signal ok' '\[fpu-smoke\] exec ok' '\[fpu-smoke\] direction flag ok' '\[fpu-smoke\] pass'; do
   if ! grep -q "${marker}" "${LOG_FILE}"; then
     echo "FPU context smoke is missing marker: ${marker}" >&2
     cat "${LOG_FILE}" >&2

@@ -35,7 +35,7 @@ curl -LO https://ftp.gnu.org/gnu/gperf/gperf-3.1.tar.gz && tar xf gperf-3.1.tar.
 - **Ext2 image.** The image builder copies every staged shared library into `/usr/lib` under its soname. It also adds `/etc/fonts` (with the `conf.d` symlinks resolved to plain files), `/usr/share/fontconfig`, `/usr/share/fonts`, an empty `/var/cache/fontconfig`, and `fc-list`/`fc-match`/`fc-cache` in `/bin`.
 
 **2D toolkit libraries: cairo, pango and GLib**
-`scripts/build_cairo_pango.sh` (run by `make -C wayland` after the rendering stack) builds the next layer into the same stage. These are the libraries GTK and most desktop applications draw text and graphics with:
+`scripts/build_cairo_pango.sh` (run by `make -C wayland` after the rendering stack) builds the next layer into the same stage; GTK 3 builds on it (`docs/gtk.md`). These are the libraries GTK and most desktop applications draw text and graphics with:
 - **zlib 1.3.1** with its own configure script; **libpng 1.6.44** and **pcre2 10.44** (8-bit only, no JIT) with autotools.
 - **GLib 2.82.2** (glib, gobject, gio, gmodule, girepository) with meson: no NLS, introspection, SELinux, xattr, libmount, docs or tests. Its code generators (`glib-mkenums`, `glib-genmarshal`, `gdbus-codegen`) are Python scripts staged in `usr/bin`. A build-machine pkg-config directory points meson projects that use them (pango) at the staged copies.
 - **fribidi 1.0.16** for the Unicode bidirectional algorithm.

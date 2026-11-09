@@ -1006,6 +1006,37 @@ pub(super) fn sys_getegid(ctx: &SyscallContext, _call: &SyscallArgs) -> i64 {
     sys_getgid(ctx, _call)
 }
 
+/// Write one id to the three `getresuid`/`getresgid` pointers (real,
+/// effective, saved). There is no separate saved/effective id model yet, so
+/// all three are the process's id, as `getuid`/`geteuid` report.
+fn write_res_ids(ctx: &SyscallContext, call: &SyscallArgs, id: u32) -> i64 {
+    for i in 0..3 {
+        if let Err(err) = write_struct_to_user(ctx.current, call.arg(i), &id) {
+            return -err;
+        }
+    }
+    0
+}
+
+/// `getresuid(ruid, euid, suid)`; GLib uses it to decide whether it runs
+/// setuid.
+pub(super) fn sys_getresuid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+    let uid = unsafe { (*crate::task::leader_of(ctx.current)).user_uid };
+    write_res_ids(ctx, call, uid as u32)
+}
+
+/// `getresgid(rgid, egid, sgid)`.
+pub(super) fn sys_getresgid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    if !ctx.has_task() {
+        return -ESRCH;
+    }
+    let gid = unsafe { (*crate::task::leader_of(ctx.current)).user_gid };
+    write_res_ids(ctx, call, gid as u32)
+}
+
 pub(super) fn sys_execve(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     match execve_common(ctx, call.arg(0), call.arg(1), call.arg(2)) {
         Ok(_) => 0,

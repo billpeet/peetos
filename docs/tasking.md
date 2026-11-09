@@ -25,7 +25,18 @@ This document describes the tasking and scheduler implementation. It supports ke
 - Scheduling metadata (time slice, tick counters, sleep deadline)
 - Saved x87/SSE register image (`fpu`, a 16-byte-aligned 512-byte `FXSAVE` area)
 
+- The syscall it last entered, number and arguments (`last_syscall`, `last_syscall_args`), for fault reports
+
 The boot task represents the current execution context and is created in `task::init()`.
+
+**Kernel Stack and Frame Checks**
+Kernel stacks are 16 KiB from the PMM, allocated back to back with no guard page. Several cheap checks catch the ways they get corrupted:
+- **Painting.** A new stack is filled with a canary pattern. `kernel_stack_high_water` measures how much has ever been used, and fatal-exception reports list every task's high-water mark (`OVERFLOWED` when the pattern is gone).
+- **Overflow check.** The scheduler checks the bottom canary words when a task switches out and logs `[TASK] BUG: kernel stack overflow ...` with the task's last syscall.
+- **Kernel-owned frames.** Task stacks and task structs are marked in a PMM bitmap. Freeing a marked frame outside the task-free path is refused and logged with the caller (`[PMM] BUG: freeing kernel-owned frame ...`). Mapping one into user space with `vmm::map_page_in` is logged too (`[VMM] BUG ...`).
+- **Stale mappings.** When a task is created, every address space is scanned for user PTEs that still map its new stack or struct frames (`[TASK] BUG: new kernel stack ... is still mapped`). That would mean the PMM handed out a frame that was freed while in use.
+
+Measured high-water marks are about 11.5 KiB for the compositor and 9 KiB for GTK, so 16 KiB has little headroom.
 
 **Kernel Threads**
 `task::kthread_create()` allocates a kernel stack and builds an `InterruptFrame` at the top of the stack. When scheduled, the ISR return path restores this frame and begins execution at `kthread_entry_wrapper`, which calls the thread entry function and then `kthread_exit()`.
@@ -83,6 +94,7 @@ Limitations / Simplifications
 - Dynamic-linking support is bootstrap-only (embedded `PT_INTERP` image, no reloc/symbol resolution).
 - Per-task FD state includes baseline descriptor semantics (`dup*`, `fcntl`, and `FD_CLOEXEC` close-on-exec), but open-file-description sharing semantics are still simplified.
 - No ASLR or stack guard pages; the stack is mapped at a fixed address.
+- Kernel stacks have no guard page either (they are reached through the direct map). Overflow is only detected after the fact by the canary check at switch-out, and only if the overflow wrote the bottom canary words.
 - Per-task FS-base TLS state is tracked/restored (`arch_prctl` `ARCH_SET_FS`/`ARCH_GET_FS`), but GS-base handling and full TLS model compatibility are still incomplete.
 - `user_clear_tid` zeroing performs a best-effort futex wake for one waiter at thread exit (`pthread_join`); robust-list semantics are not implemented.
 - FPU/SSE switching is eager: every context switch pays one `FXSAVE` plus one `FXRSTOR`, even for kernel threads that never use the FPU. Lazy switching (`CR0.TS` + `#NM`) is not implemented.

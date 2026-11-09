@@ -10,6 +10,8 @@
  *                    with the default MXCSR;
  *   3. execve      - a freshly exec'd image starts with default MXCSR/FCW
  *                    even if the pre-exec image changed them.
+ *   4. direction   - DF set by user code survives page faults and timer
+ *                    interrupts, and does not leak into kernel string ops.
  *
  * Output markers: "[fpu-smoke] <phase> ok", "[fpu-smoke] FAIL ...",
  * and a final "[fpu-smoke] pass" on success.
@@ -19,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -331,6 +334,50 @@ static int test_exec(const char *self) {
     return 0;
 }
 
+/*
+ * The direction flag is user state too: with DF set (as inside musl's
+ * backward memmove), take page faults on fresh anonymous pages and timer
+ * interrupts. The kernel must run its own code with DF clear (its page
+ * zeroing memset would otherwise run backwards over its stack) and must hand
+ * DF back unchanged. No calls between std and cld: the ABI requires DF=0
+ * at every call.
+ */
+static int test_direction_flag(void) {
+    enum { PAGES = 64 };
+    unsigned char *buf = mmap(NULL, PAGES * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        printf("[fpu-smoke] FAIL direction flag: mmap failed\n");
+        return 1;
+    }
+    uint64_t flags = 0;
+    __asm__ volatile("std" ::: "memory");
+    for (int i = 0; i < PAGES; i++) {
+        ((volatile unsigned char *)buf)[i * 4096 + 100] = 0x5a; /* page fault with DF=1 */
+    }
+    for (volatile unsigned long n = 0; n < 8 * SPIN_ITERS; n++) {
+        /* spin across timer interrupts with DF=1 */
+    }
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags)::"memory");
+    __asm__ volatile("cld" ::: "memory");
+
+    int bad = 0;
+    for (int i = 0; i < PAGES && !bad; i++) {
+        const unsigned char *p = buf + i * 4096;
+        bad = p[100] != 0x5a || p[0] != 0 || p[99] != 0 || p[101] != 0 || p[4095] != 0;
+    }
+    munmap(buf, PAGES * 4096);
+    if ((flags & 0x400) == 0) {
+        printf("[fpu-smoke] FAIL direction flag: DF was cleared across faults/interrupts\n");
+        return 1;
+    }
+    if (bad) {
+        printf("[fpu-smoke] FAIL direction flag: fresh pages were not zero-filled correctly\n");
+        return 1;
+    }
+    printf("[fpu-smoke] direction flag ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -342,6 +389,7 @@ int main(int argc, char **argv) {
     fail |= test_preempt();
     fail |= test_signal();
     fail |= test_exec(argc > 0 ? argv[0] : ABS_SELF);
+    fail |= test_direction_flag();
 
     if (fail) {
         printf("[fpu-smoke] failures\n");

@@ -78,6 +78,8 @@ Limitations / Simplifications
 
 `idt::load()` loads the same IDT on an application processor.
 
+Direction flag: the common stub starts with `cld`. Interrupts and exceptions inherit the interrupted RFLAGS (SYSCALL instead clears DF through `IA32_FMASK`), and user code can be inside `std; rep movs` (musl's backward `memmove`). Kernel string operations would then run backwards: a page-fault `memset` used to overwrite its own return address, an intermittent crash under multithreaded GTK. The interrupted DF comes back with `iretq`. `make run-fpu-smoke` covers it: with DF set, it takes page faults and timer interrupts and checks the pages and its DF.
+
 Ring-3 transitions: the common stub runs `swapgs` on entry when the saved CS is ring 3. Every exit leaves through `arch_x86_64_frame_exit`, including the scheduler's yield/block/enter paths. That exit path:
 - calls the kernel's frame-exit hook (the BKL release decision) with the frame about to be restored,
 - restores registers,

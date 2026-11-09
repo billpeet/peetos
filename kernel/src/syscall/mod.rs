@@ -134,6 +134,8 @@ const SYS_GETUID: u64 = 102;
 const SYS_GETGID: u64 = 104;
 const SYS_GETEUID: u64 = 107;
 const SYS_GETEGID: u64 = 108;
+const SYS_GETRESUID: u64 = 118;
+const SYS_GETRESGID: u64 = 120;
 const SYS_SETPGID: u64 = 109;
 const SYS_GETPID: u64 = 39;
 const SYS_EXECVE: u64 = 59;
@@ -739,6 +741,8 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     syscall_def(SYS_GETGID, "getgid", SyscallMode::AnyTask, sys_getgid),
     syscall_def(SYS_GETEUID, "geteuid", SyscallMode::AnyTask, sys_geteuid),
     syscall_def(SYS_GETEGID, "getegid", SyscallMode::AnyTask, sys_getegid),
+    syscall_def(SYS_GETRESUID, "getresuid", SyscallMode::UserTask, sys_getresuid),
+    syscall_def(SYS_GETRESGID, "getresgid", SyscallMode::UserTask, sys_getresgid),
     syscall_def(SYS_GETPID, "getpid", SyscallMode::AnyTask, sys_getpid),
     syscall_def(SYS_SETPGID, "setpgid", SyscallMode::UserTask, sys_setpgid),
     syscall_def(SYS_EXECVE, "execve", SyscallMode::UserTask, sys_execve),
@@ -1383,6 +1387,12 @@ fn log_unknown_syscall(num: u64) {
 
 fn dispatch_syscall(call: SyscallArgs) -> i64 {
     let ctx = SyscallContext::new(task::current());
+    if !ctx.current.is_null() {
+        unsafe {
+            (*ctx.current).last_syscall = call.num;
+            (*ctx.current).last_syscall_args = call.args;
+        }
+    }
     let def = match lookup_syscall(call.num) {
         Some(def) => def,
         None => {

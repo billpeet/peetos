@@ -135,6 +135,11 @@ va_val_copy = false
 have_strlcpy = true
 
 [built-in options]
+# The stage's /usr/include is a system include directory, as it would be for
+# a compiler configured with this sysroot (configure checks such as
+# has_header('linux/input.h') need it).
+c_args = ['-isystem', '${STAGE}/usr/include']
+cpp_args = ['-isystem', '${STAGE}/usr/include']
 c_link_args = ['-L${MUSL_SHARED_LIB}', '-L${STAGE}/usr/lib', '-Wl,-rpath-link,${STAGE}/usr/lib', '-Wl,-z,max-page-size=0x1000']
 cpp_link_args = ['-L${STAGE}/usr/lib', '-Wl,-rpath-link,${STAGE}/usr/lib', '-Wl,-z,max-page-size=0x1000']
 EOF

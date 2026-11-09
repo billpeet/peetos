@@ -1,6 +1,6 @@
 use core::ptr;
 
-use arch_x86_64::addr::{PhysAddr, VirtAddr, DIRECT_MAP_BASE, PAGE_SIZE};
+use arch_x86_64::addr::{PhysAddr, VirtAddr, DIRECT_MAP_BASE, PAGE_SIZE, USER_SPACE_END};
 #[cfg(target_os = "none")]
 use arch_x86_64::addr::KERNEL_VIRT_BASE;
 
@@ -818,7 +818,19 @@ fn destroy_address_space_locked(target_pml4: PhysAddr) {
     pmm::free_page(target_pml4);
 }
 
+#[track_caller]
 pub fn map_page_in(target_pml4: PhysAddr, virt: VirtAddr, phys: PhysAddr, flags: u64) -> i32 {
+    if virt.as_u64() < USER_SPACE_END && pmm::is_kernel_owned(phys) {
+        let caller = core::panic::Location::caller();
+        serial_println!(
+            "[VMM] BUG: mapping kernel-owned frame 0x{:x} at user 0x{:x} (pml4 0x{:x}) from {}:{}",
+            phys.as_u64(),
+            virt.as_u64(),
+            target_pml4.as_u64(),
+            caller.file(),
+            caller.line()
+        );
+    }
     let _guard = VMM_LOCK.lock();
     map_page_in_locked(target_pml4, virt, phys, flags)
 }
@@ -1257,6 +1269,56 @@ fn clone_user_space_locked(
         pages_copied
     );
     result
+}
+
+/// Find a user-accessible 4 KiB PTE in `target_pml4` that maps a frame in
+/// `[phys, phys + count pages)`. Returns the virtual address. Used to check
+/// that frames being handed to the kernel (task stacks) are not still mapped
+/// by some process, which would mean they were freed while in use.
+pub fn find_user_mapping_of(target_pml4: PhysAddr, phys: PhysAddr, count: usize) -> Option<u64> {
+    if target_pml4.as_u64() == 0 || target_pml4 == unsafe { PML4_PHYS } {
+        return None;
+    }
+    let _guard = VMM_LOCK.lock();
+    let lo = phys.align_down().as_u64();
+    let hi = lo + count as u64 * PAGE_SIZE;
+    let pml4_table = table_ptr(target_pml4);
+    for pml4_idx in 0..256usize {
+        let pml4e = unsafe { ptr::read(pml4_table.add(pml4_idx)) };
+        if !pte_present(pml4e) || (pml4e & PTE_USER) == 0 {
+            continue;
+        }
+        let pdpt_table = table_ptr(pte_addr(pml4e));
+        for pdpt_idx in 0..VMM_ENTRIES_PER_TABLE {
+            let pdpte = unsafe { ptr::read(pdpt_table.add(pdpt_idx)) };
+            if !pte_present(pdpte) || (pdpte & PTE_USER) == 0 || (pdpte & PTE_LARGE) != 0 {
+                continue;
+            }
+            let pd_table = table_ptr(pte_addr(pdpte));
+            for pd_idx in 0..VMM_ENTRIES_PER_TABLE {
+                let pde = unsafe { ptr::read(pd_table.add(pd_idx)) };
+                if !pte_present(pde) || (pde & PTE_USER) == 0 || (pde & PTE_LARGE) != 0 {
+                    continue;
+                }
+                let pt_table = table_ptr(pte_addr(pde));
+                for pt_idx in 0..VMM_ENTRIES_PER_TABLE {
+                    let pte = unsafe { ptr::read(pt_table.add(pt_idx)) };
+                    if !pte_present(pte) || (pte & PTE_USER) == 0 {
+                        continue;
+                    }
+                    let frame = pte_addr(pte).as_u64();
+                    if frame >= lo && frame < hi {
+                        let va = ((pml4_idx as u64) << 39)
+                            | ((pdpt_idx as u64) << 30)
+                            | ((pd_idx as u64) << 21)
+                            | ((pt_idx as u64) << 12);
+                        return Some(va);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn clear_user_space(target_pml4: PhysAddr) {

@@ -108,6 +108,7 @@ Current implemented handlers:
 - `access/faccessat/faccessat2` baseline path existence + permission checks
 - `umask(mask)` baseline process umask tracking (used by userspace runtime bring-up)
 - `stat`/`lstat`/`fstat`/`newfstatat` baseline file metadata paths (legacy + modern entry points)
+- `getresuid`/`getresgid`: real, effective and saved ids, all the process's single id (there is no setuid model)
 - `statx(dirfd, path, flags, mask, buf)`: the `newfstatat` lookup reported in the 256-byte `struct statx` layout. The returned `stx_mask` is always `STATX_BASIC_STATS` (no birth time, attributes or mount id); unknown flags, both `AT_STATX_*_SYNC` bits, or the reserved mask bit are `-EINVAL`. GLib/GIO use it for file metadata.
 - `linkat` baseline hard-link creation for regular files (ext2-backed hard links; tmpfs baseline fallback)
 - `symlinkat` baseline symlink inode creation with target payload storage

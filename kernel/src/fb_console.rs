@@ -254,6 +254,45 @@ impl FbConsoleState {
 
 static FB_CONSOLE: SpinLock<FbConsoleState> = SpinLock::new(FbConsoleState::unavailable());
 
+/// Which function last took the console lock, and in which task, so a fatal
+/// report that finds the lock busy can say who holds it.
+static FB_CONSOLE_HOLDER_SITE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static FB_CONSOLE_HOLDER_PID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+static FB_CONSOLE_HOLDER_CALLER: core::sync::atomic::AtomicPtr<core::panic::Location<'static>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+const HOLDER_SITES: [&str; 6] = ["none", "init", "write_bytes", "tick", "set_theme", "set_active"];
+
+#[track_caller]
+fn note_holder(site: usize) {
+    FB_CONSOLE_HOLDER_SITE.store(site, core::sync::atomic::Ordering::Relaxed);
+    FB_CONSOLE_HOLDER_CALLER.store(
+        core::panic::Location::caller() as *const _ as *mut _,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    let task = crate::task::current();
+    let pid = if task.is_null() { -1 } else { unsafe { (*task).pid } };
+    FB_CONSOLE_HOLDER_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[track_caller]
+fn lock_console(site: usize) -> crate::sync::SpinLockGuard<'static, FbConsoleState> {
+    let guard = FB_CONSOLE.lock();
+    note_holder(site);
+    guard
+}
+
+/// The function, its caller and the task that last took the console lock
+/// (for fault reports).
+pub fn lock_holder() -> (&'static str, Option<&'static core::panic::Location<'static>>, i32) {
+    let site = FB_CONSOLE_HOLDER_SITE.load(core::sync::atomic::Ordering::Relaxed);
+    let caller = FB_CONSOLE_HOLDER_CALLER.load(core::sync::atomic::Ordering::Relaxed);
+    (
+        HOLDER_SITES.get(site).copied().unwrap_or("?"),
+        unsafe { caller.as_ref() },
+        FB_CONSOLE_HOLDER_PID.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 #[inline]
 fn console_active() -> bool {
     crate::display_mode::console_active()
@@ -1072,7 +1111,7 @@ pub fn init() {
         return;
     }
 
-    let mut state = FB_CONSOLE.lock();
+    let mut state = lock_console(1);
     state.initialized = true;
     state.fb = fb;
     apply_theme(&mut state, DEFAULT_THEME);
@@ -1101,12 +1140,27 @@ pub fn init() {
     }
 }
 
+/// Set by [`activate_for_fatal_report`] when the console lock was held at a
+/// fatal fault: from then on console writes only use the lock if it is free,
+/// so the fault report (which also goes to serial) cannot deadlock.
+static FATAL_CONSOLE_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn write_bytes(bytes: &[u8]) {
     if bytes.is_empty() || !console_active() {
         return;
     }
 
-    let mut state = FB_CONSOLE.lock();
+    let mut state = if FATAL_CONSOLE_BUSY.load(core::sync::atomic::Ordering::Relaxed) {
+        match FB_CONSOLE.try_lock() {
+            Some(state) => {
+                note_holder(2);
+                state
+            }
+            None => return,
+        }
+    } else {
+        lock_console(2)
+    };
     if !state.initialized {
         return;
     }
@@ -1122,7 +1176,7 @@ pub fn tick() {
     if !console_active() {
         return;
     }
-    let mut state = FB_CONSOLE.lock();
+    let mut state = lock_console(3);
     if !state.initialized {
         return;
     }
@@ -1134,7 +1188,7 @@ pub fn tick() {
 }
 
 pub fn set_theme(preset: ThemePreset) {
-    let mut state = FB_CONSOLE.lock();
+    let mut state = lock_console(4);
     if !state.initialized {
         return;
     }
@@ -1153,23 +1207,47 @@ pub fn set_theme(preset: ThemePreset) {
     }
 }
 
+#[track_caller]
 pub fn set_active(active: bool, redraw: bool) {
-    let mut state = FB_CONSOLE.lock();
+    let mut state = lock_console(5);
+    set_active_locked(&mut state, active, redraw);
+}
+
+/// `set_active(true, true)` for panic and fatal-exception reports. Those can
+/// run on a CPU whose interrupted code holds the console lock (the fault may
+/// be inside console code), and waiting would deadlock with interrupts off.
+/// If the lock is taken, the redraw is skipped and the report still goes to
+/// serial. Returns whether the console was redrawn.
+pub fn activate_for_fatal_report() -> bool {
+    match FB_CONSOLE.try_lock() {
+        Some(mut state) => {
+            note_holder(5);
+            set_active_locked(&mut state, true, true);
+            true
+        }
+        None => {
+            FATAL_CONSOLE_BUSY.store(true, core::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn set_active_locked(state: &mut FbConsoleState, active: bool, redraw: bool) {
     if !state.initialized {
         return;
     }
 
-    hide_cursor(&mut state);
+    hide_cursor(state);
     state.cursor_drawn = false;
     if !active {
         return;
     }
 
-    let _ = refresh_status_path_cache(&mut state, true);
+    let _ = refresh_status_path_cache(state, true);
     if redraw {
-        clear_screen(&state);
+        clear_screen(state);
     }
-    sync_cursor(&mut state);
+    sync_cursor(state);
 }
 
 #[cfg(test)]

@@ -525,6 +525,13 @@ APIC_VEC 243
 APIC_VEC 255
 
 isr_common_stub:
+    // The SysV ABI requires DF=0 at every call, and interrupts/exceptions
+    // inherit the interrupted RFLAGS (unlike SYSCALL, where IA32_FMASK clears
+    // DF). User code can be inside `std; rep movs` (musl's backward memmove),
+    // and kernel string ops would then run backwards: a memset in the page
+    // fault handler overwrote its own return address. The interrupted DF is
+    // restored by iretq from the saved RFLAGS.
+    cld
     // Coming from ring 3: switch GS to this CPU's per-CPU area.
     test byte ptr [rsp + 24], 3
     jz 1f

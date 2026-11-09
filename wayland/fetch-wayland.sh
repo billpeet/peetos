@@ -10,7 +10,8 @@ graphics userland into <name>-src/ directories: libwayland, libffi,
 wayland-protocols, libxkbcommon and libdrm, plus the software rendering stack
 (pixman, expat, freetype, fontconfig, harfbuzz, utf8proc), the DejaVu
 fonts, the 2D toolkit libraries (zlib, libpng, pcre2, GLib, fribidi, cairo,
-pango), and tllist, fcft and the foot terminal.
+pango), the GTK 3 stack (libepoxy, ATK, gdk-pixbuf, GTK, the hicolor icon
+theme), and tllist, fcft and the foot terminal.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -106,6 +107,31 @@ CAIRO_SHA256="a62b9bb42425e844cc3d6ddde043ff39dbabedd1542eba57a2eb79f85889d45a"
 PANGO_VERSION="1.54.0"
 PANGO_URL="https://download.gnome.org/sources/pango/1.54/pango-${PANGO_VERSION}.tar.xz"
 PANGO_SHA256="8a9eed75021ee734d7fc0fdf3a65c3bba51dfefe4ae51a9b414a60c70b2d1ed8"
+
+# Khronos EGL headers (EGL/*.h, KHR/khrplatform.h): no releases, so a commit.
+EGL_REGISTRY_COMMIT="5961a7fe64cf8a126890ced6f13d69e0a1e1b83e"
+EGL_REGISTRY_URL="https://github.com/KhronosGroup/EGL-Registry/archive/${EGL_REGISTRY_COMMIT}.tar.gz"
+EGL_REGISTRY_SHA256="b360a7542cb51a74ad87f9a423903c1a88d9739167744da9397eb7190ebe83d0"
+
+LIBEPOXY_VERSION="1.5.10"
+LIBEPOXY_URL="https://github.com/anholt/libepoxy/archive/refs/tags/${LIBEPOXY_VERSION}.tar.gz"
+LIBEPOXY_SHA256="a7ced37f4102b745ac86d6a70a9da399cc139ff168ba6b8002b4d8d43c900c15"
+
+ATK_VERSION="2.38.0"
+ATK_URL="https://download.gnome.org/sources/atk/2.38/atk-${ATK_VERSION}.tar.xz"
+ATK_SHA256="ac4de2a4ef4bd5665052952fe169657e65e895c5057dffb3c2a810f6191a0c36"
+
+GDK_PIXBUF_VERSION="2.42.12"
+GDK_PIXBUF_URL="https://download.gnome.org/sources/gdk-pixbuf/2.42/gdk-pixbuf-${GDK_PIXBUF_VERSION}.tar.xz"
+GDK_PIXBUF_SHA256="b9505b3445b9a7e48ced34760c3bcb73e966df3ac94c95a148cb669ab748e3c7"
+
+GTK3_VERSION="3.24.43"
+GTK3_URL="https://download.gnome.org/sources/gtk%2B/3.24/gtk%2B-${GTK3_VERSION}.tar.xz"
+GTK3_SHA256="7e04f0648515034b806b74ae5d774d87cffb1a2a96c468cb5be476d51bf2f3c7"
+
+HICOLOR_VERSION="0.18"
+HICOLOR_URL="https://icon-theme.freedesktop.org/releases/hicolor-icon-theme-${HICOLOR_VERSION}.tar.xz"
+HICOLOR_SHA256="db0e50a80aa3bf64bb45cbca5cf9f75efd9348cf2ac690b907435238c3cf81d7"
 
 FOOT_VERSION="1.18.1"
 FOOT_URL="https://codeberg.org/dnkl/foot/archive/${FOOT_VERSION}.tar.gz"
@@ -210,5 +236,17 @@ fetch_one "cairo ${CAIRO_VERSION}" "${CAIRO_URL}" "${CAIRO_SHA256}" \
   "${OUTPUT_DIR}/cairo-src" "cairo-${CAIRO_VERSION}.tar.xz"
 fetch_one "pango ${PANGO_VERSION}" "${PANGO_URL}" "${PANGO_SHA256}" \
   "${OUTPUT_DIR}/pango-src" "pango-${PANGO_VERSION}.tar.xz"
+fetch_one "EGL-Registry ${EGL_REGISTRY_COMMIT:0:12}" "${EGL_REGISTRY_URL}" "${EGL_REGISTRY_SHA256}" \
+  "${OUTPUT_DIR}/egl-registry-src" "egl-registry-${EGL_REGISTRY_COMMIT}.tar.gz"
+fetch_one "libepoxy ${LIBEPOXY_VERSION}" "${LIBEPOXY_URL}" "${LIBEPOXY_SHA256}" \
+  "${OUTPUT_DIR}/libepoxy-src" "libepoxy-${LIBEPOXY_VERSION}.tar.gz"
+fetch_one "ATK ${ATK_VERSION}" "${ATK_URL}" "${ATK_SHA256}" \
+  "${OUTPUT_DIR}/atk-src" "atk-${ATK_VERSION}.tar.xz"
+fetch_one "gdk-pixbuf ${GDK_PIXBUF_VERSION}" "${GDK_PIXBUF_URL}" "${GDK_PIXBUF_SHA256}" \
+  "${OUTPUT_DIR}/gdk-pixbuf-src" "gdk-pixbuf-${GDK_PIXBUF_VERSION}.tar.xz"
+fetch_one "GTK ${GTK3_VERSION}" "${GTK3_URL}" "${GTK3_SHA256}" \
+  "${OUTPUT_DIR}/gtk-src" "gtk+-${GTK3_VERSION}.tar.xz"
+fetch_one "hicolor-icon-theme ${HICOLOR_VERSION}" "${HICOLOR_URL}" "${HICOLOR_SHA256}" \
+  "${OUTPUT_DIR}/hicolor-icon-theme-src" "hicolor-icon-theme-${HICOLOR_VERSION}.tar.xz"
 fetch_one "foot ${FOOT_VERSION}" "${FOOT_URL}" "${FOOT_SHA256}" \
   "${OUTPUT_DIR}/foot-src" "foot-${FOOT_VERSION}.tar.gz"

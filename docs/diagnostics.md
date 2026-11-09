@@ -23,13 +23,19 @@ Keyboard-backed console input is now provided separately via the PS/2 + TTY path
 **Exception Reporting**
 `kernel/src/exception.rs` prints a register dump and decodes page fault error codes. For page faults, it reads CR2 and prints the access type, privilege level, and present/reserved bits. Optional VGA printing exists behind the `vga` feature.
 
+A fatal exception (one `exception::handle` doesn't resolve) is reported in this order:
+1. **Serial first.** The task (pid, name, last syscall number and arguments) and the register dump go out before anything touches the framebuffer console. Redrawing the console is the riskiest step, and the original fault must not be lost if it fails.
+2. **Kernel-mode faults** also report whether any process maps the frame holding the faulting RSP, the 128 bytes at RSP, and every task's kernel-stack high-water mark (see `docs/tasking.md`).
+3. **Console.** The console is then activated with `fb_console::activate_for_fatal_report`, which only uses the console lock if it is free. The faulting code may hold it, and waiting with interrupts off would deadlock. That used to turn crashes into silent hangs. If the lock is busy, the report names its holder (function, caller `file:line`, pid) and later console writes skip the console.
+4. **Nested faults** during reporting print a note and skip the console entirely.
+
 Limitations / Simplifications
-- Reporting is serial-only by default and provides no stack traces or symbolization.
+- Reporting is serial-only by default and provides no stack traces or symbolization (resolve addresses with `addr2line -e build/kernel.elf`).
 - Exceptions are treated as fatal and halt the CPU.
 - Assumes the `InterruptFrame` layout used by the IDT stubs.
 
 **Panic Handler**
-The panic handler in `kernel/src/main.rs` initializes the serial port (if needed), prints the panic message, then halts with interrupts disabled.
+The panic handler in `kernel/src/main.rs` initializes the serial port (if needed), activates the console without waiting for its lock (as above), prints the panic message, then halts with interrupts disabled.
 
 Limitations / Simplifications
 - No unwind or recovery path; the kernel halts on panic.

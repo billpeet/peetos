@@ -47,6 +47,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - C++ programs run on PeetOS: `make -C toolchain` builds a GCC 15.2 cross toolchain for musl, and libstdc++, libgcc_s and libatomic ship in the image. `make run-cxx-smoke` checks exceptions across shared objects, RTTI, iostreams, `std::thread`, `thread_local` and `dlopen()`ed C++ plugins; see `docs/cxx.md`.
 - harfbuzz (built with that compiler) and utf8proc are part of the rendering stack, so text is shaped: kerning, combining marks and Arabic joining in `make run-text-smoke`, and fcft/foot use them for shaping and grapheme clustering.
 - cairo, pango and GLib are ported (with zlib, libpng, pcre2 and fribidi): `make run-pango-smoke` draws a cairo + pango frame with markup and bidirectional text, and checks GLib, GIO and cairo's PNG/PDF/SVG output (see `docs/rendering.md`).
+- GTK 3.24 runs under `peetwl` (Wayland backend, with libepoxy, ATK and gdk-pixbuf): `make run-gtk-smoke` types into a `GtkEntry` and clicks a `GtkButton` with real input; see `docs/gtk.md`.
 - The foot terminal runs under `peetwl`, with fcft/freetype text and a shell inside it: `make run-foot-demo` opens two foot windows in a QEMU window, with copy and paste between them (Ctrl+Shift+C/V), and `make run-foot-smoke` is the automated test (see `docs/rendering.md`).
 - The kernel manages up to 4 GiB of RAM through a direct map of physical memory; give QEMU more with `-m` (the dynamic-linking smoke uses 512 MiB). Per process there are 256 VM region slots and a 256 MiB mapping budget. System-wide, there are 256 tasks and 256 sockets, and memfd objects can be up to 256 MiB.
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
@@ -92,6 +93,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `docs/diagnostics.md` Serial output, exception reporting, panic handling, and QEMU test exit.
 - `docs/subsystems.md` Subsystem crate status and intended usage.
 - `docs/musl.md` musl bootstrap workflow and current limitations.
+- `docs/gtk.md` GTK 3 port: build, Wayland backend, the GTK smoke test and limitations.
 - `docs/cxx.md` C++ cross toolchain (GCC + libstdc++ for musl), runtime staging and the C++ smoke test.
 - `docs/toybox.md` toybox bootstrap workflow and staged applet coverage.
 - `docs/quickjs.md` quickjs bootstrap workflow and current limitations.
@@ -113,9 +115,9 @@ Optional but commonly required:
 - `e2fsck` (`e2fsprogs`) for `tests/ext3_fsck.sh`, which checks images written by the kernel's ext2/ext3 code.
 - `curl` or `wget` for fetching musl/toybox/quickjs/micropython/dropbear sources.
 - For the C++ toolchain (`make -C toolchain`): a host C/C++ compiler (`g++`) and `m4`. The graphics userland needs it too (harfbuzz is C++).
-- For the graphics userland (`make -C wayland`): host `cc`, `python3`, `bison`, expat headers (`libexpat1-dev`), `meson`, `ninja` and `gperf`. Meson, ninja and gperf can live in a private virtualenv at `~/.peetos-venv`; see `docs/rendering.md`.
+- For the graphics userland (`make -C wayland`): host `cc`, `python3`, `bison`, expat headers (`libexpat1-dev`), `meson`, `ninja`, `gperf`, and GLib's `glib-compile-resources`/`glib-compile-schemas` (`libglib2.0-dev-bin`, for GTK). Meson, ninja and gperf can live in a private virtualenv at `~/.peetos-venv`; see `docs/rendering.md`.
 - `rg` (ripgrep), `file` and `readelf`: the musl build and image scripts use them to check their outputs, and the userspace smokes in `make test` fail without them.
-- On Ubuntu (including WSL2) this covers everything: `apt install build-essential nasm qemu-system-x86 qemu-system-gui e2fsprogs meson ninja-build gperf bison flex m4 pkg-config libexpat1-dev ripgrep curl`, plus `rustup target add x86_64-unknown-none`. Under WSLg, `make run*` targets open their QEMU window on the Windows desktop.
+- On Ubuntu (including WSL2) this covers everything: `apt install build-essential nasm qemu-system-x86 qemu-system-gui e2fsprogs meson ninja-build gperf bison flex m4 pkg-config libexpat1-dev libglib2.0-dev-bin ripgrep curl`, plus `rustup target add x86_64-unknown-none`. Under WSLg, `make run*` targets open their QEMU window on the Windows desktop.
 - `make toybox` and `make -C wayland` are not safe with `-j` on a fresh checkout. Run `make toybox` serially, and run `make -C wayland fetch` once before `make -C wayland -j$(nproc)`.
 
 ## Build and Run
@@ -230,6 +232,7 @@ make run-drm-smoke
 make run-text-smoke
 make run-cxx-smoke
 make run-pango-smoke
+make run-gtk-smoke
 make run-foot-smoke
 make run-foot-demo
 make run-gui-smoke

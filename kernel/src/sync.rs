@@ -31,6 +31,16 @@ impl<T> SpinLock<T> {
         }
         SpinLockGuard { lock: self }
     }
+
+    /// Take the lock only if it is free. For paths that must not wait, such
+    /// as fatal-fault reporting, which may run while the faulting code holds
+    /// the lock on this CPU.
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinLockGuard { lock: self })
+    }
 }
 
 pub struct SpinLockGuard<'a, T> {
@@ -279,5 +289,17 @@ mod tests {
         assert!(!sem.try_down());
         sem.up();
         assert_eq!(sem.value(), 1);
+    }
+
+    #[test]
+    fn spinlock_try_lock_fails_while_held() {
+        let lock = SpinLock::new(5u32);
+        {
+            let mut held = lock.lock();
+            *held = 6;
+            assert!(lock.try_lock().is_none());
+        }
+        let again = lock.try_lock().expect("free after the guard drops");
+        assert_eq!(*again, 6);
     }
 }

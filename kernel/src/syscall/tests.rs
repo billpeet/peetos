@@ -2505,3 +2505,9 @@ fn statx_rejects_bad_flags_and_reserved_mask() {
     assert_eq!(statx_check_args(0x1, STATX_BASIC_STATS), Err(-EINVAL)); // unknown flag
     assert_eq!(statx_check_args(0, 0x8000_0000), Err(-EINVAL)); // STATX__RESERVED
 }
+
+#[test]
+fn getresuid_and_getresgid_are_registered() {
+    assert_eq!(lookup_syscall(SYS_GETRESUID).map(|d| d.name), Some("getresuid"));
+    assert_eq!(lookup_syscall(SYS_GETRESGID).map(|d| d.name), Some("getresgid"));
+}

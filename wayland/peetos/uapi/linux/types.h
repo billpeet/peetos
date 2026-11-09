@@ -21,5 +21,10 @@ typedef __u32 __be32;
 typedef __u64 __le64;
 typedef __u64 __be64;
 typedef size_t __kernel_size_t;
+/* x86_64 only: <asm/bitsperlong.h> and <asm/posix_types.h> equivalents,
+ * which <linux/input.h> uses to pick its struct input_event layout. */
+#define __BITS_PER_LONG 64
+typedef long __kernel_long_t;
+typedef unsigned long __kernel_ulong_t;
 
 #endif

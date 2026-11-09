@@ -155,6 +155,17 @@ for tool in pango-view pango-list; do
     cp "${RENDER_STAGE}/usr/bin/${tool}" "${STAGE_ROOT}/bin/${tool}"
   fi
 done
+# GTK 3 data: compiled GSettings schemas (GTK aborts without the ones it
+# uses) and the hicolor icon theme index.
+if [[ -f "${RENDER_STAGE}/usr/lib/libgtk-3.so.0" ]]; then
+  mkdir -p "${STAGE_ROOT}/usr/share/glib-2.0" "${STAGE_ROOT}/usr/share/icons"
+  cp -a "${RENDER_STAGE}/usr/share/glib-2.0/schemas" "${STAGE_ROOT}/usr/share/glib-2.0/"
+  cp -a "${RENDER_STAGE}/usr/share/icons/hicolor" "${STAGE_ROOT}/usr/share/icons/"
+fi
+if [[ -x "${ROOT_DIR}/user/gtk_smoke.elf" ]]; then
+  cp "${ROOT_DIR}/user/gtk_smoke.elf" "${STAGE_ROOT}/bin/gtk_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/gtk_smoke"
+fi
 if [[ -x "${ROOT_DIR}/user/pango_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/pango_smoke.elf" "${STAGE_ROOT}/bin/pango_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/pango_smoke"
@@ -760,6 +771,24 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/pango_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/gtk_smoke.sh" <<'EOS'
+fail=0
+export LANG=C.UTF-8 HOME=/tmp
+
+if [ ! -x bin/peetwl ] || [ ! -x bin/gtk_smoke ] || [ ! -f /usr/lib/libgtk-3.so.0 ]; then
+  echo [musl-ext2-gtk-smoke] missing bin/peetwl, bin/gtk_smoke or /usr/lib/libgtk-3.so.0
+  fail=1
+else
+  bin/peetwl --smoke --client "/mnt/ext2/bin/gtk_smoke" || fail=1
+fi
+
+echo [musl-ext2-gtk-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-gtk-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/gtk_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
 fail=0
