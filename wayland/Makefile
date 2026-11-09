@@ -16,7 +16,9 @@
 #                              include/ (xf86drm*.h) and include/libdrm/
 #   stage/                     staged /usr + /etc sysroot for meson builds:
 #                              everything above plus expat, freetype,
-#                              fontconfig, pixman and the DejaVu fonts
+#                              fontconfig, pixman, harfbuzz (C++, built
+#                              with ../toolchain's g++), utf8proc and the
+#                              DejaVu fonts
 #                              (scripts/build_render_stack.sh), then
 #                              tllist, fcft and foot (scripts/build_foot.sh)
 #   lib/lib*.so.N, lib/lib*.so shared builds of libffi, libwayland-server,
@@ -36,13 +38,17 @@ all: build
 fetch:
 	./fetch-wayland.sh
 
-wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src tllist-src fcft-src foot-src:
+wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src tllist-src fcft-src foot-src:
 	$(MAKE) fetch
 
 ../musl/shared/lib/libc.so:
 	$(MAKE) -C ../musl shared
 
-build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src tllist-src fcft-src foot-src ../musl/shared/lib/libc.so
+# harfbuzz is C++: it needs the PeetOS cross g++ and C++ runtime.
+../toolchain/out/bin/x86_64-linux-musl-g++: ../musl/shared/lib/libc.so
+	$(MAKE) -C ../toolchain
+
+build: wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src tllist-src fcft-src foot-src ../musl/shared/lib/libc.so ../toolchain/out/bin/x86_64-linux-musl-g++
 	../scripts/build_wayland.sh \
 		--wayland-src "$(CURDIR)/wayland-src" \
 		--libffi-src "$(CURDIR)/libffi-src" \
@@ -64,7 +70,7 @@ clean:
 	rm -rf "$(OUT_DIR)" build
 
 distclean: clean
-	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src tllist-src fcft-src foot-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2 tllist-*.tar.gz fcft-*.tar.gz foot-*.tar.gz
+	rm -rf wayland-src libffi-src wayland-protocols-src libxkbcommon-src libdrm-src pixman-src expat-src freetype-src fontconfig-src dejavu-src harfbuzz-src utf8proc-src tllist-src fcft-src foot-src wayland-*.tar.xz libffi-*.tar.gz libxkbcommon-*.tar.xz libdrm-*.tar.xz pixman-*.tar.gz expat-*.tar.xz freetype-*.tar.xz fontconfig-*.tar.xz dejavu-*.tar.bz2 harfbuzz-*.tar.xz utf8proc-*.tar.gz tllist-*.tar.gz fcft-*.tar.gz foot-*.tar.gz
 
 info:
 	@echo "OUT_DIR=$(OUT_DIR)"

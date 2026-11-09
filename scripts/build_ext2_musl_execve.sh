@@ -140,6 +140,22 @@ if [[ -x "${ROOT_DIR}/user/text_smoke.elf" ]]; then
   chmod 0755 "${STAGE_ROOT}/bin/text_smoke"
 fi
 
+# C++ runtime from the PeetOS cross toolchain (toolchain/build-toolchain.sh):
+# libstdc++, libgcc_s (the unwinder) and libatomic, under their sonames.
+CXX_RUNTIME_DIR="${ROOT_DIR}/toolchain/out/x86_64-linux-musl/lib64"
+if [[ -f "${CXX_RUNTIME_DIR}/libstdc++.so.6" ]]; then
+  mkdir -p "${STAGE_ROOT}/usr/lib"
+  for lib in libstdc++.so.6 libgcc_s.so.1 libatomic.so.1; do
+    cp -L "${CXX_RUNTIME_DIR}/${lib}" "${STAGE_ROOT}/usr/lib/${lib}"
+  done
+fi
+if [[ -x "${ROOT_DIR}/user/cxx_smoke.elf" ]]; then
+  mkdir -p "${STAGE_ROOT}/usr/lib"
+  cp "${ROOT_DIR}/user/cxx_smoke.elf" "${STAGE_ROOT}/bin/cxx_smoke"
+  chmod 0755 "${STAGE_ROOT}/bin/cxx_smoke"
+  cp "${ROOT_DIR}/user/libpeetcxx.so" "${ROOT_DIR}/user/libpeetcxxplugin.so" "${STAGE_ROOT}/usr/lib/"
+fi
+
 if [[ -x "${ROOT_DIR}/user/drm_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/drm_smoke.elf" "${STAGE_ROOT}/bin/drm_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/drm_smoke"
@@ -675,6 +691,23 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/text_smoke.sh"
+
+cat > "${STAGE_ROOT}/bin/cxx_smoke.sh" <<'EOS'
+fail=0
+
+if [ ! -x bin/cxx_smoke ] || [ ! -f /usr/lib/libstdc++.so.6 ]; then
+  echo [musl-ext2-cxx-smoke] missing bin/cxx_smoke or /usr/lib/libstdc++.so.6
+  fail=1
+else
+  bin/cxx_smoke || fail=1
+fi
+
+echo [musl-ext2-cxx-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-cxx-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/cxx_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
 fail=0

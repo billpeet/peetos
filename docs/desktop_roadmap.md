@@ -78,9 +78,12 @@ later.
 - [x] pixman, freetype, fontconfig + fonts (DejaVu), and expat. They are
   built into a staged sysroot with meson, and text is rendered on screen
   through DRM (`docs/rendering.md`).
-- [ ] harfbuzz (needs the C++ runtime below), libpng, cairo, pango.
-- [ ] A C++ runtime for musl (libc++ or libstdc++), needed by Mesa, Qt and many
-  applications.
+- [x] harfbuzz 10.1.0 and utf8proc 2.9.0: text shaping in fcft and grapheme
+  clustering in foot (`docs/rendering.md`).
+- [ ] libpng, cairo, pango.
+- [x] A C++ runtime for musl: GCC 15.2 cross toolchain with libstdc++,
+  libgcc_s and libatomic (`make -C toolchain`, `make run-cxx-smoke`; see
+  `docs/cxx.md`), needed by Mesa, Qt and many applications.
 - [ ] Mesa with `softpipe` (or `llvmpipe`, which needs LLVM) for EGL/GLES; GTK4
   and Qt prefer GL even though they have software fallbacks.
 
@@ -97,8 +100,8 @@ later.
 ### 5. Desktop shell and core applications
 
 - [x] **foot** terminal: foot 1.18.1 with fcft 3.1.8 runs under `peetwl`
-  (`make run-foot-demo`, `make run-foot-smoke`; see `docs/rendering.md`). It still lacks harfbuzz
-  shaping and terminfo.
+  (`make run-foot-demo`, `make run-foot-smoke`; see `docs/rendering.md`), with
+  harfbuzz shaping and utf8proc grapheme clustering. It still lacks terminfo.
 - [ ] Panel/taskbar and launcher (for example waybar or sfwbar, fuzzel or wofi).
 - [ ] GTK3/4 (GLib, GObject, gdk-pixbuf, libepoxy), unlocking a file manager
   (Thunar, PCManFM), a text editor and settings applications.
@@ -117,7 +120,8 @@ later.
 2. ~~Lift the platform limits, starting with the VM region-table stack copies.~~ Done.
 3. ~~DRM/KMS minimum: mode setting, dumb buffers, page flips.~~ Done (legacy KMS over the boot framebuffer).
 
-4. ~~fcft + foot (without harfbuzz at first)~~ Done. Next: the C++ runtime for harfbuzz.
+4. ~~fcft + foot (without harfbuzz at first)~~ Done.
+5. ~~C++ runtime, then harfbuzz~~ Done (GCC + libstdc++; fcft/foot now shape text).
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports. *(Reached: foot renders

@@ -8,8 +8,8 @@ Usage: fetch-wayland.sh [options]
 Download, verify, and extract the pinned source releases of the PeetOS
 graphics userland into <name>-src/ directories: libwayland, libffi,
 wayland-protocols, libxkbcommon and libdrm, plus the software rendering stack
-(pixman, expat, freetype, fontconfig), the DejaVu fonts, and tllist, fcft
-and the foot terminal.
+(pixman, expat, freetype, fontconfig, harfbuzz, utf8proc), the DejaVu
+fonts, and tllist, fcft and the foot terminal.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -69,6 +69,14 @@ TLLIST_SHA256="0e7b7094a02550dd80b7243bcffc3671550b0f1d8ba625e4dff52517827d5d23"
 FCFT_VERSION="3.1.8"
 FCFT_URL="https://codeberg.org/dnkl/fcft/archive/${FCFT_VERSION}.tar.gz"
 FCFT_SHA256="7000c018597e5a0a9435d924320e63f1c45654fa83bf3ffe150b174131158dbc"
+
+HARFBUZZ_VERSION="10.1.0"
+HARFBUZZ_URL="https://github.com/harfbuzz/harfbuzz/releases/download/${HARFBUZZ_VERSION}/harfbuzz-${HARFBUZZ_VERSION}.tar.xz"
+HARFBUZZ_SHA256="6ce3520f2d089a33cef0fc48321334b8e0b72141f6a763719aaaecd2779ecb82"
+
+UTF8PROC_VERSION="2.9.0"
+UTF8PROC_URL="https://github.com/JuliaStrings/utf8proc/archive/refs/tags/v${UTF8PROC_VERSION}.tar.gz"
+UTF8PROC_SHA256="18c1626e9fc5a2e192311e36b3010bfc698078f692888940f1fa150547abb0c1"
 
 FOOT_VERSION="1.18.1"
 FOOT_URL="https://codeberg.org/dnkl/foot/archive/${FOOT_VERSION}.tar.gz"
@@ -157,5 +165,7 @@ fetch_one "tllist ${TLLIST_VERSION}" "${TLLIST_URL}" "${TLLIST_SHA256}" \
   "${OUTPUT_DIR}/tllist-src" "tllist-${TLLIST_VERSION}.tar.gz"
 fetch_one "fcft ${FCFT_VERSION}" "${FCFT_URL}" "${FCFT_SHA256}" \
   "${OUTPUT_DIR}/fcft-src" "fcft-${FCFT_VERSION}.tar.gz"
+fetch_one "harfbuzz ${HARFBUZZ_VERSION}" "${HARFBUZZ_URL}" "${HARFBUZZ_SHA256}"   "${OUTPUT_DIR}/harfbuzz-src" "harfbuzz-${HARFBUZZ_VERSION}.tar.xz"
+fetch_one "utf8proc ${UTF8PROC_VERSION}" "${UTF8PROC_URL}" "${UTF8PROC_SHA256}"   "${OUTPUT_DIR}/utf8proc-src" "utf8proc-${UTF8PROC_VERSION}.tar.gz"
 fetch_one "foot ${FOOT_VERSION}" "${FOOT_URL}" "${FOOT_SHA256}" \
   "${OUTPUT_DIR}/foot-src" "foot-${FOOT_VERSION}.tar.gz"

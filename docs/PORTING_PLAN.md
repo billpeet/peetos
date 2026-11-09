@@ -10,7 +10,7 @@ current Rust kernel implementation and forward roadmap.
 - Stage 1-9 parity goals are largely complete; remaining work focuses on
   hardening, completeness, and new capability.
 
-## Status Snapshot (Last reviewed: 2026-11-08)
+## Status Snapshot (Last reviewed: 2026-11-09)
 
 ### Kernel Foundation
 
@@ -199,6 +199,8 @@ current Rust kernel implementation and forward roadmap.
   - pty `ONLCR` output processing;
   - `prctl` and `membarrier`;
   - 1 GiB sparse memfds and a 4 GiB per-process mapping budget.
+- C++ toolchain and runtime (`docs/cxx.md`): GCC 15.2 cross-built for `x86_64-linux-musl` (`make -C toolchain`), with libstdc++, libsupc++, libgcc_s and libatomic shipped as shared libraries. `make run-cxx-smoke` (2 CPUs) covers static constructors/destructors, exceptions thrown across shared objects and out of a `dlopen()`ed plugin, RTTI, iostreams, `std::format`, `std::filesystem`, `std::thread`/`mutex`/`condition_variable`/`async`, `thread_local` destructors and thread-safe statics. No kernel changes were needed.
+- harfbuzz 10.1.0 (built with the cross g++) and utf8proc 2.9.0 joined the rendering stack. `make run-text-smoke` now checks GPOS kerning, mark composition and Arabic joining forms and draws shaped text; fcft is built with grapheme and run shaping, foot with grapheme clustering.
 - The path from here to a full desktop is tracked in `docs/desktop_roadmap.md`.
 - libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the region slots per task (32 then, 256 now).
 

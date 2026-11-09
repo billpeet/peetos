@@ -43,7 +43,16 @@
 /wayland/fcft-src
 /wayland/fcft-*.tar.gz
 /wayland/foot-src
+/wayland/harfbuzz-src
+/wayland/harfbuzz-*.tar.xz
+/wayland/utf8proc-src
+/wayland/utf8proc-*.tar.gz
 /wayland/foot-*.tar.gz
+/toolchain/*-src
+/toolchain/*.tar.*
+/toolchain/out
+/toolchain/sysroot
+/toolchain/build
 __pycache__/
 /user/qjs
 /user/micropython

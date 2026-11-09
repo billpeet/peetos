@@ -3,7 +3,11 @@ set -euo pipefail
 
 # Build the software rendering stack for PeetOS userspace (musl, shared
 # libraries) into a staged sysroot at wayland/out/stage:
-#   expat (configure), freetype, fontconfig, pixman (meson), DejaVu fonts.
+#   expat (configure), freetype, harfbuzz, fontconfig, pixman (meson),
+#   utf8proc (direct build), DejaVu fonts.
+#
+# harfbuzz is C++, so it is compiled with the PeetOS cross g++
+# (toolchain/build-toolchain.sh) and links against its libstdc++.
 #
 # Everything installs with prefix /usr and sysconfdir /etc, so the paths
 # fontconfig bakes in (/etc/fonts, /usr/share/fonts) are right on the target.
@@ -21,6 +25,7 @@ STAGE="${OUT}/stage"
 BUILD="${OUT}/build/render"
 MUSL_CC="${MUSL_CC:-${ROOT_DIR}/musl/sysroot/bin/musl-gcc}"
 MUSL_SHARED_LIB="${ROOT_DIR}/musl/shared/lib"
+CROSS_CXX="${CROSS_CXX:-${ROOT_DIR}/toolchain/out/bin/x86_64-linux-musl-g++}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 2)}"
 
 if [[ -d "${HOME}/.peetos-venv/bin" ]]; then
@@ -33,7 +38,11 @@ for tool in "${MESON}" ninja gperf pkg-config; do
     exit 1
   fi
 done
-for d in pixman expat freetype fontconfig dejavu wayland-protocols; do
+if [[ ! -x "${CROSS_CXX}" ]]; then
+  echo "PeetOS g++ not found at ${CROSS_CXX} (run 'make -C toolchain'; harfbuzz needs it)" >&2
+  exit 1
+fi
+for d in pixman expat freetype harfbuzz utf8proc fontconfig dejavu wayland-protocols; do
   if [[ ! -d "${WL}/${d}-src" ]]; then
     echo "${d} source not found (run 'make -C wayland fetch')" >&2
     exit 1
@@ -56,6 +65,13 @@ for sub in stable staging unstable; do
 done
 mkdir -p "${STAGE}/usr/share/wayland"
 cp "${OUT}/share/wayland/wayland.xml" "${STAGE}/usr/share/wayland/"
+# The C++ runtime, so C programs linking a C++ library (harfbuzz) resolve its
+# libstdc++/libgcc_s dependencies through -rpath-link, and the image builder
+# stages them with the other libraries.
+CXX_RUNTIME_DIR="$(dirname "${CROSS_CXX}")/../x86_64-linux-musl/lib64"
+for lib in libstdc++.so.6 libgcc_s.so.1; do
+  cp -L "${CXX_RUNTIME_DIR}/${lib}" "${STAGE}/usr/lib/${lib}"
+done
 
 pc() {
   local name="$1" version="$2" libs="$3" extra_cflags="$4" requires="$5"
@@ -93,6 +109,7 @@ CROSS="${OUT}/peetos-cross.ini"
 cat > "${CROSS}" <<EOF
 [binaries]
 c = '${MUSL_CC}'
+cpp = '${CROSS_CXX}'
 ar = 'ar'
 strip = 'strip'
 pkg-config = 'pkg-config'
@@ -109,6 +126,7 @@ pkg_config_libdir = '${STAGE}/usr/lib/pkgconfig:${STAGE}/usr/share/pkgconfig'
 
 [built-in options]
 c_link_args = ['-L${MUSL_SHARED_LIB}', '-L${STAGE}/usr/lib', '-Wl,-rpath-link,${STAGE}/usr/lib', '-Wl,-z,max-page-size=0x1000']
+cpp_link_args = ['-L${STAGE}/usr/lib', '-Wl,-rpath-link,${STAGE}/usr/lib', '-Wl,-z,max-page-size=0x1000']
 EOF
 
 meson_build() {
@@ -143,6 +161,28 @@ rm -f "${STAGE}"/usr/lib/*.la
 
 meson_build freetype "${WL}/freetype-src" \
   -Dbrotli=disabled -Dbzip2=disabled -Dharfbuzz=disabled -Dpng=disabled -Dzlib=none -Dtests=disabled
+
+# harfbuzz with its built-in Unicode tables and the freetype font functions;
+# no glib, ICU, cairo or command-line utilities (they need glib).
+meson_build harfbuzz "${WL}/harfbuzz-src" \
+  -Dfreetype=enabled -Dglib=disabled -Dgobject=disabled -Dcairo=disabled -Dchafa=disabled \
+  -Dicu=disabled -Dintrospection=disabled -Ddocs=disabled -Dtests=disabled -Dutilities=disabled
+
+# --- utf8proc (single C file; upstream builds it with CMake or a Makefile) --------
+echo "[render] building utf8proc"
+utf8proc_define() {
+  awk -v name="UTF8PROC_VERSION_$1" '$1 == "#define" && $2 == name { print $3 }' \
+    "${WL}/utf8proc-src/utf8proc.h"
+}
+UTF8PROC_VERSION="$(utf8proc_define MAJOR).$(utf8proc_define MINOR).$(utf8proc_define PATCH)"
+# Upstream's shared-library major for the 2.9.x API.
+UTF8PROC_SOMAJOR=3
+"${MUSL_CC}" -O2 -fPIC -shared -DUTF8PROC_EXPORTS -Wl,-soname,libutf8proc.so.${UTF8PROC_SOMAJOR} \
+  -L"${MUSL_SHARED_LIB}" -Wl,-z,max-page-size=0x1000 \
+  -o "${STAGE}/usr/lib/libutf8proc.so.${UTF8PROC_SOMAJOR}" "${WL}/utf8proc-src/utf8proc.c"
+ln -sfn "libutf8proc.so.${UTF8PROC_SOMAJOR}" "${STAGE}/usr/lib/libutf8proc.so"
+cp "${WL}/utf8proc-src/utf8proc.h" "${STAGE}/usr/include/"
+pc libutf8proc "${UTF8PROC_VERSION}" "-lutf8proc" "" ""
 
 meson_build fontconfig "${WL}/fontconfig-src" \
   -Ddoc=disabled -Dnls=disabled -Dtests=disabled -Dtools=enabled -Dcache-build=disabled \

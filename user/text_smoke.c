@@ -1,8 +1,10 @@
 /*
  * Software rendering stack smoke test for PeetOS: fontconfig finds a font,
- * freetype rasterizes it, pixman composites the glyphs (and a scaled copy),
- * and the frame is shown through DRM/KMS. Dynamically linked against
- * libfontconfig, libfreetype, libpixman-1 and libdrm.
+ * freetype rasterizes it, harfbuzz shapes text (kerning, mark composition,
+ * Arabic joining), pixman composites the glyphs (and a scaled copy), and the
+ * frame is shown through DRM/KMS. Dynamically linked against libfontconfig,
+ * libfreetype, libharfbuzz (C++, so libstdc++ comes along), libpixman-1 and
+ * libdrm.
  *
  * The kernel copies the DRM scanout buffer to the VESA framebuffer, so what
  * is on screen is checked by reading /dev/fb0.
@@ -24,6 +26,8 @@
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include <hb-ft.h>
+#include <hb.h>
 #include <pixman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -83,6 +87,71 @@ static int draw_text(pixman_image_t *dst, FT_Face face, const char *text, int x,
     }
     pixman_image_unref(solid);
     return x;
+}
+
+/* Composite one rendered freetype glyph slot at (x, y) = pen + bitmap offset. */
+static void blit_glyph(pixman_image_t *dst, pixman_image_t *solid, FT_GlyphSlot g, int x, int y) {
+    FT_Bitmap *bm = &g->bitmap;
+    if (bm->width == 0 || bm->rows == 0 || bm->pixel_mode != FT_PIXEL_MODE_GRAY) {
+        return;
+    }
+    int stride = (int)((bm->width + 3) & ~3u);
+    uint8_t *buf = calloc((size_t)stride * bm->rows, 1);
+    for (unsigned r = 0; r < bm->rows; r++) {
+        memcpy(buf + (size_t)r * stride, bm->buffer + (size_t)r * bm->pitch, bm->width);
+    }
+    pixman_image_t *mask = pixman_image_create_bits(PIXMAN_a8, (int)bm->width, (int)bm->rows,
+                                                    (uint32_t *)buf, stride);
+    pixman_image_composite32(PIXMAN_OP_OVER, solid, mask, dst, 0, 0, 0, 0,
+                             x + g->bitmap_left, y - g->bitmap_top, (int)bm->width, (int)bm->rows);
+    pixman_image_unref(mask);
+    free(buf);
+}
+
+/* Shape UTF-8 `text` with harfbuzz and draw the positioned glyphs. */
+static int draw_shaped(pixman_image_t *dst, hb_font_t *font, FT_Face face, const char *text, int x, int y,
+                       uint32_t argb) {
+    pixman_color_t c = {
+        .red = (uint16_t)(((argb >> 16) & 0xff) * 257),
+        .green = (uint16_t)(((argb >> 8) & 0xff) * 257),
+        .blue = (uint16_t)((argb & 0xff) * 257),
+        .alpha = 0xffff,
+    };
+    pixman_image_t *solid = pixman_image_create_solid_fill(&c);
+    hb_buffer_t *buf = hb_buffer_create();
+    hb_buffer_add_utf8(buf, text, -1, 0, -1);
+    hb_buffer_guess_segment_properties(buf);
+    hb_shape(font, buf, NULL, 0);
+    unsigned n = 0;
+    hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buf, &n);
+    hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buf, &n);
+    for (unsigned i = 0; i < n; i++) {
+        if (FT_Load_Glyph(face, info[i].codepoint, FT_LOAD_RENDER) == 0) {
+            blit_glyph(dst, solid, face->glyph, x + (pos[i].x_offset >> 6), y - (pos[i].y_offset >> 6));
+        }
+        x += pos[i].x_advance >> 6;
+    }
+    hb_buffer_destroy(buf);
+    pixman_image_unref(solid);
+    return x;
+}
+
+/* Shape `text` and return its glyph count; optionally copy out the glyph
+ * ids (in visual order) and the x advances (26.6 fixed point). */
+static unsigned shape(hb_font_t *font, const char *text, hb_codepoint_t *glyphs, int *advances, unsigned max) {
+    hb_buffer_t *buf = hb_buffer_create();
+    hb_buffer_add_utf8(buf, text, -1, 0, -1);
+    hb_buffer_guess_segment_properties(buf);
+    hb_shape(font, buf, NULL, 0);
+    unsigned n = 0;
+    hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buf, &n);
+    hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buf, &n);
+    for (unsigned i = 0; i < n && i < max; i++) {
+        if (glyphs) glyphs[i] = info[i].codepoint;
+        if (advances) advances[i] = pos[i].x_advance;
+    }
+    hb_buffer_destroy(buf);
+    return n;
 }
 
 static int count_not(pixman_image_t *img, int x0, int y0, int w, int h, uint32_t bg) {
@@ -155,6 +224,35 @@ int main(void) {
     }
     check(coverage > 200, "freetype rasterizes an antialiased glyph");
 
+    /* --- harfbuzz ------------------------------------------------------- */
+    hb_font_t *hb_sans = NULL;
+    if (sans_face) {
+        FT_Set_Pixel_Sizes(sans_face, 0, 28);
+        hb_sans = hb_ft_font_create_referenced(sans_face);
+    }
+    printf("[text] harfbuzz %s\n", hb_version_string());
+    check(hb_sans != NULL, "harfbuzz font from the freetype face");
+    if (hb_sans) {
+        int adv_a[1] = {0}, adv_av[2] = {0};
+        shape(hb_sans, "A", NULL, adv_a, 1);
+        shape(hb_sans, "AV", NULL, adv_av, 2);
+        printf("[text] advance of A: alone %d, before V %d (26.6)\n", adv_a[0], adv_av[0]);
+        check(adv_av[0] < adv_a[0], "harfbuzz applies GPOS kerning (AV)");
+
+        hb_codepoint_t composed[2] = {0}, decomposed[2] = {0};
+        unsigned n_composed = shape(hb_sans, "\xc3\xa9", composed, NULL, 2);       /* U+00E9 */
+        unsigned n_decomposed = shape(hb_sans, "e\xcc\x81", decomposed, NULL, 2);  /* e + U+0301 */
+        check(n_composed == 1 && n_decomposed == 1 && composed[0] == decomposed[0],
+              "harfbuzz composes e + combining acute to one glyph");
+
+        hb_codepoint_t iso[1] = {0}, pair[2] = {0};
+        shape(hb_sans, "\xd8\xb3", iso, NULL, 1);                         /* U+0633 seen */
+        unsigned n_pair = shape(hb_sans, "\xd8\xb3\xd8\xb3", pair, NULL, 2);
+        printf("[text] arabic seen: isolated glyph %u, joined glyphs %u %u\n", iso[0], pair[0], pair[1]);
+        check(n_pair == 2 && pair[0] != iso[0] && pair[1] != iso[0] && pair[0] != pair[1],
+              "harfbuzz picks Arabic joining forms");
+    }
+
     /* --- pixman: compose a frame in memory ------------------------------ */
     int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
     drmModeResPtr res = fd >= 0 ? drmModeGetResources(fd) : NULL;
@@ -192,6 +290,17 @@ int main(void) {
     }
     FT_Set_Pixel_Sizes(mono, 0, 16);
     draw_text(screen, mono, "0123456789 !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", 40, 216, FG);
+    if (hb_sans) {
+        /* Shaped with harfbuzz: kerning, a composed accent, and Arabic
+         * ("salaam") drawn right to left with joining forms. The face was
+         * resized above, so put it back and tell harfbuzz. */
+        FT_Set_Pixel_Sizes(sans_face, 0, 28);
+        hb_ft_font_changed(hb_sans);
+        int hx = draw_shaped(screen, hb_sans, sans_face, "harfbuzz: AVATAR cafe\xcc\x81 ", 40, 370, ACCENT);
+        int hend = draw_shaped(screen, hb_sans, sans_face, "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85", hx, 370, ACCENT);
+        if (hend > w) hend = w;
+        check(count_not(screen, 40, 340, hend - 40, 40, BG) > 800, "harfbuzz-shaped text composited");
+    }
 
     /* A 3x bilinear upscale of a small text image: exercises pixman's
      * transforms and filters. */
