@@ -83,6 +83,7 @@ This document describes the current baseline IPC/synchronization implementation 
 - `epoll_wait(epfd, events, maxevents, timeout)` supports timeout waiting, level-triggered readiness delivery, and returns `-EINTR` when interrupted by pending unblocked signals.
 - `EPOLLET` (edge-triggered: a readiness bit is reported when it becomes set) and `EPOLLONESHOT` (silent after one report until `EPOLL_CTL_MOD`) are supported; `EPOLLRDHUP`, `EPOLLWAKEUP` and `EPOLLEXCLUSIVE` are accepted. dbus-daemon uses `EPOLLET` for watches it has disabled.
 - Per-task epoll watch ownership is capped (`64` watches across all instances), and task teardown now drops owner watches defensively.
+- An epoll fd can be watched by `poll`/`select` and added to another epoll set (libinput hands its epoll fd to the compositor): it is readable while its instance has an event ready, checked without consuming edge-triggered state. Nesting is limited to 4 levels and cycles are refused with `ELOOP`.
 - `fork` gives the child a copy of each of the parent's watches, so an inherited epoll fd keeps working after the parent exits (dbus-daemon `--fork` sets up its epoll set before forking). A watch and its inherited copies refer to the same fd on the same object and are reported once.
 
 **Event FDs (`eventfd`, `timerfd`, `signalfd`)**

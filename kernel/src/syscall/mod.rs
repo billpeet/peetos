@@ -11,6 +11,7 @@ use arch_x86_64::pit;
 use arch_x86_64::syscall::{self as arch_syscall, SyscallFrame};
 
 use crate::framebuffer;
+use crate::input;
 use crate::ipc;
 use crate::memory::{heap, pmm, vmm};
 use crate::shm;
@@ -65,6 +66,8 @@ const EISDIR: i64 = 21;
 const ENFILE: i64 = 23;
 const ENOTEMPTY: i64 = 39;
 const ENOSYS: i64 = 38;
+const ENOEXEC: i64 = 8;
+const ELOOP: i64 = 40;
 const ENOPROTOOPT: i64 = 92;
 const ENOSPC: i64 = 28;
 const ENOTSOCK: i64 = 88;
@@ -156,6 +159,7 @@ const SYS_INOTIFY_ADD_WATCH: u64 = 254;
 const SYS_INOTIFY_RM_WATCH: u64 = 255;
 const SYS_INOTIFY_INIT1: u64 = 294;
 const SYS_PIDFD_OPEN: u64 = 434;
+const SYS_WAITID: u64 = 247;
 const SYS_GETTID: u64 = 186;
 const SYS_TKILL: u64 = 200;
 const SYS_TGKILL: u64 = 234;
@@ -816,6 +820,7 @@ const SYSCALL_TABLE: &[SyscallDef] = &[
     ),
     syscall_def(SYS_INOTIFY_INIT1, "inotify_init1", SyscallMode::UserTask, sys_inotify_unsupported),
     syscall_def(SYS_PIDFD_OPEN, "pidfd_open", SyscallMode::UserTask, sys_pidfd_open_unsupported),
+    syscall_def(SYS_WAITID, "waitid", SyscallMode::UserTask, sys_waitid),
     syscall_def(SYS_UNLINK, "unlink", SyscallMode::UserTask, sys_unlink),
     syscall_def(
         SYS_ARCH_PRCTL,
@@ -1391,7 +1396,7 @@ impl LinuxStat {
             st_uid: stat.uid,
             st_gid: stat.gid,
             __pad0: 0,
-            st_rdev: 0,
+            st_rdev: stat.rdev,
             st_size: stat.size as i64,
             st_blksize: stat.blksize as i64,
             st_blocks: stat.blocks as i64,
@@ -1468,15 +1473,34 @@ fn dispatch_syscall(call: SyscallArgs) -> i64 {
     #[cfg(feature = "syscall-trace")]
     let pid = if ctx.current.is_null() { -1 } else { unsafe { (*ctx.current).pid } };
     #[cfg(feature = "syscall-trace")]
-    sys_log!(
-        "[STRACE] {} {}({:#x}, {:#x}, {:#x}, {:#x})",
-        pid,
-        def.name,
-        call.args[0],
-        call.args[1],
-        call.args[2],
-        call.args[3]
-    );
+    {
+        // Show the path of path-taking calls (arg 0, or arg 1 for *at).
+        let path_arg = match def.name {
+            "open" | "stat" | "lstat" | "access" | "readlink" | "mkdir" | "unlink" | "execve"
+            | "chdir" | "rmdir" => Some(call.args[0]),
+            "openat" | "newfstatat" | "statx" | "faccessat" | "faccessat2" | "readlinkat"
+            | "mkdirat" | "unlinkat" => Some(call.args[1]),
+            _ => None,
+        };
+        let mut buf = [0u8; 160];
+        let path = match path_arg {
+            Some(ptr) if ptr != 0 => match uaccess::copy_cstr_from_user_current(ptr, &mut buf) {
+                Ok(len) => core::str::from_utf8(&buf[..len]).unwrap_or("?"),
+                Err(_) => "?",
+            },
+            _ => "",
+        };
+        sys_log!(
+            "[STRACE] {} {}({:#x}, {:#x}, {:#x}, {:#x}) {}",
+            pid,
+            def.name,
+            call.args[0],
+            call.args[1],
+            call.args[2],
+            call.args[3],
+            path
+        );
+    }
     let ret = (def.handler)(&ctx, &call);
     #[cfg(feature = "syscall-trace")]
     sys_log!("[STRACE] {} {} -> {}", pid, def.name, ret);

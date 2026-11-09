@@ -1519,6 +1519,7 @@ fn access_allowed_uses_owner_bits_for_current_uid() {
         mtime: 0,
         ctime: 0,
         file_type: fs::FileType::Regular,
+        rdev: 0,
     };
     assert!(access_allowed(&stat, R_OK, 1000, 1000));
     assert!(!access_allowed(&stat, X_OK, 1000, 1000));
@@ -2647,4 +2648,92 @@ fn unix_credentials_carry_the_process_id_not_the_thread_id() {
     thread.tgid = 70;
     let cred = current_unix_cred(&mut thread as *mut task::Task);
     assert_eq!(cred.pid, 70);
+}
+
+#[test]
+fn evdev_requests_decode_like_linux_input_h() {
+    // EVIOCGNAME(256), EVIOCGBIT(EV_KEY, 96), EVIOCGABS(ABS_Y), EVIOCGKEY(96)
+    assert_eq!(decode_evdev_request(0x8100_4506), EvdevRequest::Name(256));
+    assert_eq!(
+        decode_evdev_request(0x8060_4521),
+        EvdevRequest::Bits { ev_type: input::EV_KEY, len: 96 }
+    );
+    assert_eq!(decode_evdev_request(0x8018_4541), EvdevRequest::Abs { axis: 1, len: 24 });
+    assert_eq!(
+        decode_evdev_request(0x8060_4518),
+        EvdevRequest::State { ev_type: input::EV_KEY, len: 96 }
+    );
+    assert_eq!(decode_evdev_request(0x8004_4501), EvdevRequest::Version);
+    assert_eq!(decode_evdev_request(0x4004_4590), EvdevRequest::Accepted);
+    // EVIOCSABS(ABS_X) is a write: not supported.
+    assert_eq!(decode_evdev_request(0x4018_45c0), EvdevRequest::Unsupported);
+    // A TTY ioctl on an evdev fd.
+    assert_eq!(decode_evdev_request(0x5401), EvdevRequest::Unsupported);
+}
+
+#[test]
+fn drm_object_any_resolves_the_type_from_the_id() {
+    assert_eq!(drmdev::drm_object_type_for(0, crate::drm::PLANE_ID), 0xeeee_eeee);
+    assert_eq!(drmdev::drm_object_type_for(0, crate::drm::CONNECTOR_ID), 0xc0c0_c0c0);
+    assert_eq!(drmdev::drm_object_type_for(0, 9999), 0);
+    assert_eq!(drmdev::drm_object_type_for(0xcccc_cccc, crate::drm::PLANE_ID), 0xcccc_cccc);
+}
+
+#[test]
+fn drm_cursor_can_be_hidden_but_not_shown() {
+    // DRM_MODE_CURSOR_BO with handle 0 hides; MOVE is a no-op; a buffer fails.
+    assert_eq!(drmdev::cursor_request_result(0x1, 0), Ok(()));
+    assert_eq!(drmdev::cursor_request_result(0x2, 0), Ok(()));
+    assert_eq!(drmdev::cursor_request_result(0x1, 5), Err(-ENXIO));
+}
+
+#[test]
+fn ioctl_requests_are_32_bit_like_linux() {
+    // musl passes `int` requests: EVIOCGID sign-extends.
+    assert_eq!(ioctl_request(0xffff_ffff_8008_4502), 0x8008_4502);
+    assert_eq!(decode_evdev_request(ioctl_request(0xffff_ffff_8008_4502)), EvdevRequest::Id);
+    assert_eq!(ioctl_request(0x5413), 0x5413);
+}
+
+#[test]
+fn nested_epoll_cycles_are_refused() {
+    let _guard = EPOLL_TEST_LOCK.lock().expect("epoll test lock");
+    reset_epoll_for_test();
+    let mut owner = task::Task::for_test(60);
+    let owner_ptr = &mut owner as *mut task::Task;
+    let a = epoll_alloc_instance().expect("a");
+    let b = epoll_alloc_instance().expect("b");
+    assert!(epoll_would_cycle(a, a, 0));
+    assert!(!epoll_would_cycle(a, b, 0));
+    // a watches b (fd 5 refers to instance b) ...
+    let inst_a = epoll_instance_get_mut(a).expect("inst a");
+    assert_eq!(epoll_ctl_add(inst_a, 60, owner_ptr, 5, task::USER_FD_KIND_EPOLL, b, EPOLLIN, 0), 0);
+    // ... so b may not watch a.
+    assert!(epoll_would_cycle(b, a, 0));
+    // An empty instance has nothing ready.
+    assert!(!epoll_instance_has_ready(b));
+}
+
+#[test]
+fn waitid_siginfo_reports_exit_and_signal() {
+    // exit(3): wait status 0x300
+    let info = waitid_siginfo(42, 0, 3 << 8);
+    let int = |o: usize| i32::from_ne_bytes([info[o], info[o + 1], info[o + 2], info[o + 3]]);
+    assert_eq!(int(0), signal::SIGCHLD as i32);
+    assert_eq!(int(8), 1); // CLD_EXITED
+    assert_eq!(int(16), 42);
+    assert_eq!(int(24), 3);
+    // killed by SIGKILL (9)
+    let info = waitid_siginfo(43, 0, 9);
+    let int = |o: usize| i32::from_ne_bytes([info[o], info[o + 1], info[o + 2], info[o + 3]]);
+    assert_eq!(int(8), 2); // CLD_KILLED
+    assert_eq!(int(24), 9);
+    assert_eq!(lookup_syscall(SYS_WAITID).map(|d| d.name), Some("waitid"));
+}
+
+#[test]
+fn execve_refuses_non_elf_images_with_enoexec() {
+    assert!(image_is_elf(&[0x7f, b'E', b'L', b'F', 2, 1, 1]));
+    assert!(!image_is_elf(b"echo hi\n"));
+    assert!(!image_is_elf(&[0x7f, b'E', b'L']));
 }

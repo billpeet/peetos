@@ -3,6 +3,7 @@
 
 #[cfg(test)]
 extern crate std;
+extern crate alloc;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -70,6 +71,7 @@ mod socket;
 mod storage;
 mod sync;
 mod syscall;
+mod sysfs;
 mod task;
 mod tcp;
 mod tty;

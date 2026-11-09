@@ -140,7 +140,11 @@ Limitations / Simplifications
 - Hard links are baseline-implemented (`linkat`), with ext2-backed inode links and a pragmatic tmpfs fallback.
 - Symbolic links are baseline-implemented (`symlinkat` + `readlinkat` target reads), but general symlink-follow path resolution is not implemented yet.
 - Console input path is baseline-only: canonical line mode with basic backspace editing and newline commit; no `termios`, raw mode, job control, or pty support.
-- ext2 importer is intentionally minimal: regular files, directories and symlinks only (device nodes, FIFOs and sockets are skipped). tmpfs files are capped at `TMPFS_MAX_FILE_SIZE` (32 KiB).
+- Symlinks are followed in the middle of a path (up to 40, then `ELOOP`), relative to the link's directory; the last component is never followed, so `stat`/`open` of a symlink still see the link itself.
+- Device nodes in `/dev` are character devices with Linux numbers (`st_rdev`): `null` 1:3, `zero` 1:5, `urandom` 1:9, `tty` 5:0, `console` 5:1, `ptmx` 5:2, `pts/N` 136:N, `fb0` 29:0, `input/eventN` 13:64+N, `dri/card0` 226:0. Directory entries still report them as `DT_REG`.
+- `/dev/shm` is a tmpfs directory for POSIX shared memory (`shm_open`).
+- `/sys` is a static tree built by the kernel before the root mount (`kernel/src/sysfs.rs`): `/sys/devices/platform/simple-framebuffer.0/drm/card0` and `/sys/devices/virtual/input/inputN/eventN` with `uevent`, `dev`, `subsystem` links and, for input devices, `name`, `id/*` and `capabilities/*`; plus `/sys/dev/char/M:N` and `/sys/class/{drm,input}` symlinks. It is what libudev-zero and libdrm need to enumerate devices (`docs/labwc.md`).
+- ext2 importer is intentionally minimal: regular files, directories and symlinks only (device nodes, FIFOs and sockets are skipped). tmpfs files are capped at `TMPFS_MAX_FILE_SIZE` (16 MiB) and their data lives in the kernel heap rather than in pages (memfds use pages).
 - There is no wall clock: timestamps come from a tick counter. `stat` has no nanoseconds or `crtime`, and pre-1970 times are not representable.
 - Truncates are not recorded on the orphan list while they run, so a crash during a long multi-transaction truncate can leave blocks freed under the old size (consistent, but not completed at the next mount). Read-only mounts do not process orphans.
 - htree: no three-level (`largedir`) indexes; leaves are never merged after unlinks (as on Linux); `readdir` lists in VFS order (not hash order) and imports the whole directory.

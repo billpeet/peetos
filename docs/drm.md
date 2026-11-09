@@ -35,9 +35,9 @@ PeetOS has a minimal DRM/KMS device in the spirit of Linux's `simpledrm`. It dri
 Limitations / Simplifications
 - One fixed mode: the VESA mode chosen at boot. There is no mode switching, no hotplug, no EDID (`GETPROPBLOB` returns `ENOENT`) and no gamma (`gamma_size` 0).
 - Legacy KMS only. `DRM_CLIENT_CAP_ATOMIC` is refused and `MODE_ATOMIC` returns `EOPNOTSUPP`. wlroots therefore needs its legacy backend (`WLR_DRM_NO_ATOMIC=1`), and there are no overlay planes or `SETPLANE`.
-- No hardware cursor: `MODE_CURSOR`/`CURSOR2` return `ENXIO`, so clients draw the cursor themselves.
+- No hardware cursor: `MODE_CURSOR`/`CURSOR2` with a buffer return `ENXIO`, so clients draw the cursor themselves. Hiding the cursor (handle 0) and moving it succeed, because wlroots' legacy commit hides it on every modeset.
 - Scanout is a CPU copy into the VESA framebuffer on every flip or dirty rectangle (about 3 MiB per 1024x768 frame). There is no real vblank, so flip events are timed with the PIT, and there is no tearing protection.
 - Only 32 bpp dumb buffers and `XRGB8888`/`ARGB8888` framebuffers are supported: single plane, offset 0, no modifiers. `GETFB` returns no handle.
 - `WAIT_VBLANK`, `CRTC_GET_SEQUENCE`, leases, syncobjs and render nodes (`/dev/dri/renderD128`) are not implemented. There is no GPU and no 3D.
-- `/dev/dri/card0` reports `S_IFCHR` 226:0 through `fstat` on an open fd, but `stat` on the path reports a regular file, like the other device nodes. There is no `/sys/class/drm` for udev or libdrm device enumeration (`drmGetDevice`).
+- `/dev/dri/card0` reports `S_IFCHR` 226:0 through `fstat` on an open fd, but `stat` on the path reports a regular file, like the other device nodes. `stat` on `/dev/dri/card0` now reports `S_IFCHR` 226:0 too, and a static `/sys` describes the card as `/sys/devices/platform/simple-framebuffer.0/drm/card0` (`docs/vfs.md`): enough for libudev and `drmGetDeviceNameFromFd2`, but `drmGetDevice` cannot parse the platform bus info and there is no render node.
 - Fixed tables: 16 open card files, 64 GEM objects, 32 framebuffers and 8 queued events per file system-wide.

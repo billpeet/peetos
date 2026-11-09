@@ -196,6 +196,16 @@ if [[ -x "${RENDER_STAGE}/usr/bin/dbus-daemon" ]]; then
     ln -f "${STAGE_ROOT}/bin/thunar" "${STAGE_ROOT}/usr/bin/Thunar"
   fi
 fi
+# labwc (scripts/build_wlroots.sh): the compositor and libinput's device
+# quirks. wlroots, libinput, libseat, libudev and libxml2 come with the
+# other shared libraries.
+if [[ -x "${RENDER_STAGE}/usr/bin/labwc" ]]; then
+  cp "${RENDER_STAGE}/usr/bin/labwc" "${STAGE_ROOT}/bin/labwc"
+  mkdir -p "${STAGE_ROOT}/usr/share"
+  if [[ -d "${RENDER_STAGE}/usr/share/libinput" ]]; then
+    cp -a "${RENDER_STAGE}/usr/share/libinput" "${STAGE_ROOT}/usr/share/"
+  fi
+fi
 if [[ -x "${ROOT_DIR}/user/gtk_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/gtk_smoke.elf" "${STAGE_ROOT}/bin/gtk_smoke"
   chmod 0755 "${STAGE_ROOT}/bin/gtk_smoke"
@@ -1004,6 +1014,60 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/dbus_smoke.sh"
+
+# labwc smoke: labwc on DRM (wlroots DRM + libinput backends, pixman
+# renderer, libseat noop backend) with foot as its startup client, running a
+# shell the driver types into (scripts/labwc_smoke_driver.py).
+cat > "${STAGE_ROOT}/bin/labwc_foot.sh" <<'EOS'
+echo "[labwc-child] started in foot (WAYLAND_DISPLAY=$WAYLAND_DISPLAY)" > /dev/console
+/mnt/ext2/bin/toybox sh
+echo "[labwc-child] shell exited" > /dev/console
+kill -TERM "$LABWC_PID"
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/labwc_foot.sh"
+
+# Typed into foot's shell by the driver (letters only: easy to send).
+cat > "${STAGE_ROOT}/bin/labwcok" <<'EOS'
+echo "[labwc-child] keyboard input reached the shell" > /dev/console
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/labwcok"
+
+cat > "${STAGE_ROOT}/bin/labwc_smoke.sh" <<'EOS'
+fail=0
+export HOME=/tmp LANG=C.UTF-8 XDG_RUNTIME_DIR=/tmp/xdg-runtime PATH=/mnt/ext2/bin:/bin
+export LIBSEAT_BACKEND=noop WLR_RENDERER=pixman WLR_DRM_NO_ATOMIC=1 WLR_BACKENDS=drm,libinput
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+# Flat pointer acceleration at speed 0: PS/2 motion is 1:1, so the driver
+# can put the pointer on exact screen positions.
+mkdir -p /tmp/.config/labwc
+cat > /tmp/.config/labwc/rc.xml <<'XML'
+<?xml version="1.0"?>
+<labwc_config>
+  <libinput>
+    <device category="default">
+      <accelProfile>flat</accelProfile>
+      <pointerSpeed>0</pointerSpeed>
+    </device>
+  </libinput>
+</labwc_config>
+XML
+
+if [ ! -x bin/labwc ] || [ ! -x bin/foot ]; then
+  echo [musl-ext2-labwc-smoke] missing bin/labwc or bin/foot
+  fail=1
+else
+  bin/labwc -V -s "/mnt/ext2/bin/foot /mnt/ext2/bin/toybox sh /mnt/ext2/bin/labwc_foot.sh" 2>&1 \
+    | toybox head -c 200000
+  echo "[musl-ext2-labwc-smoke] labwc exited"
+fi
+
+echo [musl-ext2-labwc-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-labwc-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/labwc_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
 fail=0

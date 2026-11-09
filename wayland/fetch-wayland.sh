@@ -11,8 +11,9 @@ wayland-protocols, libxkbcommon and libdrm, plus the software rendering stack
 (pixman, expat, freetype, fontconfig, harfbuzz, utf8proc), the DejaVu
 fonts, the 2D toolkit libraries (zlib, libpng, pcre2, GLib, fribidi, cairo,
 pango), the GTK 3 stack (libepoxy, ATK, gdk-pixbuf, GTK, the hicolor icon
-theme), the Xfce libraries and Thunar, D-Bus, and tllist, fcft and the
-foot terminal.
+theme), the Xfce libraries and Thunar, D-Bus, the wlroots/labwc stack (libevdev, mtdev,
+libudev-zero, libinput, seatd, hwdata, libdisplay-info, wlroots, libxml2,
+labwc), and tllist, fcft and the foot terminal.
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -168,6 +169,47 @@ DBUS_VERSION="1.16.2"
 DBUS_URL="https://dbus.freedesktop.org/releases/dbus/dbus-${DBUS_VERSION}.tar.xz"
 DBUS_SHA256="0ba2a1a4b16afe7bceb2c07e9ce99a8c2c3508e5dec290dbb643384bd6beb7e2"
 
+# wlroots + labwc stack (scripts/build_wlroots.sh).
+LIBEVDEV_VERSION="1.13.3"
+LIBEVDEV_URL="https://gitlab.freedesktop.org/libevdev/libevdev/-/archive/libevdev-${LIBEVDEV_VERSION}/libevdev-libevdev-${LIBEVDEV_VERSION}.tar.gz"
+LIBEVDEV_SHA256="39e431563f0b35e4794b3af3f61bc05f81ef5d25f10238af9768ddf4589abef7"
+
+MTDEV_VERSION="1.1.7"
+MTDEV_URL="https://bitmath.org/code/mtdev/mtdev-${MTDEV_VERSION}.tar.bz2"
+MTDEV_SHA256="a107adad2101fecac54ac7f9f0e0a0dd155d954193da55c2340c97f2ff1d814e"
+
+LIBUDEV_ZERO_VERSION="1.0.3"
+LIBUDEV_ZERO_URL="https://github.com/illiliti/libudev-zero/archive/refs/tags/${LIBUDEV_ZERO_VERSION}.tar.gz"
+LIBUDEV_ZERO_SHA256="0bd89b657d62d019598e6c7ed726ff8fed80e8ba092a83b484d66afb80b77da5"
+
+LIBINPUT_VERSION="1.27.1"
+LIBINPUT_URL="https://gitlab.freedesktop.org/libinput/libinput/-/archive/${LIBINPUT_VERSION}/libinput-${LIBINPUT_VERSION}.tar.gz"
+LIBINPUT_SHA256="f6d623dd8230db337a6457645ebca96b9d4788a56385463bb14b8174910dfe23"
+
+SEATD_VERSION="0.9.1"
+SEATD_URL="https://git.sr.ht/~kennylevinsen/seatd/archive/${SEATD_VERSION}.tar.gz"
+SEATD_SHA256="819979c922a0be258aed133d93920bce6a3d3565a60588d6d372ce9db2712cd3"
+
+HWDATA_VERSION="0.390"
+HWDATA_URL="https://github.com/vcrhonek/hwdata/archive/refs/tags/v${HWDATA_VERSION}.tar.gz"
+HWDATA_SHA256="f10684093d2a7780de8a96d3dd8a2dd544ed6136dd359197750c42bb08ce526f"
+
+LIBDISPLAY_INFO_VERSION="0.2.0"
+LIBDISPLAY_INFO_URL="https://gitlab.freedesktop.org/emersion/libdisplay-info/-/releases/${LIBDISPLAY_INFO_VERSION}/downloads/libdisplay-info-${LIBDISPLAY_INFO_VERSION}.tar.xz"
+LIBDISPLAY_INFO_SHA256="5a2f002a16f42dd3540c8846f80a90b8f4bdcd067a94b9d2087bc2feae974176"
+
+WLROOTS_VERSION="0.18.2"
+WLROOTS_URL="https://gitlab.freedesktop.org/wlroots/wlroots/-/releases/${WLROOTS_VERSION}/downloads/wlroots-${WLROOTS_VERSION}.tar.gz"
+WLROOTS_SHA256="cf776c169169f279808d9eabc6583f484338dcd454c966a285ff178c88c105d4"
+
+LIBXML2_VERSION="2.13.5"
+LIBXML2_URL="https://download.gnome.org/sources/libxml2/2.13/libxml2-${LIBXML2_VERSION}.tar.xz"
+LIBXML2_SHA256="74fc163217a3964257d3be39af943e08861263c4231f9ef5b496b6f6d4c7b2b6"
+
+LABWC_VERSION="0.8.4"
+LABWC_URL="https://github.com/labwc/labwc/archive/refs/tags/${LABWC_VERSION}.tar.gz"
+LABWC_SHA256="2d3ded90f78efb5060f7057ea802c78a79dc9b2e82ae7a2ad902af957b8b9797"
+
 FOOT_VERSION="1.18.1"
 FOOT_URL="https://codeberg.org/dnkl/foot/archive/${FOOT_VERSION}.tar.gz"
 FOOT_SHA256="f1438298117b1346405f175e8a052ba9828a610e061971cc8dde9153939344c5"
@@ -298,5 +340,25 @@ fetch_one "adwaita-icon-theme-legacy ${ADWAITA_LEGACY_VERSION}" "${ADWAITA_LEGAC
 fetch_one "shared-mime-info ${SHARED_MIME_INFO_VERSION}" "${SHARED_MIME_INFO_URL}" "${SHARED_MIME_INFO_SHA256}" \
   "${OUTPUT_DIR}/shared-mime-info-src" "shared-mime-info-${SHARED_MIME_INFO_VERSION}.tar.gz"
 fetch_one "dbus ${DBUS_VERSION}" "${DBUS_URL}" "${DBUS_SHA256}"   "${OUTPUT_DIR}/dbus-src" "dbus-${DBUS_VERSION}.tar.xz"
+fetch_one "libevdev ${LIBEVDEV_VERSION}" "${LIBEVDEV_URL}" "${LIBEVDEV_SHA256}" \
+  "${OUTPUT_DIR}/libevdev-src" "libevdev-libevdev-${LIBEVDEV_VERSION}.tar.gz"
+fetch_one "mtdev ${MTDEV_VERSION}" "${MTDEV_URL}" "${MTDEV_SHA256}" \
+  "${OUTPUT_DIR}/mtdev-src" "mtdev-${MTDEV_VERSION}.tar.bz2"
+fetch_one "libudev-zero ${LIBUDEV_ZERO_VERSION}" "${LIBUDEV_ZERO_URL}" "${LIBUDEV_ZERO_SHA256}" \
+  "${OUTPUT_DIR}/libudev-zero-src" "libudev-zero-${LIBUDEV_ZERO_VERSION}.tar.gz"
+fetch_one "libinput ${LIBINPUT_VERSION}" "${LIBINPUT_URL}" "${LIBINPUT_SHA256}" \
+  "${OUTPUT_DIR}/libinput-src" "libinput-${LIBINPUT_VERSION}.tar.gz"
+fetch_one "seatd ${SEATD_VERSION}" "${SEATD_URL}" "${SEATD_SHA256}" \
+  "${OUTPUT_DIR}/seatd-src" "seatd-${SEATD_VERSION}.tar.gz"
+fetch_one "hwdata ${HWDATA_VERSION}" "${HWDATA_URL}" "${HWDATA_SHA256}" \
+  "${OUTPUT_DIR}/hwdata-src" "hwdata-${HWDATA_VERSION}.tar.gz"
+fetch_one "libdisplay-info ${LIBDISPLAY_INFO_VERSION}" "${LIBDISPLAY_INFO_URL}" "${LIBDISPLAY_INFO_SHA256}" \
+  "${OUTPUT_DIR}/libdisplay-info-src" "libdisplay-info-${LIBDISPLAY_INFO_VERSION}.tar.xz"
+fetch_one "wlroots ${WLROOTS_VERSION}" "${WLROOTS_URL}" "${WLROOTS_SHA256}" \
+  "${OUTPUT_DIR}/wlroots-src" "wlroots-${WLROOTS_VERSION}.tar.gz"
+fetch_one "libxml2 ${LIBXML2_VERSION}" "${LIBXML2_URL}" "${LIBXML2_SHA256}" \
+  "${OUTPUT_DIR}/libxml2-src" "libxml2-${LIBXML2_VERSION}.tar.xz"
+fetch_one "labwc ${LABWC_VERSION}" "${LABWC_URL}" "${LABWC_SHA256}" \
+  "${OUTPUT_DIR}/labwc-src" "labwc-${LABWC_VERSION}.tar.gz"
 fetch_one "foot ${FOOT_VERSION}" "${FOOT_URL}" "${FOOT_SHA256}" \
   "${OUTPUT_DIR}/foot-src" "foot-${FOOT_VERSION}.tar.gz"

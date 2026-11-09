@@ -171,6 +171,13 @@ pub(super) fn execve_common(
             return Err(err);
         }
     };
+    // Not an ELF image (a script without "#!" support, data): ENOEXEC, as
+    // on Linux, before anything is torn down. Shells then run the file as a
+    // script themselves (POSIX).
+    if !image_is_elf(image.as_slice()) {
+        heap::kfree(image.ptr);
+        return Err(-ENOEXEC);
+    }
     let execfn_len = path.len();
     path_buf[execfn_len] = 0;
     let execfn = &path_buf[..execfn_len + 1];
@@ -189,6 +196,11 @@ pub(super) fn execve_common(
         close_cloexec_fds(ctx.current);
     }
     result
+}
+
+#[inline]
+pub(super) fn image_is_elf(image: &[u8]) -> bool {
+    image.len() >= 4 && image[..4] == [0x7f, b'E', b'L', b'F']
 }
 
 /// Internal `exit_code` flag: the process was killed by signal
@@ -744,6 +756,116 @@ pub(super) fn find_waitable_child(
     None
 }
 
+/// Free a zombie child's address space and task slot (after its status has
+/// been reported).
+fn reap_child(child_task: *mut task::Task) {
+    let child_pml4 = unsafe { PhysAddr::new((*child_task).pml4_phys) };
+    if child_pml4.as_u64() != 0 {
+        vmm::clear_user_space(child_pml4);
+        vmm::destroy_address_space(child_pml4);
+        unsafe {
+            (*child_task).pml4_phys = 0;
+        }
+    }
+    task::task_destroy(child_task);
+}
+
+const P_ALL: u32 = 0;
+const P_PID: u32 = 1;
+const WEXITED: u32 = 0x4;
+const WSTOPPED: u32 = 0x2;
+const WCONTINUED: u32 = 0x8;
+const WNOWAIT: u32 = 0x0100_0000;
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
+
+/// `siginfo_t` for a child that changed state (`waitid`): SIGCHLD with
+/// `si_code` CLD_EXITED/CLD_KILLED, the pid, uid and exit status or signal.
+pub(super) fn waitid_siginfo(pid: i32, uid: u32, wait_status: i32) -> [u8; 128] {
+    let mut info = [0u8; 128];
+    let (code, status) = if (wait_status & 0x7f) == 0 {
+        (CLD_EXITED, (wait_status >> 8) & 0xff)
+    } else {
+        (CLD_KILLED, wait_status & 0x7f)
+    };
+    info[0..4].copy_from_slice(&(signal::SIGCHLD as i32).to_ne_bytes());
+    info[8..12].copy_from_slice(&code.to_ne_bytes());
+    info[16..20].copy_from_slice(&pid.to_ne_bytes());
+    info[20..24].copy_from_slice(&uid.to_ne_bytes());
+    info[24..28].copy_from_slice(&status.to_ne_bytes());
+    info
+}
+
+/// `waitid(idtype, id, infop, options, rusage)`: P_ALL and P_PID, exited
+/// children only (WEXITED; stop/continue events are never reported), with
+/// WNOHANG and WNOWAIT.
+pub(super) fn sys_waitid(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
+    let idtype = call.arg(0) as u32;
+    let id = call.arg(1) as i32;
+    let infop = call.arg(2);
+    let options = call.arg(3) as u32;
+    if call.arg(4) != 0 {
+        return -ENOSYS;
+    }
+    let wait_pid: i64 = match idtype {
+        P_ALL => -1,
+        P_PID if id > 0 => id as i64,
+        _ => return -EINVAL,
+    };
+    if (options & !(WNOHANG | WEXITED | WSTOPPED | WCONTINUED | WNOWAIT)) != 0
+        || (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0
+    {
+        return -EINVAL;
+    }
+    if ctx.current.is_null() {
+        return -ESRCH;
+    }
+    let parent_pid = unsafe { (*ctx.current).tgid };
+    loop {
+        reap_exited_threads();
+        let mut found_match = false;
+        let child = if (options & WEXITED) != 0 {
+            find_waitable_child(parent_pid, wait_pid, &mut found_match)
+        } else {
+            // Only stop/continue requested: never reported here.
+            find_waitable_child(parent_pid, wait_pid, &mut found_match).and(None)
+        };
+        if let Some(child_task) = child {
+            let (pid, exit_code, uid) =
+                unsafe { ((*child_task).pid, (*child_task).exit_code, (*child_task).user_uid) };
+            if infop != 0 {
+                let info = waitid_siginfo(pid, uid, wait_status_from_exit_code(exit_code));
+                if let Err(err) = copy_to_user_task(ctx.current, infop, &info) {
+                    return -err;
+                }
+            }
+            if (options & WNOWAIT) == 0 {
+                reap_child(child_task);
+            }
+            return 0;
+        }
+        if !found_match {
+            return -ECHILD;
+        }
+        if (options & WNOHANG) != 0 {
+            // No child ready: si_pid 0 tells the caller (POSIX).
+            if infop != 0 {
+                if let Err(err) = copy_to_user_task(ctx.current, infop, &[0u8; 128]) {
+                    return -err;
+                }
+            }
+            return 0;
+        }
+        if !crate::sched::is_running() {
+            return -EAGAIN;
+        }
+        if signal::wait_interrupted(ctx.current) {
+            return -ERESTARTSYS;
+        }
+        crate::sched::yield_now();
+    }
+}
+
 pub(super) fn sys_wait4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let wait_pid = call.arg(0) as i64;
     let user_status = call.arg(1);
@@ -784,14 +906,8 @@ pub(super) fn sys_wait4(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 }
             }
 
-            if child_pml4.as_u64() != 0 {
-                vmm::clear_user_space(child_pml4);
-                vmm::destroy_address_space(child_pml4);
-                unsafe {
-                    (*child_task).pml4_phys = 0;
-                }
-            }
-            task::task_destroy(child_task);
+            let _ = child_pml4;
+            reap_child(child_task);
             return pid as i64;
         }
 

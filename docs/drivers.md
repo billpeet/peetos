@@ -79,11 +79,17 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
   - button state bits (left/right/middle)
   - signed relative motion (`dx`/`dy`)
   - overflow rejection and first-byte sync-bit resynchronization
-- Decoded pointer activity now also feeds `/dev/input/event1`:
+- Decoded pointer activity feeds the evdev devices:
   - PS/2 packets emit `EV_REL` (`REL_X`, `REL_Y`) plus `EV_KEY` button changes, using the Linux evdev convention (`REL_Y` positive = down; PS/2 reports positive = up, so the driver flips it)
-  - USB tablet absolute updates emit `EV_ABS` (`ABS_X`, `ABS_Y`) plus button changes
+  - USB tablet absolute updates emit `EV_ABS` (`ABS_X`, `ABS_Y`, screen pixels) plus button changes
   - each packet/report ends with `SYN_REPORT`
   - queue overflow is reported with `SYN_DROPPED` on the next successfully queued packet
+- Devices (`kernel/src/input.rs`), each a character device 13:64+N:
+  - `event0`: the keyboard ("AT Translated Set 2 keyboard")
+  - `event1`: a legacy aggregate of both pointers (relative and absolute events on one device), read by `peetwl` and the older compositors; like Linux's `/dev/input/mice` it is not listed in `/sys`
+  - `event2`: the PS/2 mouse alone ("PS/2 Generic Mouse")
+  - `event3`: the USB tablet alone ("QEMU QEMU USB Tablet")
+- evdev ioctls for libevdev/libinput: `EVIOCGVERSION`, `EVIOCGID`, `EVIOCGNAME`/`PHYS` (`UNIQ` gives `ENOENT`), `EVIOCGPROP`, `EVIOCGBIT` for every event type, `EVIOCGKEY`/`LED`/`SND`/`SW` (all released), `EVIOCGABS` (range 0 to the cursor's maximum position), and `EVIOCGRAB`, `EVIOCREVOKE` and `EVIOCSCLOCKID` accepted. The same capability bitmaps are published in `/sys` (`uevent` `EV=`/`KEY=`/..., `capabilities/*`) for libudev.
 - Motion deltas are accumulated in IRQ context and applied in the main loop to a software framebuffer cursor.
 - Cursor rendering uses save/restore of covered pixels and clamps movement to screen bounds.
 - Framebuffer console writes/ticks temporarily hide the cursor and redraw it after updates so text rendering and cursor overlay stay coherent.
@@ -134,9 +140,12 @@ Limitations / Simplifications
 - Hotplug, power management, and controller reset/error-recovery flows are minimal.
 - Keyboard input is US-layout set-1 only; extended keys and key-repeat handling are minimal.
 - Mouse support is baseline PS/2 packet mode plus a minimal UHCI USB HID-tablet absolute-input path; there is no generic USB hub stack, transfer scheduler, or broad HID-class coverage yet.
-- Input-event ABI coverage is intentionally narrow: fixed `event0`/`event1`
-  numbering, no `EVIOC*` capability ioctls, no hotplug, and no multi-seat or
-  focus-routing policy yet.
+- Input-event ABI coverage is intentionally narrow: fixed `event0`..`event3`
+  numbering, no hotplug, no multi-seat, and one event queue per device shared
+  by every reader (Linux gives each open file its own buffer), so only one
+  compositor should read a device at a time. `EVIOCSABS`, force feedback,
+  `EV_REP` and multitouch slots are not implemented; `EVIOCGRAB` is accepted
+  without excluding other readers.
 - Headless GUI smoke coverage currently injects synthetic keyboard/pointer
   events from a smoke-only kernel hook because the CI/QEMU harness does not yet
   provide direct host-input injection.

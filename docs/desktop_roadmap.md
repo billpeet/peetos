@@ -90,14 +90,15 @@ later.
 
 ### 4. A real compositor stack
 
-- [ ] Port wlroots (pixman renderer, DRM backend, libinput backend) plus
-  libinput, libevdev and a minimal seat/udev substitute.
-- [ ] Run **labwc** (Openbox-like stacking, closest to Windows behaviour) or a
-  custom shell on wlroots. This brings layer-shell (panels, docks), popups,
-  xdg-decoration, data-device (drag and drop; `peetwl` already has the
-  clipboard), primary selection, viewporter,
-  fractional scaling, cursor-shape, presentation-time and linux-dmabuf.
-- [ ] Keep `peetwl` as the minimal test and fallback compositor.
+- [x] Port wlroots 0.18 (pixman renderer, DRM backend, libinput backend) plus
+  libinput, libevdev, libudev-zero over a static `/sys`, and libseat's noop
+  seat (`docs/labwc.md`).
+- [x] Run **labwc** 0.8 (Openbox-like stacking) on wlroots
+  (`make run-labwc-smoke`). This brings layer-shell (panels, docks), popups,
+  xdg-decoration, data-device, primary selection, viewporter, fractional
+  scaling, cursor-shape and presentation-time; linux-dmabuf needs a GPU.
+- [x] Keep `peetwl` as the minimal test and fallback compositor (it still reads
+  the legacy `event1` pointer aggregate).
 
 ### 5. Desktop shell and core applications
 
@@ -135,7 +136,8 @@ later.
 6. ~~libpng, cairo, pango (with GLib)~~ Done.
 7. ~~gdk-pixbuf, libepoxy, GTK 3~~ Done.
 8. ~~A GTK application: Thunar~~ Done.
-9. ~~D-Bus session bus~~ Done (Thunar settings through xfconf). Next: inotify (Thunar refresh), a session launcher that starts the bus and compositor, xdg window geometry in `peetwl` for GTK's client-side decorations, then wlroots + labwc.
+9. ~~D-Bus session bus~~ Done (Thunar settings through xfconf).
+10. ~~wlroots + labwc~~ Done (`make run-labwc-smoke`). Next: a session launcher that starts the bus and labwc, a panel and launcher, inotify (Thunar refresh), and GTK applications under labwc.
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports. *(Reached: foot renders

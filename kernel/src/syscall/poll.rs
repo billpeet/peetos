@@ -277,6 +277,12 @@ pub(super) fn poll_fd_revents(task_ptr: *mut task::Task, fd: i32, requested: i16
         revents = evfd_poll_revents(task_ptr, kind, inode, requested);
     } else if kind == task::USER_FD_KIND_DRM {
         revents = drm_poll_revents(inode, requested);
+    } else if kind == task::USER_FD_KIND_EPOLL {
+        // An epoll fd is readable while its instance has an event to report
+        // (libinput hands its epoll fd to the compositor's event loop).
+        if (requested & POLLIN) != 0 && epoll_instance_has_ready(inode) {
+            revents |= POLLIN;
+        }
     }
 
     revents
@@ -602,7 +608,12 @@ pub(super) fn epoll_validate_fd_target(
         )
     };
     if kind == task::USER_FD_KIND_EPOLL {
-        return Err(-EINVAL);
+        // Nested epoll: allowed, but not into itself or a cycle (checked by
+        // the caller, which knows the destination instance).
+        if inode == task::USER_FD_NONE {
+            return Err(-EBADF);
+        }
+        return Ok((kind, inode));
     }
     if !epoll_target_kind_supported(kind) {
         return Err(-EPERM);
@@ -753,6 +764,74 @@ pub(super) fn epoll_watch_stale(watch: &EpollWatch) -> bool {
 /// `watch`, returning what to report. Edge-triggered watches report a bit
 /// only when it becomes set (an approximation of Linux, which also reports
 /// new data arriving while the fd stays readable).
+/// Linux limits epoll nesting to 5 levels (EPOLL_MAX_NESTS 4 + the top).
+const EPOLL_MAX_NESTING: u32 = 4;
+static mut EPOLL_READY_DEPTH: u32 = 0;
+
+/// Whether epoll instance `id` would report an event now, without consuming
+/// edge-triggered state or disarming one-shot watches (readiness of the epoll
+/// fd itself, for poll/select and an enclosing epoll).
+pub(super) fn epoll_instance_has_ready(id: u16) -> bool {
+    unsafe {
+        if EPOLL_READY_DEPTH >= EPOLL_MAX_NESTING {
+            return false;
+        }
+        EPOLL_READY_DEPTH += 1;
+    }
+    let ready = (|| {
+        let inst = epoll_instance_get_mut(id).ok()?;
+        for idx in 0..EPOLL_MAX_WATCHES {
+            let watch = inst.watches[idx];
+            if !watch.used || watch.disarmed || epoll_watch_stale(&watch) {
+                continue;
+            }
+            if epoll_watch_is_duplicate(inst, idx) {
+                continue;
+            }
+            let owner = epoll_watch_owner_task(&watch);
+            if owner.is_null() {
+                continue;
+            }
+            let revents = poll_fd_revents(owner, watch.fd, epoll_events_to_poll_mask(watch.events));
+            if (revents & POLLNVAL) != 0 {
+                continue;
+            }
+            let mut ep = poll_revents_to_epoll_events(watch.events, revents);
+            if (watch.events & EPOLLET) != 0 {
+                ep &= !watch.last_ready;
+            }
+            if ep != 0 {
+                return Some(());
+            }
+        }
+        None
+    })()
+    .is_some();
+    unsafe {
+        EPOLL_READY_DEPTH -= 1;
+    }
+    ready
+}
+
+/// Whether epoll instance `inner` is `outer` or (transitively) watches it:
+/// adding `inner` to `outer` would then make a cycle.
+pub(super) fn epoll_would_cycle(outer: u16, inner: u16, depth: u32) -> bool {
+    if outer == inner {
+        return true;
+    }
+    if depth > EPOLL_MAX_NESTING {
+        return true;
+    }
+    let Ok(inst) = epoll_instance_get_mut(inner) else {
+        return false;
+    };
+    let nested: [Option<u16>; EPOLL_MAX_WATCHES] = core::array::from_fn(|i| {
+        let w = inst.watches[i];
+        (w.used && w.kind == task::USER_FD_KIND_EPOLL).then_some(w.inode)
+    });
+    nested.iter().flatten().any(|&next| epoll_would_cycle(outer, next, depth + 1))
+}
+
 pub(super) fn epoll_events_to_report(watch: &mut EpollWatch, ep_events: u32) -> u32 {
     let report = if (watch.events & EPOLLET) != 0 {
         let fresh = ep_events & !watch.last_ready;
@@ -1027,6 +1106,9 @@ pub(super) fn sys_epoll_ctl(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
                 Ok(v) => v,
                 Err(err) => return err,
             };
+            if kind == task::USER_FD_KIND_EPOLL && epoll_would_cycle(epoll_id, inode, 0) {
+                return -ELOOP;
+            }
             let inst = match epoll_instance_get_mut(epoll_id) {
                 Ok(v) => v,
                 Err(err) => return err,

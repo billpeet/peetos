@@ -12,8 +12,18 @@ use crate::task::Task;
 pub const EAGAIN: i64 = 11;
 pub const EINVAL: i64 = 22;
 
+/// `/dev/input/event0`: the PS/2 keyboard.
 pub const DEVICE_KEYBOARD: u16 = 0;
+/// `/dev/input/event1`: a legacy aggregate of every pointer (relative PS/2
+/// motion and absolute tablet positions on one device), read by `peetwl`
+/// and the older compositors. Like Linux's `/dev/input/mice` it is not a
+/// real device: it is left out of `/sys`, so libinput does not see it.
 pub const DEVICE_POINTER: u16 = 1;
+/// `/dev/input/event2`: the PS/2 mouse (relative motion and buttons).
+pub const DEVICE_MOUSE: u16 = 2;
+/// `/dev/input/event3`: the USB tablet (absolute position and buttons).
+pub const DEVICE_TABLET: u16 = 3;
+pub const DEVICE_COUNT: u16 = 4;
 
 pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
@@ -283,6 +293,10 @@ struct InputState {
     keyboard: InputQueue,
     pointer: InputQueue,
     pointer_state: PointerState,
+    mouse: InputQueue,
+    mouse_buttons: u8,
+    tablet: InputQueue,
+    tablet_state: PointerState,
 }
 
 impl InputState {
@@ -291,6 +305,10 @@ impl InputState {
             keyboard: InputQueue::new(),
             pointer: InputQueue::new(),
             pointer_state: PointerState::new(),
+            mouse: InputQueue::new(),
+            mouse_buttons: 0,
+            tablet: InputQueue::new(),
+            tablet_state: PointerState::new(),
         }
     }
 
@@ -298,6 +316,8 @@ impl InputState {
         match device_id {
             DEVICE_KEYBOARD => Some(&mut self.keyboard),
             DEVICE_POINTER => Some(&mut self.pointer),
+            DEVICE_MOUSE => Some(&mut self.mouse),
+            DEVICE_TABLET => Some(&mut self.tablet),
             _ => None,
         }
     }
@@ -404,105 +424,327 @@ pub fn push_keyboard_key(code: u16, pressed: bool) {
     }
 }
 
+/// Relative motion and buttons for one pointer device; returns the event
+/// count including the closing `SYN_REPORT` (0 when nothing changed).
+fn relative_packet(
+    prev_buttons: u8,
+    dx: i16,
+    dy: i16,
+    buttons: u8,
+    ts: (i64, i64),
+    out: &mut [LinuxInputEvent; 6],
+) -> usize {
+    let mut count = 0usize;
+    if dx != 0 {
+        out[count] = event_with_timestamp(ts, EV_REL, REL_X, dx as i32);
+        count += 1;
+    }
+    if dy != 0 {
+        out[count] = event_with_timestamp(ts, EV_REL, REL_Y, dy as i32);
+        count += 1;
+    }
+    count += append_button_changes(prev_buttons, buttons, ts, &mut out[count..]);
+    if count == 0 {
+        return 0;
+    }
+    out[count] = event_with_timestamp(ts, EV_SYN, SYN_REPORT, 0);
+    count + 1
+}
+
+/// Absolute position and buttons for one pointer device, updating its state.
+fn absolute_packet(
+    st: &mut PointerState,
+    x: i32,
+    y: i32,
+    buttons: u8,
+    ts: (i64, i64),
+    out: &mut [LinuxInputEvent; 6],
+) -> usize {
+    let mut count = 0usize;
+    if !st.abs_valid || st.abs_x != x {
+        out[count] = event_with_timestamp(ts, EV_ABS, ABS_X, x);
+        count += 1;
+    }
+    if !st.abs_valid || st.abs_y != y {
+        out[count] = event_with_timestamp(ts, EV_ABS, ABS_Y, y);
+        count += 1;
+    }
+    count += append_button_changes(st.buttons, buttons, ts, &mut out[count..]);
+    st.buttons = buttons;
+    st.abs_x = x;
+    st.abs_y = y;
+    st.abs_valid = true;
+    if count == 0 {
+        return 0;
+    }
+    out[count] = event_with_timestamp(ts, EV_SYN, SYN_REPORT, 0);
+    count + 1
+}
+
+/// PS/2 mouse motion: to the aggregate pointer (event1) and the mouse device
+/// (event2).
 pub fn push_pointer_relative(dx: i16, dy: i16, buttons: u8) {
     let ts = current_timestamp();
     let dropped_event = event_with_timestamp(ts, EV_SYN, SYN_DROPPED, 0);
     let mut packet = [LinuxInputEvent::EMPTY; 6];
     let mut waiters = [ptr::null_mut::<Task>(); INPUT_WAKE_BATCH];
+    let mut device_waiters = [ptr::null_mut::<Task>(); INPUT_WAKE_BATCH];
 
-    let woke = {
+    let (woke, device_woke) = {
         let mut state = INPUT_STATE.lock();
-        let mut count = 0usize;
-        if dx != 0 {
-            packet[count] = event_with_timestamp(ts, EV_REL, REL_X, dx as i32);
-            count += 1;
-        }
-        if dy != 0 {
-            packet[count] = event_with_timestamp(ts, EV_REL, REL_Y, dy as i32);
-            count += 1;
-        }
-        count += append_button_changes(
-            state.pointer_state.buttons,
-            buttons,
-            ts,
-            &mut packet[count..],
-        );
+        let state = &mut *state;
+        let n = relative_packet(state.pointer_state.buttons, dx, dy, buttons, ts, &mut packet);
         state.pointer_state.buttons = buttons;
-        if count == 0 {
-            0
+        let woke = if n > 0 {
+            enqueue_packet(&mut state.pointer, &packet[..n], dropped_event, &mut waiters)
         } else {
-            packet[count] = event_with_timestamp(ts, EV_SYN, SYN_REPORT, 0);
-            count += 1;
-
-            enqueue_packet(
-                &mut state.pointer,
-                &packet[..count],
-                dropped_event,
-                &mut waiters,
-            )
-        }
+            0
+        };
+        let n = relative_packet(state.mouse_buttons, dx, dy, buttons, ts, &mut packet);
+        state.mouse_buttons = buttons;
+        let device_woke = if n > 0 {
+            enqueue_packet(&mut state.mouse, &packet[..n], dropped_event, &mut device_waiters)
+        } else {
+            0
+        };
+        (woke, device_woke)
     };
-    if woke > 0 {
-        wake_tasks(&waiters, woke);
-    }
+    wake_tasks(&waiters, woke);
+    wake_tasks(&device_waiters, device_woke);
 }
 
+/// USB tablet position (screen pixels): to the aggregate pointer (event1)
+/// and the tablet device (event3).
 pub fn push_pointer_absolute(x: i32, y: i32, buttons: u8) {
     let ts = current_timestamp();
     let dropped_event = event_with_timestamp(ts, EV_SYN, SYN_DROPPED, 0);
     let mut packet = [LinuxInputEvent::EMPTY; 6];
     let mut waiters = [ptr::null_mut::<Task>(); INPUT_WAKE_BATCH];
+    let mut device_waiters = [ptr::null_mut::<Task>(); INPUT_WAKE_BATCH];
 
-    let woke = {
+    let (woke, device_woke) = {
         let mut state = INPUT_STATE.lock();
-        let mut count = 0usize;
-
-        if !state.pointer_state.abs_valid || state.pointer_state.abs_x != x {
-            packet[count] = event_with_timestamp(ts, EV_ABS, ABS_X, x);
-            count += 1;
-        }
-        if !state.pointer_state.abs_valid || state.pointer_state.abs_y != y {
-            packet[count] = event_with_timestamp(ts, EV_ABS, ABS_Y, y);
-            count += 1;
-        }
-        count += append_button_changes(
-            state.pointer_state.buttons,
-            buttons,
-            ts,
-            &mut packet[count..],
-        );
-
-        state.pointer_state.buttons = buttons;
-        state.pointer_state.abs_x = x;
-        state.pointer_state.abs_y = y;
-        state.pointer_state.abs_valid = true;
-
-        if count == 0 {
-            0
+        let state = &mut *state;
+        let n = absolute_packet(&mut state.pointer_state, x, y, buttons, ts, &mut packet);
+        let woke = if n > 0 {
+            enqueue_packet(&mut state.pointer, &packet[..n], dropped_event, &mut waiters)
         } else {
-            packet[count] = event_with_timestamp(ts, EV_SYN, SYN_REPORT, 0);
-            count += 1;
-
-            enqueue_packet(
-                &mut state.pointer,
-                &packet[..count],
-                dropped_event,
-                &mut waiters,
-            )
-        }
+            0
+        };
+        let n = absolute_packet(&mut state.tablet_state, x, y, buttons, ts, &mut packet);
+        let device_woke = if n > 0 {
+            enqueue_packet(&mut state.tablet, &packet[..n], dropped_event, &mut device_waiters)
+        } else {
+            0
+        };
+        (woke, device_woke)
     };
-    if woke > 0 {
-        wake_tasks(&waiters, woke);
-    }
+    wake_tasks(&waiters, woke);
+    wake_tasks(&device_waiters, device_woke);
 }
 
 pub fn device_has_ready_data(device_id: u16) -> bool {
-    let state = INPUT_STATE.lock();
+    let mut state = INPUT_STATE.lock();
+    state.queue_mut(device_id).map(|q| q.len > 0).unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// evdev device descriptions (EVIOC* ioctls and /sys/class/input)
+// ---------------------------------------------------------------------------
+
+pub const EV_MSC: u16 = 0x04;
+pub const EV_SW: u16 = 0x05;
+pub const EV_LED: u16 = 0x11;
+pub const EV_SND: u16 = 0x12;
+pub const EV_FF: u16 = 0x15;
+pub const BUS_I8042: u16 = 0x11;
+pub const BUS_USB: u16 = 0x03;
+/// `EV_VERSION`.
+pub const EVDEV_VERSION: i32 = 0x010001;
+/// Bytes in the `KEY_MAX` (0x2ff) bitmap: 768 bits as 64-bit longs.
+pub const EVDEV_KEY_BITMAP_BYTES: usize = 96;
+
+pub struct EvdevIdentity {
+    pub name: &'static str,
+    pub phys: &'static str,
+    pub bustype: u16,
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+}
+
+/// Name and `struct input_id` of each device, modelled on what Linux reports
+/// for the same QEMU hardware.
+pub fn evdev_identity(device_id: u16) -> Option<EvdevIdentity> {
     match device_id {
-        DEVICE_KEYBOARD => state.keyboard.len > 0,
-        DEVICE_POINTER => state.pointer.len > 0,
-        _ => false,
+        DEVICE_KEYBOARD => Some(EvdevIdentity {
+            name: "AT Translated Set 2 keyboard",
+            phys: "isa0060/serio0/input0",
+            bustype: BUS_I8042,
+            vendor: 0x0001,
+            product: 0x0001,
+            version: 0xab41,
+        }),
+        DEVICE_POINTER => Some(EvdevIdentity {
+            name: "PeetOS pointer aggregate",
+            phys: "peetos/pointer",
+            bustype: BUS_I8042,
+            vendor: 0x0000,
+            product: 0x0000,
+            version: 0x0000,
+        }),
+        DEVICE_MOUSE => Some(EvdevIdentity {
+            name: "PS/2 Generic Mouse",
+            phys: "isa0060/serio1/input0",
+            bustype: BUS_I8042,
+            vendor: 0x0002,
+            product: 0x0001,
+            version: 0x0000,
+        }),
+        DEVICE_TABLET => Some(EvdevIdentity {
+            name: "QEMU QEMU USB Tablet",
+            phys: "usb-0000:00:01.2-1/input0",
+            bustype: BUS_USB,
+            vendor: 0x0627,
+            product: 0x0001,
+            version: 0x0001,
+        }),
+        _ => None,
     }
+}
+
+fn set_bit(out: &mut [u8], bit: usize) {
+    if bit / 8 < out.len() {
+        out[bit / 8] |= 1 << (bit % 8);
+    }
+}
+
+/// Size in bytes of the `EVIOCGBIT(ev_type)` bitmap (64-bit longs, as on
+/// x86_64 Linux), or `None` for types evdev has no bitmap for.
+pub fn evdev_bitmap_bytes(ev_type: u16) -> Option<usize> {
+    match ev_type {
+        0 | EV_REL | EV_ABS | EV_MSC | EV_SW | EV_LED | EV_SND => Some(8),
+        EV_KEY => Some(EVDEV_KEY_BITMAP_BYTES),
+        EV_FF => Some(16),
+        _ => None,
+    }
+}
+
+/// Fill `out` (zeroed by the caller, `evdev_bitmap_bytes(ev_type)` long) with
+/// the capability bits of `ev_type` (0: the supported event types).
+pub fn evdev_capabilities(device_id: u16, ev_type: u16, out: &mut [u8]) -> bool {
+    let (keys, rel, abs) = match device_id {
+        DEVICE_KEYBOARD => (true, false, false),
+        DEVICE_POINTER => (false, true, true),
+        DEVICE_MOUSE => (false, true, false),
+        DEVICE_TABLET => (false, false, true),
+        _ => return false,
+    };
+    let buttons = !keys;
+    match ev_type {
+        0 => {
+            set_bit(out, EV_SYN as usize);
+            set_bit(out, EV_KEY as usize);
+            if rel {
+                set_bit(out, EV_REL as usize);
+            }
+            if abs {
+                set_bit(out, EV_ABS as usize);
+            }
+        }
+        EV_KEY => {
+            if keys {
+                // Every set-1 code the keyboard driver can produce.
+                for code in 1..=127usize {
+                    set_bit(out, code);
+                }
+            }
+            if buttons {
+                set_bit(out, BTN_LEFT as usize);
+                set_bit(out, BTN_RIGHT as usize);
+                set_bit(out, BTN_MIDDLE as usize);
+            }
+        }
+        EV_REL if rel => {
+            set_bit(out, REL_X as usize);
+            set_bit(out, REL_Y as usize);
+        }
+        EV_ABS if abs => {
+            set_bit(out, ABS_X as usize);
+            set_bit(out, ABS_Y as usize);
+        }
+        _ => {}
+    }
+    true
+}
+
+/// `struct input_absinfo` (value, minimum, maximum, fuzz, flat, resolution)
+/// for an absolute axis. Positions are screen pixels.
+pub fn evdev_absinfo(device_id: u16, axis: u16) -> Option<[i32; 6]> {
+    if device_id != DEVICE_TABLET && device_id != DEVICE_POINTER {
+        return None;
+    }
+    let (max_x, max_y) = crate::mouse::absolute_range();
+    let state = INPUT_STATE.lock();
+    let st = if device_id == DEVICE_TABLET { state.tablet_state } else { state.pointer_state };
+    match axis {
+        ABS_X => Some([st.abs_x, 0, max_x, 0, 0, 0]),
+        ABS_Y => Some([st.abs_y, 0, max_y, 0, 0, 0]),
+        _ => None,
+    }
+}
+
+/// The devices listed in `/sys` (libudev/libinput): not the aggregate.
+pub const SYSFS_DEVICES: [u16; 3] = [DEVICE_KEYBOARD, DEVICE_MOUSE, DEVICE_TABLET];
+
+/// Format a capability bitmap the way Linux prints it in `uevent` and
+/// `capabilities/*` (`input_print_bitmap`): 64-bit words as `%lx`, most
+/// significant first, separated by spaces, leading zero words dropped ("0"
+/// when empty).
+pub fn format_bitmap_hex(bits: &[u8], out: &mut [u8]) -> usize {
+    let words = bits.len().div_ceil(8);
+    let word = |i: usize| -> u64 {
+        let mut v = 0u64;
+        for b in 0..8 {
+            if let Some(&byte) = bits.get(i * 8 + b) {
+                v |= (byte as u64) << (8 * b);
+            }
+        }
+        v
+    };
+    let mut top = words;
+    while top > 1 && word(top - 1) == 0 {
+        top -= 1;
+    }
+    let mut len = 0usize;
+    let mut i = top;
+    while i > 0 {
+        i -= 1;
+        let v = word(i);
+        let mut digits = [0u8; 16];
+        let mut n = 0usize;
+        let mut x = v;
+        loop {
+            digits[n] = b"0123456789abcdef"[(x & 0xf) as usize];
+            n += 1;
+            x >>= 4;
+            if x == 0 {
+                break;
+            }
+        }
+        while n > 0 {
+            n -= 1;
+            if len < out.len() {
+                out[len] = digits[n];
+                len += 1;
+            }
+        }
+        if i > 0 && len < out.len() {
+            out[len] = b' ';
+            len += 1;
+        }
+    }
+    len
 }
 
 pub fn read_device(
@@ -667,6 +909,66 @@ mod tests {
         assert_eq!(ev1.code, KEY_C);
         assert_eq!(ev2.type_, EV_SYN);
         assert_eq!(ev2.code, SYN_REPORT);
+    }
+
+    #[test]
+    fn pointer_sources_reach_the_aggregate_and_their_own_device() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        init();
+        push_pointer_relative(3, -2, 1);
+        push_pointer_absolute(100, 50, 0);
+
+        let mut buf = [0u8; size_of::<LinuxInputEvent>() * 16];
+        let n = read_device(ptr::null_mut(), DEVICE_MOUSE, &mut buf, true).expect("mouse");
+        let mouse: Vec<_> = buf[..n].chunks(size_of::<LinuxInputEvent>()).map(decode_event).collect();
+        assert!(mouse.iter().all(|e| e.type_ != EV_ABS));
+        assert!(mouse.iter().any(|e| e.type_ == EV_REL && e.code == REL_X && e.value == 3));
+        assert!(mouse.iter().any(|e| e.type_ == EV_KEY && e.code == BTN_LEFT && e.value == 1));
+
+        let n = read_device(ptr::null_mut(), DEVICE_TABLET, &mut buf, true).expect("tablet");
+        let tablet: Vec<_> = buf[..n].chunks(size_of::<LinuxInputEvent>()).map(decode_event).collect();
+        assert!(tablet.iter().all(|e| e.type_ != EV_REL));
+        assert!(tablet.iter().any(|e| e.type_ == EV_ABS && e.code == ABS_X && e.value == 100));
+        // The tablet's own button state starts released: no BTN_LEFT release.
+        assert!(!tablet.iter().any(|e| e.type_ == EV_KEY));
+
+        let n = read_device(ptr::null_mut(), DEVICE_POINTER, &mut buf, true).expect("aggregate");
+        let agg: Vec<_> = buf[..n].chunks(size_of::<LinuxInputEvent>()).map(decode_event).collect();
+        assert!(agg.iter().any(|e| e.type_ == EV_REL));
+        assert!(agg.iter().any(|e| e.type_ == EV_ABS));
+    }
+
+    #[test]
+    fn evdev_capabilities_match_each_device() {
+        let mut ev = [0u8; 8];
+        assert!(evdev_capabilities(DEVICE_TABLET, 0, &mut ev));
+        assert_eq!(ev[0], (1 << EV_SYN) | (1 << EV_KEY) | (1 << EV_ABS));
+        let mut keys = [0u8; EVDEV_KEY_BITMAP_BYTES];
+        evdev_capabilities(DEVICE_KEYBOARD, EV_KEY, &mut keys);
+        assert_ne!(keys[(KEY_ENTER / 8) as usize] & (1 << (KEY_ENTER % 8)), 0);
+        assert_eq!(keys[(BTN_LEFT / 8) as usize], 0);
+        let mut mkeys = [0u8; EVDEV_KEY_BITMAP_BYTES];
+        evdev_capabilities(DEVICE_MOUSE, EV_KEY, &mut mkeys);
+        assert_ne!(mkeys[(BTN_LEFT / 8) as usize] & (1 << (BTN_LEFT % 8)), 0);
+        assert_eq!(evdev_bitmap_bytes(EV_KEY), Some(96));
+        assert_eq!(evdev_bitmap_bytes(0x14), None);
+        assert!(evdev_absinfo(DEVICE_MOUSE, ABS_X).is_none());
+        assert_eq!(evdev_absinfo(DEVICE_TABLET, ABS_X).map(|a| a[1]), Some(0));
+    }
+
+    #[test]
+    fn bitmaps_print_like_linux() {
+        let mut out = [0u8; 128];
+        let mut ev = [0u8; 8];
+        evdev_capabilities(DEVICE_MOUSE, 0, &mut ev);
+        let n = format_bitmap_hex(&ev, &mut out);
+        assert_eq!(&out[..n], b"7");
+        let mut keys = [0u8; EVDEV_KEY_BITMAP_BYTES];
+        evdev_capabilities(DEVICE_MOUSE, EV_KEY, &mut keys);
+        let n = format_bitmap_hex(&keys, &mut out);
+        assert_eq!(&out[..n], b"70000 0 0 0 0");
+        let n = format_bitmap_hex(&[0u8; 8], &mut out);
+        assert_eq!(&out[..n], b"0");
     }
 
     #[test]

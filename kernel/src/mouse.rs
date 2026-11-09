@@ -419,6 +419,28 @@ where
     });
 }
 
+/// Largest absolute pointer position `(x, y)` delivered to evdev (the tablet
+/// positions are clamped to the cursor's range), for `EVIOCGABS`.
+#[cfg(target_os = "none")]
+pub fn absolute_range() -> (i32, i32) {
+    interrupts::without_interrupts(|| {
+        let state = CURSOR_STATE.lock();
+        if state.initialized {
+            return (state.max_x, state.max_y);
+        }
+        let fb = framebuffer::info();
+        (
+            (fb.width as i32).saturating_sub(CURSOR_WIDTH as i32).max(0),
+            (fb.height as i32).saturating_sub(CURSOR_HEIGHT as i32).max(0),
+        )
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn absolute_range() -> (i32, i32) {
+    (1023, 767)
+}
+
 #[cfg(target_os = "none")]
 fn initialize_cursor() {
     let fb = framebuffer::info();

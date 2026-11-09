@@ -84,6 +84,8 @@ pub fn init() {
     fs::init();
     serial_println!("[VFS] Initialized mount core");
     ensure_mountpoints();
+    // Before the root mount: /sys lives in the boot tmpfs.
+    crate::sysfs::populate();
     log_fstab();
 
     if !try_mount_ext2_from_block() {

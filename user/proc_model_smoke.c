@@ -943,6 +943,93 @@ static void test_lazy_user_copies(void) {
 }
 
 /*
+ * POSIX shared memory as wlroots shares keymaps: a /dev/shm file written
+ * through a MAP_SHARED mapping must read back through read() and through a
+ * private mapping in another process, while still mapped and after munmap.
+ */
+static void test_shm_shared_mapping_coherence(void) {
+    const size_t size = 3 * 4096 + 123;
+    char path[64];
+    snprintf(path, sizeof(path), "/dev/shm/proc-smoke-%d", (int)getpid());
+    int rw = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    CHECK(rw >= 0, "shm: create /dev/shm file");
+    if (rw < 0) {
+        return;
+    }
+    int ro = open(path, O_RDONLY);
+    CHECK(ro >= 0 && unlink(path) == 0, "shm: reopen read-only and unlink");
+    CHECK(ftruncate(rw, (off_t)size) == 0, "shm: ftruncate past 32 KiB-era limits");
+    char *dst = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, rw, 0);
+    CHECK(dst != MAP_FAILED, "shm: MAP_SHARED mapping");
+    if (dst == MAP_FAILED) {
+        return;
+    }
+    for (size_t i = 0; i < size; i++) {
+        dst[i] = (char)('a' + i % 26);
+    }
+    dst[size - 1] = 0;
+
+    char buf[64];
+    /* 4096 % 26 == 14: the second page starts at 'o'. */
+    CHECK(pread(ro, buf, 10, 4096) == 10 && memcmp(buf, "opqrstuvwx", 10) == 0,
+          "shm: read() sees writes through a live shared mapping");
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *src = mmap(NULL, size, PROT_READ, MAP_PRIVATE, ro, 0);
+        if (src == MAP_FAILED) {
+            _exit(80);
+        }
+        for (size_t i = 0; i + 1 < size; i++) {
+            if (src[i] != (char)('a' + i % 26)) {
+                _exit(81);
+            }
+        }
+        _exit(src[size - 1] == 0 ? 0 : 82);
+    }
+    CHECK(pid > 0 && wait_exit_status(pid) == 0, "shm: private mapping in a child sees the data");
+
+    dst[0] = 'Z';
+    munmap(dst, size);
+    CHECK(pread(ro, buf, 1, 0) == 1 && buf[0] == 'Z', "shm: writes after a read survive munmap");
+    close(rw);
+    close(ro);
+}
+
+/*
+ * waitid(P_PID/P_ALL, WEXITED [WNOHANG|WNOWAIT]) as labwc reaps children.
+ */
+static void test_waitid(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        _exit(7);
+    }
+    siginfo_t si;
+    memset(&si, 0xff, sizeof(si));
+    CHECK(waitid(P_PID, (id_t)pid, &si, WEXITED | WNOWAIT) == 0 && si.si_pid == pid &&
+              si.si_code == CLD_EXITED && si.si_status == 7 && si.si_signo == SIGCHLD,
+          "waitid: WNOWAIT reports an exited child");
+    memset(&si, 0, sizeof(si));
+    CHECK(waitid(P_ALL, 0, &si, WEXITED) == 0 && si.si_pid == pid && si.si_status == 7,
+          "waitid: P_ALL reaps it");
+    CHECK(waitid(P_ALL, 0, &si, WEXITED | WNOHANG) == -1 && errno == ECHILD,
+          "waitid: no children left gives ECHILD");
+
+    pid = fork();
+    if (pid == 0) {
+        usleep(50000);
+        _exit(0);
+    }
+    memset(&si, 0xff, sizeof(si));
+    CHECK(waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG) == 0 && si.si_pid == 0,
+          "waitid: WNOHANG with a running child returns si_pid 0");
+    kill(pid, SIGKILL);
+    memset(&si, 0, sizeof(si));
+    CHECK(waitid(P_PID, (id_t)pid, &si, WEXITED) == 0 && si.si_code == CLD_KILLED && si.si_status == SIGKILL,
+          "waitid: a killed child reports CLD_KILLED");
+}
+
+/*
  * SCM_CREDENTIALS / SO_PASSCRED, as D-Bus authentication uses them: a client
  * sends its credentials with a byte (GDBus does), and a server that set
  * SO_PASSCRED on its listening socket reads the client's pid/uid/gid with
@@ -1161,6 +1248,8 @@ int main(int argc, char **argv) {
     test_exec_long_strings();
     test_socket_waits();
     test_lazy_user_copies();
+    test_shm_shared_mapping_coherence();
+    test_waitid();
     test_unix_passcred();
     test_uaccess_race();
 

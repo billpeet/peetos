@@ -192,7 +192,7 @@ pub(super) fn sys_socket(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let raw_type = call.arg(1) as u32;
     let protocol = call.arg(2) as u32;
 
-    if domain != AF_INET && domain != AF_UNIX {
+    if domain != AF_INET && domain != AF_UNIX && domain != socket::AF_NETLINK {
         return -EAFNOSUPPORT;
     }
 
@@ -201,7 +201,10 @@ pub(super) fn sys_socket(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         Err(err) => return err,
     };
 
-    let normalized_protocol = if domain == AF_INET {
+    let normalized_protocol = if domain == socket::AF_NETLINK {
+        // Only the uevent family (udev monitors); see socket::socket_create.
+        protocol
+    } else if domain == AF_INET {
         let proto = if protocol == IPPROTO_IP { 0 } else { protocol };
         if proto != 0 && proto != IPPROTO_TCP && proto != IPPROTO_UDP && proto != IPPROTO_ICMP {
             return -EPROTONOSUPPORT;
@@ -247,6 +250,23 @@ pub(super) fn sys_bind(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     };
 
     match domain {
+        socket::AF_NETLINK => {
+            // struct sockaddr_nl { u16 family; u16 pad; u32 pid; u32 groups; }
+            if addr_ptr == 0 || addr_len < 12 {
+                return -EINVAL;
+            }
+            let family = match read_struct_from_user::<u16>(ctx.current, addr_ptr) {
+                Ok(v) => v,
+                Err(e) => return -e,
+            };
+            if family as u32 != socket::AF_NETLINK {
+                return -EINVAL;
+            }
+            match socket::socket_bind_netlink(sock_id) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
         AF_INET => {
             let (ip, port) = match parse_sockaddr_in(ctx.current, addr_ptr, addr_len) {
                 Ok(v) => v,

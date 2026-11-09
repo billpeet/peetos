@@ -395,6 +395,32 @@ pub(super) fn vm_page_cache_writeback_idx(idx: usize) -> Result<usize, i64> {
     Ok(written)
 }
 
+/// `MAP_SHARED` mappings of files outside the page cache proper (tmpfs) still
+/// write into page-cache pages, so `read()` and private mappings (which read
+/// the file) would miss those writes. Write the inode's dirty pages back
+/// first. Pages that are still mapped stay dirty: later writes through the
+/// mapping are not tracked, so the next read writes them back again.
+/// (wlroots writes keymaps through a shared mapping of a /dev/shm file and
+/// clients map it privately.)
+pub(super) fn vm_page_cache_sync_shared_writes(inode: u16) -> Result<(), i64> {
+    for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
+        let (matches, mapped) = unsafe {
+            let entry = VM_PAGE_CACHE[idx];
+            (entry.valid && entry.dirty && entry.inode == inode, entry.mapped_count > 0)
+        };
+        if !matches {
+            continue;
+        }
+        vm_page_cache_writeback_idx(idx)?;
+        if mapped {
+            unsafe {
+                VM_PAGE_CACHE[idx].dirty = true;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn vm_page_cache_writeback_page(inode: u16, page_off: u64) -> Result<usize, i64> {
     unsafe {
         for idx in 0..VM_PAGE_CACHE_MAX_PAGES {
@@ -432,6 +458,7 @@ pub(super) fn vm_page_cache_read(inode: u16, offset: u64, dst: &mut [u8]) -> Res
     }
     if !vm_page_cache_eligible_inode(inode) {
         refresh_procfs_runtime();
+        vm_page_cache_sync_shared_writes(inode)?;
         return fs::read(inode, offset, dst).map_err(|err| -fs_to_errno(err));
     }
 

@@ -217,6 +217,13 @@ current Rust kernel implementation and forward roadmap.
   - a forked child inherits the parent's epoll watches; `EPOLLET` and `EPOLLONESHOT`;
   - `clock_getres`, `fdatasync`, and a `pidfd_open` stub;
   - a `syscall-trace` debug feature.
+- wlroots 0.18.2 and labwc 0.8.4 (`docs/labwc.md`), with libevdev, mtdev, libudev-zero, libinput, libseat (noop backend), hwdata, libdisplay-info and libxml2, built by `scripts/build_wlroots.sh`. `make run-labwc-smoke` runs labwc on DRM with foot, real keyboard input through libinput, and a mouse click on labwc's maximize button. Kernel work it needed:
+  - device nodes are character devices with Linux numbers; a static `/sys` for libudev and libdrm; symlinks followed in the middle of paths;
+  - evdev `EVIOC*` ioctls and separate PS/2 mouse and USB tablet devices (`event2`, `event3`), keeping `event1` as the legacy aggregate;
+  - 32-bit ioctl requests (musl sign-extends `_IOR` requests); a netlink uevent socket; nested epoll;
+  - DRM `OBJECT_ANY` property queries and hiding the hardware cursor;
+  - `/dev/shm`, 16 MiB tmpfs files, and `MAP_SHARED` tmpfs writes visible to `read()`/private mappings;
+  - `waitid`, and `ENOEXEC` for non-ELF `execve`.
 - The path from here to a full desktop is tracked in `docs/desktop_roadmap.md`.
 - libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the region slots per task (32 then, 256 now).
 

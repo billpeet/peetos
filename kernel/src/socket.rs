@@ -27,9 +27,14 @@ const PROTO_TCP: u8 = 1;
 const PROTO_UDP: u8 = 2;
 const PROTO_ICMP: u8 = 3;
 const PROTO_UNIX: u8 = 4;
+/// `AF_NETLINK`/`NETLINK_KOBJECT_UEVENT`: a udev monitor socket. PeetOS has
+/// no hotplug, so it binds and never has anything to read.
+const PROTO_NETLINK_UEVENT: u8 = 5;
 
 const AF_UNIX: u32 = 1;
 const AF_INET: u32 = 2;
+pub const AF_NETLINK: u32 = 16;
+pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 
 const IPPROTO_ICMP: u32 = 1;
 const IPPROTO_TCP: u32 = 6;
@@ -54,6 +59,7 @@ const ERESTARTSYS: i64 = crate::signal::ERESTARTSYS;
 const EROFS: i64 = 30;
 const ENOTSOCK: i64 = 88;
 const EPROTONOSUPPORT: i64 = 93;
+const ESOCKTNOSUPPORT: i64 = 94;
 const EOPNOTSUPP: i64 = 95;
 const EADDRINUSE: i64 = 98;
 const ENOTCONN: i64 = 107;
@@ -697,6 +703,12 @@ pub fn socket_create(domain: u32, sock_type: u32, protocol: u32) -> Result<u16, 
             }
             _ => return Err(-EPROTONOSUPPORT),
         },
+        AF_NETLINK => match sock_type {
+            // SOCK_DGRAM or SOCK_RAW
+            2 | 3 if protocol == NETLINK_KOBJECT_UEVENT => PROTO_NETLINK_UEVENT,
+            2 | 3 => return Err(-EPROTONOSUPPORT),
+            _ => return Err(-ESOCKTNOSUPPORT),
+        },
         _ => return Err(-EPROTONOSUPPORT),
     };
 
@@ -723,6 +735,7 @@ pub fn socket_create(domain: u32, sock_type: u32, protocol: u32) -> Result<u16, 
             PROTO_UDP => "UDP",
             PROTO_ICMP => "ICMP",
             PROTO_UNIX => "UNIX",
+            PROTO_NETLINK_UEVENT => "NETLINK uevent",
             _ => "?",
         }
     );
@@ -771,11 +784,22 @@ pub fn socket_create_unix_pair() -> Result<(u16, u16), i64> {
 
 pub fn socket_domain(id: u16) -> Result<u32, i64> {
     let s = get_socket(id)?;
-    if s.protocol == PROTO_UNIX {
-        Ok(AF_UNIX)
-    } else {
-        Ok(AF_INET)
+    Ok(match s.protocol {
+        PROTO_UNIX => AF_UNIX,
+        PROTO_NETLINK_UEVENT => AF_NETLINK,
+        _ => AF_INET,
+    })
+}
+
+/// `bind` on a netlink uevent socket: any multicast group is accepted (no
+/// events will ever arrive).
+pub fn socket_bind_netlink(id: u16) -> Result<(), i64> {
+    let s = get_socket(id)?;
+    if s.protocol != PROTO_NETLINK_UEVENT {
+        return Err(-EINVAL);
     }
+    s.state = STATE_BOUND;
+    Ok(())
 }
 
 /// Bind a socket to a local address/port.
@@ -1263,6 +1287,11 @@ pub fn socket_send(id: u16, data: &[u8], nonblocking: bool) -> Result<usize, i64
         s.protocol
     };
 
+    if proto == PROTO_NETLINK_UEVENT {
+        let _ = data;
+        return Err(-EOPNOTSUPP);
+    }
+
     if proto == PROTO_UNIX {
         if nonblocking {
             return unix_stream_send(id, data);
@@ -1374,6 +1403,24 @@ pub fn socket_recv(id: u16, buf: &mut [u8], nonblocking: bool) -> Result<usize, 
         let s = get_socket(id)?;
         s.protocol
     };
+
+    if proto == PROTO_NETLINK_UEVENT {
+        // Nothing is ever queued. Blocking readers sleep until a signal.
+        if nonblocking {
+            return Err(-EAGAIN);
+        }
+        #[cfg(test)]
+        {
+            let _ = buf;
+            return Err(-EAGAIN);
+        }
+        #[cfg(not(test))]
+        loop {
+            if socket_block_yield() {
+                return Err(-ERESTARTSYS);
+            }
+        }
+    }
 
     if proto == PROTO_UNIX {
         if nonblocking {
@@ -2137,5 +2184,21 @@ mod tests {
             socket_send_rights(a, &rights, true).expect("queue right");
         }
         assert_eq!(socket_send_rights(a, &rights, true), Err(-EAGAIN));
+    }
+
+    #[test]
+    fn netlink_uevent_socket_binds_and_stays_empty() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        reset_sockets();
+        let id = socket_create(AF_NETLINK, 2, NETLINK_KOBJECT_UEVENT).expect("uevent socket");
+        assert_eq!(socket_domain(id), Ok(AF_NETLINK));
+        assert_eq!(socket_bind_netlink(id), Ok(()));
+        let mut buf = [0u8; 64];
+        assert_eq!(socket_recv(id, &mut buf, true), Err(-EAGAIN));
+        assert_eq!(socket_poll_events(id) & POLLIN, 0);
+        assert_eq!(socket_send(id, b"x", true), Err(-EOPNOTSUPP));
+        socket_close(id).expect("close");
+        assert_eq!(socket_create(AF_NETLINK, 2, 0), Err(-EPROTONOSUPPORT));
+        assert_eq!(socket_create(AF_NETLINK, 1, NETLINK_KOBJECT_UEVENT), Err(-ESOCKTNOSUPPORT));
     }
 }

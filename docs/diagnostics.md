@@ -42,7 +42,7 @@ Limitations / Simplifications
 - No crash dump persistence or structured panic metadata yet.
 
 **Scheduler Block Tracing**
-Building with the `syscall-trace` feature logs every table-dispatched syscall as `[STRACE] <pid> name(args)` and its result as `[STRACE] <pid> name -> ret`, a minimal strace for working out where a program stops (`DBUS_SMOKE_EXTRA_FEATURES=syscall-trace make run-dbus-smoke`). It is very noisy and off by default. The lock-free fast-path syscalls (`clock_gettime`, `getpid`, ...) are not traced.
+Building with the `syscall-trace` feature logs every table-dispatched syscall as `[STRACE] <pid> name(args) <path>` (the path argument of path-taking calls) and its result as `[STRACE] <pid> name -> ret`, a minimal strace for working out where a program stops (`DBUS_SMOKE_EXTRA_FEATURES=syscall-trace make run-dbus-smoke`). It is very noisy and off by default. The lock-free fast-path syscalls (`clock_gettime`, `getpid`, ...) are not traced.
 
 Building with the `sched-trace` feature makes `sched::block` print `[SCHED] Blocking task '<name>' (<reason>)` every time a task blocks (for example `pty-sread`, `futex-wait`, `pipe-read`). It is useful for working out where a task is stuck, but it fires on every keystroke, futex wait and frame in an interactive session, so it is off by default and left out of `make run`'s feature set. Enable it explicitly, for example `make run-current` after `make image KERNEL_FEATURES="... sched-trace"`. `make run-foot-smoke` fails if the line appears in a build without the feature.
 

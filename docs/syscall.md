@@ -119,6 +119,11 @@ Current implemented handlers:
 - `clock_getres` reports the 10 ms PIT tick for `CLOCK_REALTIME`/`CLOCK_MONOTONIC`; `fdatasync` is `fsync`.
 - `sendmsg`/`recvmsg` carry `SCM_CREDENTIALS` and `setsockopt`/`getsockopt` handle `SO_PASSCRED` on `AF_UNIX` sockets (see `docs/ipc.md`); `SO_PEERSEC`/`SO_PEERGROUPS`/`SO_PEERPIDFD` fail with `ENOPROTOOPT`.
 - `pidfd_open` is registered and returns `-ENOSYS` (dbus-daemon falls back to plain pids).
+- `waitid(idtype, id, infop, options)`: `P_ALL`/`P_PID`, exited children only (`WEXITED`, with `WNOHANG` and `WNOWAIT`); `infop` gets `SIGCHLD`, `CLD_EXITED`/`CLD_KILLED`, pid, uid and status.
+- `ioctl` compares only the low 32 bits of the request (an `unsigned int` in Linux): musl passes it as `int`, so `_IOR` requests arrive sign-extended.
+- `execve` of a file that is not ELF fails with `-ENOEXEC` (so shells run `#!`-less scripts themselves); there is still no `#!` support in the kernel.
+- `socket(AF_NETLINK, SOCK_DGRAM/SOCK_RAW, NETLINK_KOBJECT_UEVENT)`: a udev monitor socket that binds and never receives anything (no hotplug); other netlink families are `-EPROTONOSUPPORT`.
+- Writes through a `MAP_SHARED` mapping of a tmpfs file are visible to `read()` and to private mappings (the dirty page-cache pages are written back before tmpfs reads).
 - Syscall arguments may point into pages the process has not touched yet: user copies fault lazily mapped pages in (they used to fail with `EFAULT`).
 - `inotify_init`/`inotify_init1`/`inotify_add_watch`/`inotify_rm_watch` are registered but return `-ENOSYS` (no inotify yet), so callers like GLib fall back quietly instead of tripping the unknown-syscall log.
 - `fork()` with a copy-on-write address-space clone plus task metadata/fd table copy and shm inheritance (see `docs/process_model.md`)

@@ -498,8 +498,10 @@ fn drm_ioctl_dispatch(ctx: &SyscallContext, file: u16, nr: u8, b: &mut [u8; ARG_
             Ok(())
         }
         // MODE_CURSOR / CURSOR2: no hardware cursor (clients fall back to
-        // drawing it themselves).
-        0xA3 | 0xBB => Err(-ENXIO),
+        // drawing it themselves). Hiding it (DRM_MODE_CURSOR_BO with handle
+        // 0) and moving the hidden cursor succeed: wlroots' legacy commit
+        // hides the cursor on every modeset and fails the commit otherwise.
+        0xA3 | 0xBB => cursor_request_result(get_u32(b, 0), get_u32(b, 24)),
         // MODE_GETGAMMA / SETGAMMA: gamma_size is 0.
         0xA4 | 0xA5 => Err(-EINVAL),
         // MODE_GETENCODER
@@ -690,7 +692,8 @@ fn drm_ioctl_dispatch(ctx: &SyscallContext, file: u16, nr: u8, b: &mut [u8; ARG_
         }
         // MODE_OBJ_GETPROPERTIES
         0xB9 => {
-            let (obj_id, obj_type) = (get_u32(b, 20), get_u32(b, 24));
+            let obj_id = get_u32(b, 20);
+            let obj_type = drm_object_type_for(get_u32(b, 24), obj_id);
             let (ids, vals): (&[u32], [u64; 1]) = match (obj_type, obj_id) {
                 (DRM_MODE_OBJECT_CONNECTOR, drm::CONNECTOR_ID) => {
                     (&[drm::PROP_DPMS], [if drm::dpms_on() { 0 } else { 3 }])
@@ -717,6 +720,30 @@ fn drm_ioctl_dispatch(ctx: &SyscallContext, file: u16, nr: u8, b: &mut [u8; ARG_
         // MODE_ATOMIC: not supported (the client cap is refused).
         0xBC => Err(-EOPNOTSUPP),
         _ => Err(-EINVAL),
+    }
+}
+
+/// `struct drm_mode_cursor` flags and handle -> result: only "no cursor".
+pub(super) fn cursor_request_result(flags: u32, handle: u32) -> Result<(), i64> {
+    const DRM_MODE_CURSOR_BO: u32 = 0x01;
+    if (flags & DRM_MODE_CURSOR_BO) != 0 && handle != 0 {
+        return Err(-ENXIO);
+    }
+    Ok(())
+}
+
+/// `DRM_MODE_OBJECT_ANY` (0) asks the kernel to look the type up from the id
+/// (wlroots reads every property that way); object ids are unique here.
+pub(super) fn drm_object_type_for(obj_type: u32, obj_id: u32) -> u32 {
+    if obj_type != 0 {
+        return obj_type;
+    }
+    match obj_id {
+        drm::CRTC_ID => DRM_MODE_OBJECT_CRTC,
+        drm::ENCODER_ID => DRM_MODE_OBJECT_ENCODER,
+        drm::CONNECTOR_ID => DRM_MODE_OBJECT_CONNECTOR,
+        drm::PLANE_ID => DRM_MODE_OBJECT_PLANE,
+        _ => 0,
     }
 }
 

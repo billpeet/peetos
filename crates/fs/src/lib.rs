@@ -48,7 +48,9 @@ pub const VFS_MAX_NAME: usize = 256;
 /// `u16`). ext2-family directories are imported lazily, so this bounds the
 /// files touched since mount, not the size of the filesystem.
 pub const VFS_MAX_INODES: usize = 32768;
-pub const TMPFS_MAX_FILE_SIZE: usize = 32 * 1024;
+/// Largest tmpfs file. The data lives in the kernel heap (a `Vec` per file);
+/// shm_open() keymaps and the like need well over the old 32 KiB.
+pub const TMPFS_MAX_FILE_SIZE: usize = 16 * 1024 * 1024;
 
 pub const O_RDONLY: u32 = 0x0000;
 pub const O_WRONLY: u32 = 0x0001;
@@ -80,16 +82,18 @@ pub const EBUSY: i64 = 16;
 pub const ENOTEMPTY: i64 = 39;
 pub const EFBIG: i64 = 27;
 pub const EOVERFLOW: i64 = 75;
+pub const ELOOP: i64 = 40;
 
 const ROOT_INODE: u16 = 0;
 const PROCFS_BUFFER_MAX: usize = 512;
 const PROC_TICK_HZ: u64 = 100;
 const MOUNT_MAX: usize = 8;
 const LEGACY_EXT2_MOUNT_PREFIX: &str = "/mnt/ext2";
-const ROOT_PSEUDO_MOUNT_NAMES: [&[u8]; 4] = [b"dev", b"proc", b"temp", b"boot"];
+const ROOT_PSEUDO_MOUNT_NAMES: [&[u8]; 5] = [b"dev", b"proc", b"temp", b"boot", b"sys"];
 
 const STAT_S_IFMT: u32 = 0xF000;
 const STAT_S_IFDIR: u32 = 0x4000;
+const STAT_S_IFCHR: u32 = 0x2000;
 const STAT_S_IFREG: u32 = 0x8000;
 const STAT_S_IFLNK: u32 = 0xA000;
 const STAT_S_IRUSR: u32 = 0o400;
@@ -282,6 +286,8 @@ pub struct FileStat {
     pub mtime: u64,
     pub ctime: u64,
     pub file_type: FileType,
+    /// Device number of a device node (Linux `new_encode_dev`), else 0.
+    pub rdev: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1071,12 +1077,21 @@ fn ensure_init(state: &mut VfsState) {
     {
         state.inodes[inode as usize].dev_id = 0;
     }
-    if let Ok(inode) =
-        create_virtual_file_inner(state, "/dev/input/event1", NodeBackend::DevInputEvent)
-    {
-        state.inodes[inode as usize].dev_id = 1;
+    // event0 keyboard, event1 legacy pointer aggregate, event2 PS/2 mouse,
+    // event3 USB tablet (see kernel/src/input.rs).
+    for (path, dev_id) in [
+        ("/dev/input/event1", 1u16),
+        ("/dev/input/event2", 2),
+        ("/dev/input/event3", 3),
+    ] {
+        if let Ok(inode) = create_virtual_file_inner(state, path, NodeBackend::DevInputEvent) {
+            state.inodes[inode as usize].dev_id = dev_id;
+        }
     }
 
+    // POSIX shared memory: musl's shm_open() creates files here (wlroots
+    // shares keymaps that way). A plain tmpfs directory.
+    let _ = mkdir_virtual_inner(state, "/dev/shm");
     let _ = mkdir_virtual_inner(state, "/dev/pts");
     {
         let mut pty_idx: u16 = 0;
@@ -1333,6 +1348,66 @@ fn remap_legacy_ext2_root_path<'a>(state: &VfsState, path: &'a str) -> &'a str {
     &path[LEGACY_EXT2_MOUNT_PREFIX.len()..]
 }
 
+/// Symlinks followed during one lookup before `ELOOP`, as Linux (40).
+const MAX_SYMLINK_FOLLOWS: usize = 40;
+
+/// Read the target of symlink `inode` into `dst`.
+fn symlink_target_inner(state: &mut VfsState, inode: u16, dst: &mut [u8]) -> Result<usize, i64> {
+    let node = &state.inodes[inode as usize];
+    if !node.used {
+        return Err(ENOENT);
+    }
+    if node.file_type != FileType::Symlink {
+        return Err(EINVAL);
+    }
+    if dst.is_empty() {
+        return Ok(0);
+    }
+    match node.backend {
+        NodeBackend::Tmpfs => {
+            let count = core::cmp::min(dst.len(), node.size as usize);
+            dst[..count].copy_from_slice(&node.data[..count]);
+            Ok(count)
+        }
+        NodeBackend::Ext2 => {
+            if node.ext2_ino == 0 {
+                return Err(EIO);
+            }
+            let ext2_ino = node.ext2_ino;
+            ext2_read_file(state, ext2_ino, 0, dst)
+        }
+        _ => Err(EINVAL),
+    }
+}
+
+/// A symlink met in the middle of a path: the rest of the walk continues on
+/// "<target>/<remaining components>". Returns the new path bytes and whether
+/// it is absolute (relative targets resolve from the link's directory).
+fn splice_symlink(
+    state: &mut VfsState,
+    link: u16,
+    remaining: &[u8],
+    follows: &mut usize,
+) -> Result<Vec<u8>, i64> {
+    *follows += 1;
+    if *follows > MAX_SYMLINK_FOLLOWS {
+        return Err(ELOOP);
+    }
+    let mut target = [0u8; VFS_MAX_PATH];
+    let len = symlink_target_inner(state, link, &mut target)?;
+    if len == 0 {
+        return Err(ENOENT);
+    }
+    let mut out = Vec::with_capacity(len + 1 + remaining.len());
+    out.extend_from_slice(&target[..len]);
+    out.push(b'/');
+    out.extend_from_slice(remaining);
+    if out.len() >= VFS_MAX_PATH {
+        return Err(ENAMETOOLONG);
+    }
+    Ok(out)
+}
+
 fn lookup_path_from_inner(state: &mut VfsState, start: u16, path: &str) -> Result<u16, i64> {
     let path = remap_legacy_ext2_root_path(state, path);
     if path.is_empty() {
@@ -1343,16 +1418,19 @@ fn lookup_path_from_inner(state: &mut VfsState, start: u16, path: &str) -> Resul
         return Ok(ROOT_INODE);
     }
 
-    let bytes = path.as_bytes();
-    let absolute = bytes[0] == b'/';
+    let absolute = path.as_bytes()[0] == b'/';
     let mut cursor = if absolute { 1usize } else { 0usize };
     let mut current = if absolute { ROOT_INODE } else { start };
     if current as usize >= state.inodes.len() || !state.inodes[current as usize].used {
         return Err(ENOENT);
     }
     let mut name = [0u8; VFS_MAX_NAME];
+    // Set once a symlink in the middle of the path has been spliced in.
+    let mut owned: Option<Vec<u8>> = None;
+    let mut follows = 0usize;
 
     loop {
+        let bytes: &[u8] = owned.as_deref().unwrap_or(path.as_bytes());
         let len = match next_component(bytes, &mut cursor, &mut name)? {
             Some(v) => v,
             None => break,
@@ -1376,6 +1454,22 @@ fn lookup_path_from_inner(state: &mut VfsState, start: u16, path: &str) -> Resul
         }
 
         let child = find_child_loaded(state, current, &name[..len])?.ok_or(ENOENT)?;
+        // Follow symlinks in the middle of the path (the last component is
+        // returned as is: callers get lstat semantics).
+        if state.inodes[child as usize].file_type == FileType::Symlink
+            && has_remaining_component(bytes, cursor)
+        {
+            let rest = bytes[cursor..].to_vec();
+            let spliced = splice_symlink(state, child, &rest, &mut follows)?;
+            if spliced[0] == b'/' {
+                current = ROOT_INODE;
+                cursor = 1;
+            } else {
+                cursor = 0;
+            }
+            owned = Some(spliced);
+            continue;
+        }
         current = child;
     }
 
@@ -1397,16 +1491,18 @@ fn resolve_parent_from_inner(
         return Err(EINVAL);
     }
 
-    let bytes = path.as_bytes();
-    let absolute = bytes[0] == b'/';
+    let absolute = path.as_bytes()[0] == b'/';
     let mut cursor = if absolute { 1usize } else { 0usize };
     let mut current = if absolute { ROOT_INODE } else { start };
     if current as usize >= state.inodes.len() || !state.inodes[current as usize].used {
         return Err(ENOENT);
     }
     let mut component = [0u8; VFS_MAX_NAME];
+    let mut owned: Option<Vec<u8>> = None;
+    let mut follows = 0usize;
 
     loop {
+        let bytes: &[u8] = owned.as_deref().unwrap_or(path.as_bytes());
         let len = match next_component(bytes, &mut cursor, &mut component)? {
             Some(v) => v,
             None => return Err(EINVAL),
@@ -1446,6 +1542,18 @@ fn resolve_parent_from_inner(
         }
 
         let child = find_child_loaded(state, current, &component[..len])?.ok_or(ENOENT)?;
+        if state.inodes[child as usize].file_type == FileType::Symlink {
+            let rest = bytes[cursor..].to_vec();
+            let spliced = splice_symlink(state, child, &rest, &mut follows)?;
+            if spliced[0] == b'/' {
+                current = ROOT_INODE;
+                cursor = 1;
+            } else {
+                cursor = 0;
+            }
+            owned = Some(spliced);
+            continue;
+        }
         if state.inodes[child as usize].file_type != FileType::Directory {
             return Err(ENOTDIR);
         }
@@ -1629,8 +1737,8 @@ fn create_virtual_file_inner(
             | NodeBackend::DevPtmx
             | NodeBackend::DevPtsSlave
             | NodeBackend::DevFramebuffer
-            | NodeBackend::DevDrm => (STAT_S_IFREG | 0o666) as u16,
-            NodeBackend::DevInputEvent => (STAT_S_IFREG | 0o444) as u16,
+            | NodeBackend::DevDrm => (STAT_S_IFCHR | 0o666) as u16,
+            NodeBackend::DevInputEvent => (STAT_S_IFCHR | 0o644) as u16,
             _ => node.mode,
         };
     }
@@ -5745,6 +5853,7 @@ fn stat_inner(state: &mut VfsState, inode: u16) -> Result<FileStat, i64> {
         mtime: node_mtime,
         ctime: node_ctime,
         file_type: node_file_type,
+        rdev: device_node_rdev(node_backend, state.inodes[inode as usize].dev_id),
     };
 
     if node_backend == NodeBackend::Ext2 {
@@ -6565,31 +6674,7 @@ fn readlink_at_inner(
         return Err(ENOENT);
     }
     let inode = lookup_path_from_inner(state, start, path)?;
-    let node = &state.inodes[inode as usize];
-    if !node.used {
-        return Err(ENOENT);
-    }
-    if node.file_type != FileType::Symlink {
-        return Err(EINVAL);
-    }
-    if dst.is_empty() {
-        return Ok(0);
-    }
-
-    match node.backend {
-        NodeBackend::Tmpfs => {
-            let count = core::cmp::min(dst.len(), node.size as usize);
-            dst[..count].copy_from_slice(&node.data[..count]);
-            Ok(count)
-        }
-        NodeBackend::Ext2 => {
-            if node.ext2_ino == 0 {
-                return Err(EIO);
-            }
-            ext2_read_file(state, node.ext2_ino, 0, dst)
-        }
-        _ => Err(EINVAL),
-    }
+    symlink_target_inner(state, inode, dst)
 }
 
 fn set_times_inner(state: &mut VfsState, inode: u16, atime: u64, mtime: u64) -> Result<(), i64> {
@@ -6867,6 +6952,30 @@ pub fn openat(start: u16, path: &str, flags: u32, mode: u32) -> Result<OpenResul
         ensure_init(state);
         open_at_inner(state, start, path, flags, mode)
     })
+}
+
+/// Linux `new_encode_dev(MKDEV(major, minor))`.
+pub const fn encode_dev(major: u32, minor: u32) -> u64 {
+    ((minor & 0xff) as u64) | ((major as u64) << 8) | (((minor & !0xff) as u64) << 12)
+}
+
+/// Device numbers of the device nodes, as on Linux: mem devices (1:N), ttys
+/// (5:N), pty slaves (136:N), fbdev (29:0), evdev (13:64+N) and the DRM
+/// primary node (226:0).
+fn device_node_rdev(backend: NodeBackend, dev_id: u16) -> u64 {
+    match backend {
+        NodeBackend::DevNull => encode_dev(1, 3),
+        NodeBackend::DevZero => encode_dev(1, 5),
+        NodeBackend::DevUrandom => encode_dev(1, 9),
+        NodeBackend::DevTty => encode_dev(5, 0),
+        NodeBackend::DevConsole => encode_dev(5, 1),
+        NodeBackend::DevPtmx => encode_dev(5, 2),
+        NodeBackend::DevPtsSlave => encode_dev(136, dev_id as u32),
+        NodeBackend::DevFramebuffer => encode_dev(29, 0),
+        NodeBackend::DevInputEvent => encode_dev(13, 64 + dev_id as u32),
+        NodeBackend::DevDrm => encode_dev(226, 0),
+        _ => 0,
+    }
 }
 
 pub fn stat(inode: u16) -> Result<FileStat, i64> {
@@ -8126,8 +8235,64 @@ mod tests {
         assert!(inode_is_framebuffer(fb.inode));
 
         let st = stat(fb.inode).expect("stat /dev/fb0");
-        assert_eq!(st.mode & STAT_S_IFMT, STAT_S_IFREG);
+        assert_eq!(st.mode & STAT_S_IFMT, STAT_S_IFCHR);
         assert_eq!(st.mode & 0o666, 0o666);
+        assert_eq!(st.rdev, encode_dev(29, 0));
+        assert_eq!(stat(card.inode).expect("stat card0").rdev, encode_dev(226, 0));
+    }
+
+    #[test]
+    fn dev_shm_holds_posix_shared_memory_files() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        // shm_open(name, O_RDWR | O_CREAT | O_EXCL), a read-only second
+        // open, then shm_unlink while both stay usable.
+        let rw = open("/dev/shm/wlroots-1", O_CREAT | O_RDWR | O_EXCL, 0o600).expect("create");
+        write(rw.inode, 0, b"keymap", false).expect("write");
+        let ro = open("/dev/shm/wlroots-1", O_RDONLY, 0).expect("reopen");
+        assert_eq!(ro.inode, rw.inode);
+        inode_open_retain(ro.inode);
+        unlink("/dev/shm/wlroots-1").expect("unlink");
+        let mut buf = [0u8; 6];
+        assert_eq!(read(ro.inode, 0, &mut buf).expect("read"), 6);
+        assert_eq!(&buf, b"keymap");
+        assert!(open("/dev/shm/wlroots-1", O_RDONLY, 0).is_err());
+        assert!(inode_open_release(ro.inode));
+    }
+
+    #[test]
+    fn symlinks_in_the_middle_of_a_path_are_followed() {
+        let _guard = TEST_LOCK.lock().expect("lock should work");
+        init();
+
+        mkdir("/temp/sys").expect("mkdir");
+        mkdir("/temp/sys/devices").expect("mkdir");
+        mkdir("/temp/sys/devices/card0").expect("mkdir");
+        let f = open("/temp/sys/devices/card0/uevent", O_CREAT | O_WRONLY, 0o644).expect("create");
+        write(f.inode, 0, b"MAJOR=226\n", false).expect("write");
+        mkdir("/temp/sys/dev").expect("mkdir");
+        // Relative and absolute targets, and a chain of two links.
+        symlinkat(ROOT_INODE, "../devices/card0", "/temp/sys/dev/226:0").expect("symlink");
+        symlinkat(ROOT_INODE, "/temp/sys/dev/226:0", "/temp/sys/abs").expect("symlink");
+        symlinkat(ROOT_INODE, "abs", "/temp/sys/chain").expect("symlink");
+
+        for path in ["/temp/sys/dev/226:0/uevent", "/temp/sys/abs/uevent", "/temp/sys/chain/uevent"] {
+            let file = open(path, O_RDONLY, 0).unwrap_or_else(|e| panic!("open {}: {}", path, e));
+            let mut buf = [0u8; 16];
+            let n = read(file.inode, 0, &mut buf).expect("read");
+            assert_eq!(&buf[..n], b"MAJOR=226\n", "{}", path);
+        }
+        // The link itself is still returned as the last component.
+        let mut target = [0u8; 64];
+        let n = readlinkat(ROOT_INODE, "/temp/sys/dev/226:0", &mut target).expect("readlink");
+        assert_eq!(&target[..n], b"../devices/card0");
+        // Creating through a symlinked directory works too.
+        open("/temp/sys/chain/new", O_CREAT | O_WRONLY, 0o644).expect("create via link");
+        assert!(open("/temp/sys/devices/card0/new", O_RDONLY, 0).is_ok());
+
+        symlinkat(ROOT_INODE, "loop", "/temp/sys/loop").expect("symlink");
+        assert_eq!(open("/temp/sys/loop/x", O_RDONLY, 0).err(), Some(ELOOP));
     }
 
     #[test]
@@ -8137,13 +8302,24 @@ mod tests {
 
         let kbd = open("/dev/input/event0", O_RDONLY, 0).expect("open event0");
         let ptr = open("/dev/input/event1", O_RDONLY, 0).expect("open event1");
+        let mouse = open("/dev/input/event2", O_RDONLY, 0).expect("open event2");
+        let tablet = open("/dev/input/event3", O_RDONLY, 0).expect("open event3");
 
         assert_eq!(inode_input_device_id(kbd.inode), Some(0));
         assert_eq!(inode_input_device_id(ptr.inode), Some(1));
+        assert_eq!(inode_input_device_id(mouse.inode), Some(2));
+        assert_eq!(inode_input_device_id(tablet.inode), Some(3));
 
+        // Character devices with evdev numbers (13:64+N), as udev expects.
         let st = stat(kbd.inode).expect("stat event0");
-        assert_eq!(st.mode & STAT_S_IFMT, STAT_S_IFREG);
+        assert_eq!(st.mode & STAT_S_IFMT, STAT_S_IFCHR);
         assert_eq!(st.mode & 0o444, 0o444);
+        assert_eq!(st.rdev, encode_dev(13, 64));
+        assert_eq!(stat(tablet.inode).expect("stat event3").rdev, encode_dev(13, 67));
+        let null = open("/dev/null", O_RDONLY, 0).expect("open null");
+        assert_eq!(stat(null.inode).expect("stat null").rdev, encode_dev(1, 3));
+        // Minors above 255 use the split new_encode_dev layout.
+        assert_eq!(encode_dev(136, 256), (136 << 8) | (1 << 20));
     }
 
     #[test]
