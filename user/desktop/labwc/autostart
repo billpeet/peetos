@@ -1,0 +1,11 @@
+# PeetOS desktop session: started by labwc (through sh) once the compositor
+# is up, with WAYLAND_DISPLAY and the session bus address in the
+# environment. See docs/desktop.md.
+
+# The panel: application menu, launchers, taskbar and clock.
+sfwbar > /tmp/sfwbar.log 2>&1 &
+
+# Per-user additions.
+if [ -f "$HOME/.config/peet-session/autostart" ]; then
+  sh "$HOME/.config/peet-session/autostart" &
+fi

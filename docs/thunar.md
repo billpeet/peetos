@@ -25,7 +25,7 @@ On top of GTK's prerequisites (`docs/gtk.md`), the build machine needs:
   - The generated code tests `GLIB_VERSION_MAX_ALLOWED >= GLIB_VERSION_2_84`. GLib 2.82 doesn't define `GLIB_VERSION_2_84`, so the test evaluates to 0 and picks the newer API. A force-included header defines the 2.84 to 2.88 version macros so the guards work.
 - **Data.**
   - The MIME database is compiled from shared-mime-info's `freedesktop.org.xml` with the host `update-mime-database`. Its output format is stable.
-  - The icon theme is AdwaitaLegacy, because it ships PNGs and PeetOS has no SVG loader (`docs/gtk.md`).
+  - The icon theme is AdwaitaLegacy, because it ships PNGs and PeetOS has no SVG loader (`docs/gtk.md`). Its `index.theme` sits next to the icon directory in the source and is staged with it; without it GTK does not treat the directory as a theme.
   - `/etc/gtk-3.0/settings.ini` selects that icon theme and DejaVu Sans.
 
 **Kernel work Thunar needed**

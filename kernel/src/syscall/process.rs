@@ -165,22 +165,69 @@ pub(super) fn execve_common(
             return Err(-fs_to_errno(err));
         }
     };
-    let image = match read_exec_image_from_inode(inode) {
+    let mut image = match read_exec_image_from_inode(inode) {
         Ok(image) => image,
         Err(err) => {
             return Err(err);
         }
     };
-    // Not an ELF image (a script without "#!" support, data): ENOEXEC, as
-    // on Linux, before anything is torn down. Shells then run the file as a
-    // script themselves (POSIX).
-    if !image_is_elf(image.as_slice()) {
-        heap::kfree(image.ptr);
-        return Err(-ENOEXEC);
-    }
     let execfn_len = path.len();
     path_buf[execfn_len] = 0;
     let execfn = &path_buf[..execfn_len + 1];
+    // A "#!interpreter [argument]" script runs the interpreter with the
+    // script's path inserted after the optional argument, as on Linux. The
+    // interpreter must be an ELF image (no nested scripts). Anything else
+    // that is not ELF (a script without "#!", data) is ENOEXEC, before
+    // anything is torn down; shells then run the file themselves (POSIX).
+    let mut interp_buf = [0u8; SHEBANG_MAX + 1];
+    let mut interp_arg_buf = [0u8; SHEBANG_MAX + 1];
+    let mut script_argc = 0usize;
+    let mut script_argv = [&[][..]; 3];
+    if !image_is_elf(image.as_slice()) {
+        let parsed = parse_shebang(image.as_slice()).map(|(interp, arg)| {
+            interp_buf[..interp.len()].copy_from_slice(interp);
+            let arg_len = arg.map_or(0, |arg| {
+                interp_arg_buf[..arg.len()].copy_from_slice(arg);
+                arg.len()
+            });
+            (interp.len(), arg_len)
+        });
+        heap::kfree(image.ptr);
+        let (interp_len, arg_len) = parsed.ok_or(-ENOEXEC)?;
+        let interp_path = core::str::from_utf8(&interp_buf[..interp_len]).map_err(|_| -ENOEXEC)?;
+        let interp_dir = resolve_dir_for_path(ctx, fs::AT_FDCWD, interp_path)?;
+        let interp_inode = fs::lookupat(interp_dir, interp_path).map_err(|err| -fs_to_errno(err))?;
+        image = read_exec_image_from_inode(interp_inode)?;
+        if !image_is_elf(image.as_slice()) {
+            heap::kfree(image.ptr);
+            return Err(-ENOEXEC);
+        }
+        // The buffers are zeroed and one byte longer than the longest
+        // string, so each slice ends with its NUL.
+        script_argv[0] = &interp_buf[..interp_len + 1];
+        script_argc = 1;
+        if arg_len > 0 {
+            script_argv[1] = &interp_arg_buf[..arg_len + 1];
+            script_argc = 2;
+        }
+        script_argv[script_argc] = execfn;
+        script_argc += 1;
+    }
+    let mut argc = argc;
+    if script_argc > 0 {
+        // argv[0] is replaced by the interpreter, its argument and the
+        // script path; the caller's remaining arguments follow.
+        let rest = argc.saturating_sub(1);
+        if script_argc + rest > EXEC_MAX_ARGV {
+            heap::kfree(image.ptr);
+            return Err(-E2BIG);
+        }
+        for idx in (0..rest).rev() {
+            argv[script_argc + idx] = argv[1 + idx];
+        }
+        argv[..script_argc].copy_from_slice(&script_argv[..script_argc]);
+        argc = script_argc + rest;
+    }
     // Point of no return: the new image was read, so the other threads go
     // now (failures before this leave the process untouched).
     if let Err(err) = exec_prepare_thread_group(ctx) {
@@ -201,6 +248,58 @@ pub(super) fn execve_common(
 #[inline]
 pub(super) fn image_is_elf(image: &[u8]) -> bool {
     image.len() >= 4 && image[..4] == [0x7f, b'E', b'L', b'F']
+}
+
+/// Longest "#!" line `execve` looks at, including the "#!" (Linux's
+/// `BINPRM_BUF_SIZE`).
+pub(super) const SHEBANG_MAX: usize = 256;
+
+/// Parse a script's first line, `#!interpreter [argument]`, the way Linux
+/// does: blanks around the interpreter are skipped, and everything after it
+/// (trimmed) is one single argument, spaces included. Returns `None` when
+/// the image does not start with `#!`, names no interpreter, or its first
+/// line does not end within `SHEBANG_MAX` bytes.
+pub(super) fn parse_shebang(image: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    fn is_blank(byte: &u8) -> bool {
+        *byte == b' ' || *byte == b'\t'
+    }
+    fn trim(mut bytes: &[u8]) -> &[u8] {
+        while let [first, rest @ ..] = bytes {
+            if !is_blank(first) {
+                break;
+            }
+            bytes = rest;
+        }
+        while let [rest @ .., last] = bytes {
+            if !is_blank(last) && *last != b'\r' {
+                break;
+            }
+            bytes = rest;
+        }
+        bytes
+    }
+
+    if image.len() < 2 || image[..2] != *b"#!" {
+        return None;
+    }
+    let window = &image[2..cmp::min(image.len(), SHEBANG_MAX)];
+    let line = match window.iter().position(|byte| *byte == b'\n') {
+        Some(end) => &window[..end],
+        // The whole file is one short line without a newline.
+        None if image.len() <= SHEBANG_MAX => window,
+        None => return None,
+    };
+    let line = trim(line);
+    if line.is_empty() || line.contains(&0) {
+        return None;
+    }
+    match line.iter().position(is_blank) {
+        Some(end) => {
+            let arg = trim(&line[end..]);
+            Some((&line[..end], if arg.is_empty() { None } else { Some(arg) }))
+        }
+        None => Some((line, None)),
+    }
 }
 
 /// Internal `exit_code` flag: the process was killed by signal
@@ -637,7 +736,8 @@ pub(super) fn sys_futex(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
             if cmd == ipc::FUTEX_WAIT_BITSET && call.arg(5) as u32 == 0 {
                 return -EINVAL;
             }
-            let deadline = match futex_deadline(ctx, call.arg(3), cmd == ipc::FUTEX_WAIT_BITSET) {
+            let realtime = (op & ipc::FUTEX_CLOCK_REALTIME) != 0;
+            let deadline = match futex_deadline(ctx, call.arg(3), cmd == ipc::FUTEX_WAIT_BITSET, realtime) {
                 Ok(deadline) => deadline,
                 Err(err) => return err,
             };
@@ -688,13 +788,17 @@ pub(super) fn sys_futex(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
 }
 
 /// Convert a futex timeout argument to an absolute PIT-tick deadline.
-/// FUTEX_WAIT takes a relative timeout; FUTEX_WAIT_BITSET an absolute one
-/// (CLOCK_MONOTONIC and CLOCK_REALTIME share the tick clock here).
-fn futex_deadline(ctx: &SyscallContext, ts_ptr: u64, absolute: bool) -> Result<Option<u64>, i64> {
+/// FUTEX_WAIT takes a relative timeout; FUTEX_WAIT_BITSET an absolute one,
+/// on CLOCK_MONOTONIC or, with FUTEX_CLOCK_REALTIME, on the wall clock.
+fn futex_deadline(ctx: &SyscallContext, ts_ptr: u64, absolute: bool, realtime: bool) -> Result<Option<u64>, i64> {
     if ts_ptr == 0 {
         return Ok(None);
     }
-    let ts = read_struct_from_user::<LinuxTimeSpec>(ctx.current, ts_ptr).map_err(|err| -err)?;
+    let mut ts = read_struct_from_user::<LinuxTimeSpec>(ctx.current, ts_ptr).map_err(|err| -err)?;
+    if absolute && realtime && ts.tv_sec >= 0 {
+        // A wall-clock deadline before boot has already passed.
+        ts.tv_sec = cmp::max(ts.tv_sec - realtime_boot_secs() as i64, 0);
+    }
     let ticks = timespec_to_sleep_ticks(&ts)?;
     Ok(Some(if absolute {
         ticks

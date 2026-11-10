@@ -1,6 +1,6 @@
 # Desktop Environment Roadmap (Living Document)
 
-Last updated: 2026-11-08
+Last updated: 2026-11-10
 
 This is the plan from today's Wayland stack (libwayland, wayland-protocols,
 xkbcommon, the `peetwl` compositor) to a modern stacking desktop in the style of
@@ -22,13 +22,16 @@ later.
 
 - Kernel: x86_64, SMP, CoW fork + threads, Linux-compatible syscall surface
   including epoll/eventfd/timerfd/signalfd, memfd + sealing, `SCM_RIGHTS`,
-  `SO_PEERCRED`.
-- Display: one fixed VESA framebuffer (`/dev/fb0`), no mode setting, no GPU.
-- Input: PS/2 keyboard and mouse, optional USB tablet, evdev-style
-  `/dev/input/event{0,1}` (no `EVIOCG*` ioctls).
-- Userspace: static musl binaries; libwayland 1.23.1, wayland-protocols 1.38
-  (xdg-shell), libxkbcommon 1.7.0; the `peetwl` compositor with server-side
-  decorations, focus, move/close, and XKB keymaps.
+  `SO_PEERCRED`, `#!` scripts and a real-time clock.
+- Display: a simpledrm-style DRM/KMS device over one fixed VESA framebuffer;
+  no mode switching, no GPU.
+- Input: PS/2 keyboard and mouse, optional USB tablet, evdev devices with the
+  ioctls libinput needs, and a static `/sys`.
+- Userspace: musl with shared libraries and a C++ runtime; the Wayland,
+  rendering, GTK 3, D-Bus and wlroots stacks below.
+- Desktop: `peet-session` starts a session bus and labwc with a panel
+  (sfwbar) and a launcher (fuzzel); foot and Thunar are the applications
+  (`make run-desktop`, `docs/desktop.md`).
 
 ## Phases (in dependency order)
 
@@ -58,9 +61,10 @@ later.
   - 64 epoll watches per instance
   - 64 pipes, 64 shmem objects
   - 32 eventfds and 32 timerfds
-- [ ] **System information.** A usable `/proc` (and parts of `/sys`), a real-time
-  clock, and the input ioctls libinput needs (`EVIOCGNAME`, `EVIOCGBIT`,
-  `EVIOCGABS`, ...).
+- [ ] **System information.** A usable `/proc`. *(Done so far: a static `/sys`
+  and the input ioctls libinput needs (`docs/labwc.md`), and a real-time
+  clock from the CMOS RTC (`docs/syscall.md`). `/proc` is still minimal:
+  there is no `/proc/self/fd`, for example, so `ttyname` fails.)*
 
 ### 2. A real display interface
 
@@ -105,7 +109,10 @@ later.
 - [x] **foot** terminal: foot 1.18.1 with fcft 3.1.8 runs under `peetwl`
   (`make run-foot-demo`, `make run-foot-smoke`; see `docs/rendering.md`), with
   harfbuzz shaping and utf8proc grapheme clustering. It still lacks terminfo.
-- [ ] Panel/taskbar and launcher (for example waybar or sfwbar, fuzzel or wofi).
+- [x] Panel/taskbar and launcher: sfwbar 1.0 (application menu, launchers,
+  taskbar, tray, clock) and fuzzel 1.11 (`make run-desktop`,
+  `make run-desktop-smoke`; see `docs/desktop.md`). There is no notification
+  center and no wallpaper yet.
 - [x] GTK 3.24 (Wayland backend) with libepoxy, ATK and gdk-pixbuf
   (`make run-gtk-smoke`; see `docs/gtk.md`).
 - [x] File manager: Thunar 4.20 (`make run-thunar-smoke`; see
@@ -119,9 +126,11 @@ later.
 ### 6. Session services
 
 - [x] D-Bus session bus (dbus 1.16; `make run-dbus-smoke`, see `docs/dbus.md`).
-  Abstract Unix sockets and a system bus are still missing, and nothing
-  starts a session bus automatically yet.
-- [ ] A session/login manager instead of `init` launching a compositor directly.
+  Abstract Unix sockets and a system bus are still missing.
+- [x] A session launcher: `peet-session` starts the session bus and labwc
+  together, and labwc's autostart starts the panel (`docs/desktop.md`).
+- [ ] A login/display manager: `init` still starts the session directly, as
+  root.
 - [ ] Notifications; audio (Intel HDA or virtio-snd driver plus PipeWire).
 - [ ] Networking basics: DHCP and DNS.
 
@@ -137,7 +146,8 @@ later.
 7. ~~gdk-pixbuf, libepoxy, GTK 3~~ Done.
 8. ~~A GTK application: Thunar~~ Done.
 9. ~~D-Bus session bus~~ Done (Thunar settings through xfconf).
-10. ~~wlroots + labwc~~ Done (`make run-labwc-smoke`). Next: a session launcher that starts the bus and labwc, a panel and launcher, inotify (Thunar refresh), and GTK applications under labwc.
+10. ~~wlroots + labwc~~ Done (`make run-labwc-smoke`).
+11. ~~A session launcher that starts the bus and labwc, a panel and a launcher; GTK applications under labwc~~ Done (`make run-desktop`). Next: inotify (Thunar refresh), more applications with desktop entries (a text editor, settings), a wallpaper and notifications (both want an SVG loader), and a login manager.
 
 First big milestone: **foot running under `peetwl`** with fonts and a usable
 shell, before the much larger wlroots and GTK ports. *(Reached: foot renders

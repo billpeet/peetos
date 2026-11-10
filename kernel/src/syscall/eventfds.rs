@@ -22,8 +22,9 @@ pub(super) struct LinuxItimerSpec {
     pub(super) it_value_nsec: i64,
 }
 
-/// Nanoseconds on the boot-relative clock behind `CLOCK_MONOTONIC` and
-/// `CLOCK_REALTIME` (see `sys_clock_gettime`).
+/// Nanoseconds on the boot-relative clock: `CLOCK_MONOTONIC`, and
+/// `CLOCK_REALTIME` minus the wall-clock time at boot (see
+/// `sys_clock_gettime`).
 #[cfg(not(test))]
 pub(super) fn evfd_now_ns() -> u64 {
     let (sec, nsec) = ticks_to_seconds_nanos(pit::ticks());
@@ -188,10 +189,15 @@ pub(super) fn sys_timerfd_settime(ctx: &SyscallContext, call: &SyscallArgs) -> i
         Ok(spec) => spec,
         Err(err) => return -err,
     };
-    let value_ns = match timespec_parts_to_ns(spec.it_value_sec, spec.it_value_nsec) {
+    let mut value_ns = match timespec_parts_to_ns(spec.it_value_sec, spec.it_value_nsec) {
         Ok(v) => v,
         Err(err) => return err,
     };
+    // An absolute deadline on a CLOCK_REALTIME timer is a wall-clock time;
+    // the timers run on the boot-relative clock.
+    if value_ns != 0 && (flags & TFD_TIMER_ABSTIME) != 0 && evfd::timerfd_clock(id) == Ok(CLOCK_REALTIME) {
+        value_ns = realtime_ns_to_uptime_ns(value_ns).max(1);
+    }
     let interval_ns = match timespec_parts_to_ns(spec.it_interval_sec, spec.it_interval_nsec) {
         Ok(v) => v,
         Err(err) => return err,

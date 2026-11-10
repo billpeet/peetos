@@ -161,6 +161,12 @@ if [[ -f "${RENDER_STAGE}/usr/lib/libgtk-3.so.0" ]]; then
   mkdir -p "${STAGE_ROOT}/usr/share/glib-2.0" "${STAGE_ROOT}/usr/share/icons"
   cp -a "${RENDER_STAGE}/usr/share/glib-2.0/schemas" "${STAGE_ROOT}/usr/share/glib-2.0/"
   cp -a "${RENDER_STAGE}/usr/share/icons/hicolor" "${STAGE_ROOT}/usr/share/icons/"
+  # GLib starts desktop entries (g_app_info_launch: the panel's application
+  # menu, "open with" in Thunar) through this helper.
+  if [[ -x "${RENDER_STAGE}/usr/libexec/gio-launch-desktop" ]]; then
+    mkdir -p "${STAGE_ROOT}/usr/libexec"
+    cp "${RENDER_STAGE}/usr/libexec/gio-launch-desktop" "${STAGE_ROOT}/usr/libexec/"
+  fi
 fi
 # Thunar: the binary, its plugins and helpers, its default custom actions,
 # the MIME database, the AdwaitaLegacy icon theme and the GTK settings that
@@ -205,6 +211,36 @@ if [[ -x "${RENDER_STAGE}/usr/bin/labwc" ]]; then
   if [[ -d "${RENDER_STAGE}/usr/share/libinput" ]]; then
     cp -a "${RENDER_STAGE}/usr/share/libinput" "${STAGE_ROOT}/usr/share/"
   fi
+fi
+# Desktop session (docs/desktop.md): the sfwbar panel and the fuzzel launcher
+# (scripts/build_desktop.sh), the session launcher and its configuration
+# (user/desktop), and the desktop entries the application menu and the
+# launcher list. json-c and gtk-layer-shell come with the other shared
+# libraries.
+if [[ -x "${RENDER_STAGE}/usr/bin/sfwbar" && -x "${STAGE_ROOT}/bin/labwc" ]]; then
+  mkdir -p "${STAGE_ROOT}/usr/bin" "${STAGE_ROOT}/usr/lib" "${STAGE_ROOT}/usr/share/applications" "${STAGE_ROOT}/etc/xdg"
+  cp "${RENDER_STAGE}/usr/bin/sfwbar" "${RENDER_STAGE}/usr/bin/fuzzel" "${STAGE_ROOT}/usr/bin/"
+  # sfwbar's library and modules (it has a RUNPATH to /usr/lib/sfwbar), and
+  # its widget definitions without the SVG icons (there is no SVG loader).
+  cp -a "${RENDER_STAGE}/usr/lib/sfwbar" "${STAGE_ROOT}/usr/lib/"
+  cp -a "${RENDER_STAGE}/usr/share/sfwbar" "${STAGE_ROOT}/usr/share/"
+  rm -rf "${STAGE_ROOT}/usr/share/sfwbar/icons"
+  # The session starts programs by name from /usr/bin.
+  ln -f "${STAGE_ROOT}/bin/labwc" "${STAGE_ROOT}/usr/bin/labwc"
+  for entry in org.codeberg.dnkl.foot.desktop thunar.desktop; do
+    if [[ -f "${RENDER_STAGE}/usr/share/applications/${entry}" ]]; then
+      cp "${RENDER_STAGE}/usr/share/applications/${entry}" "${STAGE_ROOT}/usr/share/applications/"
+    fi
+  done
+  install -m 0755 "${ROOT_DIR}/user/desktop/peet-session" "${STAGE_ROOT}/usr/bin/peet-session"
+  for dir in labwc fuzzel; do
+    mkdir -p "${STAGE_ROOT}/etc/xdg/${dir}"
+    cp "${ROOT_DIR}/user/desktop/${dir}"/* "${STAGE_ROOT}/etc/xdg/${dir}/"
+    chmod 0644 "${STAGE_ROOT}/etc/xdg/${dir}"/*
+  done
+  # sfwbar looks for its configuration in ~/.config/sfwbar and then in
+  # XDG_DATA_DIRS, not /etc/xdg: the session's replaces the stock one.
+  install -m 0644 "${ROOT_DIR}/user/desktop/sfwbar/sfwbar.config" "${STAGE_ROOT}/usr/share/sfwbar/sfwbar.config"
 fi
 if [[ -x "${ROOT_DIR}/user/gtk_smoke.elf" ]]; then
   cp "${ROOT_DIR}/user/gtk_smoke.elf" "${STAGE_ROOT}/bin/gtk_smoke"
@@ -1068,6 +1104,113 @@ if [ "$fail" -ne 0 ]; then
 fi
 EOS
 chmod 0755 "${STAGE_ROOT}/bin/labwc_smoke.sh"
+
+# Desktop session (docs/desktop.md): `make run-desktop` boots straight into
+# peet-session (a session bus, labwc, the panel).
+cat > "${STAGE_ROOT}/bin/desktop.sh" <<'EOS'
+export HOME=/root
+if [ ! -x /usr/bin/peet-session ]; then
+  echo [musl-ext2-desktop] missing /usr/bin/peet-session
+  exit 1
+fi
+echo [musl-ext2-desktop] starting the desktop session
+/usr/bin/peet-session
+echo "[musl-ext2-desktop] the session ended (status $?)"
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/desktop.sh"
+
+# Desktop smoke: the same session, driven by scripts/desktop_smoke_driver.py.
+# This runs from the session's autostart hook and reports to the console
+# what is on the session bus.
+cat > "${STAGE_ROOT}/bin/desktop_watch.sh" <<'EOS'
+say() { echo "[desktop-child] $1" > /dev/console; }
+bus_call() {
+  /usr/bin/gdbus call --session --timeout 20 --dest org.freedesktop.DBus \
+    --object-path /org/freedesktop/DBus --method "org.freedesktop.DBus.$1" $2 2>&1
+}
+# wait_name <bus name> <seconds>: block until the name has an owner.
+wait_name() {
+  /usr/bin/gdbus wait --session --timeout "$2" "$1" 2>/dev/null
+}
+
+if [ -n "$WAYLAND_DISPLAY" ] && [ -n "$DBUS_SESSION_BUS_ADDRESS" ] && [ -n "$LABWC_PID" ]; then
+  say "autostart ran with a compositor and a session bus"
+else
+  say "FAIL autostart environment: WAYLAND_DISPLAY=$WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS LABWC_PID=$LABWC_PID"
+fi
+bus_pid="$(bus_call GetConnectionUnixProcessID org.freedesktop.DBus | toybox sed -n 's/^(uint32 \([0-9]*\),)$/\1/p')"
+echo "$DBUS_SESSION_BUS_ADDRESS" > /tmp/desktop_bus.address
+say "session bus daemon is pid ${bus_pid:-unknown}"
+if wait_name org.kde.StatusNotifierWatcher 240; then
+  say "panel is on the session bus"
+else
+  say "FAIL panel is not on the session bus: $(bus_call ListNames)"
+fi
+if wait_name org.xfce.Thunar 900; then
+  say "Thunar is on the session bus"
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/desktop_watch.sh"
+
+# Typed into foot's shell by the driver (letters only: easy to send). They
+# report the pid of the shell that ran them, which tells the driver which
+# foot had the keyboard focus.
+cat > "${STAGE_ROOT}/bin/desktopok" <<'EOS'
+echo "[desktop-child] keyboard input reached the shell in foot (shell $PPID)" > /dev/console
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/desktopok"
+cat > "${STAGE_ROOT}/bin/desktopbye" <<'EOS'
+echo "[desktop-child] logging out from foot (shell $PPID)" > /dev/console
+kill -TERM "$LABWC_PID"
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/desktopbye"
+
+cat > "${STAGE_ROOT}/bin/desktop_smoke.sh" <<'EOS'
+fail=0
+export HOME=/tmp LANG=C.UTF-8
+
+if [ ! -x /usr/bin/peet-session ] || [ ! -x /usr/bin/sfwbar ] || [ ! -x /usr/bin/fuzzel ]; then
+  echo [musl-ext2-desktop-smoke] missing peet-session, sfwbar or fuzzel
+  fail=1
+else
+  mkdir -p /tmp/.config/peet-session
+  echo "sh /mnt/ext2/bin/desktop_watch.sh" > /tmp/.config/peet-session/autostart
+  # Started the way `make run-desktop` starts it: through the kernel's "#!"
+  # support, without arguments.
+  /usr/bin/peet-session 2>&1 | toybox head -c 400000
+  echo "[musl-ext2-desktop-smoke] session exited"
+  # dbus-run-session stops the bus when labwc exits: nothing may answer on
+  # the session's address any more (it does not wait for the daemon, so
+  # give it a moment).
+  bus_address="$(cat /tmp/desktop_bus.address 2>/dev/null)"
+  bus_up=1
+  i=0
+  while [ -n "$bus_address" ] && [ "$i" -lt 10 ]; do
+    if ! DBUS_SESSION_BUS_ADDRESS="$bus_address" /usr/bin/gdbus call --session --timeout 5 \
+      --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.ListNames > /dev/null 2>&1; then
+      bus_up=0
+      break
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  if [ "$bus_up" -eq 0 ]; then
+    echo "[musl-ext2-desktop-smoke] the session bus stopped with the session"
+  else
+    echo "[musl-ext2-desktop-smoke] the session bus ($bus_address) is still running"
+    fail=1
+  fi
+  echo "[musl-ext2-desktop-smoke] panel log:"
+  toybox head -c 4000 /tmp/sfwbar.log
+fi
+
+echo [musl-ext2-desktop-smoke] done
+if [ "$fail" -ne 0 ]; then
+  echo [musl-ext2-desktop-smoke] failures
+fi
+EOS
+chmod 0755 "${STAGE_ROOT}/bin/desktop_smoke.sh"
 
 cat > "${STAGE_ROOT}/bin/drm_smoke.sh" <<'EOS'
 fail=0

@@ -128,7 +128,13 @@ Boot logs include per-device registration lines, an aggregated `[BLK] Inventory`
   - full clear (`clear`)
 - Boot logs now include framebuffer activation/fallback status over serial.
 
+**Real-Time Clock**
+- `crates/arch_x86_64/src/rtc.rs` reads the CMOS RTC (MC146818, ports `0x70`/`0x71`) once at boot, after the PIT is up: it waits out an update in progress and reads the time registers until two reads agree.
+- Status register B selects the decoding: BCD or binary, 12-hour (PM in bit 7 of the hours) or 24-hour. The two-digit year is taken as 20xx.
+- The kernel stores the result as the Unix time at boot; `CLOCK_REALTIME` is that plus uptime (`docs/syscall.md`). Boot logs show `[RTC] Unix time at boot: <seconds>`.
+
 Limitations / Simplifications
+- The RTC is read once, with one-second resolution, and assumed to be UTC (QEMU's default). There is no century register handling, no RTC interrupt or alarm, and no writing the time back.
 - AHCI command execution is polling-based; interrupts and async completion are not wired.
 - Barriers are full drains (all dirty lines of the device plus a device flush); there is no FUA or tagged ordering, so each journal commit costs two device flushes.
 - Block-cache coherence for uncached and mixed-size I/O is a linear scan of the 64 lines per request, and the cache is one global array with no lock of its own (it relies on the callers' serialisation).

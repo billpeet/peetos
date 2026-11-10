@@ -2737,3 +2737,47 @@ fn execve_refuses_non_elf_images_with_enoexec() {
     assert!(!image_is_elf(b"echo hi\n"));
     assert!(!image_is_elf(&[0x7f, b'E', b'L']));
 }
+
+#[test]
+fn realtime_clock_is_rtc_at_boot_plus_uptime() {
+    let hz = pit::TIMER_FREQUENCY as u64;
+    // The RTC read 1_700_000_100 after 100 s of uptime: boot was at ...000.
+    set_realtime_at_boot(1_700_000_100, 100 * hz);
+    assert_eq!(realtime_boot_secs(), 1_700_000_000);
+    // Absolute wall-clock deadlines map onto the boot-relative timer clock.
+    assert_eq!(realtime_ns_to_uptime_ns(1_700_000_005 * 1_000_000_000 + 7), 5 * 1_000_000_000 + 7);
+    // Before boot: already expired.
+    assert_eq!(realtime_ns_to_uptime_ns(1_600_000_000 * 1_000_000_000), 0);
+    // No RTC: the realtime clock is the uptime clock.
+    set_realtime_at_boot(0, 0);
+    assert_eq!(realtime_boot_secs(), 0);
+    assert_eq!(realtime_ns_to_uptime_ns(42), 42);
+}
+
+#[test]
+fn execve_parses_shebang_lines_like_linux() {
+    assert_eq!(parse_shebang(b"#!/bin/sh\necho hi\n"), Some((&b"/bin/sh"[..], None)));
+    // Blanks around the interpreter are skipped; the rest of the line is
+    // one argument, inner spaces included, with trailing blanks dropped.
+    assert_eq!(
+        parse_shebang(b"#! \t/usr/bin/env  sh -e \t\nrest"),
+        Some((&b"/usr/bin/env"[..], Some(&b"sh -e"[..])))
+    );
+    assert_eq!(parse_shebang(b"#!/bin/sh -e\r\n"), Some((&b"/bin/sh"[..], Some(&b"-e"[..]))));
+    // A one-line file without a trailing newline.
+    assert_eq!(parse_shebang(b"#!/bin/toybox"), Some((&b"/bin/toybox"[..], None)));
+    // Not scripts, or no interpreter named.
+    assert_eq!(parse_shebang(b"echo hi\n"), None);
+    assert_eq!(parse_shebang(b"#"), None);
+    assert_eq!(parse_shebang(b"#!\necho hi\n"), None);
+    assert_eq!(parse_shebang(b"#!   \n"), None);
+    assert_eq!(parse_shebang(&[0x7f, b'E', b'L', b'F']), None);
+    // The first line has to end within SHEBANG_MAX bytes.
+    let mut long = [b'a'; SHEBANG_MAX + 8];
+    long[0] = b'#';
+    long[1] = b'!';
+    long[2] = b'/';
+    assert_eq!(parse_shebang(&long), None);
+    long[SHEBANG_MAX - 1] = b'\n';
+    assert_eq!(parse_shebang(&long).map(|(interp, arg)| (interp.len(), arg)), Some((SHEBANG_MAX - 3, None)));
+}

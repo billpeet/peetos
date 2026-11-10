@@ -192,6 +192,31 @@ pub(super) fn timespec_to_sleep_ticks(spec: &LinuxTimeSpec) -> Result<u64, i64> 
     Ok(ticks as u64)
 }
 
+/// Unix time (seconds) at boot, set once from the CMOS RTC
+/// (`set_realtime_at_boot`). `CLOCK_REALTIME` is this plus the uptime that
+/// `CLOCK_MONOTONIC` reports. Zero when the RTC could not be read, which
+/// leaves the realtime clock counting from the epoch.
+static REALTIME_BOOT_SECS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record the wall-clock time: `unix_secs` is the RTC's time now, after
+/// `uptime_ticks` PIT ticks of uptime.
+pub(crate) fn set_realtime_at_boot(unix_secs: u64, uptime_ticks: u64) {
+    let (uptime_secs, _) = ticks_to_seconds_nanos(uptime_ticks);
+    REALTIME_BOOT_SECS.store(unix_secs.saturating_sub(uptime_secs as u64), Ordering::Relaxed);
+}
+
+#[inline]
+pub(super) fn realtime_boot_secs() -> u64 {
+    REALTIME_BOOT_SECS.load(Ordering::Relaxed)
+}
+
+/// An absolute `CLOCK_REALTIME` time in nanoseconds since the epoch, on the
+/// boot-relative clock the timers run on. Times before boot map to 0.
+#[inline]
+pub(super) fn realtime_ns_to_uptime_ns(realtime_ns: u64) -> u64 {
+    realtime_ns.saturating_sub(realtime_boot_secs().saturating_mul(1_000_000_000))
+}
+
 pub(super) fn sys_gettimeofday(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
     let tv_ptr = call.arg(0);
     let _tz_ptr = call.arg(1);
@@ -200,7 +225,7 @@ pub(super) fn sys_gettimeofday(ctx: &SyscallContext, call: &SyscallArgs) -> i64 
         let ticks = pit::ticks();
         let (sec, nsec) = ticks_to_seconds_nanos(ticks);
         let tv = LinuxTimeVal {
-            tv_sec: sec,
+            tv_sec: sec.saturating_add(realtime_boot_secs() as i64),
             tv_usec: nsec / 1_000,
         };
         if let Err(err) = write_struct_to_user(ctx.current, tv_ptr, &tv) {
@@ -219,7 +244,7 @@ pub(super) fn sys_clock_gettime(ctx: &SyscallContext, call: &SyscallArgs) -> i64
     let ticks = pit::ticks();
     let (sec, nsec) = ticks_to_seconds_nanos(ticks);
     let ts = LinuxTimeSpec {
-        tv_sec: sec,
+        tv_sec: if clock_id == CLOCK_REALTIME { sec.saturating_add(realtime_boot_secs() as i64) } else { sec },
         tv_nsec: nsec,
     };
     match write_struct_to_user(ctx.current, call.arg(1), &ts) {

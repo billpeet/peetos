@@ -1,0 +1,13 @@
+Do not build fuzzel's man pages: they need scdoc on the build machine, and
+PeetOS has no man page viewer. (fuzzel 1.11 has no option for this.)
+
+--- a/meson.build
++++ b/meson.build
+@@ -200,7 +200,6 @@
+   install_dir: join_paths(get_option('datadir'), 'doc', 'fuzzel'))
+
+ subdir('completions')
+-subdir('doc')
+
+ summary(
+   {

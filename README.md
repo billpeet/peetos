@@ -51,6 +51,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - The Thunar file manager (Xfce 4.20) runs under `peetwl`: `make run-thunar-smoke` opens a folder, navigates into a subfolder with the keyboard and creates a folder through Thunar's New Folder dialog; see `docs/thunar.md`.
 - D-Bus 1.16 runs as a session bus: `make run-dbus-smoke` starts `dbus-daemon`, talks to it with libdbus and GDBus clients, and has it activate Xfce's settings daemon; Thunar keeps its settings there. See `docs/dbus.md`.
 - labwc 0.8 (on wlroots 0.18) runs as a full Wayland compositor on DRM with libinput: `make run-labwc-smoke` starts labwc with foot, types into foot with real key presses and maximizes it with a mouse click on labwc's title bar; see `docs/labwc.md`.
+- A desktop session: `make run-desktop` boots into `peet-session`, which starts a D-Bus session bus and labwc together, with the sfwbar panel (application menu, launchers, taskbar, clock) and the fuzzel launcher (Alt+F2). `make run-desktop-smoke` is the automated test: it starts foot from the panel, Thunar from the application menu and a second terminal from the launcher, switches windows with the taskbar and logs out. See `docs/desktop.md`.
 - The foot terminal runs under `peetwl`, with fcft/freetype text and a shell inside it: `make run-foot-demo` opens two foot windows in a QEMU window, with copy and paste between them (Ctrl+Shift+C/V), and `make run-foot-smoke` is the automated test (see `docs/rendering.md`).
 - The kernel manages up to 4 GiB of RAM through a direct map of physical memory; give QEMU more with `-m` (the dynamic-linking smoke uses 512 MiB). Per process there are 256 VM region slots and a 256 MiB mapping budget. System-wide, there are 256 tasks and 256 sockets, and memfd objects can be up to 256 MiB.
 - Per-task x87/SSE register state is saved and restored with `FXSAVE`/`FXRSTOR` on every context switch, copied on `fork`, reset on `execve`, and preserved across signal handlers (saved in the signal frame and restored by `rt_sigreturn`). A dedicated QEMU smoke target (`run-fpu-smoke`) checks all three paths.
@@ -99,6 +100,7 @@ The older C tree in `../peetos_c` is still useful as a historical reference, but
 - `docs/gtk.md` GTK 3 port: build, Wayland backend, the GTK smoke test and limitations.
 - `docs/thunar.md` Thunar file manager: the Xfce library builds, staged data, the Thunar smoke test and limitations.
 - `docs/labwc.md` wlroots and labwc: the input/seat/udev stack, running labwc, the kernel work it needed, the labwc smoke test and limitations.
+- `docs/desktop.md` Desktop session: the session launcher, the panel and launcher, their configuration, the kernel work they needed, the desktop smoke test and limitations.
 - `docs/dbus.md` D-Bus session bus: build, starting a bus, the kernel work it needed, the D-Bus smoke test and limitations.
 - `docs/cxx.md` C++ cross toolchain (GCC + libstdc++ for musl), runtime staging and the C++ smoke test.
 - `docs/toybox.md` toybox bootstrap workflow and staged applet coverage.
@@ -242,6 +244,8 @@ make run-gtk-smoke
 make run-thunar-smoke
 make run-dbus-smoke
 make run-labwc-smoke
+make run-desktop-smoke
+make run-desktop
 make run-foot-smoke
 make run-foot-demo
 make run-gui-smoke

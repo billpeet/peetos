@@ -1873,6 +1873,7 @@ use vm::*;
 pub(crate) use fd::{fd_object_release, fd_object_retain};
 pub(crate) use vm::vm_page_cache_release_mapped_phys;
 pub(crate) use vm::mmap_register_user_stack;
+pub(crate) use misc::set_realtime_at_boot;
 pub use vm::{terminate_current_user_fault, try_handle_page_fault};
 
 #[cfg(test)]

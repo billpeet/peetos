@@ -117,11 +117,13 @@ Current implemented handlers:
 - `copy_file_range` baseline buffered VFS-to-VFS copy path
 - `execve(path, argv, envp)` with in-kernel argument/environment copy, VFS-backed ELF load, and direct frame handoff to the new image entry. The strings are copied into one heap buffer of up to 28 KiB total (any single string may use all of it), with at most 64 `argv` and 64 `envp` entries; more is `-E2BIG`.
 - `clock_getres` reports the 10 ms PIT tick for `CLOCK_REALTIME`/`CLOCK_MONOTONIC`; `fdatasync` is `fsync`.
+- `clock_gettime(CLOCK_REALTIME)` and `gettimeofday` report wall-clock time: the CMOS RTC's time, read once at boot (`arch_x86_64::rtc`, taken as UTC), plus the uptime that `CLOCK_MONOTONIC` reports. Absolute `CLOCK_REALTIME` deadlines (`timerfd_settime` with `TFD_TIMER_ABSTIME`, `FUTEX_WAIT_BITSET` with `FUTEX_CLOCK_REALTIME`) are converted to the uptime clock the timers run on. Without a valid RTC the realtime clock starts at the epoch.
 - `sendmsg`/`recvmsg` carry `SCM_CREDENTIALS` and `setsockopt`/`getsockopt` handle `SO_PASSCRED` on `AF_UNIX` sockets (see `docs/ipc.md`); `SO_PEERSEC`/`SO_PEERGROUPS`/`SO_PEERPIDFD` fail with `ENOPROTOOPT`.
 - `pidfd_open` is registered and returns `-ENOSYS` (dbus-daemon falls back to plain pids).
 - `waitid(idtype, id, infop, options)`: `P_ALL`/`P_PID`, exited children only (`WEXITED`, with `WNOHANG` and `WNOWAIT`); `infop` gets `SIGCHLD`, `CLD_EXITED`/`CLD_KILLED`, pid, uid and status.
 - `ioctl` compares only the low 32 bits of the request (an `unsigned int` in Linux): musl passes it as `int`, so `_IOR` requests arrive sign-extended.
-- `execve` of a file that is not ELF fails with `-ENOEXEC` (so shells run `#!`-less scripts themselves); there is still no `#!` support in the kernel.
+- `execve` of a script that starts with `#!interpreter [argument]` runs the interpreter, as on Linux: its `argv` is the interpreter, the optional argument (everything after the interpreter on the line, as one string), the script path, and then the caller's arguments after `argv[0]`. The line must end within 256 bytes, and `AT_EXECFN` stays the script path. A missing interpreter is `-ENOENT`.
+- `execve` of any other file that is not ELF fails with `-ENOEXEC` (so shells run `#!`-less scripts themselves).
 - `socket(AF_NETLINK, SOCK_DGRAM/SOCK_RAW, NETLINK_KOBJECT_UEVENT)`: a udev monitor socket that binds and never receives anything (no hotplug); other netlink families are `-EPROTONOSUPPORT`.
 - Writes through a `MAP_SHARED` mapping of a tmpfs file are visible to `read()` and to private mappings (the dirty page-cache pages are written back before tmpfs reads).
 - Syscall arguments may point into pages the process has not touched yet: user copies fault lazily mapped pages in (they used to fail with `EFAULT`).
@@ -205,10 +207,10 @@ Limitations / Simplifications
 - `brk` still uses simple contiguous growth/shrink and does not yet integrate with full userspace allocator policies (no overcommit accounting, no guard-page policy).
 - `futex` has no `WAKE_OP`, priority-inheritance or robust-list support, and bitsets do not filter wakeups.
 - Shared memory support is intentionally narrow: fixed-size segment/attachment tables, `IPC_RMID` only for `shmctl`, and no permission enforcement. Attachments are inherited across `fork` and dropped on exit; `execve` does not detach them yet.
-- `execve` is intentionally narrow: `FD_CLOEXEC` teardown is now wired, but there is still no shebang/script loading, bounded `argv`/`envp` vector sizes, and no full Linux signal-reset semantics.
+- `execve` is intentionally narrow: `FD_CLOEXEC` teardown is wired, but `argv`/`envp` vector sizes are bounded, there are no full Linux signal-reset semantics, and a `#!` interpreter must be an ELF program (a script as interpreter is `-ENOEXEC`; Linux allows four levels).
 - `arch_prctl` is intentionally narrow: only `ARCH_SET_FS` and `ARCH_GET_FS` are implemented; GS-base operations return `-EINVAL`.
 - `access`/`faccessat` semantics are baseline-only (no ACLs/capabilities, simplified effective-vs-real ID behavior).
-- Time-related syscalls currently derive from PIT uptime ticks; there is no realtime clock source or wall-clock synchronization.
+- Time-related syscalls derive from PIT uptime ticks (10 ms resolution). The wall clock is the RTC read once at boot, in whole seconds and taken as UTC: it is never re-read, cannot be set (`settimeofday`, `clock_settime` and `adjtimex` are missing), and there is no time zone data or NTP. File timestamps do not use it (`docs/vfs.md`).
 - `getcwd` uses bounded in-kernel directory traversal and does not yet have dedicated VFS reverse-path metadata.
 - Signal support: delivery is syscall-boundary based and user handlers require `SA_RESTORER`. Frames use the Linux `rt_sigframe` layout (`siginfo_t` + `ucontext_t` + FXSAVE image), signals 1..=64 work, and interrupted waits restart or fail with `EINTR` according to `SA_RESTART`. `sigaltstack` and queued real-time payloads are not implemented. See `docs/process_model.md`.
 - Several Toybox-relevant syscalls are still stubbed and return `-ENOSYS` pending VFS/metadata support (`fchmodat`, `fchownat`, `mknodat`, plus compatibility wrappers `utimes`/`futimesat`).

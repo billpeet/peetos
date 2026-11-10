@@ -224,6 +224,10 @@ current Rust kernel implementation and forward roadmap.
   - DRM `OBJECT_ANY` property queries and hiding the hardware cursor;
   - `/dev/shm`, 16 MiB tmpfs files, and `MAP_SHARED` tmpfs writes visible to `read()`/private mappings;
   - `waitid`, and `ENOEXEC` for non-ELF `execve`.
+- A desktop session (`docs/desktop.md`): `peet-session` starts a D-Bus session bus and labwc together; labwc's autostart runs the sfwbar panel (application menu, launchers, taskbar, tray, clock), and Alt+F2 opens the fuzzel launcher. json-c, gtk-layer-shell, sfwbar and fuzzel are built by `scripts/build_desktop.sh`. `make run-desktop` is the interactive session and `make run-desktop-smoke` the test. Kernel work it needed:
+  - `execve` runs `#!` scripts through their interpreter;
+  - a real-time clock: `CLOCK_REALTIME` and `gettimeofday` are the CMOS RTC's time at boot plus uptime, and absolute `CLOCK_REALTIME` timerfd and futex timeouts are wall-clock deadlines;
+  - `SCM_RIGHTS` descriptors stay with the message they were sent with (a read never runs on into the next descriptor-carrying message), and one message may carry 28 of them. Before this labwc disconnected GTK clients whose requests it read without their descriptors.
 - The path from here to a full desktop is tracked in `docs/desktop_roadmap.md`.
 - libxkbcommon 1.7.0 is ported (`make -C wayland`) with a build-time-verified xkeyboard-config subset staged at `/usr/share/X11/xkb`; `peetwl` serves real XKB keymaps. Adjacent compatible VM regions now merge, which musl's allocator needs for workloads like keymap compilation within the region slots per task (32 then, 256 now).
 
@@ -293,7 +297,7 @@ current Rust kernel implementation and forward roadmap.
   M5 is done: 64-bit file sizes (no 32 KiB or 4 GiB limits, sparse growth),
   post-2038 timestamps, reference-counted VFS files with unlink-while-open
   semantics backed by the ext4 orphan list, orphan processing at mount, and
-  `orphan_file` support. Remaining gaps: no wall clock, xattrs not exposed.
+  `orphan_file` support. Remaining gaps: file timestamps are not wall-clock times, xattrs not exposed.
 - Add additional filesystem support (for example FAT-family support) as needed.
 - Improve durability guarantees around writeback scheduling and crash handling.
 

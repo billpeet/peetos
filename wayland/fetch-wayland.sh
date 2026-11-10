@@ -13,7 +13,8 @@ fonts, the 2D toolkit libraries (zlib, libpng, pcre2, GLib, fribidi, cairo,
 pango), the GTK 3 stack (libepoxy, ATK, gdk-pixbuf, GTK, the hicolor icon
 theme), the Xfce libraries and Thunar, D-Bus, the wlroots/labwc stack (libevdev, mtdev,
 libudev-zero, libinput, seatd, hwdata, libdisplay-info, wlroots, libxml2,
-labwc), and tllist, fcft and the foot terminal.
+labwc), tllist, fcft and the foot terminal, and the desktop shell (json-c,
+gtk-layer-shell, the sfwbar panel and the fuzzel launcher).
 
 Options:
   --output-dir <dir>   destination root (default: script dir)
@@ -214,6 +215,23 @@ FOOT_VERSION="1.18.1"
 FOOT_URL="https://codeberg.org/dnkl/foot/archive/${FOOT_VERSION}.tar.gz"
 FOOT_SHA256="f1438298117b1346405f175e8a052ba9828a610e061971cc8dde9153939344c5"
 
+# Desktop shell (scripts/build_desktop.sh).
+JSON_C_VERSION="0.18"
+JSON_C_URL="https://s3.amazonaws.com/json-c_releases/releases/json-c-${JSON_C_VERSION}.tar.gz"
+JSON_C_SHA256="876ab046479166b869afc6896d288183bbc0e5843f141200c677b3e8dfb11724"
+
+GTK_LAYER_SHELL_VERSION="0.9.2"
+GTK_LAYER_SHELL_URL="https://github.com/wmww/gtk-layer-shell/archive/refs/tags/v${GTK_LAYER_SHELL_VERSION}.tar.gz"
+GTK_LAYER_SHELL_SHA256="526dd95c083e2a73eafd8baa1f5d676a36cb80fc8e7b304cbe3efebd62f0600c"
+
+SFWBAR_VERSION="1.0_beta16.1"
+SFWBAR_URL="https://github.com/LBCrion/sfwbar/archive/refs/tags/v${SFWBAR_VERSION}.tar.gz"
+SFWBAR_SHA256="98f3d77713a2e3a10fcb09c365c92fa96ab84bf157e59bd3f4d4d274ce0496e8"
+
+FUZZEL_VERSION="1.11.1"
+FUZZEL_URL="https://codeberg.org/dnkl/fuzzel/archive/${FUZZEL_VERSION}.tar.gz"
+FUZZEL_SHA256="8f7d00c912d5b46d09ad726347644f38b295b586d76ac8113c7a24da962dfb54"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir)
@@ -362,3 +380,11 @@ fetch_one "labwc ${LABWC_VERSION}" "${LABWC_URL}" "${LABWC_SHA256}" \
   "${OUTPUT_DIR}/labwc-src" "labwc-${LABWC_VERSION}.tar.gz"
 fetch_one "foot ${FOOT_VERSION}" "${FOOT_URL}" "${FOOT_SHA256}" \
   "${OUTPUT_DIR}/foot-src" "foot-${FOOT_VERSION}.tar.gz"
+fetch_one "json-c ${JSON_C_VERSION}" "${JSON_C_URL}" "${JSON_C_SHA256}" \
+  "${OUTPUT_DIR}/json-c-src" "json-c-${JSON_C_VERSION}.tar.gz"
+fetch_one "gtk-layer-shell ${GTK_LAYER_SHELL_VERSION}" "${GTK_LAYER_SHELL_URL}" "${GTK_LAYER_SHELL_SHA256}" \
+  "${OUTPUT_DIR}/gtk-layer-shell-src" "gtk-layer-shell-${GTK_LAYER_SHELL_VERSION}.tar.gz"
+fetch_one "sfwbar ${SFWBAR_VERSION}" "${SFWBAR_URL}" "${SFWBAR_SHA256}" \
+  "${OUTPUT_DIR}/sfwbar-src" "sfwbar-${SFWBAR_VERSION}.tar.gz"
+fetch_one "fuzzel ${FUZZEL_VERSION}" "${FUZZEL_URL}" "${FUZZEL_SHA256}" \
+  "${OUTPUT_DIR}/fuzzel-src" "fuzzel-${FUZZEL_VERSION}.tar.gz"

@@ -89,7 +89,7 @@ This document describes the current baseline IPC/synchronization implementation 
 **Event FDs (`eventfd`, `timerfd`, `signalfd`)**
 - Object state lives in `kernel/src/evfd.rs` (refcounted tables: 32 eventfds, 32 timerfds, 16 signalfds); syscalls and read/write/poll hooks are in `kernel/src/syscall/eventfds.rs`. Each is its own fd kind (`USER_FD_KIND_EVENTFD`/`_TIMERFD`/`_SIGNALFD`) and works with `poll`/`select`/`epoll`, `dup*`, `fork`, `fcntl(F_SETFL, O_NONBLOCK)`, and close-on-exec.
 - `eventfd`/`eventfd2(initval, flags)`: 64-bit counter. `read` returns and clears it (or decrements by one with `EFD_SEMAPHORE`), `write` adds to it. Readable while non-zero; writable while below `0xffff_ffff_ffff_fffe`. Blocks unless `EFD_NONBLOCK`/`O_NONBLOCK`.
-- `timerfd_create(clock, flags)` accepts `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, and `CLOCK_BOOTTIME` (all backed by the same boot-relative PIT clock that `clock_gettime` uses). `timerfd_settime` supports relative and `TFD_TIMER_ABSTIME` deadlines, intervals, disarm, and returns the old setting; `timerfd_gettime` reports remaining time. `read` returns the number of expirations since the last read, counting missed periods.
+- `timerfd_create(clock, flags)` accepts `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, and `CLOCK_BOOTTIME` (all backed by the same boot-relative PIT clock; an absolute deadline on a `CLOCK_REALTIME` timer is a wall-clock time and is converted to it). `timerfd_settime` supports relative and `TFD_TIMER_ABSTIME` deadlines, intervals, disarm, and returns the old setting; `timerfd_gettime` reports remaining time. `read` returns the number of expirations since the last read, counting missed periods.
 - `signalfd`/`signalfd4(fd, mask, 8, flags)`: creates a signalfd or updates an existing one's mask. Reading dequeues pending signals in the mask from the calling task and returns one 128-byte `signalfd_siginfo` per signal (only `ssi_signo` is filled). `SIGKILL`/`SIGSTOP` are never reported. As on Linux, callers block the signals first so they stay pending instead of being delivered.
 
 **Signals (Baseline + User Handlers)**
@@ -117,6 +117,20 @@ This document describes the current baseline IPC/synchronization implementation 
   pathname is already present.
 - Receive path installs transferred descriptors into the receiving task fd table
   as new fd numbers, preserving descriptor kind/inode/offset semantics.
+- Descriptors travel with their data, as on Linux:
+  - a descriptor is tied to the stream position of the first byte it was
+    sent with, and `recvmsg` returns it with the read that takes that byte;
+  - a read never runs on into the data of a later descriptor-carrying
+    message, so one `recvmsg` returns at most one message's descriptors
+    (plus any plain data before or after it). A receiver therefore never
+    sees a message's bytes before its descriptors. libwayland depends on
+    this: labwc used to read two requests of a GTK client in one `recvmsg`,
+    get only the first one's descriptor and disconnect the client;
+  - a non-blocking `sendmsg` whose data would not fit (`EAGAIN`) queues no
+    descriptors, so the caller's retry does not send them twice.
+- One `sendmsg` may carry up to 28 descriptors (libwayland's batch size;
+  more is `-EINVAL`), and up to 64 may be in flight per receiving socket
+  (beyond that a non-blocking send fails with `EAGAIN`).
 - Supported transferable descriptor kinds:
   - VFS regular descriptors
   - pipe descriptors
@@ -165,7 +179,7 @@ Limitations / Simplifications
 - Event fds are baseline-only: object tables are fixed-size, timer resolution is the 10 ms PIT tick, `TFD_TIMER_CANCEL_ON_SET` is accepted but ignored (there is no settable realtime clock), blocking reads busy-yield instead of sleeping on a wait queue, `signalfd_siginfo` carries only the signal number, and eventfd/timerfd/signalfd descriptors cannot be passed over `SCM_RIGHTS` yet.
 - Signal handling: delivery happens at syscall-return boundaries and requires `SA_RESTORER`. Handlers get a Linux `rt_sigframe` (`siginfo_t`, `ucontext_t`), signals 1..=64 are supported, and blocking waits are interrupted with `SA_RESTART`-aware restart. There are no alternate signal stacks or queued real-time payloads. See `docs/process_model.md`.
 - Unix ancillary coverage is baseline-only:
-  - `SCM_RIGHTS` is implemented
+  - `SCM_RIGHTS` is implemented, with at most 28 descriptors per message (Linux: 253) and 64 in flight per socket. A plain `read`/`recv` that takes the data of a descriptor-carrying message leaves the descriptors for the next `recvmsg` (Linux discards them)
   - `SCM_CREDENTIALS`: a sent `struct ucred` is validated like Linux (only root may claim another pid/uid/gid); with `SO_PASSCRED` set (inherited by accepted sockets) `recvmsg` returns the peer's credentials as an `SCM_CREDENTIALS` message, ahead of any `SCM_RIGHTS`. They are the peer's credentials at connection time, not the per-message sender's, which differs only when another process writes to the same socket (after `fork`).
   - `SO_PEERSEC`, `SO_PEERGROUPS` and `SO_PEERPIDFD` fail with `ENOPROTOOPT` (no LSM, group lists or pidfds); other unknown socket options still read back as zero
   - `SO_PEERCRED` reports the peer's pid/uid/gid captured when the connection formed (`socketpair`, or `connect` against a listener, which records the listening process's credentials at `listen`)

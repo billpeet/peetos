@@ -121,6 +121,9 @@ run_logged "${BUILD}/mime.log" update-mime-database -n "${STAGE}/usr/share/mime"
 echo "[thunar] staging the AdwaitaLegacy icon theme"
 rm -rf "${STAGE}/usr/share/icons/AdwaitaLegacy"
 cp -a "${WL}/adwaita-icon-theme-legacy-src/AdwaitaLegacy" "${STAGE}/usr/share/icons/"
+# The theme index is next to the icon directory in the source. Without it
+# GTK does not treat the directory as a theme and finds none of its icons.
+cp "${WL}/adwaita-icon-theme-legacy-src/index.theme" "${STAGE}/usr/share/icons/AdwaitaLegacy/index.theme"
 mkdir -p "${STAGE}/etc/gtk-3.0"
 cat > "${STAGE}/etc/gtk-3.0/settings.ini" <<'EOF'
 [Settings]

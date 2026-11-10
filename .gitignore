@@ -111,6 +111,14 @@
 /wayland/libxml2-*.tar.xz
 /wayland/labwc-*.tar.gz
 /wayland/foot-*.tar.gz
+/wayland/json-c-src
+/wayland/gtk-layer-shell-src
+/wayland/sfwbar-src
+/wayland/fuzzel-src
+/wayland/json-c-*.tar.gz
+/wayland/gtk-layer-shell-*.tar.gz
+/wayland/sfwbar-*.tar.gz
+/wayland/fuzzel-*.tar.gz
 /toolchain/*-src
 /toolchain/*.tar.*
 /toolchain/out

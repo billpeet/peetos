@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<!-- PeetOS desktop session: labwc configuration (docs/desktop.md). -->
+<labwc_config>
+  <theme>
+    <cornerRadius>4</cornerRadius>
+    <font name="DejaVu Sans" size="10" />
+  </theme>
+
+  <keyboard>
+    <default />
+    <!-- Application launcher. -->
+    <keybind key="A-F2">
+      <action name="Execute" command="fuzzel" />
+    </keybind>
+    <keybind key="A-F3">
+      <action name="Execute" command="fuzzel" />
+    </keybind>
+    <keybind key="W-space">
+      <action name="Execute" command="fuzzel" />
+    </keybind>
+    <!-- Terminal and file manager. -->
+    <keybind key="W-Return">
+      <action name="Execute" command="foot" />
+    </keybind>
+    <keybind key="C-A-t">
+      <action name="Execute" command="foot" />
+    </keybind>
+    <keybind key="W-e">
+      <action name="Execute" command="thunar" />
+    </keybind>
+  </keyboard>
+
+  <mouse>
+    <default />
+  </mouse>
+
+  <!-- QEMU's PS/2 mouse reports raw motion; libinput's adaptive
+       acceleration on top of the host's makes the pointer hard to place. -->
+  <libinput>
+    <device category="default">
+      <accelProfile>flat</accelProfile>
+      <pointerSpeed>0</pointerSpeed>
+    </device>
+  </libinput>
+</labwc_config>

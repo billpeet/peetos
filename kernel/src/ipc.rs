@@ -17,6 +17,7 @@ pub const FUTEX_CMP_REQUEUE: u32 = 4;
 pub const FUTEX_WAIT_BITSET: u32 = 9;
 pub const FUTEX_WAKE_BITSET: u32 = 10;
 pub const FUTEX_PRIVATE_FLAG: u32 = 128;
+pub const FUTEX_CLOCK_REALTIME: u32 = 256;
 
 /// Futex namespace shared by every process: non-private futexes are keyed by
 /// virtual address alone, so a word mapped at the same address in several

@@ -426,7 +426,7 @@ reports no rehash needed) and lookups use it.
   e2fsck finish the kernel's orphan after replaying a crash image. The QEMU
   journal smokes unlink a file they hold open, read it back through the fd,
   and crash with the orphan pending; e2fsck and the kernel both finish it.
-- **Gaps.** There is no wall clock: timestamps are a tick counter, so files
+- **Gaps.** Timestamps do not use the wall clock: they are a tick counter, so files
   carry 1970-era times and `i_dtime` stays 0 on delete. Truncates do not put
   the inode on the orphan list while they run (Linux does), so a crash in
   the middle of a long multi-transaction truncate leaves a file with some

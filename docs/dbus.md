@@ -18,7 +18,7 @@ dbus-uuidgen --ensure=/etc/machine-id
 dbus-daemon --session --fork --address=unix:path=/tmp/dbus-session --print-pid=1
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session
 ```
-`dbus-run-session -- <command>` does the same for one command. GLib and libdbus need `/etc/machine-id`; `dbus-uuidgen --ensure` creates it once.
+`dbus-run-session -- <command>` does the same for one command, and stops the bus when the command exits. The desktop session uses it: `peet-session` runs `dbus-run-session -- labwc` (`docs/desktop.md`). GLib and libdbus need `/etc/machine-id`; `dbus-uuidgen --ensure` creates it once.
 
 **Kernel work D-Bus needed**
 - **Credentials.** libdbus servers read the client's pid/uid/gid with `SO_PEERCRED` (already there). GDBus clients send their credentials as an `SCM_CREDENTIALS` message with the authentication nul byte, which `sendmsg` used to reject. It now validates them like Linux, and `SO_PASSCRED` makes `recvmsg` deliver the peer's credentials (`docs/ipc.md`).
@@ -41,7 +41,7 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session
 The runner fails on unhandled syscalls. Set `DBUS_SMOKE_EXTRA_FEATURES=syscall-trace` to trace the run. The proc smoke (`make run-proc-smoke`) covers `SCM_CREDENTIALS`/`SO_PASSCRED` between processes and syscall arguments in untouched pages. The Thunar smoke runs Thunar on a session bus.
 
 Limitations / Simplifications
-- Session bus only. There is no system bus, no `messagebus` user, no `dbus-daemon-launch-helper` setup, and no service supervisor: something has to start the bus and export `DBUS_SESSION_BUS_ADDRESS`. Nothing does that automatically yet; the smokes do it themselves.
+- Session bus only. There is no system bus, no `messagebus` user, no `dbus-daemon-launch-helper` setup, and no service supervisor: something has to start the bus and export `DBUS_SESSION_BUS_ADDRESS`. `peet-session` does that for the desktop session (`docs/desktop.md`); the other smokes do it themselves.
 - Everything runs as root, so the bus's per-user policy is trivially satisfied. The credentials a server sees are the peer's at connection time, not per message (`docs/ipc.md`).
 - No inotify: the daemon does not notice configuration or `.service` files changing while it runs.
 - No abstract-namespace Unix sockets: buses must use path addresses (`unix:path=`, `unix:tmpdir=`).

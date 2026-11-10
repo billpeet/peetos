@@ -150,6 +150,15 @@ pub extern "C" fn kmain() -> ! {
     pit::init();
     serial_println!("[PIT] Initialized");
 
+    // Wall-clock time for CLOCK_REALTIME: the CMOS RTC at boot plus uptime.
+    match arch_x86_64::rtc::read_unix_seconds() {
+        Some(unix_secs) => {
+            syscall::set_realtime_at_boot(unix_secs, pit::ticks());
+            serial_println!("[RTC] Unix time at boot: {}", unix_secs);
+        }
+        None => serial_println!("[RTC] No valid time; CLOCK_REALTIME starts at the epoch"),
+    }
+
     input::init();
     serial_println!("[INPUT] Initialized");
 

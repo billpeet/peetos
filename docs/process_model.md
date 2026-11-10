@@ -149,7 +149,8 @@ Pipe writes that already moved data return the partial count.
 ## Futex
 
 - `FUTEX_WAIT` takes an optional relative timeout and `FUTEX_WAIT_BITSET` an
-  absolute one (CLOCK_MONOTONIC and CLOCK_REALTIME share the PIT tick clock).
+  absolute one, on CLOCK_MONOTONIC or, with `FUTEX_CLOCK_REALTIME`, on the
+  wall clock (converted to the PIT tick clock, see `docs/syscall.md`).
   An expired wait fails with `ETIMEDOUT`; the kernel sleeps the task with a
   deadline rather than polling.
 - `FUTEX_WAKE_BITSET` wakes like `FUTEX_WAKE`. Bitsets must be non-zero but do

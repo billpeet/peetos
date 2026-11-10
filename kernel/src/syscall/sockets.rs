@@ -786,6 +786,16 @@ pub(super) fn sys_sendmsg(ctx: &SyscallContext, call: &SyscallArgs) -> i64 {
         if domain != AF_UNIX || hdr.msg_name != 0 {
             return -EOPNOTSUPP;
         }
+        // The descriptors and the data go out together or not at all: a
+        // non-blocking send with a full receive buffer must not queue the
+        // descriptors, or the caller's retry would send them twice.
+        if nb && copy_len > 0 {
+            match socket::socket_unix_send_space(sock_id) {
+                Ok(0) => return -EAGAIN,
+                Ok(_) => {}
+                Err(e) => return e,
+            }
+        }
         if let Err(e) = socket::socket_send_rights(sock_id, &rights[..rights_count], nb) {
             return e;
         }

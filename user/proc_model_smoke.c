@@ -12,12 +12,16 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -823,6 +827,227 @@ static void test_exec_long_strings(void) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "execve passes a 6000-byte argument and 4000-byte env string");
 }
 
+/* execve of "#!" scripts: the kernel runs the interpreter with its optional
+ * argument, then the script path, then the caller's arguments. */
+static int write_script(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (fd < 0) {
+        return -1;
+    }
+    ssize_t len = (ssize_t)strlen(text);
+    int ok = write(fd, text, (size_t)len) == len;
+    close(fd);
+    return ok ? 0 : -1;
+}
+
+static int run_script(const char *path, char *const argv[]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execv(path, argv);
+        _exit(errno == ENOEXEC ? 101 : errno == ENOENT ? 102 : 103);
+    }
+    return wait_exit_status(pid);
+}
+
+static void test_exec_scripts(void) {
+    const char *script = "/tmp/proc_smoke_script";
+    char *args[] = {(char *)"ignored-argv0", (char *)"alpha", (char *)"beta gamma", NULL};
+    char *no_args[] = {(char *)"script", NULL};
+
+    /* $0 is the script path; the caller's argv[0] is dropped. */
+    CHECK(write_script(script, "#!/bin/sh\n"
+                               "[ \"$0\" = /tmp/proc_smoke_script ] && [ $# = 2 ] && [ \"$1\" = alpha ] &&"
+                               " [ \"$2\" = \"beta gamma\" ] && exit 42\n"
+                               "exit 1\n") == 0 &&
+              run_script(script, args) == 42,
+          "execve runs a #! script through its interpreter with the arguments");
+    /* Everything after the interpreter is one argument: `sh -e` stops at
+     * the failing command instead of reaching `exit 7`. */
+    CHECK(write_script(script, "#! /bin/sh  -e \nfalse\nexit 7\n") == 0 && run_script(script, no_args) == 1,
+          "execve passes the #! line's argument to the interpreter");
+    CHECK(write_script(script, "#!/nonexistent/interpreter\n") == 0 && run_script(script, no_args) == 102,
+          "execve of a #! script with a missing interpreter is ENOENT");
+    CHECK(write_script(script, "#!/tmp/proc_smoke_script\n") == 0 && run_script(script, no_args) == 101,
+          "execve of a #! script whose interpreter is a script is ENOEXEC");
+    CHECK(write_script(script, "exit 0\n") == 0 && run_script(script, no_args) == 101,
+          "execve of a script without #! is ENOEXEC");
+    unlink(script);
+}
+
+/* SCM_RIGHTS on a stream socket: descriptors arrive with the first byte of
+ * the data they were sent with, and a read never runs on into the data of a
+ * later descriptor-carrying message (libwayland relies on this: a request's
+ * bytes must not be seen before its descriptor). */
+#define RIGHTS_BATCH 20
+
+static ssize_t send_with_fds(int sock, const char *data, size_t len, const int *fds, int nfds) {
+    struct iovec iov = {.iov_base = (void *)data, .iov_len = len};
+    union {
+        char buf[CMSG_SPACE(sizeof(int) * RIGHTS_BATCH)];
+        struct cmsghdr align;
+    } ctl;
+    memset(&ctl, 0, sizeof(ctl));
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+    if (nfds > 0) {
+        msg.msg_control = ctl.buf;
+        msg.msg_controllen = CMSG_SPACE(sizeof(int) * (size_t)nfds);
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(sizeof(int) * (size_t)nfds);
+        memcpy(CMSG_DATA(cm), fds, sizeof(int) * (size_t)nfds);
+    }
+    return sendmsg(sock, &msg, MSG_DONTWAIT);
+}
+
+/* Returns the bytes read; stores the received descriptors and their count. */
+static ssize_t recv_with_fds(int sock, char *buf, size_t len, int *fds, int *nfds) {
+    struct iovec iov = {.iov_base = buf, .iov_len = len};
+    union {
+        char buf[CMSG_SPACE(sizeof(int) * 32)];
+        struct cmsghdr align;
+    } ctl;
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl.buf,
+                         .msg_controllen = sizeof(ctl.buf)};
+    *nfds = 0;
+    ssize_t n = recvmsg(sock, &msg, MSG_DONTWAIT);
+    if (n < 0) {
+        return n;
+    }
+    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm)) {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+            int count = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            memcpy(fds + *nfds, CMSG_DATA(cm), sizeof(int) * (size_t)count);
+            *nfds += count;
+        }
+    }
+    return n;
+}
+
+static int rights_file(const char *path, char tag) {
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0 && write(fd, &tag, 1) != 1) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int fd_tag(int fd) {
+    char tag = 0;
+    return pread(fd, &tag, 1, 0) == 1 ? tag : -1;
+}
+
+static void test_unix_rights_boundaries(void) {
+    int sv[2];
+    int file_a = rights_file("/tmp/proc_smoke_rights_a", 'A');
+    int file_b = rights_file("/tmp/proc_smoke_rights_b", 'B');
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && file_a >= 0 && file_b >= 0, "rights: setup");
+
+    /* Plain data, two messages with one descriptor each, plain data again:
+     * everything is queued before the receiver reads. */
+    CHECK(send_with_fds(sv[0], "plain", 5, NULL, 0) == 5 && send_with_fds(sv[0], "first", 5, &file_a, 1) == 5 &&
+              send_with_fds(sv[0], "second", 6, &file_b, 1) == 6 && send_with_fds(sv[0], "tail", 4, NULL, 0) == 4,
+          "rights: four sends queued");
+
+    char buf[64];
+    int fds[32];
+    int nfds = 0;
+    ssize_t n = recv_with_fds(sv[1], buf, sizeof(buf), fds, &nfds);
+    CHECK(n == 10 && memcmp(buf, "plainfirst", 10) == 0 && nfds == 1 && fd_tag(fds[0]) == 'A',
+          "rights: a read stops before the next message that carries a descriptor");
+    if (nfds == 1) {
+        close(fds[0]);
+    }
+    n = recv_with_fds(sv[1], buf, sizeof(buf), fds, &nfds);
+    CHECK(n == 10 && memcmp(buf, "secondtail", 10) == 0 && nfds == 1 && fd_tag(fds[0]) == 'B',
+          "rights: the second message brings its own descriptor");
+    if (nfds == 1) {
+        close(fds[0]);
+    }
+
+    /* One message with a batch of descriptors (libwayland sends up to 28),
+     * read in two parts: the whole batch comes with the first part. */
+    int batch[RIGHTS_BATCH];
+    for (int i = 0; i < RIGHTS_BATCH; i++) {
+        batch[i] = (i % 2) ? file_b : file_a;
+    }
+    CHECK(send_with_fds(sv[0], "batch!", 6, batch, RIGHTS_BATCH) == 6, "rights: send 20 descriptors in one message");
+    n = recv_with_fds(sv[1], buf, 2, fds, &nfds);
+    int tags_ok = nfds == RIGHTS_BATCH;
+    for (int i = 0; i < nfds; i++) {
+        tags_ok = tags_ok && fd_tag(fds[i]) == ((i % 2) ? 'B' : 'A');
+        close(fds[i]);
+    }
+    CHECK(n == 2 && memcmp(buf, "ba", 2) == 0 && tags_ok, "rights: 20 descriptors arrive in order with the first bytes");
+    n = recv_with_fds(sv[1], buf, sizeof(buf), fds, &nfds);
+    CHECK(n == 4 && memcmp(buf, "tch!", 4) == 0 && nfds == 0, "rights: the rest of the message has no descriptors");
+
+    close(sv[0]);
+    close(sv[1]);
+    close(file_a);
+    close(file_b);
+    unlink("/tmp/proc_smoke_rights_a");
+    unlink("/tmp/proc_smoke_rights_b");
+}
+
+/* CLOCK_REALTIME is the RTC's wall-clock time; absolute timeouts on it are
+ * wall-clock deadlines, not uptime ones. */
+static long long ts_ms(const struct timespec *ts) {
+    return (long long)ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
+}
+
+static void test_realtime_clock(void) {
+    struct timespec real, mono, later;
+    CHECK(clock_gettime(CLOCK_REALTIME, &real) == 0 && clock_gettime(CLOCK_MONOTONIC, &mono) == 0,
+          "clock_gettime(REALTIME and MONOTONIC)");
+    /* After 2023-11-14 (1.7e9), and far ahead of the uptime clock. */
+    CHECK(real.tv_sec > 1700000000 && real.tv_sec > mono.tv_sec + 1000000000,
+          "CLOCK_REALTIME reports wall-clock time from the RTC");
+    struct timeval tv;
+    CHECK(gettimeofday(&tv, NULL) == 0 && tv.tv_sec >= real.tv_sec && tv.tv_sec <= real.tv_sec + 2,
+          "gettimeofday agrees with CLOCK_REALTIME");
+
+    /* An absolute CLOCK_REALTIME timerfd deadline 300 ms ahead. */
+    int tfd = timerfd_create(CLOCK_REALTIME, 0);
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value = real;
+    its.it_value.tv_nsec += 300000000;
+    if (its.it_value.tv_nsec >= 1000000000) {
+        its.it_value.tv_nsec -= 1000000000;
+        its.it_value.tv_sec += 1;
+    }
+    uint64_t expirations = 0;
+    int armed = tfd >= 0 && timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0;
+    int fired = armed && read(tfd, &expirations, sizeof(expirations)) == (ssize_t)sizeof(expirations);
+    clock_gettime(CLOCK_REALTIME, &later);
+    long long waited = ts_ms(&later) - ts_ms(&real);
+    CHECK(fired && expirations == 1 && waited >= 250 && waited < 3000,
+          "absolute CLOCK_REALTIME timerfd fires at its wall-clock deadline");
+    if (tfd >= 0) {
+        close(tfd);
+    }
+
+    /* FUTEX_WAIT_BITSET with FUTEX_CLOCK_REALTIME: an absolute wall-clock
+     * timeout 200 ms ahead. */
+    static int futex_word = 0;
+    clock_gettime(CLOCK_REALTIME, &real);
+    struct timespec deadline = real;
+    deadline.tv_nsec += 200000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_nsec -= 1000000000;
+        deadline.tv_sec += 1;
+    }
+    long rc = syscall(SYS_futex, &futex_word, 9 /* FUTEX_WAIT_BITSET */ | 256 /* FUTEX_CLOCK_REALTIME */, 0,
+                      &deadline, NULL, 0xffffffffu);
+    int futex_errno = errno;
+    clock_gettime(CLOCK_REALTIME, &later);
+    waited = ts_ms(&later) - ts_ms(&real);
+    CHECK(rc == -1 && futex_errno == ETIMEDOUT && waited >= 150 && waited < 3000,
+          "futex wait with an absolute CLOCK_REALTIME timeout");
+}
+
 static int exec_child_main(const char *expected_pid) {
     int ok = getpid() == atoi(expected_pid) && gettid_raw() == getpid();
     printf("[proc-smoke] exec-child %s (pid=%d tid=%d)\n", ok ? "ok" : "BAD", (int)getpid(),
@@ -1246,6 +1471,9 @@ int main(int argc, char **argv) {
     test_cancellation();
     test_exec_from_thread();
     test_exec_long_strings();
+    test_exec_scripts();
+    test_realtime_clock();
+    test_unix_rights_boundaries();
     test_socket_waits();
     test_lazy_user_copies();
     test_shm_shared_mapping_coherence();

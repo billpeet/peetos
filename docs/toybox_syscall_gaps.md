@@ -459,7 +459,7 @@ These depend on kernel subsystems not yet complete or intentionally out of scope
   - `readlinkat` supports baseline VFS symlink targets plus synthetic `/proc/self/exe`.
   - `utimensat` currently updates inode timestamps in VFS/ext2 metadata without full permission/ownership policy compatibility.
   - `copy_file_range` is currently implemented as a buffered read/write copy for VFS fds (not a zero-copy filesystem-optimized path).
-  - time syscalls are PIT tick-derived monotonic values (no RTC or true wall clock).
+  - time syscalls are PIT tick-derived; `CLOCK_REALTIME` adds the RTC's time at boot (`docs/syscall.md`), and the clock cannot be set.
   - `getcwd` path lookup is bounded and depends on current VFS traversal behavior.
   - `fork` currently clones full userspace mappings (no copy-on-write optimization yet).
   - `clone`/`vfork` currently map to a narrow fork-compatible subset (no full Linux thread/shared-VM semantics).

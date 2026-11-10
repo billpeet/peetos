@@ -19,8 +19,11 @@ const UNIX_NO_PEER: u16 = u16::MAX;
 const UNIX_PATH_MAX: usize = 108;
 const UNIX_BINDINGS_MAX: usize = 128;
 const UNIX_ACCEPT_QUEUE_SIZE: usize = 8;
-const UNIX_RIGHTS_QUEUE_SIZE: usize = 8;
-pub const UNIX_RIGHTS_MAX_FDS: usize = 8;
+/// Descriptors in flight per receiving socket (sent, not yet received).
+const UNIX_RIGHTS_QUEUE_SIZE: usize = 64;
+/// Descriptors one `sendmsg` may carry and one `recvmsg` may return.
+/// libwayland batches up to 28 per message; Linux allows 253.
+pub const UNIX_RIGHTS_MAX_FDS: usize = 28;
 
 // Socket protocol types
 const PROTO_TCP: u8 = 1;
@@ -133,6 +136,11 @@ struct SocketEntry {
     unix_rx_head: u16,
     unix_rx_tail: u16,
     unix_rx_len: u16,
+    /// Bytes ever written to / read from this socket's receive stream.
+    /// Passed descriptors are tied to stream positions (see
+    /// `UnixRightsQueueEntry`).
+    unix_rx_written: u64,
+    unix_rx_read: u64,
     unix_peer_open: bool,
     unix_bound_path_len: u8,
     unix_bound_path: [u8; UNIX_PATH_MAX],
@@ -167,6 +175,8 @@ impl SocketEntry {
             unix_rx_head: 0,
             unix_rx_tail: 0,
             unix_rx_len: 0,
+            unix_rx_written: 0,
+            unix_rx_read: 0,
             unix_peer_open: false,
             unix_bound_path_len: 0,
             unix_bound_path: [0; UNIX_PATH_MAX],
@@ -199,6 +209,8 @@ impl SocketEntry {
         self.unix_rx_head = 0;
         self.unix_rx_tail = 0;
         self.unix_rx_len = 0;
+        self.unix_rx_written = 0;
+        self.unix_rx_read = 0;
         self.unix_peer_open = false;
         self.unix_bound_path_len = 0;
         self.unix_accept_q_head = 0;
@@ -214,17 +226,23 @@ impl SocketEntry {
     }
 }
 
+/// One descriptor in flight. As on Linux, a descriptor travels with the
+/// first byte of the data it was sent with: `pos` is the position in the
+/// receiver's stream (`unix_rx_written` at the send) where that data starts.
+/// A read delivers the descriptors whose data it has started, and never
+/// runs on into the data of a later descriptor-carrying message, so the
+/// receiver cannot see a message's bytes before its descriptors.
 #[derive(Clone, Copy)]
 struct UnixRightsQueueEntry {
-    count: u8,
-    fds: [UnixRightsFd; UNIX_RIGHTS_MAX_FDS],
+    fd: UnixRightsFd,
+    pos: u64,
 }
 
 impl UnixRightsQueueEntry {
     const fn empty() -> Self {
         Self {
-            count: 0,
-            fds: [UnixRightsFd::EMPTY; UNIX_RIGHTS_MAX_FDS],
+            fd: UnixRightsFd::EMPTY,
+            pos: 0,
         }
     }
 }
@@ -361,11 +379,39 @@ fn unix_rights_queue_pop(s: &mut SocketEntry) -> Option<UnixRightsQueueEntry> {
     s.unix_rights_q[s.unix_rights_q_tail as usize] = UnixRightsQueueEntry::empty();
     s.unix_rights_q_tail = ((s.unix_rights_q_tail as usize + 1) % UNIX_RIGHTS_QUEUE_SIZE) as u8;
     s.unix_rights_q_len -= 1;
-    if out.count == 0 {
-        None
-    } else {
-        Some(out)
+    Some(out)
+}
+
+/// The `n`th queued descriptor, oldest first.
+#[inline]
+fn unix_rights_queue_peek(s: &SocketEntry, n: usize) -> Option<&UnixRightsQueueEntry> {
+    if n >= s.unix_rights_q_len as usize {
+        return None;
     }
+    Some(&s.unix_rights_q[(s.unix_rights_q_tail as usize + n) % UNIX_RIGHTS_QUEUE_SIZE])
+}
+
+/// How many bytes a read may take now without running on into a second
+/// descriptor-carrying message. The first message whose data is still
+/// unread may be read (its descriptors come with it); the read stops where
+/// the next one's data starts.
+fn unix_rx_read_limit(s: &SocketEntry) -> usize {
+    let mut first: Option<u64> = None;
+    let mut n = 0usize;
+    while let Some(entry) = unix_rights_queue_peek(s, n) {
+        n += 1;
+        if entry.pos < s.unix_rx_read {
+            // Its data was already started (by a plain read): it is
+            // delivered with the next recvmsg whatever that reads.
+            continue;
+        }
+        match first {
+            None => first = Some(entry.pos),
+            Some(pos) if entry.pos == pos => {}
+            Some(_) => return (entry.pos - s.unix_rx_read) as usize,
+        }
+    }
+    usize::MAX
 }
 
 fn unix_rights_retain_one(fd: &UnixRightsFd) -> Result<(), i64> {
@@ -389,12 +435,8 @@ fn unix_rights_release_one(fd: &UnixRightsFd) {
 }
 
 fn unix_rights_drain_socket(s: &mut SocketEntry) {
-    while let Some(msg) = unix_rights_queue_pop(s) {
-        let mut idx = 0usize;
-        while idx < msg.count as usize {
-            unix_rights_release_one(&msg.fds[idx]);
-            idx += 1;
-        }
+    while let Some(entry) = unix_rights_queue_pop(s) {
+        unix_rights_release_one(&entry.fd);
     }
 }
 
@@ -525,6 +567,7 @@ fn unix_rx_push(s: &mut SocketEntry, byte: u8) -> bool {
     s.unix_rx_buf[s.unix_rx_head as usize] = byte;
     s.unix_rx_head = ((s.unix_rx_head as usize + 1) % UNIX_STREAM_BUF_SIZE) as u16;
     s.unix_rx_len += 1;
+    s.unix_rx_written += 1;
     true
 }
 
@@ -533,13 +576,14 @@ fn unix_rx_pop(s: &mut SocketEntry, out: &mut [u8]) -> usize {
         return 0;
     }
     let mut count = 0usize;
-    let max = out.len().min(s.unix_rx_len as usize);
+    let max = out.len().min(s.unix_rx_len as usize).min(unix_rx_read_limit(s));
     while count < max {
         out[count] = s.unix_rx_buf[s.unix_rx_tail as usize];
         s.unix_rx_tail = ((s.unix_rx_tail as usize + 1) % UNIX_STREAM_BUF_SIZE) as u16;
         s.unix_rx_len -= 1;
         count += 1;
     }
+    s.unix_rx_read += count as u64;
     count
 }
 
@@ -1206,17 +1250,16 @@ fn unix_send_rights_once(id: u16, fds: &[UnixRightsFd]) -> Result<(), i64> {
                     src.unix_peer_open = false;
                     src.unix_peer = UNIX_NO_PEER;
                     Err(-EPIPE)
-                } else if peer.unix_rights_q_len as usize >= UNIX_RIGHTS_QUEUE_SIZE {
+                } else if peer.unix_rights_q_len as usize + fds.len() > UNIX_RIGHTS_QUEUE_SIZE {
                     Err(-EAGAIN)
                 } else {
-                    let mut msg = UnixRightsQueueEntry::empty();
-                    msg.count = fds.len() as u8;
-                    msg.fds[..fds.len()].copy_from_slice(fds);
-                    if !unix_rights_queue_push(peer, msg) {
-                        Err(-EAGAIN)
-                    } else {
-                        Ok(())
+                    // The data sent with them is appended next, starting at
+                    // the current end of the peer's stream.
+                    let pos = peer.unix_rx_written;
+                    for fd in fds {
+                        let _ = unix_rights_queue_push(peer, UnixRightsQueueEntry { fd: *fd, pos });
                     }
+                    Ok(())
                 }
             }
         }
@@ -1255,6 +1298,29 @@ pub fn socket_send_rights(id: u16, fds: &[UnixRightsFd], nonblocking: bool) -> R
     }
 }
 
+/// Room in the peer's receive buffer, for a sender that has to know whether
+/// data will go out before it queues descriptors with it.
+pub fn socket_unix_send_space(id: u16) -> Result<usize, i64> {
+    let idx = id as usize;
+    if idx >= MAX_SOCKETS {
+        return Err(-ENOTSOCK);
+    }
+    unsafe {
+        let src = &SOCKETS[idx];
+        if !src.used || src.protocol != PROTO_UNIX {
+            return Err(-ENOTSOCK);
+        }
+        let peer_idx = src.unix_peer as usize;
+        if !src.unix_peer_open || src.unix_peer == UNIX_NO_PEER || peer_idx >= MAX_SOCKETS {
+            return Err(-EPIPE);
+        }
+        Ok(unix_rx_space(&SOCKETS[peer_idx]))
+    }
+}
+
+/// The descriptors that arrived with the data read so far: those whose
+/// data has been started (see `UnixRightsQueueEntry`), oldest first, at
+/// most `UNIX_RIGHTS_MAX_FDS` per call. Called after the data read.
 pub fn socket_recv_rights(id: u16) -> Result<Option<UnixRightsMessage>, i64> {
     let idx = id as usize;
     if idx >= MAX_SOCKETS {
@@ -1269,11 +1335,22 @@ pub fn socket_recv_rights(id: u16) -> Result<Option<UnixRightsMessage>, i64> {
         if s.state != STATE_CONNECTED && s.state != STATE_SHUTDOWN {
             return Err(-ENOTCONN);
         }
-        if let Some(msg) = unix_rights_queue_pop(s) {
-            return Ok(Some(UnixRightsMessage {
-                count: msg.count as usize,
-                fds: msg.fds,
-            }));
+        let mut msg = UnixRightsMessage {
+            count: 0,
+            fds: [UnixRightsFd::EMPTY; UNIX_RIGHTS_MAX_FDS],
+        };
+        while msg.count < UNIX_RIGHTS_MAX_FDS {
+            match unix_rights_queue_peek(s, 0) {
+                Some(entry) if entry.pos < s.unix_rx_read => {}
+                _ => break,
+            }
+            if let Some(entry) = unix_rights_queue_pop(s) {
+                msg.fds[msg.count] = entry.fd;
+                msg.count += 1;
+            }
+        }
+        if msg.count > 0 {
+            return Ok(Some(msg));
         }
     }
 
@@ -2157,11 +2234,85 @@ mod tests {
         }];
 
         socket_send_rights(a, &rights, true).expect("send rights");
+        assert_eq!(socket_send(a, b"x", true), Ok(1));
+        // A descriptor arrives with the first byte of its data, not before.
+        assert!(socket_recv_rights(b).expect("recv rights").is_none());
+        let mut buf = [0u8; 8];
+        assert_eq!(socket_recv(b, &mut buf, true), Ok(1));
         let msg = socket_recv_rights(b)
             .expect("recv rights")
             .expect("expected rights");
         assert_eq!(msg.count, 1);
         assert_eq!(msg.fds[0], rights[0]);
+        assert!(socket_recv_rights(b).expect("recv rights").is_none());
+
+        let _ = socket_close(a);
+        let _ = socket_close(b);
+    }
+
+    fn test_right(inode: u16) -> UnixRightsFd {
+        UnixRightsFd {
+            kind: task::USER_FD_KIND_VFS,
+            inode,
+            flags: 0,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn unix_rights_stay_with_their_message() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        reset_sockets();
+        let (a, b) = socket_create_unix_pair().expect("create pair");
+
+        // Plain data, then two messages that each carry a descriptor, then
+        // more plain data, all queued before the receiver reads anything.
+        assert_eq!(socket_send(a, b"plain", true), Ok(5));
+        socket_send_rights(a, &[test_right(1)], true).expect("send rights");
+        assert_eq!(socket_send(a, b"first", true), Ok(5));
+        socket_send_rights(a, &[test_right(2), test_right(3)], true).expect("send rights");
+        assert_eq!(socket_send(a, b"second", true), Ok(6));
+        assert_eq!(socket_send(a, b"tail", true), Ok(4));
+
+        // One read takes the plain data and the first message with its
+        // descriptor, and stops before the second message.
+        let mut buf = [0u8; 64];
+        assert_eq!(socket_recv(b, &mut buf, true), Ok(10));
+        assert_eq!(&buf[..10], b"plainfirst");
+        let msg = socket_recv_rights(b).expect("recv rights").expect("first rights");
+        assert_eq!((msg.count, msg.fds[0].inode), (1, 1));
+        assert!(socket_recv_rights(b).expect("recv rights").is_none());
+
+        // The next read takes the second message, both its descriptors, and
+        // the plain data after it.
+        assert_eq!(socket_recv(b, &mut buf, true), Ok(10));
+        assert_eq!(&buf[..10], b"secondtail");
+        let msg = socket_recv_rights(b).expect("recv rights").expect("second rights");
+        assert_eq!((msg.count, msg.fds[0].inode, msg.fds[1].inode), (2, 2, 3));
+        assert_eq!(socket_recv(b, &mut buf, true), Err(-EAGAIN));
+
+        let _ = socket_close(a);
+        let _ = socket_close(b);
+    }
+
+    #[test]
+    fn unix_rights_arrive_with_the_first_byte_of_a_split_read() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        reset_sockets();
+        let (a, b) = socket_create_unix_pair().expect("create pair");
+
+        let batch: [UnixRightsFd; UNIX_RIGHTS_MAX_FDS] = core::array::from_fn(|i| test_right(100 + i as u16));
+        socket_send_rights(a, &batch, true).expect("send a full batch");
+        assert_eq!(socket_send(a, b"abcdef", true), Ok(6));
+
+        // A short read gets the whole batch with the first bytes.
+        let mut buf = [0u8; 2];
+        assert_eq!(socket_recv(b, &mut buf, true), Ok(2));
+        let msg = socket_recv_rights(b).expect("recv rights").expect("rights");
+        assert_eq!(msg.count, UNIX_RIGHTS_MAX_FDS);
+        assert_eq!(msg.fds[UNIX_RIGHTS_MAX_FDS - 1].inode, 100 + UNIX_RIGHTS_MAX_FDS as u16 - 1);
+        assert_eq!(socket_recv(b, &mut buf, true), Ok(2));
+        assert!(socket_recv_rights(b).expect("recv rights").is_none());
 
         let _ = socket_close(a);
         let _ = socket_close(b);
@@ -2184,6 +2335,7 @@ mod tests {
             socket_send_rights(a, &rights, true).expect("queue right");
         }
         assert_eq!(socket_send_rights(a, &rights, true), Err(-EAGAIN));
+        assert_eq!(socket_send_rights(a, &[rights[0], rights[0]], true), Err(-EAGAIN));
     }
 
     #[test]

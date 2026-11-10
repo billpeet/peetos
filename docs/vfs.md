@@ -145,7 +145,7 @@ Limitations / Simplifications
 - `/dev/shm` is a tmpfs directory for POSIX shared memory (`shm_open`).
 - `/sys` is a static tree built by the kernel before the root mount (`kernel/src/sysfs.rs`): `/sys/devices/platform/simple-framebuffer.0/drm/card0` and `/sys/devices/virtual/input/inputN/eventN` with `uevent`, `dev`, `subsystem` links and, for input devices, `name`, `id/*` and `capabilities/*`; plus `/sys/dev/char/M:N` and `/sys/class/{drm,input}` symlinks. It is what libudev-zero and libdrm need to enumerate devices (`docs/labwc.md`).
 - ext2 importer is intentionally minimal: regular files, directories and symlinks only (device nodes, FIFOs and sockets are skipped). tmpfs files are capped at `TMPFS_MAX_FILE_SIZE` (16 MiB) and their data lives in the kernel heap rather than in pages (memfds use pages).
-- There is no wall clock: timestamps come from a tick counter. `stat` has no nanoseconds or `crtime`, and pre-1970 times are not representable.
+- File timestamps do not use the wall clock (`CLOCK_REALTIME`, `docs/syscall.md`): they come from a tick counter. `stat` has no nanoseconds or `crtime`, and pre-1970 times are not representable.
 - Truncates are not recorded on the orphan list while they run, so a crash during a long multi-transaction truncate can leave blocks freed under the old size (consistent, but not completed at the next mount). Read-only mounts do not process orphans.
 - htree: no three-level (`largedir`) indexes; leaves are never merged after unlinks (as on Linux); `readdir` lists in VFS order (not hash order) and imports the whole directory.
 - Extended attributes are preserved and released but not exposed to userspace, and POSIX ACLs stored in xattrs are not enforced.

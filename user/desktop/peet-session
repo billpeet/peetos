@@ -1,0 +1,56 @@
+#!/bin/sh
+# PeetOS desktop session: a D-Bus session bus and the labwc compositor,
+# started together. labwc then runs /etc/xdg/labwc/autostart, which starts
+# the panel (sfwbar). When labwc exits, dbus-run-session stops the bus.
+#
+# Usage: peet-session [labwc options]
+# See docs/desktop.md.
+
+export HOME="${HOME:-/root}"
+export LANG="${LANG:-C.UTF-8}"
+export PATH="/usr/bin:/mnt/ext2/bin:/bin"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/xdg-runtime}"
+export XDG_CONFIG_DIRS="${XDG_CONFIG_DIRS:-/etc/xdg}"
+export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/share}"
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=labwc:wlroots
+
+# labwc on PeetOS: no seat daemon (devices are opened directly), software
+# rendering into DRM dumb buffers, legacy KMS (docs/labwc.md).
+export LIBSEAT_BACKEND=noop
+export WLR_RENDERER=pixman
+export WLR_DRM_NO_ATOMIC=1
+export WLR_BACKENDS=drm,libinput
+
+# GTK applications: Wayland only, and no accessibility bus to look for.
+export GDK_BACKEND=wayland
+export NO_AT_BRIDGE=1
+
+mkdir -p "$HOME" "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+# Applications start in the home directory.
+cd "$HOME"
+
+if [ ! -x /usr/bin/labwc ]; then
+  echo "peet-session: /usr/bin/labwc is missing" >&2
+  exit 1
+fi
+
+# The session command: labwc inside dbus-run-session, which starts the bus,
+# exports DBUS_SESSION_BUS_ADDRESS to labwc and stops the bus when labwc
+# exits.
+if [ -x /usr/bin/dbus-run-session ] && [ -x /usr/bin/dbus-daemon ]; then
+  # GLib and libdbus need a machine id; this creates it once.
+  dbus-uuidgen --ensure=/etc/machine-id
+  session="dbus-run-session -- labwc"
+else
+  echo "peet-session: no D-Bus (dbus-run-session is missing); starting labwc without a session bus" >&2
+  session="labwc"
+fi
+
+# toybox sh gives a script that is run without arguments its own name as
+# $1, which labwc would reject: pass arguments on only when there are some.
+if [ $# -eq 0 ] || { [ $# -eq 1 ] && [ "$1" = "$0" ]; }; then
+  exec $session
+fi
+exec $session "$@"

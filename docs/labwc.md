@@ -27,7 +27,7 @@ export WLR_RENDERER=pixman WLR_DRM_NO_ATOMIC=1 WLR_BACKENDS=drm,libinput
 mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
 labwc -s foot
 ```
-The DRM device is legacy-KMS only, so wlroots needs `WLR_DRM_NO_ATOMIC=1`. There is no GPU, so it needs the pixman renderer. labwc reads its configuration from `~/.config/labwc` and then `/etc/xdg/labwc`. The defaults give a root menu (Reconfigure, Exit) on a desktop click.
+The DRM device is legacy-KMS only, so wlroots needs `WLR_DRM_NO_ATOMIC=1`. There is no GPU, so it needs the pixman renderer. labwc reads its configuration from `~/.config/labwc` and then `/etc/xdg/labwc`. The defaults give a root menu (Reconfigure, Exit) on a desktop click. The desktop session (`peet-session`, `docs/desktop.md`) sets this environment, starts labwc with a session bus, and installs a configuration with key bindings, a menu and a panel.
 
 **Kernel work labwc needed**
 - **Device nodes** in `/dev` report `S_IFCHR` with Linux device numbers (`st_rdev`), for example 226:0 for `card0` and 13:64+N for `eventN`. Before this they reported regular files (`docs/vfs.md`).
@@ -66,6 +66,6 @@ Limitations / Simplifications
 - **No hotplug.** `/sys` is static and the netlink uevent socket stays silent. Input devices are the fixed PS/2 keyboard and mouse and the USB tablet.
 - **The USB tablet** (`event3`) is exposed to libinput, but the kernel's UHCI driver does not enumerate QEMU's `usb-tablet` in this configuration, so the smoke uses the PS/2 mouse.
 - **No Xwayland.** Only Wayland clients run.
-- **No D-Bus integration** in the smoke. labwc updates the D-Bus activation environment when `DBUS_SESSION_BUS_ADDRESS` is set (`docs/dbus.md`).
+- **No D-Bus integration** in this smoke. labwc updates the D-Bus activation environment when `DBUS_SESSION_BUS_ADDRESS` is set (`docs/dbus.md`); the desktop smoke runs labwc on a session bus with GTK clients (`docs/desktop.md`).
 - **libinput timing.** Under TCG emulation libinput warns that "your system is too slow": events are processed tens of milliseconds late, and the 10 ms PIT tick limits timer precision.
 - No X11 Compose tables are installed, so foot logs that dead keys will not work.
